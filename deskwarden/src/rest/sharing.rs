@@ -212,18 +212,34 @@ impl SharingView {
 
 // ---- the sentences a refused write says (spec 13) --------------------------------
 
-pub const NOT_AN_EMAIL: &str = "That doesn't look like an email address.";
-pub const YOURSELF: &str = "That's your own address.";
-pub const IN_TRASH: &str = "This record is in the trash or the archive. Restore it before sharing it.";
-pub const HAS_ATTACHMENTS: &str =
-    "This record has attachments. Deskwarden can't share records with attachments yet.";
-pub const UNREADABLE_PART: &str =
-    "Part of this record could not be read, so it can't be moved. Open it in the Bitwarden web vault first.";
-pub const OTHER_ORG: &str = "This record belongs to an organisation. Share it from there.";
-pub const SHARE_FAILED: &str = "Couldn't share the record. It's still in your vault.";
-pub const ORG_FAILED: &str = "Deskwarden couldn't start sharing on this server.";
+pub fn not_an_email() -> &'static str {
+    crate::i18n::t("share.not_an_email")
+}
+pub fn yourself() -> &'static str {
+    crate::i18n::t("share.yourself")
+}
+pub fn in_trash() -> &'static str {
+    crate::i18n::t("share.in_trash")
+}
+pub fn has_attachments_text() -> &'static str {
+    crate::i18n::t("share.has_attachments")
+}
+pub fn unreadable_part() -> &'static str {
+    crate::i18n::t("share.unreadable_part")
+}
+pub fn other_org() -> &'static str {
+    crate::i18n::t("share.other_org")
+}
+pub fn share_failed() -> &'static str {
+    crate::i18n::t("share.share_failed")
+}
+pub fn org_failed() -> &'static str {
+    crate::i18n::t("share.org_failed")
+}
 /// The server's list of the people in the sharing org was not one.
-pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with. Try again.";
+pub fn roster_unreadable() -> &'static str {
+    crate::i18n::t("share.roster_unreadable")
+}
 /// More than one organisation passes every test for this account's own
 /// sharing org, and Deskwarden made none of them on this PC (plan fix round
 /// 1, I1). Picking one would be a guess about which the user meant -- and a
@@ -236,70 +252,93 @@ pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with
 /// the only thing a picker could show to tell them apart is an id, and the
 /// user's pick between a real org and a planted twin would be the same guess
 /// this sentence refuses to make.
-pub const SEVERAL_ORGS: &str = "You own more than one organisation named for you on this server, and Deskwarden can't tell \
-     which of them is yours on this PC, so it hasn't shared anything.";
+pub fn several_orgs() -> &'static str {
+    crate::i18n::t("share.several_orgs")
+}
 /// The sharing org's roster answered 404 and the profile no longer lists it
 /// as this account's to own: deleted, or this account was moved out of the
 /// owner role. Its id is dropped, so the next share makes a new one.
-pub const ORG_GONE: &str = "Your sharing organisation is no longer on this server. Share again to start a new one.";
+pub fn org_gone() -> &'static str {
+    crate::i18n::t("share.org_gone")
+}
 /// The user said No to an organisation Deskwarden did not create, and the
 /// server would not let a new one be made.
-pub const NO_FRESH_ORG: &str = "This server won't let Deskwarden create a sharing organisation, so it can't share \
-     without the one you didn't choose.";
+pub fn no_fresh_org() -> &'static str {
+    crate::i18n::t("share.no_fresh_org")
+}
 /// Yes to an organisation that no longer passes the roster rule, or is no
 /// longer listed, by the time the answer came.
-pub const ADOPT_REFUSED: &str = "Deskwarden can't use that organisation for sharing any more. Try sharing again.";
+pub fn adopt_refused() -> &'static str {
+    crate::i18n::t("share.adopt_refused")
+}
 /// An adopt with no question pending, or for an org other than the one the
 /// last share asked about (fix round 2, m2): only the user's answer to the
 /// question Deskwarden asked can pin an org it did not create.
-pub const ADOPT_NOT_ASKED: &str = "Deskwarden didn't ask about that organisation. Share again to choose.";
+pub fn adopt_not_asked() -> &'static str {
+    crate::i18n::t("share.adopt_not_asked")
+}
 /// Yes was said, but the choice could not be saved, so it would be asked
 /// again: said rather than pretended.
-pub const ADOPT_NOT_SAVED: &str = "Deskwarden couldn't save that choice. Try again.";
+pub fn adopt_not_saved() -> &'static str {
+    crate::i18n::t("share.adopt_not_saved")
+}
 /// A stop's refusal opens with this; the person who can still see the record
 /// follows it.
-pub const STOP_FAILED_PREFIX: &str = "Couldn't stop sharing.";
+pub fn stop_failed_prefix() -> &'static str {
+    crate::i18n::t("share.stop_failed_prefix")
+}
 /// A share of an org copy whose move back to the personal vault is pending:
 /// the personal copy is the record to share.
-pub const COMING_HOME: &str = "This record is being moved back to your vault. Share it from there.";
+pub fn coming_home() -> &'static str {
+    crate::i18n::t("share.coming_home")
+}
 /// The last person was stopped and the personal copy could not be made.
 /// Nothing was changed.
-pub const MOVE_BACK_FAILED: &str = "Couldn't move the record back to your vault. It is still shared.";
+pub fn move_back_failed() -> &'static str {
+    crate::i18n::t("share.move_back_failed")
+}
 /// The last person was stopped and the record has an attachment, which the
 /// delete that ends a move back would destroy (see [`Sharing::move_back`]).
-pub const MOVE_BACK_ATTACHMENTS: &str =
-    "This record has attachments, so Deskwarden can't move it back to your vault. It is still shared.";
+pub fn move_back_attachments() -> &'static str {
+    crate::i18n::t("share.move_back_attachments")
+}
 /// The last person was stopped from a record in the trash or the archive: it
 /// would come home as a live personal record.
-pub const STOP_IN_TRASH: &str = "This record is in the trash or the archive. Restore it before you stop sharing it.";
+pub fn stop_in_trash() -> &'static str {
+    crate::i18n::t("share.stop_in_trash")
+}
 /// **An account with no key pair** -- one made before its server kept keys,
 /// and never opened since in an app that makes them. Sharing is on for it --
 /// nothing about the server is wrong, and nothing asks the server about its
 /// own key ([`Sharing::ensure_loaded`]) -- so the refusal is
 /// here, and says what is actually missing rather than blaming the server's
 /// age or the organisation. Bitwarden's web vault makes the pair at sign-in.
-pub const NO_KEY_PAIR: &str =
-    "This account has no encryption keys for sharing yet. Sign in to the web vault once to create them, then try again.";
+pub fn no_key_pair() -> &'static str {
+    crate::i18n::t("share.no_key_pair")
+}
 /// An invite code asked for by an account that is not NodeWarden's
 /// administrator -- refused here before any write, and the sentence the
 /// route's own 403 is read as too.
-pub const NOT_ADMIN: &str = "Only this server's administrator can make an invite code.";
+pub fn not_admin() -> &'static str {
+    crate::i18n::t("share.not_admin")
+}
 /// An invite code the server would not make, for a reason with no sentence
 /// of its own; the server's words follow it (`SharingError::or_say`).
-pub const INVITE_CODE_FAILED: &str = "Couldn't make an invite code.";
+pub fn invite_code_failed() -> &'static str {
+    crate::i18n::t("share.invite_code_failed")
+}
 /// The master password typed for an invite code was not this account's --
 /// the route's "Invalid password".
-pub const WRONG_PASSWORD: &str = "That master password isn't right.";
+pub fn wrong_password() -> &'static str {
+    crate::i18n::t("share.wrong_password")
+}
 
 /// A Re-invite of someone whose collection name Deskwarden did not write --
 /// see [`Sharing::reinvite`]. Says what to do instead: a share from the
 /// dialog starts from an address the user typed.
 #[must_use]
 pub fn not_vouched_for(email: &str) -> String {
-    format!(
-        "Deskwarden didn't set up sharing with {email}, so it won't re-invite them. \
-         Share a record with them from the Share dialog instead."
-    )
+    crate::i18n::tf("share.deskwarden_didn_t_set_up", &[("email", email)])
 }
 
 /// The Share dialog's sentence when the server will not create the sharing
@@ -310,10 +349,7 @@ pub fn not_vouched_for(email: &str) -> String {
 /// did not create it.
 #[must_use]
 pub fn needs_org(email: &str) -> String {
-    format!(
-        "Your server needs an organisation for sharing. Create one named \"{}\" in the web vault, then try again.",
-        crate::rest::organizations::sharing_org_name(email)
-    )
+    crate::i18n::tf("share.server_needs_an_organisation", &[("org", &(crate::rest::organizations::sharing_org_name(email)).to_string())])
 }
 
 /// What a share ended as: the words the dialog chooses between (mock 6a).
@@ -426,7 +462,7 @@ impl AdoptionQuestion {
     #[must_use]
     pub fn sentence(&self) -> String {
         let short: String = self.organization_id.chars().take(8).collect();
-        format!("Use the organisation \u{201c}{}\u{201d} ({short}) for sharing? Deskwarden did not create it.", self.name)
+        crate::i18n::tf("share.use_the_organisation_for_sharing", &[("name", &self.name.to_string()), ("short", &short.to_string())])
     }
 }
 
@@ -451,7 +487,7 @@ impl SharingError {
         match self {
             Self::Vault(VaultError::Unauthorized) | Self::Unavailable(_) | Self::NeedsAdoption(_) => self,
             Self::Refused(server) if !server.is_empty() && server != sentence => {
-                Self::Refused(format!("{sentence} The server said: {server}"))
+                Self::Refused(crate::i18n::tf("share.the_server_said", &[("sentence", sentence), ("server", &server.to_string())]))
             }
             _ => Self::Refused(sentence.to_string()),
         }
@@ -577,7 +613,7 @@ pub(crate) struct Account {
     pub(crate) admin: bool,
     /// The profile carries a private key, so the account has a key pair and
     /// the server holds its public half. Every owner's write asks this before
-    /// its first key is touched -- see [`NO_KEY_PAIR`].
+    /// its first key is touched -- see [`no_key_pair()`].
     pub(crate) keyed: bool,
 }
 
@@ -1225,11 +1261,7 @@ pub(crate) fn crypto(e: CryptoError) -> SharingError {
 /// Their account's key is too short to hand the org key to.
 #[must_use]
 pub fn key_too_short(bits: usize) -> String {
-    format!(
-        "Their encryption key is only {bits} bits, too short to share with safely. \
-         Deskwarden needs at least {}.",
-        crate::rest::crypto::MIN_RSA_BITS
-    )
+    crate::i18n::tf("share.key_too_short", &[("bits", &bits.to_string()), ("min", &(crate::rest::crypto::MIN_RSA_BITS).to_string())])
 }
 
 /// Plausibly an email: one `@` with something either side, no whitespace.
@@ -1262,16 +1294,16 @@ fn refuse_unmovable(
     my_org: Option<&str>,
 ) -> Result<(), SharingError> {
     if in_trash_or_archive(&record.item) {
-        return Err(SharingError::Refused(IN_TRASH.to_string()));
+        return Err(SharingError::Refused(in_trash().to_string()));
     }
     if has_attachments(&record.item) {
-        return Err(SharingError::Refused(HAS_ATTACHMENTS.to_string()));
+        return Err(SharingError::Refused(has_attachments_text().to_string()));
     }
     if !failures.is_empty() {
-        return Err(SharingError::Refused(UNREADABLE_PART.to_string()));
+        return Err(SharingError::Refused(unreadable_part().to_string()));
     }
     match organization_of(&record.item) {
-        Some(org) if Some(org) != my_org => Err(SharingError::Refused(OTHER_ORG.to_string())),
+        Some(org) if Some(org) != my_org => Err(SharingError::Refused(other_org().to_string())),
         _ => Ok(()),
     }
 }
@@ -1290,12 +1322,12 @@ fn in_trash_or_archive(item: &VaultItem) -> bool {
 }
 
 /// The account the profile just named, refused when it has no key pair --
-/// see [`NO_KEY_PAIR`]. Every owner's write asks this before its first key
+/// see [`no_key_pair()`]. Every owner's write asks this before its first key
 /// is touched.
 fn keyed_account(account: Option<Account>) -> Result<Account, SharingError> {
-    let account = account.ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
+    let account = account.ok_or_else(|| SharingError::Refused(org_failed().to_string()))?;
     if !account.keyed {
-        return Err(SharingError::Refused(NO_KEY_PAIR.to_string()));
+        return Err(SharingError::Refused(no_key_pair().to_string()));
     }
     Ok(account)
 }
@@ -1431,7 +1463,7 @@ impl Sharing {
     ///
     /// - none passes: [`OrgChoice::Nothing`], and the share makes a new org;
     /// - one passes: [`OrgChoice::Adoptable`], and the share asks the user;
-    /// - more than one: refused with [`SEVERAL_ORGS`] (I1) -- picking the
+    /// - more than one: refused with [`several_orgs()`] (I1) -- picking the
     ///   first was a guess, and a planted org among them would be it half the
     ///   time.
     ///
@@ -1441,7 +1473,7 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// **A roster that cannot be read is a refusal** ([`ROSTER_UNREADABLE`]),
+    /// **A roster that cannot be read is a refusal** ([`roster_unreadable()`]),
     /// never a "no": read as no, a share would make a second org beside the
     /// real one, and drop its cached id. A failed request is the backend's.
     pub(crate) fn org_for_a_share(&self, profile: &Profile, account: &Account, keys: &VaultKeys) -> Result<OrgChoice, SharingError> {
@@ -1458,7 +1490,7 @@ impl Sharing {
                 Attestation::Mine => passing.push(org),
                 Attestation::NotMine if cached.as_deref() == Some(org.id.as_str()) => self.forget_cached_org(&account.id, &org.id),
                 Attestation::NotMine => {}
-                Attestation::Unknown => return Err(SharingError::Refused(ROSTER_UNREADABLE.to_string())),
+                Attestation::Unknown => return Err(SharingError::Refused(roster_unreadable().to_string())),
             }
         }
         match passing.as_slice() {
@@ -1467,7 +1499,7 @@ impl Sharing {
                 organization_id: org.id.clone(),
                 name: org.name.clone().unwrap_or_default(),
             })),
-            _ => Err(SharingError::Refused(SEVERAL_ORGS.to_string())),
+            _ => Err(SharingError::Refused(several_orgs().to_string())),
         }
     }
 
@@ -1503,15 +1535,15 @@ impl Sharing {
     ///
     /// The org is judged again first, as a share would judge it: the answer
     /// may come minutes after the question, and a roster that changed in
-    /// between -- an admin added -- is refused ([`ADOPT_REFUSED`]) rather than
+    /// between -- an admin added -- is refused ([`adopt_refused()`]) rather than
     /// pinned on the strength of what it said before.
     ///
     /// # Errors
     ///
     /// It is not the org the last share asked about, or that question was
-    /// already answered ([`ADOPT_NOT_ASKED`]); the org is no longer a
+    /// already answered ([`adopt_not_asked()`]); the org is no longer a
     /// candidate or no longer passes; its roster could not be read; or the
-    /// choice could not be saved ([`ADOPT_NOT_SAVED`]) -- said, since unsaved
+    /// choice could not be saved ([`adopt_not_saved()`]) -- said, since unsaved
     /// it would be asked again.
     pub fn adopt(&self, organization_id: &str) -> Result<(), SharingError> {
         let _one = self.one_at_a_time();
@@ -1521,22 +1553,22 @@ impl Sharing {
         // needs a share to ask again.
         let asked = self.held().asked_adoption.take();
         if asked.as_deref() != Some(organization_id) {
-            return Err(SharingError::Refused(ADOPT_NOT_ASKED.to_string()));
+            return Err(SharingError::Refused(adopt_not_asked().to_string()));
         }
         self.require_available()?;
         let profile = self.profile()?;
         let account = keyed_account(self.held().account.clone())?;
         if !profile.organizations.iter().any(|o| o.id == organization_id && owned_and_named(o, &account.email)) {
-            return Err(SharingError::Refused(ADOPT_REFUSED.to_string()));
+            return Err(SharingError::Refused(adopt_refused().to_string()));
         }
         let keys = self.keys_from(&profile)?;
         match self.vouched(organization_id, &account.id, &keys)? {
             Attestation::Mine => {}
-            Attestation::NotMine => return Err(SharingError::Refused(ADOPT_REFUSED.to_string())),
-            Attestation::Unknown => return Err(SharingError::Refused(ROSTER_UNREADABLE.to_string())),
+            Attestation::NotMine => return Err(SharingError::Refused(adopt_refused().to_string())),
+            Attestation::Unknown => return Err(SharingError::Refused(roster_unreadable().to_string())),
         }
         let Some(path) = self.setup().state_path else {
-            return Err(SharingError::Refused(ADOPT_NOT_SAVED.to_string()));
+            return Err(SharingError::Refused(adopt_not_saved().to_string()));
         };
         let written = crate::sharing_state::update(&path, |state| {
             let me = state.account_mut(&account.id);
@@ -1549,7 +1581,7 @@ impl Sharing {
             Err(e) if crate::sharing_state::unreadable(&e).is_some() => Err(state_refused(&e)),
             Err(e) => {
                 log::warn!("an adopted sharing organisation could not be saved: {e}");
-                Err(SharingError::Refused(ADOPT_NOT_SAVED.to_string()))
+                Err(SharingError::Refused(adopt_not_saved().to_string()))
             }
         }
     }
@@ -1605,7 +1637,7 @@ impl Sharing {
         let Some(answer) = answer else {
             return Err(self.own_roster_missing(org));
         };
-        crate::rest::organizations::map_members(&answer).ok_or_else(|| SharingError::Refused(ROSTER_UNREADABLE.to_string()))
+        crate::rest::organizations::map_members(&answer).ok_or_else(|| SharingError::Refused(roster_unreadable().to_string()))
     }
 
     /// **The sharer's own roster answered 404** (fix round 1, I3). Official
@@ -1615,7 +1647,7 @@ impl Sharing {
     /// route that is missing, and sharing goes off ([`REASON_TOO_OLD`]).
     /// Otherwise the org is dropped -- from `held` and from the cached id,
     /// made-here or adopted -- so the next share makes a new one, and the
-    /// write that asked is told so ([`ORG_GONE`]).
+    /// write that asked is told so ([`org_gone()`]).
     fn own_roster_missing(&self, org: &str) -> SharingError {
         let profile = match self.profile() {
             Ok(profile) => profile,
@@ -1635,7 +1667,7 @@ impl Sharing {
         if let Some(account) = account {
             self.forget_cached_org(&account.id, org);
         }
-        SharingError::Refused(ORG_GONE.to_string())
+        SharingError::Refused(org_gone().to_string())
     }
 
     /// One record, fresh from the server, decrypted with `keys`.
@@ -1664,7 +1696,7 @@ impl Sharing {
     pub(crate) fn context_if_any(&self) -> Result<Option<Ctx>, SharingError> {
         self.require_available()?;
         let profile = self.profile()?;
-        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
+        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(org_failed().to_string()))?;
         let Some(org_id) = self.my_org_id(&profile, &account)? else {
             return Ok(None);
         };
@@ -1673,7 +1705,7 @@ impl Sharing {
         let org_key = keys
             .organization(&org_id)
             .cloned()
-            .ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
+            .ok_or_else(|| SharingError::Refused(org_failed().to_string()))?;
         let collections = self.collections_of(&org_id, &org_key)?;
         let roster = self.fetch_roster(&org_id)?;
         let own_ou_id = own_row(&roster, &account.id).map(|row| row.id.clone());
@@ -1684,7 +1716,7 @@ impl Sharing {
     /// account's own public key -- derived from its own private key, not
     /// asked of the server -- an RSA pair, and the first person's collection
     /// name. Returns the org's id and key. `refused` is the sentence a
-    /// failure is said with: [`ORG_FAILED`], or [`NO_FRESH_ORG`] when the
+    /// failure is said with: [`org_failed()`], or [`no_fresh_org()`] when the
     /// user has just said No to an org they could have used. A server that
     /// answers the create with a refusal is, outside that No, told
     /// [`needs_org`] instead, and remembered as one that will not create.
@@ -1714,7 +1746,7 @@ impl Sharing {
         // §4.3). The user makes it in the web vault and the next share offers
         // it for adoption (official-path spec §3.1); the server's own words
         // follow. After a No to an org that could have been used, the
-        // sentence stays [`NO_FRESH_ORG`]: making yet another org of the same
+        // sentence stays [`no_fresh_org()`]: making yet another org of the same
         // name would only be asked about again.
         //
         // **Only a 400 is that answer** (fix round 1): the attribute throws
@@ -1730,7 +1762,7 @@ impl Sharing {
             Ok(id) => id,
             Err(RestError::Rejected { description, .. }) => {
                 self.held().capabilities.creates_orgs = Some(false);
-                let sentence = if refused == NO_FRESH_ORG { refused.to_string() } else { needs_org(&account.email) };
+                let sentence = if refused == no_fresh_org() { refused.to_string() } else { needs_org(&account.email) };
                 return Err(SharingError::Refused(description).or_say(&sentence));
             }
             Err(other) => return Err(SharingError::Vault(crate::rest::backend::rest_error(other)).or_say(refused)),
@@ -1757,11 +1789,11 @@ impl Sharing {
         if let Some(id) = ctx.authenticated_collection_for(email) {
             return Ok(id.to_string());
         }
-        let manager = ctx.own_ou_id.clone().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
+        let manager = ctx.own_ou_id.clone().ok_or_else(|| SharingError::Refused(org_failed().to_string()))?;
         let name = crate::rest::crypto::encrypt(&ctx.org_key, email.as_bytes()).map_err(crypto)?;
         let id = self
             .route(|client, auth| sharing_api::create_collection(client, &mut auth.session, &ctx.org_id, &name, &manager))
-            .map_err(|e| e.or_say(&format!("Couldn't prepare sharing with {email}. Try again.")))?;
+            .map_err(|e| e.or_say(&crate::i18n::tf("share.couldn_t_prepare_sharing_with", &[("email", email)])))?;
         // Authenticated: this engine wrote the name, under the org key.
         ctx.collections.push(PersonCollection { id: id.clone(), email: email.to_string(), authenticated: true });
         Ok(id)
@@ -1803,7 +1835,7 @@ impl Sharing {
     /// is gone with the route; a key is wrapped only by the confirm pass,
     /// under its pin rule (spec 11.5).
     pub(crate) fn ensure_member(&self, ctx: &mut Ctx, email: &str, collection: &str) -> Result<ShareResult, SharingError> {
-        let refused = format!("Couldn't invite {email}.");
+        let refused = crate::i18n::tf("share.couldn_t_invite", &[("email", email)]);
         if let Some(member) = ctx.member(email).cloned() {
             // A revoked member is listed on the collection and reaches none
             // of it (fix round 2, m1): invited again like one without access.
@@ -1844,7 +1876,7 @@ impl Sharing {
                 let (fresh, failures) = self.fetch_record(&record.item.id, &ctx.keys)?;
                 refuse_unmovable(&fresh, &failures, Some(ctx.org_id.as_str()))?;
                 self.file_once(ctx, &fresh, collection).map_err(|filing| match filing {
-                    Filing::Stale(e) => e.or_say(SHARE_FAILED),
+                    Filing::Stale(e) => e.or_say(share_failed()),
                     Filing::Failed(e) => e,
                 })
             }
@@ -1863,11 +1895,11 @@ impl Sharing {
             match answer {
                 Ok(answer) => crate::rest::sync::decrypt_cipher(&answer, &ctx.keys)
                     .map(|(written, _)| written.item)
-                    .ok_or_else(|| Filing::Failed(SharingError::Refused(SHARE_FAILED.to_string()))),
+                    .ok_or_else(|| Filing::Failed(SharingError::Refused(share_failed().to_string()))),
                 Err(SharingError::Refused(said)) if said.to_lowercase().contains("out of date") => {
                     Err(Filing::Stale(SharingError::Refused(said)))
                 }
-                Err(e) => Err(Filing::Failed(e.or_say(SHARE_FAILED))),
+                Err(e) => Err(Filing::Failed(e.or_say(share_failed()))),
             }
         };
         if organization_of(&record.item) == Some(ctx.org_id.as_str()) {
@@ -1919,7 +1951,7 @@ impl Sharing {
         ctx: &Ctx,
         record: &crate::rest::sync::DecryptedItem,
     ) -> Result<crate::rest::write::MappedCipher, SharingError> {
-        let unreadable = |_: CryptoError| SharingError::Refused(UNREADABLE_PART.to_string());
+        let unreadable = |_: CryptoError| SharingError::Refused(unreadable_part().to_string());
         let mut moved = crate::vault_bridge::with_revision_date_from(&record.item, &record.item);
         moved.other.insert("organizationId".into(), serde_json::Value::String(ctx.org_id.clone()));
         moved.other.remove("collectionIds");
@@ -1934,7 +1966,7 @@ impl Sharing {
             None => None,
         };
         let mut cipher = crate::rest::write::encrypt_item(&record.carrying(moved), &ctx.keys)
-            .map_err(|e| crypto(e).or_say(SHARE_FAILED))?;
+            .map_err(|e| crypto(e).or_say(share_failed()))?;
         match &own_key {
             Some(key) => cipher.rekey_carried(key, key),
             None => cipher.rekey_carried(ctx.keys.user(), &ctx.org_key),
@@ -1982,7 +2014,7 @@ impl Sharing {
     /// **The share after No** to "Use the organisation ... ?": the org that
     /// was offered is left alone and pinned as nothing, and this share makes
     /// a new org of its own -- or, on a server that will not let it, says so
-    /// ([`NO_FRESH_ORG`]). An org this client made or the user adopted
+    /// ([`no_fresh_org()`]). An org this client made or the user adopted
     /// meanwhile is still used, rather than made twice.
     ///
     /// # Errors
@@ -2001,12 +2033,12 @@ impl Sharing {
         self.require_available()?;
         let email = normalise_email(email);
         if !plausible_email(&email) {
-            return Err(SharingError::Refused(NOT_AN_EMAIL.to_string()));
+            return Err(SharingError::Refused(not_an_email().to_string()));
         }
         let profile = self.profile()?;
         let account = self.held().account.clone();
         if account.as_ref().is_some_and(|account| email == normalise_email(&account.email)) {
-            return Err(SharingError::Refused(YOURSELF.to_string()));
+            return Err(SharingError::Refused(yourself().to_string()));
         }
         let account = keyed_account(account)?;
         // **An org copy whose move back is pending is not shared again.** Its
@@ -2015,7 +2047,7 @@ impl Sharing {
         // then silently lose it. Refused, not finished first: the record to
         // share is the personal copy, which the user shares from their vault.
         if self.pending_move(&account.id, item_id).is_some() {
-            return Err(SharingError::Refused(COMING_HOME.to_string()));
+            return Err(SharingError::Refused(coming_home().to_string()));
         }
         // **Pins that cannot be read end the share here**, before an org, a
         // collection or a membership is written: the confirm a share may run
@@ -2048,12 +2080,12 @@ impl Sharing {
 
         let (org_id, org_key, collections, created) = match existing {
             Some(org_id) => {
-                let org_key = keys.organization(&org_id).cloned().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
+                let org_key = keys.organization(&org_id).cloned().ok_or_else(|| SharingError::Refused(org_failed().to_string()))?;
                 let collections = self.collections_of(&org_id, &org_key)?;
                 (org_id, org_key, collections, false)
             }
             None => {
-                let refused = if new_org { NO_FRESH_ORG } else { ORG_FAILED };
+                let refused = if new_org { no_fresh_org() } else { org_failed() };
                 let (org_id, org_key) = self.create_org(&profile, &account, &keys, &email, refused)?;
                 keys = Arc::new(keys.with_organization(&org_id, org_key.clone()));
                 // Into the backend's key cache too, which `keys_from` filled:
@@ -2173,7 +2205,7 @@ impl Sharing {
     /// the last person's, so finishing it is the whole of any stop on it.
     pub(crate) fn stop_with(&self, ctx: &Ctx, item_id: &str, email: &str) -> Result<StopOutcome, SharingError> {
         let email = normalise_email(email);
-        let refused = format!("{STOP_FAILED_PREFIX} {email} can still see it.");
+        let refused = crate::i18n::tf("share.stop_failed_can_still_see", &[("stop_failed_prefix", stop_failed_prefix()), ("email", &email.to_string())]);
         if let Some(personal_id) = self.pending_move(&ctx.account.id, item_id) {
             return self.finish_pending(ctx, item_id, &personal_id, &email);
         }
@@ -2251,17 +2283,17 @@ impl Sharing {
     ///
     /// Each refused before anything is written, with its own sentence:
     ///
-    /// * **The trash or the archive** ([`STOP_IN_TRASH`]): it would come home
+    /// * **The trash or the archive** ([`stop_in_trash()`]): it would come home
     ///   live. Only here, at the move back -- taking one of several people
     ///   off a trashed record moves nothing, and `forget` must still be able
     ///   to.
-    /// * **An attachment** ([`MOVE_BACK_ATTACHMENTS`]): it belongs to the org
+    /// * **An attachment** ([`move_back_attachments()`]): it belongs to the org
     ///   cipher's id (decision 3's reason, from the other side), and the
     ///   delete that ends a move back would destroy it. The share refuses
     ///   attachments, but the web vault can add one to a record already
     ///   shared.
     /// * **A field that did not decrypt, or a leaf under neither key**
-    ///   ([`UNREADABLE_PART`], the share's own sentence): it would arrive
+    ///   ([`unreadable_part()`], the share's own sentence): it would arrive
     ///   unreadable.
     fn move_back(
         &self,
@@ -2271,13 +2303,13 @@ impl Sharing {
         refused: &str,
     ) -> Result<StopOutcome, SharingError> {
         let say = |sentence: &str| SharingError::Refused(sentence.to_string());
-        let refuse = || say(MOVE_BACK_FAILED);
-        let unreadable = || say(UNREADABLE_PART);
+        let refuse = || say(move_back_failed());
+        let unreadable = || say(unreadable_part());
         if in_trash_or_archive(&record.item) {
-            return Err(say(STOP_IN_TRASH));
+            return Err(say(stop_in_trash()));
         }
         if has_attachments(&record.item) {
-            return Err(say(MOVE_BACK_ATTACHMENTS));
+            return Err(say(move_back_attachments()));
         }
         if !failures.is_empty() {
             return Err(unreadable());
@@ -2308,7 +2340,7 @@ impl Sharing {
         home.folder_id = placed.folder_id;
         home.favorite = placed.favorite;
         let mut cipher = crate::rest::write::encrypt_item(&record.carrying(home), &ctx.keys)
-            .map_err(|e| crypto(e).or_say(MOVE_BACK_FAILED))?;
+            .map_err(|e| crypto(e).or_say(move_back_failed()))?;
         match &own_key {
             Some(key) => cipher.rekey_carried(key, key),
             None => cipher.rekey_carried(&ctx.org_key, ctx.keys.user()),
@@ -2316,7 +2348,7 @@ impl Sharing {
         .map_err(|_| unreadable())?;
         let answer = self
             .call(|client, auth| client.create_cipher(&mut auth.session, &cipher))
-            .map_err(|e| e.or_say(MOVE_BACK_FAILED))?;
+            .map_err(|e| e.or_say(move_back_failed()))?;
         let created = match crate::rest::sync::decrypt_cipher(&answer, &ctx.keys) {
             Some((created, failures))
                 if failures.is_empty() && !created.item.id.is_empty() && created.item.id != old && organization_of(&created.item).is_none() =>
@@ -2359,7 +2391,7 @@ impl Sharing {
     /// reaches this path, whoever it names, so "{email} can still see it" is
     /// said only when the org copy -- re-read for the purpose, on this rare
     /// branch alone -- is still filed in that person's collection. Otherwise
-    /// the neutral [`STOP_FAILED_PREFIX`]: the stop did fail, and whoever can
+    /// the neutral [`stop_failed_prefix()`]: the stop did fail, and whoever can
     /// see the record, it is not someone this stop can name.
     fn finish_pending(&self, ctx: &Ctx, old: &str, personal_id: &str, email: &str) -> Result<StopOutcome, SharingError> {
         let (unfiled, purged) = self.second_half(old);
@@ -2377,9 +2409,9 @@ impl Sharing {
                         .fetch_record(old, &ctx.keys)
                         .is_ok_and(|(org_copy, _)| collection_ids_of(&org_copy.item).iter().any(|id| theirs.contains(id)));
                 return Err(SharingError::Refused(if still_theirs {
-                    format!("{STOP_FAILED_PREFIX} {email} can still see it.")
+                    format!("{stop_failed_prefix} {email} can still see it.", stop_failed_prefix = stop_failed_prefix())
                 } else {
-                    STOP_FAILED_PREFIX.to_string()
+                    stop_failed_prefix().to_string()
                 }));
             }
         }
@@ -2550,8 +2582,8 @@ struct Unstopped {
 /// The refusal of a forget some of whose stops failed.
 ///
 /// **One record: its own reason, named**, so the user can act on it -- the
-/// trash ([`STOP_IN_TRASH`]), an attachment ([`MOVE_BACK_ATTACHMENTS`]), a
-/// part that did not decrypt ([`UNREADABLE_PART`]) each say what to do, and
+/// trash ([`stop_in_trash()`]), an attachment ([`move_back_attachments()`]), a
+/// part that did not decrypt ([`unreadable_part()`]) each say what to do, and
 /// "This record" in them needs the name beside it: a trashed record is not
 /// in the daemon's copy, so the view cannot point at it. **Several: how
 /// many** -- a list of sentences is not a toast. The count is not said to be
@@ -2561,11 +2593,11 @@ struct Unstopped {
 fn forget_refused(email: &str, unstopped: &[Unstopped]) -> String {
     match unstopped {
         [Unstopped { name, reason: Some(reason) }] => match name {
-            Some(name) => format!("Couldn't forget {email}. Sharing \u{201c}{name}\u{201d} couldn't be stopped. {reason}"),
-            None => format!("Couldn't forget {email}. {reason}"),
+            Some(name) => crate::i18n::tf("share.couldn_t_forget_sharing_couldn_3", &[("email", email), ("name", &name.to_string()), ("reason", &reason.to_string())]),
+            None => crate::i18n::tf("share.couldn_t_forget", &[("email", email), ("reason", &reason.to_string())]),
         },
-        [_] => format!("Couldn't forget {email}. Sharing couldn't be stopped on one record."),
-        several => format!("Couldn't forget {email}. Sharing couldn't be stopped on {} records.", several.len()),
+        [_] => crate::i18n::tf("share.couldn_t_forget_sharing_couldn_2", &[("email", email)]),
+        several => crate::i18n::tf("share.couldn_t_forget_sharing_couldn", &[("email", email), ("len", &several.len().to_string())]),
     }
 }
 
@@ -2582,7 +2614,7 @@ impl Sharing {
     /// trash and no archive, so a trashed record filed only for them was
     /// never stopped, and the collection delete then left it in the org under
     /// a collection that no longer exists (review of Task 11). The server's
-    /// list names it, its stop refuses ([`STOP_IN_TRASH`]), and so the
+    /// list names it, its stop refuses ([`stop_in_trash()`]), and so the
     /// forget stops short of the delete, below. A list that cannot be read
     /// ends the forget before anything is written.
     ///
@@ -2632,7 +2664,7 @@ impl Sharing {
     ///
     /// Before anything was written -- the collection's list unread, say --
     /// the sentence to show, or the backend's failure. The account's own
-    /// address is refused ([`YOURSELF`]) -- its
+    /// address is refused ([`yourself()`]) -- its
     /// membership is the org's owner.
     pub fn forget(&self, email: &str, items: &[VaultItem]) -> Result<ForgetOutcome, SharingError> {
         let _one = self.one_at_a_time();
@@ -2643,7 +2675,7 @@ impl Sharing {
         };
         let email = normalise_email(email);
         if email == normalise_email(&ctx.account.email) {
-            return Err(SharingError::Refused(YOURSELF.to_string()));
+            return Err(SharingError::Refused(yourself().to_string()));
         }
         let mut outcome = ForgetOutcome::default();
         // Every collection named for them, a plaintext twin included -- a
@@ -2654,7 +2686,7 @@ impl Sharing {
         for collection in &collections {
             let listed = self
                 .call(|client, auth| sharing_api::collection_items(client, &mut auth.session, &ctx.org_id, collection))
-                .map_err(|e| e.or_say(&format!("Couldn't forget {email}. Deskwarden couldn't read what is shared with them. Try again.")))?;
+                .map_err(|e| e.or_say(&crate::i18n::tf("share.couldn_t_forget_deskwarden_couldn", &[("email", &email.to_string())])))?;
             for id in listed {
                 if !records.contains(&id) {
                     records.push(id);
@@ -2717,7 +2749,7 @@ impl Sharing {
             // Past the stops, the person can see nothing of ours: the
             // sentence for a later step says so, and the server's own words
             // follow it (`or_say`).
-            let unfinished = format!("Sharing with {email} has stopped, but Deskwarden couldn't finish forgetting them. Try again.");
+            let unfinished = crate::i18n::tf("share.sharing_with_has_stopped_but", &[("email", &email.to_string())]);
             let roster = match self.fetch_roster(&ctx.org_id) {
                 Ok(roster) => roster,
                 Err(e) => break 'forget Some(e),
@@ -2783,15 +2815,15 @@ impl Sharing {
         let mut ctx = self.context()?;
         let email = normalise_email(email);
         if !plausible_email(&email) {
-            return Err(SharingError::Refused(NOT_AN_EMAIL.to_string()));
+            return Err(SharingError::Refused(not_an_email().to_string()));
         }
         if email == normalise_email(&ctx.account.email) {
-            return Err(SharingError::Refused(YOURSELF.to_string()));
+            return Err(SharingError::Refused(yourself().to_string()));
         }
         if ctx.authenticated_collection_for(&email).is_none() {
             return Err(SharingError::Refused(not_vouched_for(&email)));
         }
-        let refused = format!("Couldn't re-invite {email}.");
+        let refused = crate::i18n::tf("share.couldn_t_re_invite", &[("email", &email.to_string())]);
         let result = match ctx.member(&email).cloned() {
             Some(member) if member.status == MemberStatus::Invited => {
                 let ou = member.id.clone();
@@ -3034,7 +3066,7 @@ impl Sharing {
         let _one = self.one_at_a_time();
         let ctx = self.context()?;
         let email = normalise_email(email);
-        let not_waiting = || SharingError::Refused(format!("{email} is not waiting to be confirmed."));
+        let not_waiting = || SharingError::Refused(crate::i18n::tf("share.is_not_waiting_to_be", &[("email", &email.to_string())]));
         if ctx.authenticated_collection_for(&email).is_none() {
             return Err(not_waiting());
         }
@@ -3050,10 +3082,10 @@ impl Sharing {
         let user_id = member.user_id.clone().unwrap_or_default();
         let spki = self
             .call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &user_id))?
-            .ok_or_else(|| SharingError::Refused(format!("{email} has not signed in to a Bitwarden app yet.")))?;
+            .ok_or_else(|| SharingError::Refused(crate::i18n::tf("share.has_not_signed_in_yet", &[("email", &email.to_string())])))?;
         if !crate::rest::crypto::public_key_sha256_hex(&spki).eq_ignore_ascii_case(expected_sha256.trim()) {
             self.held().key_changed.insert(email.clone());
-            return Err(SharingError::Refused(format!("{email}'s key changed again. Check the fingerprint before sharing.")));
+            return Err(SharingError::Refused(crate::i18n::tf("share.s_key_changed_again_check", &[("email", &email.to_string())])));
         }
         self.confirm_to(&ctx.org_id, &ctx.org_key, &ctx.account.id, &member, &email, sharing_api::AccountKey { user_id, public_key: spki })?;
         if let Err(e) = self.reload_org(&ctx) {
@@ -3084,7 +3116,7 @@ impl Sharing {
             .fetch_roster(&ctx.org_id)?
             .into_iter()
             .find(|m| normalise_email(&m.email) == email && m.user_id.as_deref().is_some_and(|id| !id.is_empty()))
-            .ok_or_else(|| SharingError::Refused(format!("{email} has not accepted yet, so there is no key to check.")))?;
+            .ok_or_else(|| SharingError::Refused(crate::i18n::tf("share.has_not_accepted_yet_so", &[("email", &email.to_string())])))?;
         let user_id = member.user_id.unwrap_or_default();
         let spki = self
             .call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &user_id))?
@@ -3101,17 +3133,21 @@ impl Sharing {
 /// A leave asked of an organisation that is not someone else's sharing org --
 /// this account's own (whose owner NodeWarden will not let leave anyway), a
 /// real organisation, or one this account has already left.
-pub const NOT_A_SHARER: &str = "That is not someone sharing with you.";
+pub fn not_a_sharer() -> &'static str {
+    crate::i18n::t("share.not_a_sharer")
+}
 /// A pasted invite link the server would not accept; its own words follow
 /// (`SharingError::or_say`).
-pub const LINK_ACCEPT_FAILED: &str = "Couldn't accept the invitation.";
+pub fn link_accept_failed() -> &'static str {
+    crate::i18n::t("share.link_accept_failed")
+}
 
 /// A pasted invite link addressed to another account (official-path spec
 /// §4.1). The server would refuse it too; this says so in words, before a
 /// request is made.
 #[must_use]
 pub fn link_for_someone_else(link_email: &str, account_email: &str) -> String {
-    format!("This invite link is for {link_email}. You're signed in as {account_email}.")
+    crate::i18n::tf("share.this_invite_link_is_for", &[("link_email", link_email), ("account_email", account_email)])
 }
 
 impl Sharing {
@@ -3140,12 +3176,12 @@ impl Sharing {
     ///
     /// The link is not one ([`crate::invite_link::LinkError::sentence`]), it
     /// is for someone else ([`link_for_someone_else`]), or the server refused
-    /// -- its sentence after [`LINK_ACCEPT_FAILED`].
+    /// -- its sentence after [`link_accept_failed()`].
     pub fn accept_link(&self, link: &str) -> Result<(), SharingError> {
         let _one = self.one_at_a_time();
         self.require_available()?;
         let invite = crate::invite_link::parse(link).map_err(|e| SharingError::Refused(e.sentence().to_string()))?;
-        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(LINK_ACCEPT_FAILED.to_string()))?;
+        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(link_accept_failed().to_string()))?;
         let mine = normalise_email(&account.email);
         if invite.email != mine {
             return Err(SharingError::Refused(link_for_someone_else(&invite.email, &mine)));
@@ -3153,7 +3189,7 @@ impl Sharing {
         self.call(|client, auth| {
             sharing_api::accept_invite(client, &mut auth.session, &invite.organization_id, &invite.organization_user_id, &invite.token)
         })
-        .map_err(|e| e.or_say(LINK_ACCEPT_FAILED))?;
+        .map_err(|e| e.or_say(link_accept_failed()))?;
         Ok(())
     }
 
@@ -3171,13 +3207,13 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// Not someone else's sharing org ([`NOT_A_SHARER`]), or the server
+    /// Not someone else's sharing org ([`not_a_sharer()`]), or the server
     /// refused.
     pub fn leave(&self, organization_id: &str, items: &[VaultItem]) -> Result<SharingOutcome, SharingError> {
         let _one = self.one_at_a_time();
         self.require_available()?;
         if !self.held().others.iter().any(|(id, _)| id == organization_id) {
-            return Err(SharingError::Refused(NOT_A_SHARER.to_string()));
+            return Err(SharingError::Refused(not_a_sharer().to_string()));
         }
         self.call(|client, auth| sharing_api::leave_organization(client, &mut auth.session, organization_id))
             .map_err(|e| e.or_say("Couldn't stop receiving."))?;
@@ -3234,19 +3270,19 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// Not the administrator ([`NOT_ADMIN`]), no pending invitation for the
-    /// address, a wrong password ([`WRONG_PASSWORD`]), another server refusal
-    /// after [`INVITE_CODE_FAILED`], or the backend's own failure.
+    /// Not the administrator ([`not_admin()`]), no pending invitation for the
+    /// address, a wrong password ([`wrong_password()`]), another server refusal
+    /// after [`invite_code_failed()`], or the backend's own failure.
     pub fn mint_invite_code(&self, email: &str, password: &[u8]) -> Result<sharing_api::InviteCode, SharingError> {
         let _one = self.one_at_a_time();
         self.require_available()?;
         let profile = self.profile()?;
         if !profile.is_server_admin() {
-            return Err(SharingError::Refused(NOT_ADMIN.to_string()));
+            return Err(SharingError::Refused(not_admin().to_string()));
         }
         let email = normalise_email(email);
-        let no_invitation = || SharingError::Refused(format!("There is no invitation waiting for {email}."));
-        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(INVITE_CODE_FAILED.to_string()))?;
+        let no_invitation = || SharingError::Refused(crate::i18n::tf("share.there_is_no_invitation_waiting", &[("email", &email.to_string())]));
+        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(invite_code_failed().to_string()))?;
         let Some(org) = self.my_org_id(&profile, &account)? else {
             return Err(no_invitation());
         };
@@ -3272,7 +3308,7 @@ impl Sharing {
                 // NodeWarden's 403 here is the admin check alone (a
                 // non-manager is a 404): the role was taken away since the
                 // profile read above.
-                RestError::Status(403) => RestError::Rejected { error: String::new(), description: NOT_ADMIN.to_string() },
+                RestError::Status(403) => RestError::Rejected { error: String::new(), description: not_admin().to_string() },
                 other => other,
             })
         })
@@ -3282,34 +3318,34 @@ impl Sharing {
 
 /// An address whose row is a member, not an invitation.
 fn has_an_account(email: &str) -> String {
-    format!("{email} already has an account, so they don't need an invite code.")
+    crate::i18n::tf("share.already_has_an_account_so", &[("email", email)])
 }
 
 fn invitation_expired(email: &str) -> String {
-    format!("The invitation to {email} has expired. Re-invite them, then make the code.")
+    crate::i18n::tf("share.the_invitation_to_has_expired", &[("email", email)])
 }
 
 /// **The registration-invite route's refusals, as plain sentences.** The
 /// server's own words are matched lower-cased on a phrase, as
 /// `sharing_api`'s races are, since they are the only thing that tells a
 /// wrong password from a person who registered meanwhile; anything else
-/// keeps them after [`INVITE_CODE_FAILED`] (`or_say`), and a session that
+/// keeps them after [`invite_code_failed()`] (`or_say`), and a session that
 /// ended keeps its own error.
 fn invite_code_refused(error: SharingError, email: &str) -> SharingError {
     let SharingError::Refused(said) = &error else {
-        return error.or_say(INVITE_CODE_FAILED);
+        return error.or_say(invite_code_failed());
     };
     let lowered = said.to_lowercase();
-    if said == NOT_ADMIN {
+    if said == not_admin() {
         error
     } else if lowered.contains("invalid password") {
-        SharingError::Refused(WRONG_PASSWORD.to_string())
+        SharingError::Refused(wrong_password().to_string())
     } else if lowered.contains("already has an account") {
         SharingError::Refused(has_an_account(email))
     } else if lowered.contains("expired") {
         SharingError::Refused(invitation_expired(email))
     } else {
-        error.or_say(INVITE_CODE_FAILED)
+        error.or_say(invite_code_failed())
     }
 }
 
@@ -3630,7 +3666,7 @@ mod tests {
             server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
             server.mock("POST", "/api/organizations").with_status(status).expect(1).create();
             match engine.share("p1", "anna@example.com") {
-                Err(SharingError::Refused(sentence)) => assert_eq!(sentence, ORG_FAILED, "{status}"),
+                Err(SharingError::Refused(sentence)) => assert_eq!(sentence, org_failed(), "{status}"),
                 other => panic!("{status}: expected the plain failure, got {other:?}"),
             }
             assert_eq!(engine.held().capabilities.creates_orgs, None, "{status}");
@@ -3897,7 +3933,7 @@ mod tests {
         moved.assert();
         assert_eq!(answer.status, 400);
         let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
-        assert_eq!(body["message"], SHARE_FAILED);
+        assert_eq!(body["message"], share_failed());
         // The move WAS tried (above) and failed: the daemon's copy is the one
         // it held before, byte for byte, and no window was told otherwise.
         let after = serde_json::to_value(cache.get_by_id("live-1").expect("still in the daemon's vault")).expect("json");
@@ -3934,7 +3970,7 @@ mod tests {
         let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com","newOrganization":true}"#);
         assert_eq!(answer.status, 400, "{}", answer.body);
         let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
-        assert!(body["message"].as_str().is_some_and(|m| m.starts_with(NO_FRESH_ORG)), "{body}");
+        assert!(body["message"].as_str().is_some_and(|m| m.starts_with(no_fresh_org())), "{body}");
         assert_eq!(cached(&dir), (None, false), "No pinned nothing");
 
         // No spent the question (m2): Yes needs the share to ask again, and
@@ -3947,7 +3983,7 @@ mod tests {
         assert!(asked.body.contains("\"adopt\""), "{}", asked.body);
         let wrong = adopt("org-other");
         assert_eq!(wrong.status, 400, "{}", wrong.body);
-        assert!(wrong.body.contains(ADOPT_NOT_ASKED), "{}", wrong.body);
+        assert!(wrong.body.contains(adopt_not_asked()), "{}", wrong.body);
         crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com"}"#);
         let answer = adopt(FIXTURE_ORG);
         assert_eq!(answer.status, 200, "{}", answer.body);
@@ -3967,13 +4003,13 @@ mod tests {
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
         match engine.share("p1", "anna@example.com") {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, HAS_ATTACHMENTS),
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, has_attachments_text()),
             other => panic!("expected the attachments refusal, got {other:?}"),
         }
         writes.assert();
         puts.assert();
-        assert!(matches!(engine.share("p1", "not an email"), Err(SharingError::Refused(s)) if s == NOT_AN_EMAIL));
-        assert!(matches!(engine.share("p1", FIXTURE_EMAIL), Err(SharingError::Refused(s)) if s == YOURSELF));
+        assert!(matches!(engine.share("p1", "not an email"), Err(SharingError::Refused(s)) if s == not_an_email()));
+        assert!(matches!(engine.share("p1", FIXTURE_EMAIL), Err(SharingError::Refused(s)) if s == yourself()));
     }
 
     /// **A keyless account is refused on its keys, before anything is read
@@ -3995,7 +4031,7 @@ mod tests {
         engine.refresh(Trigger::WholeRead).expect("a first pass");
         assert!(engine.view(&[]).available, "control: sharing is on for a keyless account");
         match engine.share("p1", "anna@example.com") {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, NO_KEY_PAIR),
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, no_key_pair()),
             other => panic!("expected the keys refusal, got {other:?}"),
         }
         record.assert();
@@ -4243,7 +4279,7 @@ mod tests {
         server.mock("GET", "/api/ciphers/u1").with_body(broken.to_string()).create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
-        for (id, sentence) in [("t1", IN_TRASH), ("o1", OTHER_ORG), ("u1", UNREADABLE_PART)] {
+        for (id, sentence) in [("t1", in_trash()), ("o1", other_org()), ("u1", unreadable_part())] {
             match engine.share(id, "anna@example.com") {
                 Err(SharingError::Refused(said)) => assert_eq!(said, sentence, "{id}"),
                 other => panic!("{id}: expected a refusal, got {other:?}"),
@@ -4289,7 +4325,7 @@ mod tests {
         anna_is_confirmed(&mut server);
         let stale = stale_share(&mut server, "p1");
         match engine.share("p1", "anna@example.com") {
-            Err(SharingError::Refused(said)) => assert_eq!(said, IN_TRASH),
+            Err(SharingError::Refused(said)) => assert_eq!(said, in_trash()),
             other => panic!("expected the trash refusal, got {other:?}"),
         }
         stale.assert();
@@ -4312,8 +4348,8 @@ mod tests {
             .create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
-        assert!(matches!(engine.fetch_roster(FIXTURE_ORG), Err(SharingError::Refused(s)) if s == ROSTER_UNREADABLE));
-        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::Refused(s)) if s == ROSTER_UNREADABLE));
+        assert!(matches!(engine.fetch_roster(FIXTURE_ORG), Err(SharingError::Refused(s)) if s == roster_unreadable()));
+        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::Refused(s)) if s == roster_unreadable()));
         writes.assert();
         puts.assert();
     }
@@ -4573,7 +4609,7 @@ mod tests {
             "uriChecksum": crate::rest::crypto::tests::seal(&stranger, b"checksum-1"),
             "match": null
         }]);
-        stays_shared_with_nothing_written(&record, UNREADABLE_PART);
+        stays_shared_with_nothing_written(&record, unreadable_part());
     }
 
     /// **A modelled field that did not decrypt does not come home either.**
@@ -4581,7 +4617,7 @@ mod tests {
     fn a_field_that_did_not_decrypt_does_not_come_home() {
         let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
         record["notes"] = serde_json::json!(user_sealed("under the wrong key for an org record"));
-        stays_shared_with_nothing_written(&record, UNREADABLE_PART);
+        stays_shared_with_nothing_written(&record, unreadable_part());
     }
 
     /// **An attachment keeps the record shared, and says why**: it belongs to
@@ -4591,7 +4627,7 @@ mod tests {
     fn a_record_with_an_attachment_does_not_come_home() {
         let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
         record["attachments"] = serde_json::json!([{ "id": "a1", "fileName": "2.x|y|z" }]);
-        stays_shared_with_nothing_written(&record, MOVE_BACK_ATTACHMENTS);
+        stays_shared_with_nothing_written(&record, move_back_attachments());
     }
 
     /// **A record in the trash or the archive does not come home live.**
@@ -4600,7 +4636,7 @@ mod tests {
         for field in ["deletedDate", "archivedDate"] {
             let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
             record[field] = serde_json::json!("2026-09-01T00:00:00.000Z");
-            stays_shared_with_nothing_written(&record, STOP_IN_TRASH);
+            stays_shared_with_nothing_written(&record, stop_in_trash());
         }
     }
 
@@ -4622,7 +4658,7 @@ mod tests {
     }
 
     /// A move back of `s1` (folder and star remembered) whose create is
-    /// answered by `reply`: refused with [`MOVE_BACK_FAILED`], the org copy
+    /// answered by `reply`: refused with [`move_back_failed()`], the org copy
     /// neither unfiled nor deleted, its folder and star still remembered, and
     /// nothing pending. `orphan` names the copy the reply made, which must be
     /// deleted -- and no other DELETE may be sent.
@@ -4640,7 +4676,7 @@ mod tests {
         let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
         let cleaned = orphan.map(|id| server.mock("DELETE", format!("/api/ciphers/{id}").as_str()).with_status(204).expect(1).create());
         match engine.stop("s1", "anna@example.com") {
-            Err(SharingError::Refused(said)) => assert_eq!(said, MOVE_BACK_FAILED),
+            Err(SharingError::Refused(said)) => assert_eq!(said, move_back_failed()),
             other => panic!("expected the move-back refusal, got {other:?}"),
         }
         create.assert();
@@ -4693,7 +4729,7 @@ mod tests {
         let create = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).expect(1).create();
         let unfile_fails = server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).expect(2).create();
         let delete_fails = server.mock("DELETE", "/api/ciphers/s1").with_status(500).expect(2).create();
-        let still_sees = format!("{STOP_FAILED_PREFIX} anna@example.com can still see it.");
+        let still_sees = format!("{stop_failed_prefix} anna@example.com can still see it.", stop_failed_prefix = stop_failed_prefix());
         for attempt in ["first", "second"] {
             match engine.stop("s1", "anna@example.com") {
                 Err(SharingError::Refused(said)) => assert_eq!(said, still_sees, "{attempt}"),
@@ -4792,7 +4828,7 @@ mod tests {
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
         let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
         match engine.share("s1", "bob@example.com") {
-            Err(SharingError::Refused(said)) => assert_eq!(said, COMING_HOME),
+            Err(SharingError::Refused(said)) => assert_eq!(said, coming_home()),
             other => panic!("expected the coming-home refusal, got {other:?}"),
         }
         read.assert();
@@ -4816,9 +4852,9 @@ mod tests {
         server.mock("DELETE", "/api/ciphers/s1").with_status(500).create();
         let creates = server.mock("POST", Matcher::Any).expect(0).create();
         for (email, sentence) in [
-            ("bob@example.com", STOP_FAILED_PREFIX.to_string()),
-            ("carol@example.com", STOP_FAILED_PREFIX.to_string()),
-            ("anna@example.com", format!("{STOP_FAILED_PREFIX} anna@example.com can still see it.")),
+            ("bob@example.com", stop_failed_prefix().to_string()),
+            ("carol@example.com", stop_failed_prefix().to_string()),
+            ("anna@example.com", format!("{stop_failed_prefix} anna@example.com can still see it.", stop_failed_prefix = stop_failed_prefix())),
         ] {
             match engine.stop("s1", email) {
                 Err(SharingError::Refused(said)) => assert_eq!(said, sentence, "{email}"),
@@ -5086,7 +5122,7 @@ mod tests {
         assert_eq!(outcome.changed.upserted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["s2"]);
         match &outcome.failed {
             Some(SharingError::Refused(said)) => {
-                assert_eq!(said, &format!("Couldn't forget anna@example.com. Sharing \u{201c}s1\u{201d} couldn't be stopped. {MOVE_BACK_ATTACHMENTS}"));
+                assert_eq!(said, &format!("Couldn't forget anna@example.com. Sharing \u{201c}s1\u{201d} couldn't be stopped. {move_back_attachments}", move_back_attachments = move_back_attachments()));
             }
             other => panic!("expected the forget's refusal, got {other:?}"),
         }
@@ -5141,7 +5177,7 @@ mod tests {
         with_collections(&mut server, &[]);
         with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
         let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
-        assert!(matches!(engine.forget(&FIXTURE_EMAIL.to_uppercase(), &[]), Err(SharingError::Refused(s)) if s == YOURSELF));
+        assert!(matches!(engine.forget(&FIXTURE_EMAIL.to_uppercase(), &[]), Err(SharingError::Refused(s)) if s == yourself()));
         deletes.assert();
     }
 
@@ -5168,7 +5204,7 @@ mod tests {
         off.assert();
         deletes.assert();
         assert_eq!(answer.status, 400, "{}", answer.body);
-        assert!(answer.body.contains(MOVE_BACK_ATTACHMENTS), "{}", answer.body);
+        assert!(answer.body.contains(move_back_attachments()), "{}", answer.body);
         let changes = api.feed().wait_after(Some(0), false, std::time::Duration::ZERO).changes;
         use crate::change_feed::Change;
         use crate::rest::notifications::Announcement;
@@ -5215,7 +5251,7 @@ mod tests {
         match &outcome.failed {
             Some(SharingError::Refused(said)) => assert_eq!(
                 said,
-                &format!("Couldn't forget anna@example.com. Sharing \u{201c}Acme VPN\u{201d} couldn't be stopped. {STOP_IN_TRASH}")
+                &format!("Couldn't forget anna@example.com. Sharing \u{201c}Acme VPN\u{201d} couldn't be stopped. {stop_in_trash}", stop_in_trash = stop_in_trash())
             ),
             other => panic!("expected the trash refusal, got {other:?}"),
         }
@@ -5797,7 +5833,7 @@ mod tests {
     /// spends the question; No spends it too.
     #[test]
     fn adopt_takes_only_the_org_the_share_asked_about_and_only_once() {
-        let not_asked = |answer: Result<(), SharingError>| matches!(answer, Err(SharingError::Refused(s)) if s == ADOPT_NOT_ASKED);
+        let not_asked = |answer: Result<(), SharingError>| matches!(answer, Err(SharingError::Refused(s)) if s == adopt_not_asked());
         let (_server, _backend, engine, dir) = unpinned_org(&[me_row()], &[]);
         assert!(not_asked(engine.adopt(FIXTURE_ORG)), "no question pending");
         assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::NeedsAdoption(_))));
@@ -5909,7 +5945,7 @@ mod tests {
             .with_body(r#"{"message":"You cannot create an organization."}"#)
             .create();
         match engine.share_in_a_new_org("p1", "anna@example.com") {
-            Err(SharingError::Refused(sentence)) => assert!(sentence.starts_with(NO_FRESH_ORG), "{sentence}"),
+            Err(SharingError::Refused(sentence)) => assert!(sentence.starts_with(no_fresh_org()), "{sentence}"),
             other => panic!("expected the refusal, got {other:?}"),
         }
         assert_eq!(cached(&dir), (None, false), "nothing pinned");
@@ -5930,7 +5966,7 @@ mod tests {
         server.mock("GET", "/api/organizations/org-two/users?includeCollections=true").with_body(roster(&[me_row()])).create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         match engine.share("p1", "anna@example.com") {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, SEVERAL_ORGS),
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, several_orgs()),
             other => panic!("expected the refusal, got {other:?}"),
         }
         writes.assert();
@@ -5976,7 +6012,7 @@ mod tests {
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
         with_collections(&mut server, &[]);
         match engine.share("p1", "anna@example.com") {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, ROSTER_UNREADABLE),
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, roster_unreadable()),
             other => panic!("expected the refusal, got {other:?}"),
         }
         assert_eq!(cached(&dir), (Some(FIXTURE_ORG.into()), false), "an unreadable roster drops nothing");
@@ -6010,7 +6046,7 @@ mod tests {
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
         server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).with_status(404).create();
         match engine.fetch_roster(FIXTURE_ORG) {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, ORG_GONE),
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, org_gone()),
             other => panic!("expected the org to be gone, got {other:?}"),
         }
         assert!(!engine.held().capabilities.too_old, "a deleted org is not an old server");
@@ -6450,7 +6486,7 @@ mod tests {
         let (mut other, _backend, engine, _dir) = on_nodewarden_as(false);
         with_roster(&mut other, &[carol_invited()]);
         let never = other.mock("POST", Matcher::Any).expect(0).create();
-        assert!(matches!(engine.mint_invite_code("carol@example.com", b"master"), Err(SharingError::Refused(s)) if s == NOT_ADMIN));
+        assert!(matches!(engine.mint_invite_code("carol@example.com", b"master"), Err(SharingError::Refused(s)) if s == not_admin()));
         never.assert();
         assert!(!engine.view(&[]).can_mint_invites);
     }
@@ -6501,11 +6537,11 @@ mod tests {
             .expect(1)
             .create();
         server.mock("POST", carol.as_str()).with_status(400).with_body(said("Something else")).expect(1).create();
-        assert_eq!(refused(&engine, "carol@example.com"), WRONG_PASSWORD);
+        assert_eq!(refused(&engine, "carol@example.com"), wrong_password());
         assert_eq!(refused(&engine, "carol@example.com"), "carol@example.com already has an account, so they don't need an invite code.");
         assert_eq!(refused(&engine, "carol@example.com"), "The invitation to carol@example.com has expired. Re-invite them, then make the code.");
-        assert_eq!(refused(&engine, "carol@example.com"), NOT_ADMIN);
-        assert_eq!(refused(&engine, "carol@example.com"), format!("{INVITE_CODE_FAILED} The server said: Something else"));
+        assert_eq!(refused(&engine, "carol@example.com"), not_admin());
+        assert_eq!(refused(&engine, "carol@example.com"), format!("{invite_code_failed} The server said: Something else", invite_code_failed = invite_code_failed()));
     }
 
     /// A Bitwarden invite link for `email`, to the fixture-free org `org-guid`.
@@ -6592,7 +6628,7 @@ mod tests {
             .with_body(r#"{"message":"Invalid token."}"#)
             .create();
         match engine.accept_link(&invite_link_for(FIXTURE_EMAIL)) {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, format!("{LINK_ACCEPT_FAILED} The server said: Invalid token.")),
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, format!("{link_accept_failed} The server said: Invalid token.", link_accept_failed = link_accept_failed())),
             other => panic!("a refused accept succeeded: {other:?}"),
         }
     }

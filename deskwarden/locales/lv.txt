@@ -364,3 +364,5 @@ main.cli_unrecognized_body = Bitwarden CLI, ko Deskwarden grasās izmantot: {hea
 main.signer_none = Tam nav parakstītāja sertifikāta.
 main.signer_org = Parakstījis: {org}
 main.signer_no_org = Tā parakstītāja sertifikātā nav norādīta organizācija.
+login.server_eu = EU
+login.server_self_hosted = Pašmitināts

@@ -32,7 +32,7 @@
 //!    [`draw_window_chrome`]'s bar instead.
 //!  * **"Deskwarden 1.4.0" in 3e's nav footer is mock data.** The real version
 //!    comes from `CARGO_PKG_VERSION`. So does 3e's "Bitwarden account linked" --
-//!    see [`ACCOUNT_STATUS`] for why that one cannot be shown here at all yet.
+//!    see [`account_status()`] for why that one cannot be shown here at all yet.
 
 use crate::login_ui::{draw_window_chrome, round_window_corners, ChromeAction};
 use crate::service_keys::{Access, KeyRecord, Scope, Subject};
@@ -53,6 +53,7 @@ use std::rc::Rc;
 
 /// Slice 7: Settings as a screen of the vault window.
 pub mod security_score;
+pub mod language_picker;
 pub mod settings_v2;
 
 const WINDOW_TITLE: &str = "Deskwarden Preferences";
@@ -123,12 +124,16 @@ const SHORTCUT_CONTROL_GAP: f32 = 8.0;
 /// "Bitwarden backend" while the row was drawn on both backends and had to
 /// cover a case where the thing running was not `bw`. It is only ever drawn to
 /// somebody who has the CLI now, so it can say so.
-const BACKEND_LABEL: &str = "Keep the Bitwarden CLI running";
+fn backend_label() -> &'static str {
+    crate::i18n::t("prefs.backend_label")
+}
 
 /// The label for [`crate::settings::Settings::keep_ui_loaded`].
-const UI_LOADED_LABEL: &str = "Open the vault instantly";
+fn ui_loaded_label() -> &'static str {
+    crate::i18n::t("prefs.ui_loaded_label")
+}
 
-/// The description under [`UI_LOADED_LABEL`].
+/// The description under [`ui_loaded_label()`].
 ///
 /// **Names the cost as well as what it buys**, as the backend row above
 /// does: this is the same trade in a different process, and somebody who
@@ -168,11 +173,15 @@ const UI_LOADED_LABEL: &str = "Open the vault instantly";
 ///    that the old sentence explained with the wrong reason. Naming both
 ///    directions of the toggle in one clause covers 2 and 3 together, and
 ///    tells the reader when it starts working.
-const UI_LOADED_SUB: &str = "Opens at once next time";
+fn ui_loaded_sub() -> &'static str {
+    crate::i18n::t("prefs.ui_loaded_sub")
+}
 /// The tip behind the row's `?` dot.
-const UI_LOADED_TIP: &str = "Keeps the vault window loaded and hidden after you close it, so it opens immediately, and holds about 76 MB while the vault is unlocked. Locking or switching account closes it fully, and turning this on or off closes the open window, so it applies from the next time you open the vault.";
+fn ui_loaded_tip() -> &'static str {
+    crate::i18n::t("prefs.ui_loaded_tip")
+}
 
-/// The description under [`BACKEND_LABEL`].
+/// The description under [`backend_label()`].
 ///
 /// **No longer a function of a `bool`, and that is the change.** It had a
 /// second arm that read "there is nothing here to decide" -- a row whose only
@@ -207,9 +216,13 @@ const UI_LOADED_TIP: &str = "Keeps the vault window loaded and hidden after you 
 /// running backend would ghost the row a restart later than the switch that
 /// caused it, so the user would turn `bw` back on and find this row still
 /// grey with nothing on the page explaining the delay.
-const BACKEND_SUB: &str = "Faster, but uses more memory";
+fn backend_sub() -> &'static str {
+    crate::i18n::t("prefs.backend_sub")
+}
 /// The tip behind the row's `?` dot.
-const BACKEND_TIP: &str = "Faster, and uses about 118 MB while idle. Off runs it only while the vault window is open; autofill is unaffected either way.";
+fn backend_tip() -> &'static str {
+    crate::i18n::t("prefs.backend_tip")
+}
 
 /// The backend choice's label: the QUESTION, with the two answers beside it.
 ///
@@ -218,7 +231,7 @@ const BACKEND_TIP: &str = "Faster, and uses about 118 MB while idle. Off runs it
 /// and left the other as the unnamed absence of it -- a user who wanted the
 /// built-in client had to work out that "off" meant a second product existed.
 /// The owner's instruction was to make both sides visible as peers, so the row
-/// now asks which client, and [`OFFICIAL_CHOICE`] and [`BUILT_IN_CHOICE`]
+/// now asks which client, and [`official_choice()`] and [`built_in_choice()`]
 /// answer it in a two-cell [`theme::segmented_control`].
 ///
 /// So this string deliberately names NEITHER client: naming one here would put
@@ -230,16 +243,20 @@ const BACKEND_TIP: &str = "Faster, and uses about 118 MB while idle. Off runs it
 /// (`bw_acquire::CliSetupState::Choosing`'s "Which client should open this
 /// vault?"), because a user who meets the choice in both places is meeting one
 /// decision and not two.
-const BACKEND_CHOICE_LABEL: &str = "Which client opens this vault";
+fn backend_choice_label() -> &'static str {
+    crate::i18n::t("prefs.backend_choice_label")
+}
 
 /// The picker's first cell: the official CLI.
 ///
 /// **Names `bw` the way the user will meet it**, which is
-/// [`BACKEND_LABEL`]'s rule and the reason both are pinned by
+/// [`backend_label()`]'s rule and the reason both are pinned by
 /// `the_two_backend_labels_name_the_cli_and_not_this_codebases_words`.
 /// "bw" is a filename and "crypto" is a word about internals; the official
 /// Bitwarden CLI is a thing a person can look up and find in Task Manager.
-const OFFICIAL_CHOICE: &str = "The official Bitwarden CLI";
+fn official_choice() -> &'static str {
+    crate::i18n::t("prefs.official_choice")
+}
 
 /// The picker's second cell: this app's own client.
 ///
@@ -247,9 +264,11 @@ const OFFICIAL_CHOICE: &str = "The official Bitwarden CLI";
 /// what the two-cell control buys over the pill it replaced. It is
 /// Deskwarden's, and saying so is what makes the two cells peers rather than a
 /// thing and its absence.
-const BUILT_IN_CHOICE: &str = "Deskwarden's built-in client";
+fn built_in_choice() -> &'static str {
+    crate::i18n::t("prefs.built_in_choice")
+}
 
-/// The description shown under [`BACKEND_CHOICE_LABEL`], in its two states.
+/// The description shown under [`backend_choice_label()`], in its two states.
 ///
 /// A pure function of one fact, for [`disk_cache_tip`]'s reason
 /// exactly: this is the text a user reads before deciding where their master
@@ -298,8 +317,7 @@ const BUILT_IN_CHOICE: &str = "Deskwarden's built-in client";
 /// only one, so the row names the moment rather than one route to it.
 fn official_crypto_tip(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "The official Bitwarden CLI (`bw`) holds your keys in a background process of its own and costs about 118 MB of RAM. \
-         Deskwarden's built-in client talks to your server itself for about 19 MB, but then the key that unlocks your vault is stored in the app, protected by Windows, and unlike a session it never expires, so anyone who can run programs as you on this PC can use it."
+        crate::i18n::t("prefs.official_crypto_tip")
     } else {
         // Not a silent no-op under the same label, and not a hidden row. The
         // owner's rule is "disabled if not self-hosted vault to avoid issues
@@ -309,16 +327,16 @@ fn official_crypto_tip(self_hosted: bool) -> &'static str {
         // a self-hoster who has not finished setting up wondering where the
         // setting went; a ghosted one with this sentence under it says
         // exactly what would make it available.
-        "On bitwarden.com and bitwarden.eu, and until Deskwarden knows which server this account is on, the vault always goes through the official Bitwarden CLI."
+        crate::i18n::t("prefs.official_crypto_locked_sub")
     }
 }
 
-/// The short line under [`BACKEND_CHOICE_LABEL`].
+/// The short line under [`backend_choice_label()`].
 fn official_crypto_sub(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "Applies the next time you sign in"
+        crate::i18n::t("prefs.official_crypto_next_sign_in")
     } else {
-        "Only available on a self-hosted server"
+        crate::i18n::t("prefs.official_crypto_self_hosted_only")
     }
 }
 
@@ -392,16 +410,20 @@ fn account_server(status: &Option<AccountStatus>) -> Option<&str> {
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
 /// has to weigh.
-const DISK_CACHE_LABEL: &str = "Keep an encrypted copy of your vault on this PC";
+fn disk_cache_label() -> &'static str {
+    crate::i18n::t("prefs.disk_cache_label")
+}
 
 /// The read-path row's label, and the child of the one above it.
 ///
 /// Phrased as what the user gets rather than as the mechanism: "read from
 /// the copy first" is a thing to want, where "cache-first read path" is a
 /// thing to look up.
-const READ_THROUGH_LABEL: &str = "Read from that copy first";
+fn read_through_label() -> &'static str {
+    crate::i18n::t("prefs.read_through_label")
+}
 
-/// The description under [`READ_THROUGH_LABEL`], in its two states.
+/// The description under [`read_through_label()`], in its two states.
 ///
 /// # Why this row is a child
 ///
@@ -414,18 +436,22 @@ const READ_THROUGH_LABEL: &str = "Read from that copy first";
 /// unchanged.
 fn read_through_sub(cache_on: bool) -> &'static str {
     if cache_on {
-        "Filling works even when Bitwarden is unreachable"
+        crate::i18n::t("prefs.read_through_sub_on")
     } else {
-        "Needs the copy above"
+        crate::i18n::t("prefs.read_through_sub_off")
     }
 }
 
-/// The tip behind [`READ_THROUGH_LABEL`]: what reading from the copy first
+/// The tip behind [`read_through_label()`]: what reading from the copy first
 /// means, and what leaving it off keeps.
-const READ_THROUGH_TIP: &str = "On, Deskwarden answers from the encrypted copy before asking your server, which is what makes filling work when the connection to Bitwarden is stopped. Off keeps the copy on disk for a fast start but always asks the server for what it fills.";
+fn read_through_tip() -> &'static str {
+    crate::i18n::t("prefs.read_through_tip")
+}
 
-/// The short line under [`DISK_CACHE_LABEL`]: the one fact a user weighs.
-const DISK_CACHE_SUB: &str = "Stays on disk, even while the vault is locked";
+/// The short line under [`disk_cache_label()`]: the one fact a user weighs.
+fn disk_cache_sub() -> &'static str {
+    crate::i18n::t("prefs.disk_cache_sub")
+}
 
 /// The tip behind the disk-cache toggle's `?` dot.
 ///
@@ -462,8 +488,7 @@ fn disk_cache_tip() -> &'static str {
         // It still obeys this module's rules for such copy: it names what
         // is in the file, what gates it, and who can read it anyway,
         // without ever using the word "secure".
-        "The copy contains your usernames, passwords, notes and two-factor secrets, encrypted with a key kept on this PC and protected by Windows, so anyone who can run programs as you on this PC can read it, and so can someone who takes this disk and knows your Windows password. \
-         It is not deleted when your vault locks, only when you log out or after 7 days."
+        crate::i18n::t("prefs.disk_cache_tip")
     }
 }
 
@@ -473,7 +498,9 @@ fn disk_cache_tip() -> &'static str {
 /// knows, and the "no saved login for this app" card for one it does not. A
 /// label that named only matches was a label a user had to disbelieve: they
 /// turned it off, and the card for unmatched apps went on appearing.
-const PROMPT_LABEL: &str = "Show autofill prompts";
+fn prompt_label() -> &'static str {
+    crate::i18n::t("prefs.prompt_label")
+}
 /// **Says what OFF does, because off is the state that changes what the app
 /// does on its own.** The user's own framing: "only shortcuts will work in
 /// that case". Naming the hotkey here is what stops the toggle reading as
@@ -481,11 +508,15 @@ const PROMPT_LABEL: &str = "Show autofill prompts";
 /// both states (`app::match_arms_hotkey`).
 ///
 /// It now says *any* window rather than a matched one, for the reason on
-/// `PROMPT_LABEL` directly above.
+/// `prompt_label()` directly above.
 /// The tip behind the row's `?` dot.
-const PROMPT_TIP: &str = "Offers to fill, or to save, when a window that wants a password comes to the front; nothing is typed until you ask. Off means nothing opens on its own and CTRL+ALT+B is the only way to fill.";
+fn prompt_tip() -> &'static str {
+    crate::i18n::t("prefs.prompt_tip")
+}
 
-const BREACH_LABEL: &str = "Check passwords against known breaches";
+fn breach_label() -> &'static str {
+    crate::i18n::t("prefs.breach_label")
+}
 /// **Says what leaves the machine, because something does.** Off by default is
 /// stated in the copy and not only in `Settings::default`: this is the one row
 /// on General whose ON state makes a network request keyed on a password, and
@@ -493,9 +524,13 @@ const BREACH_LABEL: &str = "Check passwords against known breaches";
 /// The k-anonymity bargain -- five hex characters out, thirty-five matched
 /// here -- is what makes the request safe to offer at all, so it is the
 /// description rather than a footnote.
-const BREACH_SUB: &str = "Sends part of a hash, never the password";
+fn breach_sub() -> &'static str {
+    crate::i18n::t("prefs.breach_sub")
+}
 /// The tip behind the row's `?` dot.
-const BREACH_TIP: &str = "Off by default. When on, Deskwarden sends the first 5 characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this machine, so your password and the rest of its hash never leave your PC.";
+fn breach_tip() -> &'static str {
+    crate::i18n::t("prefs.breach_tip")
+}
 
 /// The scan card's own heading.
 ///
@@ -509,29 +544,47 @@ const BREACH_TIP: &str = "Off by default. When on, Deskwarden sends the first 5 
 ///
 /// An imperative rather than a noun phrase because it stays true while a scan
 /// is running.
-const SCAN_SECTION_LABEL: &str = "Scan the whole vault";
-const SCAN_BUTTON: &str = "Scan all passwords now";
-const SCAN_RUNNING_BUTTON: &str = "Scanning...";
+fn scan_section_label() -> &'static str {
+    crate::i18n::t("prefs.scan_section_label")
+}
+fn scan_button_text() -> &'static str {
+    crate::i18n::t("prefs.scan_button")
+}
+fn scan_running_button() -> &'static str {
+    crate::i18n::t("prefs.scan_running_button")
+}
 /// **Says what a scan costs before it is started**, in requests and in what
 /// leaves the machine, because the button beside it is the one control in
 /// this app that makes hundreds of outbound calls from a single click.
-const SCAN_IDLE_SUB: &str = "One request per distinct password";
+fn scan_idle_sub() -> &'static str {
+    crate::i18n::t("prefs.scan_idle_sub")
+}
 /// The tip behind the row's `?` dot.
-const SCAN_IDLE_TIP: &str = "Checks every saved password against Have I Been Pwned, one request per distinct password, so a vault full of reused passwords is far fewer requests than it has items. Only the first 5 characters of each hash leave your PC.";
+fn scan_idle_tip() -> &'static str {
+    crate::i18n::t("prefs.scan_idle_tip")
+}
 /// The empty state of the history list. A result, not a blank panel: see
 /// `password_health`'s summary for the same argument.
-const SCAN_NO_HISTORY: &str = "No scan has been run yet.";
-const SCAN_HISTORY_LABEL: &str = "Previous scans";
+fn scan_no_history() -> &'static str {
+    crate::i18n::t("prefs.scan_no_history")
+}
+fn scan_history_label() -> &'static str {
+    crate::i18n::t("prefs.scan_history_label")
+}
 /// What the page says when the vault has nothing to check. Its own wording,
 /// not "0 found": those are different results.
-const SCAN_NOTHING_DESCRIPTION: &str = "There are no saved passwords in this vault to check. \
-     Cards, notes, SSH keys and logins with an empty password are not checked.";
+fn scan_nothing_description() -> &'static str {
+    crate::i18n::t("prefs.scan_nothing_description")
+}
 /// The state no shipped build reaches -- rendered honestly rather than as a
 /// button that does nothing.
-const SCAN_UNAVAILABLE_DESCRIPTION: &str = "This build cannot scan: nothing set the scan up when \
-     Deskwarden started.";
+fn scan_unavailable_description() -> &'static str {
+    crate::i18n::t("prefs.scan_unavailable_description")
+}
 
-const FETCH_ICONS_LABEL: &str = "Show site icons";
+fn fetch_icons_label() -> &'static str {
+    crate::i18n::t("prefs.fetch_icons_label")
+}
 /// **Says what the request discloses, and says it is the DOMAIN.** This is the
 /// row for the request `PRIVACY.md` calls the one with the most privacy weight
 /// in the app, and the whole reason a user would turn it off is what the
@@ -545,12 +598,16 @@ const FETCH_ICONS_LABEL: &str = "Show site icons";
 /// worried reader assumes, and it is wrong.
 ///
 /// On by default, and stated in the copy rather than left to
-/// `Settings::default`, the same way `BREACH_TIP` states its own
+/// `Settings::default`, the same way `breach_tip()` states its own
 /// opposite default.
 /// The tip behind the row's `?` dot.
-const FETCH_ICONS_TIP: &str = "On by default. Deskwarden asks the icon service for an item's site icon by domain name (your own server's if you self-host) and never sends the username, the password or which account the item is in. Off shows coloured initials instead and nothing leaves your PC.";
+fn fetch_icons_tip() -> &'static str {
+    crate::i18n::t("prefs.fetch_icons_tip")
+}
 
-const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
+fn direct_icons_label() -> &'static str {
+    crate::i18n::t("prefs.direct_icons_label")
+}
 /// **Says what ON costs, in the sentence a user would otherwise have to work
 /// out for themselves.** This is the only switch in the app that makes it
 /// connect to hosts it has no other relationship with, and the whole reason
@@ -572,8 +629,8 @@ const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
 /// the long form of the same argument and `PRIVACY.md` carries the longest.
 ///
 /// Off by default, and stated in the copy rather than left to
-/// `Settings::default`, the same way `BREACH_TIP` and
-/// `FETCH_ICONS_TIP` state theirs.
+/// `Settings::default`, the same way `breach_tip()` and
+/// `fetch_icons_tip()` state theirs.
 ///
 /// **It no longer says the icon service goes unasked, because that stopped
 /// being true and a switch whose label overstates its reach is worse than no
@@ -591,11 +648,17 @@ const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
 /// fallback adds no disclosure to any site -- the requests it receives are the
 /// same requests -- so what a site learns is what it always learned, and that
 /// is what is stated.
-const DIRECT_ICONS_SUB: &str = "Sites you hold entries for see a request";
+fn direct_icons_sub() -> &'static str {
+    crate::i18n::t("prefs.direct_icons_sub")
+}
 /// The tip behind the row's `?` dot.
-const DIRECT_ICONS_TIP: &str = "Off by default. On, your PC asks each site for its own icon first, and the icon service is asked only about the ones the site itself did not answer, so every site you hold an entry for learns that an entry for it exists in your vault and roughly when you looked at it. An address on your own network (192.168.x.x, 10.x.x.x, localhost) is always fetched from that address itself, whatever this says.";
+fn direct_icons_tip() -> &'static str {
+    crate::i18n::t("prefs.direct_icons_tip")
+}
 
-const LAN_TLS_LABEL: &str = "Trust any certificate on your own network";
+fn lan_tls_label() -> &'static str {
+    crate::i18n::t("prefs.lan_tls_label")
+}
 /// **Names the boundary in the label and states the cost in the copy**, which
 /// for a row that switches off certificate checking is the whole content.
 ///
@@ -619,11 +682,17 @@ const LAN_TLS_LABEL: &str = "Trust any certificate on your own network";
 /// the request still tells it that this vault holds an entry for that
 /// address. That is a small thing and it is not nothing, which is exactly why
 /// it is off by default and why the sentence is here rather than in a doc.
-const LAN_TLS_SUB: &str = "Icons from your own network only";
+fn lan_tls_sub() -> &'static str {
+    crate::i18n::t("prefs.lan_tls_sub")
+}
 /// The tip behind the row's `?` dot.
-const LAN_TLS_TIP: &str = "Off by default. Skips certificate checks for icon requests to addresses on your own network (192.168.x.x, 10.x.x.x, localhost) and never for the internet, so on a network where another machine can answer for that address it chooses the picture on that row and learns you hold an entry for it.";
+fn lan_tls_tip() -> &'static str {
+    crate::i18n::t("prefs.lan_tls_tip")
+}
 
-const BRAND_LOGOS_LABEL: &str = "Show card network logos";
+fn brand_logos_label() -> &'static str {
+    crate::i18n::t("prefs.brand_logos_label")
+}
 /// **Says where the images come from, because that is the part a user cannot
 /// guess and the only part they have to act on.** This row is unlike every
 /// other pill on this page: turning it on does nothing whatever until the user
@@ -640,20 +709,28 @@ const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 /// careful reader assumes a second one.
 ///
 /// Off by default, and stated in the copy rather than left to
-/// `Settings::default`, the same way `FETCH_ICONS_TIP` and
-/// `BREACH_TIP` state theirs.
-const BRAND_LOGOS_SUB: &str = "Uses PNG files you add yourself";
+/// `Settings::default`, the same way `fetch_icons_tip()` and
+/// `breach_tip()` state theirs.
+fn brand_logos_sub() -> &'static str {
+    crate::i18n::t("prefs.brand_logos_sub")
+}
 /// The tip behind the row's `?` dot.
-const BRAND_LOGOS_TIP: &str = "Off by default. Draws a card's network mark from PNG files you put in a brand-marks folder (visa.png, mastercard.png, amex.png and so on), beside your settings or the program itself. Nothing is downloaded, and any brand with no image keeps its printed name.";
+fn brand_logos_tip() -> &'static str {
+    crate::i18n::t("prefs.brand_logos_tip")
+}
 
 /// The v2 sidebar's two looks. On View until slice 7 gives Settings its
 /// General > Look page.
-const SIDEBAR_STYLE_LABEL: &str = "Sidebar";
+fn sidebar_style_label() -> &'static str {
+    crate::i18n::t("prefs.sidebar_style_label")
+}
 
-const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
+fn totp_secret_label() -> &'static str {
+    crate::i18n::t("prefs.totp_secret_label")
+}
 /// **Says what ON adds, and what it costs.** Off is the default and is stated
 /// in the copy rather than left to `Settings::default`, exactly as
-/// `BREACH_TIP` states its own: these are the two rows on General
+/// `breach_tip()` states its own: these are the two rows on General
 /// whose ON state gives something away, and a user reading the pane should
 /// not have to infer either from the pill.
 ///
@@ -668,14 +745,18 @@ const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// the user looking for a row with that name and there is not one. A
 /// description that names a label the app does not paint is worse than a
 /// vague one: the user concludes the setting did not work.
-const TOTP_SECRET_SUB: &str = "Masked until you click the eye";
+fn totp_secret_sub() -> &'static str {
+    crate::i18n::t("prefs.totp_secret_sub")
+}
 /// The tip behind the row's `?` dot.
-const TOTP_SECRET_TIP: &str = "Off by default. When on, an item's TOTP secret appears on the details screen as an extra masked row under its TOTP code. The code expires in 30 seconds; the secret behind it never does.";
+fn totp_secret_tip() -> &'static str {
+    crate::i18n::t("prefs.totp_secret_tip")
+}
 
 /// The automatic-check row's label.
 ///
 /// **It said "Check for updates" until this row moved onto
-/// [`Section::Updates`]**, where [`UPDATE_CHECK_BUTTON`] says exactly that in
+/// [`Section::Updates`]**, where [`update_check_button()`] says exactly that in
 /// the card directly below. Two identical strings a card apart, one a switch
 /// and one a button, is the worst possible reading of a distinction the whole
 /// page is built to make -- and it was invisible while they were two pages
@@ -684,10 +765,12 @@ const TOTP_SECRET_TIP: &str = "Off by default. When on, an item's TOTP secret ap
 /// So the switch names the half it actually governs, and the button keeps the
 /// words for the thing a user presses. Nothing about either behaviour
 /// changed; the row simply stopped calling itself by the button's name. The
-/// copy underneath it ([`UPDATE_CHECK_TIP`]) was already written this
+/// copy underneath it ([`update_check_tip()`]) was already written this
 /// way -- "Deskwarden asks GitHub" -- so this is the label catching up to its
 /// own description.
-const UPDATE_CHECK_LABEL: &str = "Check for updates automatically";
+fn update_check_label() -> &'static str {
+    crate::i18n::t("prefs.update_check_label")
+}
 /// **Says what the request discloses and, unusually, argues for leaving it
 /// on.** Every other privacy row here describes a cost; this one has to
 /// describe a cost that is small and a consequence of switching it off that
@@ -697,14 +780,20 @@ const UPDATE_CHECK_LABEL: &str = "Check for updates automatically";
 /// "Nothing about you or your vault" is the accurate claim and is the same
 /// one `PRIVACY.md` makes: the request names this app's own public
 /// repository, not the user.
-const UPDATE_CHECK_SUB: &str = "Asks GitHub; says nothing about you";
+fn update_check_sub() -> &'static str {
+    crate::i18n::t("prefs.update_check_sub")
+}
 /// The tip behind the row's `?` dot.
-const UPDATE_CHECK_TIP: &str = "On by default. Deskwarden asks GitHub whether a newer Deskwarden has been released, and the request says nothing about you or your vault. Off means you will not be told about fixes, including security ones, until you look yourself.";
+fn update_check_tip() -> &'static str {
+    crate::i18n::t("prefs.update_check_tip")
+}
 
 
 // --- Clipboard ------------------------------------------------------------
 
-const CLIPBOARD_MASTER_LABEL: &str = "Take copied secrets back off the clipboard";
+fn clipboard_master_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_master_label")
+}
 /// **The master switch's copy has to say what OFF means, because off is the
 /// state that withdraws a protection.** Turning this off is a real reduction
 /// in what the app does, freely chosen -- exactly like
@@ -715,43 +804,71 @@ const CLIPBOARD_MASTER_LABEL: &str = "Take copied secrets back off the clipboard
 /// reader will otherwise assume this pill governs: the formats that keep a
 /// copied password out of `Win+V` and off the user's other devices are
 /// unconditional and are not on this page as a control. See
-/// `CLIPBOARD_HISTORY_NOTE`, the row that says so in its own words.
-const CLIPBOARD_MASTER_SUB: &str = "Off leaves copied secrets in place";
+/// `clipboard_history_note()`, the row that says so in its own words.
+fn clipboard_master_sub() -> &'static str {
+    crate::i18n::t("prefs.clipboard_master_sub")
+}
 /// The tip behind the row's `?` dot.
-const CLIPBOARD_MASTER_TIP: &str = "On by default. Off means a secret you copy stays on the clipboard until something else replaces it, with no timer and none of the three below. Keeping copies out of clipboard history is separate and stays on either way.";
+fn clipboard_master_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_master_tip")
+}
 
-const CLIPBOARD_ON_LOCK_LABEL: &str = "Clear when the vault locks";
+fn clipboard_on_lock_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_lock_label")
+}
 /// Names all four ways the vault locks, because a user who locks by idling
 /// should not have to guess whether the Lock button is the only one meant.
 /// The fourth -- the session being invalidated elsewhere -- is described
 /// rather than named, since "needs_reauth" is not a word on any screen.
-const CLIPBOARD_ON_LOCK_SUB: &str = "However the vault locks";
+fn clipboard_on_lock_sub() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_lock_sub")
+}
 /// The tip behind the row's `?` dot.
-const CLIPBOARD_ON_LOCK_TIP: &str = "Locking by hand, from the tray, after idling, or because the session expired. Deskwarden has no separate sign-out, so this switch covers all of them.";
+fn clipboard_on_lock_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_lock_tip")
+}
 
-const CLIPBOARD_ON_ACCOUNT_LABEL: &str = "Clear when the account changes";
-const CLIPBOARD_ON_ACCOUNT_SUB: &str = "Switching, adding or removing one";
+fn clipboard_on_account_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_account_label")
+}
+fn clipboard_on_account_sub() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_account_sub")
+}
 /// The tip behind the row's `?` dot.
-const CLIPBOARD_ON_ACCOUNT_TIP: &str = "A credential from the vault you have just left does not follow you to the next one.";
+fn clipboard_on_account_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_account_tip")
+}
 
-const CLIPBOARD_ON_QUIT_LABEL: &str = "Clear when Deskwarden quits";
+fn clipboard_on_quit_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_quit_label")
+}
 /// **Says what it cannot cover**, because a switch called "when Deskwarden
 /// quits" reads as a promise about every way the process can end, and three of
 /// those ways no in-process arrangement can catch. `PRIVACY.md` makes the same
 /// admission; a page that made the stronger claim would be the one disagreeing
 /// with it.
-const CLIPBOARD_ON_QUIT_SUB: &str = "Not after a crash or power cut";
+fn clipboard_on_quit_sub() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_quit_sub")
+}
 /// The tip behind the row's `?` dot.
-const CLIPBOARD_ON_QUIT_TIP: &str = "Covers quitting from the tray and shutting down to install an update. A crash, a Task Manager kill or a power cut cannot be caught, and leave the copy where it is.";
+fn clipboard_on_quit_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_on_quit_tip")
+}
 
-const CLIPBOARD_INTERVAL_LABEL: &str = "Clear after";
+fn clipboard_interval_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_interval_label")
+}
 /// **States the unit, the range and the resolution**, because all three are
 /// things a user would otherwise discover by being refused. The floor is
 /// stated on screen and not only enforced, exactly as `settings_v2::IDLE_MINUTES_SUB`
 /// states its own.
-const CLIPBOARD_INTERVAL_SUB: &str = "Minutes, from 0.5 to 60";
+fn clipboard_interval_sub() -> &'static str {
+    crate::i18n::t("prefs.clipboard_interval_sub")
+}
 /// The tip behind the row's `?` dot.
-const CLIPBOARD_INTERVAL_TIP: &str = "Minutes before a copied secret is taken back. Decimals are fine: 0.5 is thirty seconds, which is the shortest Deskwarden will use, and 60 minutes the longest, to one decimal place.";
+fn clipboard_interval_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_interval_tip")
+}
 
 /// The row that exists to say a thing is **not** a setting.
 ///
@@ -762,20 +879,34 @@ const CLIPBOARD_INTERVAL_TIP: &str = "Minutes before a copied secret is taken ba
 /// argument for it being unconditional is in `clipboard.rs`'s own header and
 /// in `PRIVACY.md`; this is the one-sentence version, on the page where
 /// somebody would go looking for the switch.
-const CLIPBOARD_HISTORY_LABEL: &str = "Clipboard history and sync are always excluded";
-const CLIPBOARD_HISTORY_NOTE: &str = "Kept out of Win+V history, never synced to other devices";
+fn clipboard_history_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_history_label")
+}
+fn clipboard_history_note() -> &'static str {
+    crate::i18n::t("prefs.clipboard_history_note")
+}
 /// The tip behind it: why there is no switch.
-const CLIPBOARD_HISTORY_TIP: &str = "This has no setting and is not affected by anything above; there is no version of it worth turning off.";
+fn clipboard_history_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_history_tip")
+}
 
-const CLIPBOARD_RESET_LABEL: &str = "Reset to default";
+fn clipboard_reset_label() -> &'static str {
+    crate::i18n::t("prefs.clipboard_reset_label")
+}
 /// Says the scope, because "reset to default" on a page inside a preferences
 /// window is otherwise ambiguous between this page and the app. It also says
 /// what the defaults *are*, so the button's effect is legible before it is
 /// pressed rather than only after.
-const CLIPBOARD_RESET_SUB: &str = "Nothing on other pages changes";
+fn clipboard_reset_sub() -> &'static str {
+    crate::i18n::t("prefs.clipboard_reset_sub")
+}
 /// The tip behind the row's `?` dot.
-const CLIPBOARD_RESET_TIP: &str = "Puts the five settings on this page back to how they ship: everything on, one minute. There is no confirmation, because setting them again is the same five clicks.";
-const CLIPBOARD_RESET_BUTTON: &str = "Reset";
+fn clipboard_reset_tip() -> &'static str {
+    crate::i18n::t("prefs.clipboard_reset_tip")
+}
+fn clipboard_reset_button() -> &'static str {
+    crate::i18n::t("prefs.clipboard_reset_button")
+}
 
 /// What the interval field says when it refuses an entry.
 ///
@@ -787,13 +918,18 @@ const CLIPBOARD_RESET_BUTTON: &str = "Reset";
 /// The refused entry is **not** applied, so the value in effect is still the
 /// one shown a moment ago -- which is why every one of these says what the
 /// field wants rather than only what it got.
-const CLIPBOARD_ENTRY_NOT_A_NUMBER: &str = "Type a number of minutes, like 1 or 0.5.";
-const CLIPBOARD_ENTRY_BELOW_FLOOR: &str =
-    "0.5 minutes (thirty seconds) is the shortest — below that the clipboard expires before a \
-     slow sign-in page is ready.";
-const CLIPBOARD_ENTRY_ABOVE_CEILING: &str =
-    "60 minutes is the longest. To stop clearing altogether, use the switch at the top.";
-const CLIPBOARD_ENTRY_BETWEEN_STEPS: &str = "One decimal place — 1.5, not 1.25.";
+fn clipboard_entry_not_a_number() -> &'static str {
+    crate::i18n::t("prefs.clipboard_entry_not_a_number")
+}
+fn clipboard_entry_below_floor() -> &'static str {
+    crate::i18n::t("prefs.clipboard_entry_below_floor")
+}
+fn clipboard_entry_above_ceiling() -> &'static str {
+    crate::i18n::t("prefs.clipboard_entry_above_ceiling")
+}
+fn clipboard_entry_between_steps() -> &'static str {
+    crate::i18n::t("prefs.clipboard_entry_between_steps")
+}
 
 /// **One switch, two ways of leaving.** This governs the idle timeout below
 /// *and* `deskwarden::away_lock` -- locking Windows (Win+L), switching user,
@@ -802,9 +938,13 @@ const CLIPBOARD_ENTRY_BETWEEN_STEPS: &str = "One decimal place — 1.5, not 1.25
 /// their back, and Win+L is behind their back in the most literal sense
 /// available. The label says "step away" rather than "idle" because the
 /// timeout is now the weaker of the two things it turns on.
-const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when you step away";
+fn auto_lock_enabled_label() -> &'static str {
+    crate::i18n::t("prefs.auto_lock_enabled_label")
+}
 
-const AUTO_LOCK_LABEL: &str = "Lock the vault after";
+fn auto_lock_label() -> &'static str {
+    crate::i18n::t("prefs.auto_lock_label")
+}
 
 // **`FILL_HOTKEY` is no longer a production constant in this file**, and its
 // absence is the point: there are five chords now and every one of them is
@@ -840,30 +980,38 @@ const AUTO_LOCK_LABEL: &str = "Lock the vault after";
 /// **A suffix rather than five more constants.** Every row can be in this
 /// state, and five hand-written "… — shortcut not working" labels are five
 /// chances for one of them to say something else.
-const SHORTCUT_UNAVAILABLE_SUFFIX: &str = " — shortcut not working";
+fn shortcut_unavailable_label(label: &str) -> String {
+    crate::i18n::tf("prefs.shortcut_unavailable", &[("shortcut", label)])
+}
 
 /// What the chip says on a row the user has cleared.
-const SHORTCUT_NOT_SET: &str = "Not set";
+fn shortcut_not_set() -> &'static str {
+    crate::i18n::t("prefs.shortcut_not_set")
+}
 
 /// The button that clears a row.
-const SHORTCUT_CLEAR: &str = "Clear";
+fn shortcut_clear() -> &'static str {
+    crate::i18n::t("prefs.shortcut_clear")
+}
 
 /// What a row says while it is waiting for keys.
 ///
 /// **It replaces the chord in the chip, not the description**, so the thing
 /// under the pointer is the thing that changed. The instructions -- including
 /// both escapes, which a user in this state needs and cannot guess -- go where
-/// the description was; see [`SHORTCUT_CAPTURE_HINT`].
-const SHORTCUT_CAPTURING: &str = "Press keys…";
+/// the description was; see [`shortcut_capture_hint()`].
+fn shortcut_capturing() -> &'static str {
+    crate::i18n::t("prefs.shortcut_capturing")
+}
 
 /// The instructions, shown only while a row is capturing.
 ///
 /// Names all three ways out, because a widget that swallows the keyboard and
 /// does not say how to stop is the worst thing on this page. Esc first because
 /// it is the one a user will try.
-const SHORTCUT_CAPTURE_HINT: &str =
-    "Hold Ctrl, Alt, Shift or Windows and press a key. Esc leaves this shortcut as it was; \
-     Backspace turns it off.";
+fn shortcut_capture_hint() -> &'static str {
+    crate::i18n::t("prefs.shortcut_capture_hint")
+}
 
 /// Why a captured combination was refused: it had no modifier.
 ///
@@ -872,9 +1020,9 @@ const SHORTCUT_CAPTURE_HINT: &str =
 /// logon session -- bind `P` and every `P` typed into every program on the
 /// machine arrives here instead of in the document the user is writing, with
 /// no way back except a Preferences window they can no longer type a `P` into.
-const SHORTCUT_NEEDS_A_MODIFIER: &str =
-    "That needs a modifier. Hold Ctrl, Alt, Shift or Windows as well, or Deskwarden would \
-     take that key from every program on this PC.";
+fn shortcut_needs_a_modifier() -> &'static str {
+    crate::i18n::t("prefs.shortcut_needs_a_modifier")
+}
 
 /// Why a captured combination was refused: this app already uses it.
 ///
@@ -884,7 +1032,7 @@ const SHORTCUT_NEEDS_A_MODIFIER: &str =
 /// app reporting a conflict *with itself* as though another program had taken
 /// the keys.
 fn shortcut_taken_note(other: crate::app::FillShortcut) -> String {
-    format!("Deskwarden already uses that for “{}”. Pick another combination.", other.label())
+    crate::i18n::tf("prefs.shortcut_taken_note", &[("other", other.label())])
 }
 
 /// Why a captured key cannot be bound at all.
@@ -892,9 +1040,9 @@ fn shortcut_taken_note(other: crate::app::FillShortcut) -> String {
 /// The key table (`hotkey::KEYS`) is closed on purpose -- see its doc -- so a
 /// key press that maps to nothing has to say so rather than be swallowed,
 /// which would leave the row sitting in capture mode looking broken.
-const SHORTCUT_UNUSABLE_KEY: &str =
-    "Deskwarden cannot use that key. Try a letter, a digit, a function key, or one of the \
-     navigation keys.";
+fn shortcut_unusable_key() -> &'static str {
+    crate::i18n::t("prefs.shortcut_unusable_key")
+}
 
 /// The line under every direct action's label, appended to what that action
 /// types.
@@ -907,7 +1055,9 @@ const SHORTCUT_UNUSABLE_KEY: &str =
 /// user can find out *why*, and the Shortcuts page is where they come to ask
 /// it, so every one of those four rows says it here and names the one chord
 /// that does answer for an unmatched window.
-const DIRECT_SHORTCUT_NOTE: &str = "Needs a window Deskwarden has matched; with nothing matched it does nothing, and the fill shortcut above is the one that asks about the window instead.";
+fn direct_shortcut_note() -> &'static str {
+    crate::i18n::t("prefs.direct_shortcut_note")
+}
 
 /// What the About page says about the account when nobody has published one.
 ///
@@ -918,7 +1068,9 @@ const DIRECT_SHORTCUT_NOTE: &str = "Needs a window Deskwarden has matched; with 
 /// page without going through `main`. The row is never blank in any of them,
 /// which is the property the original constant existed for: a label with an
 /// empty right-hand column reads as a field that failed to load.
-const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account.";
+fn account_status() -> &'static str {
+    crate::i18n::t("prefs.account_status")
+}
 
 /// The row's label, and the two things it can say about a known account.
 ///
@@ -928,8 +1080,12 @@ const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account
 /// "Not signed in" -- the two being opposite claims rather than shades of one.
 /// That spawn is gone: the address is read off the `Account`, or off the
 /// sign-in that established it, and both answer on the frame they are asked.
-const ACCOUNT_LABEL: &str = "Bitwarden account";
-const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
+fn account_label() -> &'static str {
+    crate::i18n::t("prefs.account_label")
+}
+fn account_signed_out() -> &'static str {
+    crate::i18n::t("prefs.account_signed_out")
+}
 /// **One sentence for two situations, because this build cannot tell them
 /// apart.** `login_ui::unknown_status_details` returns the same value for a
 /// CLI that could not be spawned, one that answered nothing usable, and one
@@ -940,14 +1096,18 @@ const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
 /// It named the Bitwarden CLI, which is only one of the two things that can
 /// fail to answer: on the built-in client the status comes from `rest::api`
 /// and no CLI is running at all.
-const ACCOUNT_SIGNED_OUT_NOTE: &str =
-    "No account is signed in, or Deskwarden could not reach the vault to ask.";
+fn account_signed_out_note() -> &'static str {
+    crate::i18n::t("prefs.account_signed_out_note")
+}
 /// A signed-in account whose address was not reported. Not blank, and
 /// not silently "signed in" either -- the row promises to say WHICH account.
-const ACCOUNT_NO_EMAIL: &str = "Signed in";
-const ACCOUNT_NO_EMAIL_NOTE: &str = "The address for this account was not reported.";
-/// Under a known address: which server this vault lives on.
-const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
+fn account_no_email() -> &'static str {
+    crate::i18n::t("prefs.account_no_email")
+}
+fn account_no_email_note() -> &'static str {
+    crate::i18n::t("prefs.account_no_email_note")
+}
+// Under a known address: which server this vault lives on is `prefs.account_signed_in_at`.
 
 /// What the About page knows about the signed-in account.
 ///
@@ -973,7 +1133,7 @@ const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
 /// `Account`, or off the sign-in that established it, and both answer on the
 /// frame they are asked. `None` -- nothing published yet -- is the only
 /// before-state left, and it has its own honest sentence in
-/// [`ACCOUNT_STATUS`]. Re-adding an in-flight variant would need a real
+/// [`account_status()`]. Re-adding an in-flight variant would need a real
 /// in-flight moment to go with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountStatus {
@@ -981,7 +1141,7 @@ pub enum AccountStatus {
     /// reported; `server` is `None` for Bitwarden's own cloud.
     SignedIn { email: Option<String>, server: Option<String> },
     /// Nobody is signed in -- or the vault could not be asked. See
-    /// [`ACCOUNT_SIGNED_OUT_NOTE`].
+    /// [`account_signed_out_note()`].
     SignedOut,
 }
 
@@ -1010,7 +1170,9 @@ pub enum AccountStatus {
 // What is left is the pair that carries information: the status line, which
 // differs at every stage, and the button, which names its own action. See
 // `status_row`, which is the row shape that has no title.
-const UPDATE_CHECK_BUTTON: &str = "Check for updates";
+fn update_check_button() -> &'static str {
+    crate::i18n::t("prefs.update_check_button")
+}
 
 /// The flow row's status line once a release has been found and not yet
 /// fetched.
@@ -1021,21 +1183,39 @@ const UPDATE_CHECK_BUTTON: &str = "Check for updates";
 /// drift away from the paint while both still compile -- which is exactly how
 /// a test starts passing without reaching the thing it names.
 fn update_available_status(version: &semver::Version) -> String {
-    format!("Version {version} is available.")
+    crate::i18n::tf("prefs.update_available_status", &[("version", &version.to_string())])
 }
-const UPDATE_CHECKING_BUTTON: &str = "Checking...";
-const UPDATE_DOWNLOAD_BUTTON: &str = "Download";
-const UPDATE_DOWNLOADING_BUTTON: &str = "Downloading...";
-const UPDATE_RESTART_BUTTON: &str = "Restart to install";
-const UPDATE_RETRY_BUTTON: &str = "Try again";
+fn update_checking_button() -> &'static str {
+    crate::i18n::t("prefs.update_checking_button")
+}
+fn update_download_button() -> &'static str {
+    crate::i18n::t("prefs.update_download_button")
+}
+fn update_downloading_button() -> &'static str {
+    crate::i18n::t("prefs.update_downloading_button")
+}
+fn update_restart_button() -> &'static str {
+    crate::i18n::t("prefs.update_restart_button")
+}
+fn update_retry_button() -> &'static str {
+    crate::i18n::t("prefs.update_retry_button")
+}
 
-const UPDATE_IDLE_DESCRIPTION: &str = "Asks GitHub; nothing downloads until you ask.";
-const UPDATE_CHECKING_DESCRIPTION: &str = "Asking GitHub for the latest release.";
-const UPDATE_UP_TO_DATE_DESCRIPTION: &str = "This is the latest release.";
-const UPDATE_READY_DESCRIPTION: &str =
-    "Downloaded and signature-checked. Deskwarden will close, install, and start again.";
-const UPDATE_UNAVAILABLE_DESCRIPTION: &str =
-    "This build cannot check for updates. Please report it \u{2014} it is a defect, not a setting.";
+fn update_idle_description() -> &'static str {
+    crate::i18n::t("prefs.update_idle_description")
+}
+fn update_checking_description() -> &'static str {
+    crate::i18n::t("prefs.update_checking_description")
+}
+fn update_up_to_date_description() -> &'static str {
+    crate::i18n::t("prefs.update_up_to_date_description")
+}
+fn update_ready_description() -> &'static str {
+    crate::i18n::t("prefs.update_ready_description")
+}
+fn update_unavailable_description() -> &'static str {
+    crate::i18n::t("prefs.update_unavailable_description")
+}
 
 /// Shown under the button when `Settings::check_for_updates` is off.
 ///
@@ -1052,14 +1232,16 @@ const UPDATE_UNAVAILABLE_DESCRIPTION: &str =
 /// -- which is the whole reason the two were put on one page. Naming a page
 /// that no longer holds the switch would have been worse than vague; naming
 /// no page at all, with the switch in the same glance, is better than either.
-const UPDATE_AUTOMATIC_OFF_NOTE: &str =
-    "Automatic checks are off — the switch above. This button still asks, because you asked it \
-     to.";
+fn update_automatic_off_note() -> &'static str {
+    crate::i18n::t("prefs.update_automatic_off_note")
+}
 
 /// Shown in place of the notes when the release has none. A release with an
 /// empty body is normal; an empty box is not distinguishable from a box that
 /// failed to load.
-const UPDATE_NOTES_EMPTY: &str = "This release came with no notes.";
+fn update_notes_empty() -> &'static str {
+    crate::i18n::t("prefs.update_notes_empty")
+}
 
 /// The floor under the notes region's height.
 ///
@@ -1211,7 +1393,7 @@ pub enum Section {
     /// moved here rather than being left behind. A pill on one page and the
     /// button it does *not* govern on another is precisely the arrangement
     /// that makes a user distrust both -- see
-    /// [`crate::breach_scan::SCAN_CONSENT_NOTE`], which has to be readable in
+    /// [`crate::breach_scan::scan_consent_note()`], which has to be readable in
     /// the same glance as the switch it is talking about.
     ///
     /// Directly after General, because that is where this setting used to be
@@ -1305,7 +1487,7 @@ pub enum Section {
     /// same split, with both halves already built. The switch governs what
     /// Deskwarden asks **on its own**; the button is the user asking. Those
     /// two sentences only read as honest when the switch and the control it
-    /// does not govern are in one glance -- see [`UPDATE_AUTOMATIC_OFF_NOTE`],
+    /// does not govern are in one glance -- see [`update_automatic_off_note()`],
     /// which used to have to name another page and now points at the row
     /// directly above it.
     ///
@@ -1368,18 +1550,18 @@ impl Section {
     /// the same word for both).
     pub fn label(self) -> &'static str {
         match self {
-            Section::General => "General",
-            Section::Shortcuts => "Shortcuts",
-            Section::View => "View",
-            Section::Lock => "Lock",
-            Section::Breaches => "Breaches",
-            Section::Vault => "Vault",
-            Section::Sync => "Sync",
-            Section::Sharing => "Sharing",
-            Section::Api => "Local API",
-            Section::Clipboard => "Clipboard",
-            Section::Updates => "Updates",
-            Section::About => "About",
+            Section::General => crate::i18n::t("prefs.section_general"),
+            Section::Shortcuts => crate::i18n::t("prefs.section_shortcuts"),
+            Section::View => crate::i18n::t("prefs.section_view"),
+            Section::Lock => crate::i18n::t("prefs.section_lock"),
+            Section::Breaches => crate::i18n::t("prefs.section_breaches"),
+            Section::Vault => crate::i18n::t("prefs.section_vault"),
+            Section::Sync => crate::i18n::t("prefs.section_sync"),
+            Section::Sharing => crate::i18n::t("prefs.section_sharing"),
+            Section::Api => crate::i18n::t("prefs.section_api"),
+            Section::Clipboard => crate::i18n::t("prefs.section_clipboard"),
+            Section::Updates => crate::i18n::t("prefs.section_updates"),
+            Section::About => crate::i18n::t("prefs.section_about"),
         }
     }
 
@@ -2465,7 +2647,7 @@ fn child_toggle_row(
 
 /// A row with no control at all: a statement, not a setting.
 ///
-/// Used for `CLIPBOARD_HISTORY_NOTE`, and shaped exactly like About's account
+/// Used for `clipboard_history_note()`, and shaped exactly like About's account
 /// line -- the same `card_row` plus `row_text`, no trailing column. A row with
 /// an empty right-hand column would read as a field that failed to load, and a
 /// *disabled* toggle would read as a feature that is present and broken. It is
@@ -2484,7 +2666,7 @@ fn note_row(ui: &mut Ui, label: &str, note: &str, tip: &str) {
 /// switch with no visible consequence; a user pressing a scan button on
 /// another page would have been acting on a rule they could not see. Here the
 /// switch, the control it does *not* govern, the sentence saying so
-/// ([`crate::breach_scan::SCAN_CONSENT_NOTE`]), and the record of what has
+/// ([`crate::breach_scan::scan_consent_note()`]), and the record of what has
 /// actually been sent are all in one glance.
 ///
 /// # The button is not gated on the pill, and the page says so
@@ -2518,9 +2700,9 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
         // by a click on it and by nothing else.
         state.settings.check_breaches = toggle_row(
             ui,
-            BREACH_LABEL,
-            BREACH_SUB,
-            BREACH_TIP,
+            breach_label(),
+            breach_sub(),
+            breach_tip(),
             state.settings.check_breaches,
         );
     });
@@ -2528,7 +2710,7 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         let stage = state.scan.stage().clone();
         let (description, tip) = match &stage {
-            ScanStage::Idle => (SCAN_IDLE_SUB.to_string(), SCAN_IDLE_TIP),
+            ScanStage::Idle => (scan_idle_sub().to_string(), scan_idle_tip()),
             ScanStage::Running { done, total, found, failed } => {
                 (crate::breach_scan::progress_wording(*done, *total, *found, *failed), "")
             }
@@ -2537,8 +2719,8 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
             // disagree about what just happened -- and so the failure count
             // is the last thing said, here as everywhere.
             ScanStage::Finished(record) => (crate::breach_scan::outcome_wording(record), ""),
-            ScanStage::NothingToScan => (SCAN_NOTHING_DESCRIPTION.to_string(), ""),
-            ScanStage::Unavailable => (SCAN_UNAVAILABLE_DESCRIPTION.to_string(), ""),
+            ScanStage::NothingToScan => (scan_nothing_description().to_string(), ""),
+            ScanStage::Unavailable => (scan_unavailable_description().to_string(), ""),
         };
         // A running scan still draws a button -- disabled, and labelled with
         // what is happening -- rather than drawing nothing: a control that
@@ -2546,10 +2728,10 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
         // STAGE, not by `is_busy`: the screenshot example parks a panel in
         // `Running` with no channel behind it.
         let running = matches!(stage, ScanStage::Running { .. });
-        let label = if running { SCAN_RUNNING_BUTTON } else { SCAN_BUTTON };
+        let label = if running { scan_running_button() } else { scan_button_text() };
         let mut clicked = false;
         let width = outline_button_width(ui, label);
-        control_row_tip(ui, SCAN_SECTION_LABEL, &description, tip, false, width, |ui| {
+        control_row_tip(ui, scan_section_label(), &description, tip, false, width, |ui| {
             clicked = scan_button(ui, label, !running);
         });
         if let ScanStage::Running { done, total, .. } = &stage {
@@ -2576,15 +2758,15 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
 
         row_separator(ui);
         card_row(ui, |ui| {
-            sub_note(ui, crate::breach_scan::SCAN_CONSENT_NOTE);
+            sub_note(ui, crate::breach_scan::scan_consent_note());
         });
     });
 
-    group_title(ui, SCAN_HISTORY_LABEL);
+    group_title(ui, scan_history_label());
     card(ui, |ui| {
         if state.scan_history.entries.is_empty() {
             card_row(ui, |ui| {
-                sub_note(ui, SCAN_NO_HISTORY);
+                sub_note(ui, scan_no_history());
             });
             return;
         }
@@ -2651,9 +2833,11 @@ pub(crate) fn outline_button_width(ui: &Ui, label: &str) -> f32 {
 /// The master switch's label. It names **what happens to the vault**, not the
 /// mechanism: "Run the local API" describes a process, and the thing the
 /// owner is deciding about is that other programs get their items.
-const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
+fn service_label() -> &'static str {
+    crate::i18n::t("prefs.service_label")
+}
 
-/// The description under [`SERVICE_LABEL`], in its two states.
+/// The description under [`service_label()`], in its two states.
 ///
 /// A pure function, and asserted on by tests, for [`disk_cache_tip`]'s
 /// reason exactly: this is the sentence a person reads before deciding to put
@@ -2666,7 +2850,7 @@ const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
 ///    matters and the one that is easy to get wrong -- an off state that says
 ///    only "off" leaves the decision to the label, and the label is six
 ///    words. Off is also the default, and the copy says so rather than
-///    leaving it to `Settings::default`, the same way `BREACH_TIP`
+///    leaving it to `Settings::default`, the same way `breach_tip()`
 ///    states its own.
 ///  * **It names what is served, without a euphemism**: usernames, passwords,
 ///    notes and two-factor secrets. Not "vault data". The disk-cache row two
@@ -2679,20 +2863,18 @@ const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
 ///    who assumes it does has misjudged the entire trade.
 fn service_tip(enabled: bool) -> &'static str {
     if enabled {
-        "Deskwarden is listening on 127.0.0.1 and hands out decrypted vault items (usernames, passwords, notes and two-factor secrets) to any program on this PC that presents one of the keys below. \
-         It never asks for your master password: a key is the whole credential, so anyone who can read one can use it."
+        crate::i18n::t("prefs.service_tip_on")
     } else {
-        "Turning it on starts a local HTTP endpoint on 127.0.0.1 that hands out decrypted vault items (usernames, passwords, notes and two-factor secrets) to any program on this PC that presents one of the keys you mint below. \
-         It never asks for your master password: a key is the whole credential, so anyone who can read one can use it."
+        crate::i18n::t("prefs.service_tip_off")
     }
 }
 
-/// The short line under [`SERVICE_LABEL`], in its two states.
+/// The short line under [`service_label()`], in its two states.
 fn service_sub(enabled: bool) -> &'static str {
     if enabled {
-        "On, and listening on 127.0.0.1"
+        crate::i18n::t("prefs.service_sub_on")
     } else {
-        "Off by default; nothing is listening"
+        crate::i18n::t("prefs.service_sub_off")
     }
 }
 
@@ -2728,37 +2910,68 @@ fn load_service_keys() -> Vec<KeyRecord> {
 /// would make every one of them a writer of the owner's real key store.
 fn save_service_keys(records: &[KeyRecord]) -> Result<(), String> {
     let path = service_keys_path()
-        .ok_or_else(|| "Deskwarden could not work out where its own settings live".to_string())?;
+        .ok_or_else(|| crate::i18n::t("prefs.settings_path_unknown").to_string())?;
     crate::service_keys::save(&path, records)
 }
 
 // -- copy -------------------------------------------------------------------
 
-const KEYS_SECTION_LABEL: &str = "API keys";
+fn keys_section_label() -> &'static str {
+    crate::i18n::t("prefs.keys_section_label")
+}
 
 /// The empty state. A result, not a blank panel -- and it says what the
 /// emptiness *means*, because "no keys" and "the service is wide open" are
 /// exactly the confusion this page has to prevent.
-const KEYS_NONE: &str = "No keys have been minted, so nothing can reach the service yet. A \
-                         program needs a key from here before it is answered at all.";
+fn keys_none() -> &'static str {
+    crate::i18n::t("prefs.keys_none")
+}
 
-const MINT_SECTION_LABEL: &str = "Mint a key";
-const MINT_SECTION_DESCRIPTION: &str = "Shown once; only its hash is kept.";
-const NAME_LABEL: &str = "Name";
-const NAME_SUB: &str = "Name it after the program";
+fn mint_section_label() -> &'static str {
+    crate::i18n::t("prefs.mint_section_label")
+}
+fn mint_section_description() -> &'static str {
+    crate::i18n::t("prefs.mint_section_description")
+}
+fn name_label() -> &'static str {
+    crate::i18n::t("prefs.name_label")
+}
+fn name_sub() -> &'static str {
+    crate::i18n::t("prefs.name_sub")
+}
 /// The tip behind the row's `?` dot.
-const NAME_TIP: &str = "The name is how you recognise this key in the list, and how you revoke it.";
-const EXPIRY_LABEL: &str = "Expires after";
-const EXPIRY_SUB: &str = "Days from now; empty never expires";
+fn name_tip() -> &'static str {
+    crate::i18n::t("prefs.name_tip")
+}
+fn expiry_label() -> &'static str {
+    crate::i18n::t("prefs.expiry_label")
+}
+fn expiry_sub() -> &'static str {
+    crate::i18n::t("prefs.expiry_sub")
+}
 /// The tip behind the row's `?` dot.
-const EXPIRY_TIP: &str = "Leave it empty for a key that never expires and works until you revoke it.";
-const SUBJECT_LABEL: &str = "What it can reach";
-const ACCESS_LABEL: &str = "What it may do";
-const ITEM_ID_LABEL: &str = "Item id";
-const ITEM_ID_SUB: &str = "The one item this key may reach";
+fn expiry_tip() -> &'static str {
+    crate::i18n::t("prefs.expiry_tip")
+}
+fn subject_label_text() -> &'static str {
+    crate::i18n::t("prefs.subject_label")
+}
+fn access_label() -> &'static str {
+    crate::i18n::t("prefs.access_label")
+}
+fn item_id_label() -> &'static str {
+    crate::i18n::t("prefs.item_id_label")
+}
+fn item_id_sub() -> &'static str {
+    crate::i18n::t("prefs.item_id_sub")
+}
 /// The tip behind the row's `?` dot.
-const ITEM_ID_TIP: &str = "The id as it appears in the vault's own links.";
-const MINT_BUTTON: &str = "Mint the key";
+fn item_id_tip() -> &'static str {
+    crate::i18n::t("prefs.item_id_tip")
+}
+fn mint_button() -> &'static str {
+    crate::i18n::t("prefs.mint_button")
+}
 
 /// The mint form's field ids, stable across frames for [`STEPPER_FIELD_ID`]'s
 /// reason: focus and the caret live in egui's memory under the widget's id,
@@ -2772,13 +2985,23 @@ const NAME_FIELD_WIDTH: f32 = CONTROL_COLUMN_WIDTH;
 /// A box for a number of days, sized like the two steppers' value cells.
 const EXPIRY_FIELD_WIDTH: f32 = 72.0;
 
-const EVERYTHING_CHOICE: &str = "Everything";
-const ONE_ITEM_CHOICE: &str = "One item";
-const READ_CHOICE: &str = "Read";
-const WRITE_CHOICE: &str = "Write";
+fn everything_choice() -> &'static str {
+    crate::i18n::t("prefs.everything_choice")
+}
+fn one_item_choice() -> &'static str {
+    crate::i18n::t("prefs.one_item_choice")
+}
+fn read_choice() -> &'static str {
+    crate::i18n::t("prefs.read_choice")
+}
+fn write_choice() -> &'static str {
+    crate::i18n::t("prefs.write_choice")
+}
 
 /// The heading over a key that has just been minted.
-const REVEAL_LABEL: &str = "Copy this key now";
+fn reveal_label() -> &'static str {
+    crate::i18n::t("prefs.reveal_label")
+}
 
 /// **The whole contract of the reveal, in the place it is shown.**
 ///
@@ -2786,15 +3009,25 @@ const REVEAL_LABEL: &str = "Copy this key now";
 /// -- because "shown once" reads as a policy someone could relax, and "we
 /// keep only a hash of it" is the reason it cannot be relaxed. A reader who
 /// believes the key is retrievable will close this card and come back for it.
-const REVEAL_NOTE: &str = "This is the only time this key is shown. Deskwarden stores nothing \
-                           but a hash of it, so it cannot be shown again \u{2014} not by this screen, \
-                           not from the file. If you lose it, revoke this key and mint another.";
+fn reveal_note() -> &'static str {
+    crate::i18n::t("prefs.reveal_note")
+}
 
-const COPY_BUTTON: &str = "Copy";
-const DONE_BUTTON: &str = "Done";
-const REVOKE_BUTTON: &str = "Revoke";
-const REVOKE_CONFIRM_BUTTON: &str = "Revoke it";
-const REVOKE_CANCEL_BUTTON: &str = "Keep it";
+fn copy_button() -> &'static str {
+    crate::i18n::t("prefs.copy_button")
+}
+fn done_button() -> &'static str {
+    crate::i18n::t("prefs.done_button")
+}
+fn revoke_button() -> &'static str {
+    crate::i18n::t("prefs.revoke_button")
+}
+fn revoke_confirm_button() -> &'static str {
+    crate::i18n::t("prefs.revoke_confirm_button")
+}
+fn revoke_cancel_button() -> &'static str {
+    crate::i18n::t("prefs.revoke_cancel_button")
+}
 
 /// What the owner is asked before a key goes.
 ///
@@ -2804,12 +3037,7 @@ const REVOKE_CANCEL_BUTTON: &str = "Keep it";
 /// failure it gets says nothing about why, and that there is no undo -- which
 /// is exactly the mis-click this confirmation exists for.
 fn revoke_prompt(name: &str) -> String {
-    format!(
-        "Revoke \u{201c}{name}\u{201d}? Any program still holding this key stops being answered \
-         the moment you do \u{2014} with a refusal that tells it nothing about why \u{2014} and the key \
-         cannot be brought back. Replacing it means putting a new key into whatever was using \
-         this one."
-    )
+    crate::i18n::tf("prefs.revoke_prompt", &[("name", name)])
 }
 
 /// Why a form was refused before [`crate::service_keys::mint`] ever saw it.
@@ -2821,20 +3049,24 @@ fn revoke_prompt(name: &str) -> String {
 /// permissions" by the time it is called -- both of which are legitimate
 /// values it must accept. Judging them here is the only place they are still
 /// distinguishable from the thing the owner meant.
-const EXPIRY_NOT_A_NUMBER: &str = "Enter the number of days this key should last \u{2014} 30, say \u{2014} \
-                                   or leave the box empty for a key that never expires.";
-const NO_ITEM_ID: &str = "Enter the id of the item this key is for. A key scoped to no item is \
-                          refused every item, which is a key that looks live and is not.";
-const NO_ACCESS: &str = "Choose Read, Write, or both. A key with neither is refused everything \
-                         it asks for, which is a key that looks live and is not.";
+fn expiry_not_a_number() -> &'static str {
+    crate::i18n::t("prefs.expiry_not_a_number")
+}
+fn no_item_id() -> &'static str {
+    crate::i18n::t("prefs.no_item_id")
+}
+fn no_access() -> &'static str {
+    crate::i18n::t("prefs.no_access")
+}
 
 /// Said after a key was minted but the store could not be written.
 ///
 /// **The key is live in this window and dead after a restart**, which is the
 /// worst of the three possible states and the one a "could not save" would
 /// not convey.
-const MINT_NOT_SAVED: &str = "The key was made, but the key store could not be written, so it \
-                              will be gone the next time Deskwarden starts: ";
+fn mint_not_saved() -> &'static str {
+    crate::i18n::t("prefs.mint_not_saved")
+}
 
 /// Said after a key was revoked but the store could not be written.
 ///
@@ -2842,9 +3074,9 @@ const MINT_NOT_SAVED: &str = "The key was made, but the key store could not be w
 /// longer shows the key and the file still grants it. A message that said
 /// only "could not save" would leave the owner believing they had revoked
 /// it.
-const REVOKE_NOT_SAVED: &str = "The key is gone from this list, but the key store could not be \
-                                written \u{2014} so it still works, and will be back in this list when \
-                                Deskwarden restarts: ";
+fn revoke_not_saved() -> &'static str {
+    crate::i18n::t("prefs.revoke_not_saved")
+}
 
 // -- what a key is, in words ------------------------------------------------
 
@@ -2869,23 +3101,22 @@ const KEY_CATEGORIES: [ItemKind; 5] = [
 /// costs a disclosure or an edit.
 fn scope_wording(scope: &Scope) -> String {
     let access = match scope.access {
-        Access::Read => "Read",
-        Access::Write => "Write",
+        Access::Read => crate::i18n::t("prefs.read_choice"),
+        Access::Write => crate::i18n::t("prefs.write_choice"),
     };
     let subject = match &scope.subject {
-        Subject::All => "everything in the vault".to_string(),
-        Subject::Category(kind) => format!("every {}", kind.label().to_lowercase()),
-        Subject::Item(id) => format!("the item {id}"),
+        Subject::All => crate::i18n::t("prefs.scope_everything").to_string(),
+        Subject::Category(kind) => crate::i18n::tf("prefs.scope_every_kind", &[("kind", &(kind.label().to_lowercase()).to_string())]),
+        Subject::Item(id) => crate::i18n::tf("prefs.scope_item", &[("id", &id.to_string())]),
         // **Named, and named as granting nothing**, because that is what
         // `service_keys` does with it. A row that quietly omitted an
         // unrecognised scope would be a screen claiming a key is narrower
         // than the file says, on a build that is merely older than the file.
         Subject::Unrecognised(raw) => {
-            format!("\u{201c}{raw}\u{201d}, which this version does not understand and treats as \
-                     permitting nothing")
+            crate::i18n::tf("prefs.scope_unrecognised", &[("scope", raw)])
         }
     };
-    format!("{access} {subject}")
+    crate::i18n::tf("prefs.scope_line", &[("access", access), ("subject", &subject.to_string())])
 }
 
 /// Every grant on a key, as one line.
@@ -2896,7 +3127,7 @@ fn scope_wording(scope: &Scope) -> String {
 /// record can genuinely be in.
 fn scopes_wording(scopes: &[Scope]) -> String {
     if scopes.is_empty() {
-        return "No permissions at all: this key is refused everything it asks for.".to_string();
+        return crate::i18n::t("prefs.scopes_none").to_string();
     }
     scopes.iter().map(scope_wording).collect::<Vec<_>>().join(" \u{00b7} ")
 }
@@ -2922,16 +3153,16 @@ fn key_when_wording(
             zone,
         ))
     };
-    let created = format!("Created {}", when(record.created_unix));
+    let created = crate::i18n::tf("prefs.key_created", &[("when", &(when(record.created_unix)).to_string())]);
     match record.expires_unix {
-        None => format!("{created} \u{00b7} Never expires"),
+        None => crate::i18n::tf("prefs.key_never_expires", &[("created", &created.to_string())]),
         // Inclusive, exactly as `service_keys::find` is: a key whose expiry
         // is this second is already refused, so this second is already
         // "expired" and not "expires now".
         Some(at) if at <= now_unix => {
-            format!("{created} \u{00b7} Expired {} \u{2014} it is already refused", when(at))
+            crate::i18n::tf("prefs.key_expired", &[("created", &created.to_string()), ("when", &(when(at)).to_string())])
         }
-        Some(at) => format!("{created} \u{00b7} Expires {}", when(at)),
+        Some(at) => crate::i18n::tf("prefs.key_expires", &[("created", &created.to_string()), ("when", &(when(at)).to_string())]),
     }
 }
 
@@ -2975,9 +3206,9 @@ fn subject_choices() -> Vec<SubjectChoice> {
 /// too -- the same rule `FillChoice::label` follows for the overlay's rows.
 fn subject_label(subject: SubjectChoice) -> String {
     match subject {
-        SubjectChoice::Everything => EVERYTHING_CHOICE.to_string(),
+        SubjectChoice::Everything => everything_choice().to_string(),
         SubjectChoice::Category(kind) => kind.label(),
-        SubjectChoice::OneItem => ONE_ITEM_CHOICE.to_string(),
+        SubjectChoice::OneItem => one_item_choice().to_string(),
     }
 }
 
@@ -3024,13 +3255,13 @@ impl Default for KeyForm {
 /// What is wrong with the form, before `mint` is asked.
 fn form_refusal(form: &KeyForm) -> Option<&'static str> {
     if !form.expiry_days.trim().is_empty() && form.expiry_days.trim().parse::<u64>().is_err() {
-        return Some(EXPIRY_NOT_A_NUMBER);
+        return Some(expiry_not_a_number());
     }
     if form.subject == SubjectChoice::OneItem && form.item_id.trim().is_empty() {
-        return Some(NO_ITEM_ID);
+        return Some(no_item_id());
     }
     if !form.read && !form.write {
-        return Some(NO_ACCESS);
+        return Some(no_access());
     }
     None
 }
@@ -3226,8 +3457,12 @@ fn backend_switch(stored: bool, clicked: bool) -> Option<BackendSwitch> {
     }
 }
 
-const BACKEND_SWITCH_CONFIRM_BUTTON: &str = "Switch it";
-const BACKEND_SWITCH_CANCEL_BUTTON: &str = "Leave it";
+fn backend_switch_confirm_button() -> &'static str {
+    crate::i18n::t("prefs.backend_switch_confirm_button")
+}
+fn backend_switch_cancel_button() -> &'static str {
+    crate::i18n::t("prefs.backend_switch_cancel_button")
+}
 
 /// What the owner is asked before the backend moves.
 ///
@@ -3262,14 +3497,9 @@ const BACKEND_SWITCH_CANCEL_BUTTON: &str = "Leave it";
 /// requirement.
 fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
     if switch.deletes_the_stored_vault_key() {
-        "Switch back to the official Bitwarden CLI? It does not take effect until you next \
-         sign in to this account \u{2014} either sign out and back in, or close Deskwarden and open \
-         it again yourself. This also deletes the vault key stored on this PC, so nothing is \
-         left behind by the switch."
+        crate::i18n::t("prefs.backend_switch_back_prompt")
     } else {
-        "Switch to Deskwarden's built-in client? It does not take effect until you next sign \
-         in to this account \u{2014} either sign out and back in, or close Deskwarden and open it \
-         again yourself."
+        crate::i18n::t("prefs.backend_switch_built_in_prompt")
     }
 }
 
@@ -3285,10 +3515,10 @@ fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
         error_note(ui, backend_switch_prompt(switch));
         ui.horizontal(|ui| {
-            if key_button(ui, BACKEND_SWITCH_CONFIRM_BUTTON) {
+            if key_button(ui, backend_switch_confirm_button()) {
                 action = Some(RowAction::Confirm);
             }
-            if key_button(ui, BACKEND_SWITCH_CANCEL_BUTTON) {
+            if key_button(ui, backend_switch_cancel_button()) {
                 action = Some(RowAction::Cancel);
             }
         });
@@ -3396,9 +3626,9 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
             row_separator(ui);
             state.settings.keep_backend_running = toggle_row(
                 ui,
-                BACKEND_LABEL,
-                BACKEND_SUB,
-                BACKEND_TIP,
+                backend_label(),
+                backend_sub(),
+                backend_tip(),
                 state.settings.keep_backend_running,
             );
         }
@@ -3409,9 +3639,9 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         // it shares a card with the one row that goes.
         state.settings.keep_ui_loaded = toggle_row(
             ui,
-            UI_LOADED_LABEL,
-            UI_LOADED_SUB,
-            UI_LOADED_TIP,
+            ui_loaded_label(),
+            ui_loaded_sub(),
+            ui_loaded_tip(),
             state.settings.keep_ui_loaded,
         );
     });
@@ -3445,8 +3675,8 @@ fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
         // existing.
         state.settings.cache_vault_to_disk = child_toggle_row(
             ui,
-            DISK_CACHE_LABEL,
-            DISK_CACHE_SUB,
+            disk_cache_label(),
+            disk_cache_sub(),
             disk_cache_tip(),
             state.settings.cache_vault_to_disk,
             // Always live now: nothing about this row depends on Hello.
@@ -3458,9 +3688,9 @@ fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
         // reason -- a row that vanishes is a row a user cannot find out about.
         state.settings.read_through_cache = child_toggle_row(
             ui,
-            READ_THROUGH_LABEL,
+            read_through_label(),
             read_through_sub(state.settings.cache_vault_to_disk),
-            READ_THROUGH_TIP,
+            read_through_tip(),
             state.settings.read_through_cache,
             state.settings.cache_vault_to_disk,
         );
@@ -3487,22 +3717,22 @@ fn draw_sync_poll_card(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         state.settings.sync_push = toggle_row(
             ui,
-            SYNC_PUSH_LABEL,
-            SYNC_PUSH_SUB,
-            SYNC_PUSH_TIP,
+            sync_push_label(),
+            sync_push_sub(),
+            sync_push_tip(),
             state.settings.sync_push,
         );
         row_separator(ui);
         state.settings.sync_polling = toggle_row(
             ui,
-            SYNC_POLL_ENABLED_LABEL,
-            SYNC_POLL_ENABLED_SUB,
-            SYNC_POLL_ENABLED_TIP,
+            sync_poll_enabled_label(),
+            sync_poll_enabled_sub(),
+            sync_poll_enabled_tip(),
             state.settings.sync_polling,
         );
         row_separator(ui);
         let enabled = state.settings.sync_polling;
-        control_row_tip(ui, SYNC_POLL_LABEL, SYNC_POLL_SUB, SYNC_POLL_TIP, false, STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, |ui| {
+        control_row_tip(ui, sync_poll_label(), sync_poll_sub(), sync_poll_tip(), false, STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, |ui| {
             state.settings.sync_poll_minutes = minutes_stepper_with(
                 ui,
                 state.settings.sync_poll_minutes,
@@ -3519,24 +3749,32 @@ fn draw_sharing_card(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         state.settings.advanced_sharing = toggle_row(
             ui,
-            ADVANCED_SHARING_LABEL,
-            ADVANCED_SHARING_SUB,
-            ADVANCED_SHARING_TIP,
+            advanced_sharing_label(),
+            advanced_sharing_sub(),
+            advanced_sharing_tip(),
             state.settings.advanced_sharing,
         );
     });
 }
 
 /// The switch, in the owner's words for it.
-const ADVANCED_SHARING_LABEL: &str = "Use advanced sharing";
+fn advanced_sharing_label() -> &'static str {
+    crate::i18n::t("prefs.advanced_sharing_label")
+}
 /// What each position does -- and what the default sends, spelled out,
 /// because the default sends the password.
-const ADVANCED_SHARING_SUB: &str = "Off sends the whole record";
+fn advanced_sharing_sub() -> &'static str {
+    crate::i18n::t("prefs.advanced_sharing_sub")
+}
 /// The tip behind the row's `?` dot.
-const ADVANCED_SHARING_TIP: &str = "Choose which fields of a record a Send carries. Off, a Send carries the whole record: username, password, websites and notes.";
+fn advanced_sharing_tip() -> &'static str {
+    crate::i18n::t("prefs.advanced_sharing_tip")
+}
 
 /// The switch, in the owner's own words for it.
-const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
+fn sync_poll_enabled_label() -> &'static str {
+    crate::i18n::t("prefs.sync_poll_enabled_label")
+}
 /// What the switch does, said as the behaviour and not as the mechanism --
 /// and saying why it is polling at all, because a reader who knows
 /// Bitwarden's own apps update instantly will otherwise wonder why this one
@@ -3548,21 +3786,37 @@ const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
 /// reader who turns this off must not come away thinking the window stops
 /// updating, and a reader who leaves it on must not think it costs a
 /// download every five minutes when it does not.
-const SYNC_POLL_ENABLED_SUB: &str = "Also checks when you switch back";
+fn sync_poll_enabled_sub() -> &'static str {
+    crate::i18n::t("prefs.sync_poll_enabled_sub")
+}
 /// The tip behind the row's `?` dot.
-const SYNC_POLL_ENABLED_TIP: &str = "Checks for changes made in other Bitwarden apps while the vault window is open, when you switch back to it and on the interval below; with live updates connected these checks pause. Off, the vault still updates when the window opens and when you press Sync.";
+fn sync_poll_enabled_tip() -> &'static str {
+    crate::i18n::t("prefs.sync_poll_enabled_tip")
+}
 
 /// The live-updates switch, above the polling one.
-const SYNC_PUSH_LABEL: &str = "Live updates from the server";
+fn sync_push_label() -> &'static str {
+    crate::i18n::t("prefs.sync_push_label")
+}
 /// Says what it does, where it works, and what off means -- the last because
 /// "switch to polling" is the owner's own description of turning it off.
-const SYNC_PUSH_SUB: &str = "Changes arrive within seconds";
+fn sync_push_sub() -> &'static str {
+    crate::i18n::t("prefs.sync_push_sub")
+}
 /// The tip behind the row's `?` dot.
-const SYNC_PUSH_TIP: &str = "Keeps a connection open so the server can announce changes made in other Bitwarden apps. Needs the built-in client and a server that supports it; off, the vault window uses polling below.";
-const SYNC_POLL_LABEL: &str = "Check every";
-const SYNC_POLL_SUB: &str = "Minutes between checks";
+fn sync_push_tip() -> &'static str {
+    crate::i18n::t("prefs.sync_push_tip")
+}
+fn sync_poll_label() -> &'static str {
+    crate::i18n::t("prefs.sync_poll_label")
+}
+fn sync_poll_sub() -> &'static str {
+    crate::i18n::t("prefs.sync_poll_sub")
+}
 /// The tip behind the row's `?` dot.
-const SYNC_POLL_TIP: &str = "Each check downloads the vault, so a short interval costs more on a large one.";
+fn sync_poll_tip() -> &'static str {
+    crate::i18n::t("prefs.sync_poll_tip")
+}
 
 /// The page's cards, in reading order.
 ///
@@ -3578,7 +3832,7 @@ fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         state.settings.service_enabled = toggle_row(
             ui,
-            SERVICE_LABEL,
+            service_label(),
             service_sub(state.settings.service_enabled),
             service_tip(state.settings.service_enabled),
             state.settings.service_enabled,
@@ -3588,11 +3842,11 @@ fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
     draw_minted_key(ui, state);
     draw_mint_form(ui, state);
 
-    group_title(ui, KEYS_SECTION_LABEL);
+    group_title(ui, keys_section_label());
     card(ui, |ui| {
         if state.keys.is_empty() {
             card_row(ui, |ui| {
-                sub_note(ui, KEYS_NONE);
+                sub_note(ui, keys_none());
             });
             return;
         }
@@ -3631,7 +3885,7 @@ fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
             if crate::service_keys::revoke(&mut state.keys, &name) {
                 let sink = state.keys_sink;
             if let Err(error) = sink(&state.keys) {
-                    state.key_message = Some(format!("{REVOKE_NOT_SAVED}{error}"));
+                    state.key_message = Some(format!("{}{error}", revoke_not_saved()));
                 } else {
                     state.key_message = None;
                 }
@@ -3672,14 +3926,14 @@ fn key_row(ui: &mut Ui, record: &KeyRecord, now_unix: u64, pending: bool) -> Opt
         if pending {
             error_note(ui, &revoke_prompt(&record.name));
             ui.horizontal(|ui| {
-                if key_button(ui, REVOKE_CONFIRM_BUTTON) {
+                if key_button(ui, revoke_confirm_button()) {
                     action = Some(RowAction::Confirm);
                 }
-                if key_button(ui, REVOKE_CANCEL_BUTTON) {
+                if key_button(ui, revoke_cancel_button()) {
                     action = Some(RowAction::Cancel);
                 }
             });
-        } else if key_button(ui, REVOKE_BUTTON) {
+        } else if key_button(ui, revoke_button()) {
             action = Some(RowAction::Ask);
         }
     });
@@ -3697,9 +3951,9 @@ fn draw_minted_key(ui: &mut Ui, state: &mut PrefsState) {
         card(ui, |ui| {
             card_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-                ui.label(tokens::job(ROW_TITLE, REVEAL_LABEL, palette(ui.ctx()).ink));
+                ui.label(tokens::job(ROW_TITLE, reveal_label(), palette(ui.ctx()).ink));
                 sub_note(ui, &minted.name);
-                error_note(ui, REVEAL_NOTE);
+                error_note(ui, reveal_note());
             });
             row_separator(ui);
             card_row(ui, |ui| {
@@ -3716,8 +3970,8 @@ fn draw_minted_key(ui: &mut Ui, state: &mut PrefsState) {
             row_separator(ui);
             card_row(ui, |ui| {
                 ui.horizontal(|ui| {
-                    copy = key_button(ui, COPY_BUTTON);
-                    done = key_button(ui, DONE_BUTTON);
+                    copy = key_button(ui, copy_button());
+                    done = key_button(ui, done_button());
                 });
             });
         });
@@ -3735,26 +3989,26 @@ fn draw_minted_key(ui: &mut Ui, state: &mut PrefsState) {
 /// The form that makes a key, and the one button in this app that does.
 fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
     let mut mint = false;
-    group_title(ui, MINT_SECTION_LABEL);
+    group_title(ui, mint_section_label());
     card(ui, |ui| {
         card_row(ui, |ui| {
-            sub_note(ui, MINT_SECTION_DESCRIPTION);
+            sub_note(ui, mint_section_description());
         });
 
         row_separator(ui);
-        control_row(ui, NAME_LABEL, NAME_SUB, NAME_TIP, |ui| {
+        control_row(ui, name_label(), name_sub(), name_tip(), |ui| {
             form_field(ui, NAME_FIELD_ID, &mut state.key_form.name, NAME_FIELD_WIDTH);
         });
 
         row_separator(ui);
-        control_row(ui, EXPIRY_LABEL, EXPIRY_SUB, EXPIRY_TIP, |ui| {
+        control_row(ui, expiry_label(), expiry_sub(), expiry_tip(), |ui| {
             form_field(ui, EXPIRY_FIELD_ID, &mut state.key_form.expiry_days, EXPIRY_FIELD_WIDTH);
         });
 
         row_separator(ui);
         card_row(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-            ui.label(tokens::job(ROW_TITLE, SUBJECT_LABEL, palette(ui.ctx()).ink));
+            ui.label(tokens::job(ROW_TITLE, subject_label_text(), palette(ui.ctx()).ink));
             // The seven subjects in one list, so the run below is built from
             // the same order the click is read back through. Two loops --
             // one to paint and one to interpret an index -- would be two
@@ -3776,7 +4030,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
 
         if state.key_form.subject == SubjectChoice::OneItem {
             row_separator(ui);
-            control_row(ui, ITEM_ID_LABEL, ITEM_ID_SUB, ITEM_ID_TIP, |ui| {
+            control_row(ui, item_id_label(), item_id_sub(), item_id_tip(), |ui| {
                 form_field(ui, ITEM_FIELD_ID, &mut state.key_form.item_id, NAME_FIELD_WIDTH);
             });
         }
@@ -3784,7 +4038,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
         row_separator(ui);
         card_row(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-            ui.label(tokens::job(ROW_TITLE, ACCESS_LABEL, palette(ui.ctx()).ink));
+            ui.label(tokens::job(ROW_TITLE, access_label(), palette(ui.ctx()).ink));
             // **The one run on either page where more than one cell can be
             // lit at once**, and it is still this control rather than two
             // switches: read and write are the two halves of one answer to
@@ -3794,7 +4048,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
             // ones can be the same widget.
             let picked = segmented_flags(
                 ui,
-                &[READ_CHOICE, WRITE_CHOICE],
+                &[read_choice(), write_choice()],
                 &[state.key_form.read, state.key_form.write],
                 true,
             );
@@ -3807,7 +4061,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
 
         row_separator(ui);
         card_row(ui, |ui| {
-            mint = key_button(ui, MINT_BUTTON);
+            mint = key_button(ui, mint_button());
         });
 
         if let Some(message) = &state.key_message {
@@ -3833,7 +4087,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
             let sink = state.keys_sink;
             state.key_message = match sink(&state.keys) {
                 Ok(()) => None,
-                Err(error) => Some(format!("{MINT_NOT_SAVED}{error}")),
+                Err(error) => Some(format!("{}{error}", mint_not_saved())),
             };
             // The plaintext goes here and nowhere else. It is not logged, not
             // put on the record, and not written to the store.
@@ -3883,7 +4137,7 @@ fn form_field(ui: &mut Ui, id: &str, buffer: &mut String, width: f32) {
 /// something: it has no label, no position of its own, and a user who wants it
 /// has to infer that "off" is a second product rather than a feature being
 /// declined. The two cells are the same shape as each other, and the label
-/// above them ([`BACKEND_CHOICE_LABEL`]) is the question rather than one of
+/// above them ([`backend_choice_label()`]) is the question rather than one of
 /// the answers.
 ///
 /// # It reuses [`theme::segmented_control`] rather than inventing a control
@@ -3909,11 +4163,11 @@ fn backend_choice_row(ui: &mut Ui, description: &str, tip: &str, official: bool,
     let mut next = official;
     card_row(ui, |ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-        row_text_ink(ui, BACKEND_CHOICE_LABEL, description, tip, !enabled);
+        row_text_ink(ui, backend_choice_label(), description, tip, !enabled);
         // The cells are a control under the copy, so the air above them is
         // the row's own padding, not the lead between two lines of text.
         ui.add_space(f32::from(ROW_PAD_Y));
-        let labels = [OFFICIAL_CHOICE, BUILT_IN_CHOICE];
+        let labels = [official_choice(), built_in_choice()];
         let picked = segmented_flags(ui, &labels, &[official, !official], enabled);
         // The pressed index is turned back into the value it stands for
         // rather than flipping `next`, so that pressing the cell already in
@@ -4009,9 +4263,9 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         // this page nothing else can grey out.
         state.settings.clear_clipboard = toggle_row(
             ui,
-            CLIPBOARD_MASTER_LABEL,
-            CLIPBOARD_MASTER_SUB,
-            CLIPBOARD_MASTER_TIP,
+            clipboard_master_label(),
+            clipboard_master_sub(),
+            clipboard_master_tip(),
             state.settings.clear_clipboard,
         );
         row_separator(ui);
@@ -4020,27 +4274,27 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         // how likely they are to be turned off, which nobody knows.
         state.settings.clear_clipboard_on_lock = child_toggle_row(
             ui,
-            CLIPBOARD_ON_LOCK_LABEL,
-            CLIPBOARD_ON_LOCK_SUB,
-            CLIPBOARD_ON_LOCK_TIP,
+            clipboard_on_lock_label(),
+            clipboard_on_lock_sub(),
+            clipboard_on_lock_tip(),
             state.settings.clear_clipboard_on_lock,
             children_enabled,
         );
         row_separator(ui);
         state.settings.clear_clipboard_on_account_change = child_toggle_row(
             ui,
-            CLIPBOARD_ON_ACCOUNT_LABEL,
-            CLIPBOARD_ON_ACCOUNT_SUB,
-            CLIPBOARD_ON_ACCOUNT_TIP,
+            clipboard_on_account_label(),
+            clipboard_on_account_sub(),
+            clipboard_on_account_tip(),
             state.settings.clear_clipboard_on_account_change,
             children_enabled,
         );
         row_separator(ui);
         state.settings.clear_clipboard_on_quit = child_toggle_row(
             ui,
-            CLIPBOARD_ON_QUIT_LABEL,
-            CLIPBOARD_ON_QUIT_SUB,
-            CLIPBOARD_ON_QUIT_TIP,
+            clipboard_on_quit_label(),
+            clipboard_on_quit_sub(),
+            clipboard_on_quit_tip(),
             state.settings.clear_clipboard_on_quit,
             children_enabled,
         );
@@ -4058,15 +4312,15 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
     // history joins it because it is the other thing on this page that is not
     // a setting.
     card(ui, |ui| {
-        note_row(ui, CLIPBOARD_HISTORY_LABEL, CLIPBOARD_HISTORY_NOTE, CLIPBOARD_HISTORY_TIP);
+        note_row(ui, clipboard_history_label(), clipboard_history_note(), clipboard_history_tip());
         row_separator(ui);
         // Always live, including while the master switch is off: "put this
         // page back" is exactly what a user who has switched everything off
         // and changed their mind wants, and a reset button that greyed out
         // with the thing it resets would be unreachable from the state you
         // most want to leave.
-        let reset_w = outline_button_width(ui, CLIPBOARD_RESET_BUTTON);
-        control_row_tip(ui, CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_SUB, CLIPBOARD_RESET_TIP, false, reset_w, |ui| {
+        let reset_w = outline_button_width(ui, clipboard_reset_button());
+        control_row_tip(ui, clipboard_reset_label(), clipboard_reset_sub(), clipboard_reset_tip(), false, reset_w, |ui| {
             if reset_button(ui) {
                 // The whole of the button's behaviour is one pure function on
                 // `Settings`, so "this resets the section and nothing else" is
@@ -4094,17 +4348,17 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
 fn interval_row(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
     let description = state
         .clipboard_entry_error
-        .map_or(CLIPBOARD_INTERVAL_SUB, |error| error);
+        .map_or(clipboard_interval_sub(), |error| error);
     // Two calls rather than a function pointer chosen up front: the two row
     // helpers take a closure, and a `let row = if .. { control_row } else
     // { control_row_ghosted }` cannot be given a type general enough over
     // the closure's lifetime.
     if enabled {
-        control_row_tip(ui, CLIPBOARD_INTERVAL_LABEL, description, CLIPBOARD_INTERVAL_TIP, false, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
+        control_row_tip(ui, clipboard_interval_label(), description, clipboard_interval_tip(), false, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
             interval_field(ui, state, true);
         });
     } else {
-        control_row_tip(ui, CLIPBOARD_INTERVAL_LABEL, description, CLIPBOARD_INTERVAL_TIP, true, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
+        control_row_tip(ui, clipboard_interval_label(), description, clipboard_interval_tip(), true, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
             interval_field(ui, state, false);
         });
     }
@@ -4215,16 +4469,16 @@ fn interval_field(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
             // reading why it was not taken, and silently replacing it would
             // hide the thing being explained.
             ClipboardEntry::NotANumber => {
-                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_NOT_A_NUMBER);
+                state.clipboard_entry_error = Some(clipboard_entry_not_a_number());
             }
             ClipboardEntry::BelowFloor => {
-                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_BELOW_FLOOR);
+                state.clipboard_entry_error = Some(clipboard_entry_below_floor());
             }
             ClipboardEntry::AboveCeiling => {
-                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_ABOVE_CEILING);
+                state.clipboard_entry_error = Some(clipboard_entry_above_ceiling());
             }
             ClipboardEntry::BetweenSteps => {
-                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_BETWEEN_STEPS);
+                state.clipboard_entry_error = Some(clipboard_entry_between_steps());
             }
         }
     }
@@ -4234,7 +4488,7 @@ fn interval_field(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
 /// label centred in it. Built from 3e's own parts, like the stepper, since
 /// 3e's only button of this shape is its "+ Add app".
 fn reset_button(ui: &mut Ui) -> bool {
-    outline_button(ui, CLIPBOARD_RESET_BUTTON, true)
+    outline_button(ui, clipboard_reset_button(), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -4322,7 +4576,7 @@ fn shortcut_row(
     let refusal = if capturing { state.shortcut_error.clone() } else { None };
     let description = match (refusal, capturing, bound, live) {
         (Some(note), _, _, _) => note,
-        (None, true, _, _) => SHORTCUT_CAPTURE_HINT.to_string(),
+        (None, true, _, _) => shortcut_capture_hint().to_string(),
         // A cleared row is not a broken one: it says what it would do if it
         // were bound, and nothing about failure. The chip beside it says
         // "Not set", which is the whole of the state.
@@ -4336,7 +4590,7 @@ fn shortcut_row(
     // a row that can be read as working.
     let broken = !capturing && bound.is_some() && matches!(live, HotkeyStatus::Unavailable(_));
     let label = if broken {
-        format!("{}{SHORTCUT_UNAVAILABLE_SUFFIX}", which.label())
+        shortcut_unavailable_label(which.label())
     } else {
         which.label().to_string()
     };
@@ -4357,9 +4611,9 @@ fn shortcut_row(
         // both absences are the same rule: a button whose action has already
         // happened, or which would fight the widget beside it, is a button
         // that cannot be pressed usefully. Cancelling a capture is Esc, which
-        // `SHORTCUT_CAPTURE_HINT` says out loud.
+        // `shortcut_capture_hint()` says out loud.
         if !capturing && bound.is_some() {
-            pressed_clear = key_button(ui, SHORTCUT_CLEAR);
+            pressed_clear = key_button(ui, shortcut_clear());
         }
         pressed_chip = chord_button(ui, capturing, bound);
     };
@@ -4389,7 +4643,7 @@ fn shortcut_row(
 /// **What one shortcut types**, as the line under its label.
 ///
 /// Built rather than five constants, so that the sentence every direct action
-/// has to carry -- [`DIRECT_SHORTCUT_NOTE`], which is where the "nothing
+/// has to carry -- [`direct_shortcut_note()`], which is where the "nothing
 /// matched" behaviour is written down for the user -- is appended in one
 /// place. Four hand-written copies of it is four chances for one row to stop
 /// saying it, and the row that stopped saying it would be the row whose
@@ -4397,22 +4651,24 @@ fn shortcut_row(
 fn shortcut_sub(which: crate::app::FillShortcut) -> &'static str {
     use crate::app::FillShortcut;
     match which {
-        FillShortcut::Picker => "Fills the window in front of you",
-        FillShortcut::Username => "Types the matched item's username",
-        FillShortcut::Password => "Types the matched item's password",
-        FillShortcut::Totp => "Types the matched item's one-time code",
-        FillShortcut::Sequence => "Types the item's saved sign-in steps",
+        FillShortcut::Picker => crate::i18n::t("prefs.shortcut_sub_picker"),
+        FillShortcut::Username => crate::i18n::t("prefs.shortcut_sub_username"),
+        FillShortcut::Password => crate::i18n::t("prefs.shortcut_sub_password"),
+        FillShortcut::Totp => crate::i18n::t("prefs.shortcut_sub_totp"),
+        FillShortcut::Sequence => crate::i18n::t("prefs.shortcut_sub_sequence"),
     }
 }
 
 /// The tip behind a shortcut row: what it does when nothing matched.
 fn shortcut_tip(which: crate::app::FillShortcut) -> &'static str {
     match which {
-        crate::app::FillShortcut::Picker => PICKER_SHORTCUT_TIP,
-        _ => DIRECT_SHORTCUT_NOTE,
+        crate::app::FillShortcut::Picker => picker_shortcut_tip(),
+        _ => direct_shortcut_note(),
     }
 }
-const PICKER_SHORTCUT_TIP: &str = "With nothing matched it asks Deskwarden about that window instead, which is what makes this the shortcut to reach for when nothing happens.";
+fn picker_shortcut_tip() -> &'static str {
+    crate::i18n::t("prefs.picker_shortcut_tip")
+}
 
 /// The chord chip, as a button: press it and the row starts listening.
 ///
@@ -4465,7 +4721,7 @@ fn chord_button(ui: &mut Ui, capturing: bool, bound: Option<crate::hotkey::Chord
 /// The chord's keys as the chips say them: `Ctrl`, `Shift`, `F`.
 fn chord_keys(capturing: bool, bound: Option<crate::hotkey::Chord>) -> Vec<String> {
     match (capturing, bound) {
-        (true, _) => vec![SHORTCUT_CAPTURING.to_string()],
+        (true, _) => vec![shortcut_capturing().to_string()],
         (false, Some(chord)) => chord
             .to_string()
             .split('+')
@@ -4479,7 +4735,7 @@ fn chord_keys(capturing: bool, bound: Option<crate::hotkey::Chord>) -> Vec<Strin
                 }
             })
             .collect(),
-        (false, None) => vec![SHORTCUT_NOT_SET.to_string()],
+        (false, None) => vec![shortcut_not_set().to_string()],
     }
 }
 
@@ -4498,7 +4754,7 @@ fn shortcut_controls_width(ui: &Ui, capturing: bool, bound: Option<crate::hotkey
         .sum();
     let well = chips + 6.0 * keys.len().saturating_sub(1) as f32 + 16.0;
     if !capturing && bound.is_some() {
-        well + SHORTCUT_CONTROL_GAP + outline_button_width(ui, SHORTCUT_CLEAR)
+        well + SHORTCUT_CONTROL_GAP + outline_button_width(ui, shortcut_clear())
     } else {
         well
     }
@@ -4515,7 +4771,7 @@ fn shortcut_controls_width(ui: &Ui, capturing: bool, bound: Option<crate::hotkey
 ///   because a user reaching to erase something reaches for either, and this
 ///   is the keyboard's way to the thing the *Clear* button does.
 /// * **A key with no modifier** is refused and the previous binding kept --
-///   see [`SHORTCUT_NEEDS_A_MODIFIER`] for the trap that avoids.
+///   see [`shortcut_needs_a_modifier()`] for the trap that avoids.
 /// * **A chord another row already holds** is refused and the previous binding
 ///   kept. Two rows on one chord means the second `RegisterHotKey` fails and
 ///   this app reports a conflict with itself as though another program had
@@ -4583,12 +4839,12 @@ fn read_a_chord(ui: &mut Ui, state: &mut PrefsState, which: crate::app::FillShor
                 ui.ctx().request_repaint();
             };
             let Some(code) = code_for(key) else {
-                refuse(state, SHORTCUT_UNUSABLE_KEY.to_string());
+                refuse(state, shortcut_unusable_key().to_string());
                 return;
             };
             let chord = crate::hotkey::Chord::new(egui_modifiers(modifiers), code);
             if !chord.has_a_modifier() {
-                refuse(state, SHORTCUT_NEEDS_A_MODIFIER.to_string());
+                refuse(state, shortcut_needs_a_modifier().to_string());
                 return;
             }
             if let Some(other) = state.settings.shortcuts.conflict(which, chord) {
@@ -4642,7 +4898,7 @@ fn egui_modifiers(modifiers: egui::Modifiers) -> global_hotkey::hotkey::Modifier
 /// holding Shift, and which have no `Code` of their own because a `Code` names
 /// the physical key. Binding one would store a chord whose registered form is
 /// the *unshifted* key, so the page would name one combination and the OS
-/// would listen for another. They are refused, and `SHORTCUT_UNUSABLE_KEY`
+/// would listen for another. They are refused, and `shortcut_unusable_key()`
 /// says so out loud rather than leaving the row looking stuck.
 fn code_for(key: egui::Key) -> Option<global_hotkey::hotkey::Code> {
     use egui::Key as K;
@@ -4740,8 +4996,8 @@ fn account_row(ui: &mut Ui, status: Option<AccountStatus>) {
         // Nothing published: the old sentence, in the old shape. A row with
         // no value is honest here because there is no value -- as opposed to
         // a row with an empty one, which claims there should be.
-        None => card_row(ui, |ui| row_text(ui, ACCOUNT_LABEL, &description)),
-        Some(value) => value_row(ui, ACCOUNT_LABEL, &description, "", &value),
+        None => card_row(ui, |ui| row_text(ui, account_label(), &description)),
+        Some(value) => value_row(ui, account_label(), &description, "", &value),
     }
 }
 
@@ -4751,9 +5007,9 @@ fn account_row(ui: &mut Ui, status: Option<AccountStatus>) {
 /// the three cases are visible in one place rather than spread through a draw.
 fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) {
     match status {
-        None => (ACCOUNT_STATUS.to_string(), None),
+        None => (account_status().to_string(), None),
         Some(AccountStatus::SignedOut) => {
-            (ACCOUNT_SIGNED_OUT_NOTE.to_string(), Some(ACCOUNT_SIGNED_OUT.to_string()))
+            (account_signed_out_note().to_string(), Some(account_signed_out().to_string()))
         }
         Some(AccountStatus::SignedIn { email, server }) => {
             // `server_host` is `login_ui`'s, so the address here reads
@@ -4761,12 +5017,12 @@ fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) 
             // naming one server one way -- and `None` renders as Bitwarden's
             // own cloud, which is what the CLI's default means.
             let where_it_lives =
-                format!("{ACCOUNT_SERVER_PREFIX}{}.", crate::login_ui::server_host(server.as_deref()));
+                crate::i18n::tf("prefs.account_signed_in_at", &[("server", &(crate::login_ui::server_host(server.as_deref())).to_string())]);
             match email {
                 Some(email) => (where_it_lives, Some(email.clone())),
                 None => (
-                    format!("{where_it_lives} {ACCOUNT_NO_EMAIL_NOTE}"),
-                    Some(ACCOUNT_NO_EMAIL.to_string()),
+                    format!("{where_it_lives} {}", account_no_email_note()),
+                    Some(account_no_email().to_string()),
                 ),
             }
         }
@@ -4784,7 +5040,7 @@ fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) 
 /// for updates* was acting on a rule they could not see. The two cards below
 /// are the same arrangement Breaches settled two days ago: the switch, the
 /// control it does **not** gate, and the sentence saying so
-/// ([`UPDATE_AUTOMATIC_OFF_NOTE`]) all in one glance.
+/// ([`update_automatic_off_note()`]) all in one glance.
 ///
 /// # The button is not gated on the pill, and the page says so
 ///
@@ -4798,7 +5054,7 @@ fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
     // The Store edition never checks, downloads or installs: say where its
     // updates come from instead of offering a switch that does nothing.
     if let Some(notice) = state.updates_from_store {
-        card(ui, |ui| note_row(ui, UPDATES_LABEL, notice, ""));
+        card(ui, |ui| note_row(ui, updates_label(), notice, ""));
         return;
     }
     card(ui, |ui| {
@@ -4808,9 +5064,9 @@ fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
         // separation is now the page break, which says it louder.
         state.settings.check_for_updates = toggle_row(
             ui,
-            UPDATE_CHECK_LABEL,
-            UPDATE_CHECK_SUB,
-            UPDATE_CHECK_TIP,
+            update_check_label(),
+            update_check_sub(),
+            update_check_tip(),
             state.settings.check_for_updates,
         );
     });
@@ -4825,7 +5081,9 @@ fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
 /// background thread": it does not need `main.rs`'s loop, because it has its
 /// own frames and `pump` never blocks in one.
 /// The row title the Store edition's notice sits under.
-const UPDATES_LABEL: &str = "Updates";
+fn updates_label() -> &'static str {
+    crate::i18n::t("prefs.updates_label")
+}
 
 fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
     use crate::update_panel::UpdateStage;
@@ -4845,19 +5103,19 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
         let stage = state.update.stage().clone();
 
         let (description, button) = match &stage {
-            UpdateStage::Idle => (UPDATE_IDLE_DESCRIPTION.to_string(), Some(UPDATE_CHECK_BUTTON)),
-            UpdateStage::Checking => (UPDATE_CHECKING_DESCRIPTION.to_string(), None),
+            UpdateStage::Idle => (update_idle_description().to_string(), Some(update_check_button())),
+            UpdateStage::Checking => (update_checking_description().to_string(), None),
             UpdateStage::UpToDate => {
-                (UPDATE_UP_TO_DATE_DESCRIPTION.to_string(), Some(UPDATE_CHECK_BUTTON))
+                (update_up_to_date_description().to_string(), Some(update_check_button()))
             }
             UpdateStage::Available(r) => {
-                (update_available_status(&r.version), Some(UPDATE_DOWNLOAD_BUTTON))
+                (update_available_status(&r.version), Some(update_download_button()))
             }
             UpdateStage::Downloading { release, .. } => {
-                (format!("Downloading version {}.", release.version), None)
+                (crate::i18n::tf("prefs.update_downloading_status", &[("version", &release.version.to_string())]), None)
             }
             UpdateStage::Ready(r) => {
-                (format!("Version {} is ready. {UPDATE_READY_DESCRIPTION}", r.version), Some(UPDATE_RESTART_BUTTON))
+                (format!("{} {}", crate::i18n::tf("prefs.update_ready_version", &[("version", &r.version.to_string())]), update_ready_description()), Some(update_restart_button()))
             }
             // The message comes from `updater` and is the reason as that
             // module saw it. Shown rather than reduced to "something went
@@ -4868,17 +5126,17 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
             // the right word for both, and a failure with no way forward is
             // a dead end on the only page that has one.
             UpdateStage::Failed { message, .. } => {
-                (format!("Update failed: {message}"), Some(UPDATE_RETRY_BUTTON))
+                (crate::i18n::tf("prefs.update_failed", &[("message", &message.to_string())]), Some(update_retry_button()))
             }
-            UpdateStage::Unavailable => (UPDATE_UNAVAILABLE_DESCRIPTION.to_string(), None),
+            UpdateStage::Unavailable => (update_unavailable_description().to_string(), None),
         };
 
         // The busy stages still draw a button, disabled and labelled with what
         // is happening, rather than drawing nothing: a row whose control
         // vanishes mid-action reflows the card under the cursor.
         let busy_label = match &stage {
-            UpdateStage::Checking => Some(UPDATE_CHECKING_BUTTON),
-            UpdateStage::Downloading { .. } => Some(UPDATE_DOWNLOADING_BUTTON),
+            UpdateStage::Checking => Some(update_checking_button()),
+            UpdateStage::Downloading { .. } => Some(update_downloading_button()),
             _ => None,
         };
 
@@ -4889,7 +5147,7 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
         // releases"/"Updates" in one view, after the nav row and the page
         // heading, and the fourth thing over notes that open with their own
         // `## What's new in <version>`. See `status_row`.
-        let shown = busy_label.or(button).unwrap_or(UPDATE_CHECK_BUTTON);
+        let shown = busy_label.or(button).unwrap_or(update_check_button());
         let button_w = outline_button_width(ui, shown);
         status_row(ui, &description, button_w, |ui| {
             if let Some(label) = busy_label {
@@ -4924,7 +5182,7 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
         {
             row_separator(ui);
             card_row(ui, |ui| {
-                sub_note(ui, UPDATE_AUTOMATIC_OFF_NOTE);
+                sub_note(ui, update_automatic_off_note());
             });
         }
 
@@ -4987,7 +5245,7 @@ fn release_notes(ui: &mut Ui, body: &str) {
         // names the version, and it is the only one of the three the app does
         // not author. See `updater::notes_heading` for the other removal.
         if shown.is_empty() {
-            sub_note(ui, UPDATE_NOTES_EMPTY);
+            sub_note(ui, update_notes_empty());
             return;
         }
         // egui's default scrollbar is painted in its own light grey, which on
@@ -5642,7 +5900,9 @@ const MODAL_HEADER_HEIGHT: f32 = 44.0;
 /// it. That visible frame is the whole point of the feature.
 const MODAL_SCREEN_MARGIN: f32 = 24.0;
 const MODAL_RADIUS: u8 = 12;
-const MODAL_TITLE: &str = "Preferences";
+fn modal_title() -> &'static str {
+    crate::i18n::t("prefs.modal_title")
+}
 
 /// What a frame of the modal asks its host to do.
 ///
@@ -5816,7 +6076,7 @@ pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAct
             }
 
             let galley = ui.painter().layout_no_wrap(
-                MODAL_TITLE.to_string(),
+                modal_title().to_string(),
                 FontId::new(13.0, FontFamily::Proportional),
                 theme::INK,
             );
@@ -6203,7 +6463,7 @@ mod tests {
         // The sidebar style is on the v2 General page, with the rest of Look.
         state.page = settings_v2::Page::General;
         let painted = tall_frame(&ctx, &mut state, &[]);
-        assert!(painted.texts.iter().any(|(t, _)| t == SIDEBAR_STYLE_LABEL));
+        assert!(painted.texts.iter().any(|(t, _)| t == sidebar_style_label()));
         let light = painted.rect_of("Light").center();
         let _ = tall_click(&ctx, &mut state, light);
         assert_eq!(state.settings.sidebar_style, crate::kit::tokens::SidebarStyle::Light);
@@ -6603,23 +6863,23 @@ mod tests {
     #[test]
     fn the_ui_loaded_row_names_both_halves_of_the_trade() {
         assert!(
-            UI_LOADED_TIP.contains("MB"),
+            ui_loaded_tip().contains("MB"),
             "the row does not say what it costs, so the memory is a surprise: \
-             {UI_LOADED_TIP}"
+             {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
         );
         // **The measured figure, not a round one.** A kept-loaded vault window
         // is ~76 MB of private working set -- Task Manager's "Memory" column,
         // the counter `README.md`'s table publishes. The row said "about
         // 100 MB" and nothing in this repository measures that.
         assert!(
-            UI_LOADED_TIP.contains("76 MB"),
-            "the row is off the measured vault-window figure: {UI_LOADED_TIP}"
+            ui_loaded_tip().contains("76 MB"),
+            "the row is off the measured vault-window figure: {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
         );
         for stale in ["100 MB", "110 MB", "111 MB"] {
             assert!(
-                !UI_LOADED_TIP.contains(stale),
+                !ui_loaded_tip().contains(stale),
                 "the row is back on {stale}, which nothing in this repository measures: \
-                 {UI_LOADED_TIP}"
+                 {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
             );
         }
         // **And it does not claim a second process.** Whether the window has
@@ -6630,16 +6890,16 @@ mod tests {
         // that promised one sent the user looking in Task Manager for a
         // process that is not there.
         assert!(
-            !UI_LOADED_TIP.contains("second process"),
+            !ui_loaded_tip().contains("second process"),
             "the row promises a second process the built-in client does not always have: \
-             {UI_LOADED_TIP}"
+             {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
         );
         assert!(
-            UI_LOADED_LABEL.to_lowercase().contains("open"),
-            "the row does not say what it buys: {UI_LOADED_LABEL}"
+            ui_loaded_label().to_lowercase().contains("open"),
+            "the row does not say what it buys: {ui_loaded_label}", ui_loaded_label = ui_loaded_label()
         );
         assert!(
-            UI_LOADED_TIP.to_lowercase().contains("lock"),
+            ui_loaded_tip().to_lowercase().contains("lock"),
             "the row promises instant opening without saying what still closes the \
              window, so a lock reads as the setting having failed"
         );
@@ -6659,13 +6919,13 @@ mod tests {
     /// doorbell to catch it, which is how it survived several releases.
     #[test]
     fn the_ui_loaded_row_does_not_blame_a_settings_edit_for_the_close() {
-        let copy = UI_LOADED_TIP.to_lowercase();
+        let copy = ui_loaded_tip().to_lowercase();
         for stale in ["changing these settings", "these settings closes"] {
             assert!(
                 !copy.contains(stale),
                 "the row is back on {stale:?}, which the live settings channel made \
                  false: a delivered edit hides. See `ui_process::on_close`. \
-                 {UI_LOADED_TIP}"
+                 {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
             );
         }
         // **The control for the two bans above.** A `contains` over a
@@ -6676,7 +6936,7 @@ mod tests {
         assert!(
             copy.contains("closes it fully"),
             "the control phrase is gone, so the two bans above prove nothing: \
-             {UI_LOADED_TIP}"
+             {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
         );
         // **What replaced it: the toggle is what closes the open window.**
         // True in both directions and for different reasons -- off is
@@ -6688,12 +6948,12 @@ mod tests {
             copy.contains("turning this on or off"),
             "the row does not say the toggle itself closes the window that is open, \
              so the first close after switching it on reads as the setting being \
-             broken: {UI_LOADED_TIP}"
+             broken: {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
         );
         assert!(
             copy.contains("next time you"),
             "the row does not say when the setting starts working, which is the \
-             half that turns a surprise into an instruction: {UI_LOADED_TIP}"
+             half that turns a surprise into an instruction: {ui_loaded_tip}", ui_loaded_tip = ui_loaded_tip()
         );
         // **No stray carriage return.** These sources are CRLF and the
         // copy above is five continued lines; a backslash followed by CRLF
@@ -6702,14 +6962,14 @@ mod tests {
         // reason the direct-icons row gives: writing a CR literal into a
         // CRLF source is the very hazard under test.
         assert!(
-            !UI_LOADED_TIP.contains(char::from(13u8)),
+            !ui_loaded_tip().contains(char::from(13u8)),
             "a literal carriage return survived a line continuation into the copy"
         );
         // The control: the same check on the label beside it, which is a
         // single unbroken literal and has always been clean, so a
         // `contains` that could never be true is not what is passing.
         assert!(
-            !UI_LOADED_LABEL.contains(char::from(13u8)),
+            !ui_loaded_label().contains(char::from(13u8)),
             "a literal carriage return reached the label, which is not even continued"
         );
     }
@@ -6875,13 +7135,13 @@ mod tests {
         let base = KeyForm { name: "Backup".to_string(), ..KeyForm::default() };
 
         let nonsense = KeyForm { expiry_days: "soon".to_string(), ..base.clone() };
-        assert_eq!(form_refusal(&nonsense), Some(EXPIRY_NOT_A_NUMBER));
+        assert_eq!(form_refusal(&nonsense), Some(expiry_not_a_number()));
 
         let no_id = KeyForm { subject: SubjectChoice::OneItem, ..base.clone() };
-        assert_eq!(form_refusal(&no_id), Some(NO_ITEM_ID));
+        assert_eq!(form_refusal(&no_id), Some(no_item_id()));
 
-        let no_access = KeyForm { read: false, write: false, ..base.clone() };
-        assert_eq!(form_refusal(&no_access), Some(NO_ACCESS));
+        let neither = KeyForm { read: false, write: false, ..base.clone() };
+        assert_eq!(form_refusal(&neither), Some(no_access()));
 
         // The controls, one per refusal: each is the same form with the one
         // fault repaired, and each must pass -- otherwise the assertions
@@ -7092,7 +7352,7 @@ mod tests {
     /// sentence can still change someone's mind.
     #[test]
     fn the_page_says_what_turning_the_service_on_would_do() {
-        let painted = tip_on(Section::Api, SERVICE_LABEL);
+        let painted = tip_on(Section::Api, service_label());
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what would be served: {:?}",
@@ -7165,7 +7425,7 @@ mod tests {
             "the key was on screen before anything was minted: {:?}",
             first.strings()
         );
-        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let mint = first.ink_of(mint_button()).rect.center();
 
         let minted = tall_click(&ctx, &mut state, mint);
         assert!(
@@ -7183,7 +7443,7 @@ mod tests {
         let again = tall_frame(&ctx, &mut state, &[]);
         assert!(again.contains(TEST_KEY), "the reveal did not survive a repaint");
 
-        let done = again.ink_of(DONE_BUTTON).rect.center();
+        let done = again.ink_of(done_button()).rect.center();
         let dismissed = tall_click(&ctx, &mut state, done);
         assert!(!dismissed.contains(TEST_KEY), "the key is still on screen after Done");
         assert!(state.minted.is_none(), "the plaintext is still being held");
@@ -7209,7 +7469,7 @@ mod tests {
         let mut state = api_state();
         state.key_form.name = "Backup".to_string();
         let first = tall_frame(&ctx, &mut state, &[]);
-        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let mint = first.ink_of(mint_button()).rect.center();
         let _ = tall_click(&ctx, &mut state, mint);
 
         let stored = serde_json::to_string(&state.keys).expect("the store serialises");
@@ -7241,13 +7501,13 @@ mod tests {
         });
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let mint = first.ink_of(mint_button()).rect.center();
         let minted = tall_click(&ctx, &mut state, mint);
         // The control: nothing has been copied yet, so the assertion after
         // the click is about the click.
         assert!(COPIED.lock().expect("the copy sink").is_none());
 
-        let copy = minted.ink_of(COPY_BUTTON).rect.center();
+        let copy = minted.ink_of(copy_button()).rect.center();
         let after = tall_click(&ctx, &mut state, copy);
         assert_eq!(COPIED.lock().expect("the copy sink").as_deref(), Some(TEST_KEY));
         assert!(after.contains(TEST_KEY), "the card cleared itself on a copy");
@@ -7265,7 +7525,7 @@ mod tests {
         state.show_service_keys(vec![stored_key("Backup", None)]);
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let revoke = first.ink_of(REVOKE_BUTTON).rect.center();
+        let revoke = first.ink_of(revoke_button()).rect.center();
         let asked = tall_click(&ctx, &mut state, revoke);
         assert_eq!(state.keys.len(), 1, "one click revoked the key with no confirmation");
         assert!(
@@ -7276,7 +7536,7 @@ mod tests {
         assert!(asked.any_containing("cannot be brought back"), "the question hides the undo");
 
         // Keeping it puts the row back as it was, with the key still there.
-        let keep = asked.ink_of(REVOKE_CANCEL_BUTTON).rect.center();
+        let keep = asked.ink_of(revoke_cancel_button()).rect.center();
         let kept = tall_click(&ctx, &mut state, keep);
         assert_eq!(state.keys.len(), 1);
         assert!(!kept.any_containing("stops being answered"), "the question is still up");
@@ -7298,13 +7558,13 @@ mod tests {
         let revoke = first
             .ink
             .iter()
-            .filter(|i| i.source == REVOKE_BUTTON)
+            .filter(|i| i.source == revoke_button())
             .min_by(|a, b| a.rect.top().total_cmp(&b.rect.top()))
             .expect("a revoke button")
             .rect
             .center();
         let asked = tall_click(&ctx, &mut state, revoke);
-        let confirm = asked.ink_of(REVOKE_CONFIRM_BUTTON).rect.center();
+        let confirm = asked.ink_of(revoke_confirm_button()).rect.center();
         let after = tall_click(&ctx, &mut state, confirm);
 
         assert_eq!(state.keys.len(), 1, "the confirmation did not remove the key");
@@ -7329,7 +7589,7 @@ mod tests {
         state.key_form.name = "Backup".to_string();
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let mint = first.ink_of(mint_button()).rect.center();
         let minted = tall_click(&ctx, &mut state, mint);
         assert!(
             minted.any_containing("gone the next time Deskwarden starts"),
@@ -7338,11 +7598,11 @@ mod tests {
         );
         assert!(minted.any_containing("the disk is read-only"), "the reason was swallowed");
 
-        let done = minted.ink_of(DONE_BUTTON).rect.center();
+        let done = minted.ink_of(done_button()).rect.center();
         let listed = tall_click(&ctx, &mut state, done);
-        let revoke = listed.ink_of(REVOKE_BUTTON).rect.center();
+        let revoke = listed.ink_of(revoke_button()).rect.center();
         let asked = tall_click(&ctx, &mut state, revoke);
-        let confirm = asked.ink_of(REVOKE_CONFIRM_BUTTON).rect.center();
+        let confirm = asked.ink_of(revoke_confirm_button()).rect.center();
         let after = tall_click(&ctx, &mut state, confirm);
         assert!(
             after.any_containing("it still works"),
@@ -7362,7 +7622,7 @@ mod tests {
         state.key_form.expiry_days = "30".to_string();
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let mint = first.ink_of(mint_button()).rect.center();
         let refused = tall_click(&ctx, &mut state, mint);
 
         assert!(state.keys.is_empty(), "a key with no name was minted");
@@ -7777,7 +8037,7 @@ mod tests {
     fn the_disk_cache_row_is_usable_without_windows_hello() {
         let without = paint_vault_with_hello(false);
         assert!(
-            without.contains(DISK_CACHE_LABEL),
+            without.contains(disk_cache_label()),
             "the disk-cache row is not on the Vault page at all: {:?}",
             without.strings()
         );
@@ -7791,7 +8051,7 @@ mod tests {
         // one that has quietly vanished from this page.
         let with = paint_vault_with_hello(true);
         assert!(
-            with.contains(DISK_CACHE_LABEL),
+            with.contains(disk_cache_label()),
             "control: the row is missing even with Hello available, so the page changed in \
              some way this test cannot see"
         );
@@ -7811,7 +8071,7 @@ mod tests {
 
     #[test]
     fn the_vault_page_says_what_is_in_the_file_when_hello_is_available() {
-        let painted = tip_on(Section::Vault, DISK_CACHE_LABEL);
+        let painted = tip_on(Section::Vault, disk_cache_label());
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what is in the file"
@@ -7830,7 +8090,7 @@ mod tests {
         state.show(Section::Sharing);
         assert!(!state.settings.advanced_sharing, "the default: the whole record");
         let first = tall_frame(&ctx, &mut state, &[]);
-        assert!(first.contains(ADVANCED_SHARING_LABEL), "{:?}", first.strings());
+        assert!(first.contains(advanced_sharing_label()), "{:?}", first.strings());
         let pills = first.pills_of(Section::Sharing);
         assert_eq!(pills.len(), 1, "the Sharing page paints one switch");
         tall_frame(&ctx, &mut state, &click(pills[0].center()));
@@ -7851,13 +8111,13 @@ mod tests {
         assert!(state.settings.sync_polling, "the default: polling on");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        for label in [SYNC_PUSH_LABEL, SYNC_POLL_ENABLED_LABEL, SYNC_POLL_LABEL] {
+        for label in [sync_push_label(), sync_poll_enabled_label(), sync_poll_label()] {
             assert!(first.contains(label), "{label:?} missing: {:?}", first.strings());
         }
         let pills = first.pills_of(Section::Sync);
         assert_eq!(pills.len(), 2, "the Sync page paints two switches");
         assert!(
-            first.ink_of(SYNC_PUSH_LABEL).rect.top() < first.ink_of(SYNC_POLL_ENABLED_LABEL).rect.top(),
+            first.ink_of(sync_push_label()).rect.top() < first.ink_of(sync_poll_enabled_label()).rect.top(),
             "live updates are not the upper switch"
         );
 
@@ -8047,8 +8307,8 @@ mod tests {
     /// a page row set their titles at the same size.
     #[test]
     fn a_pane_row_and_a_page_row_are_the_same_row() {
-        let pane = paint(Section::Clipboard).ink_of(CLIPBOARD_MASTER_LABEL).rect.height();
-        let page = paint(Section::General).ink_of(PROMPT_LABEL).rect.height();
+        let pane = paint(Section::Clipboard).ink_of(clipboard_master_label()).rect.height();
+        let page = paint(Section::General).ink_of(prompt_label()).rect.height();
         assert!(
             (pane - page).abs() < 0.5,
             "a pane row's title is {pane} points tall and a page row's is {page}: two row styles"
@@ -8083,17 +8343,17 @@ mod tests {
     #[test]
     fn every_section_opens_the_page_that_holds_its_rows() {
         let wanted: [(Section, settings_v2::Page, &str); 12] = [
-            (Section::General, settings_v2::Page::Autofill, PROMPT_LABEL),
+            (Section::General, settings_v2::Page::Autofill, prompt_label()),
             (Section::Shortcuts, settings_v2::Page::Shortcuts, "Type the username"),
-            (Section::View, settings_v2::Page::Vault, FETCH_ICONS_LABEL),
-            (Section::Lock, settings_v2::Page::Security, AUTO_LOCK_ENABLED_LABEL),
-            (Section::Breaches, settings_v2::Page::Security, BREACH_LABEL),
-            (Section::Vault, settings_v2::Page::Vault, BACKEND_CHOICE_LABEL),
-            (Section::Sync, settings_v2::Page::Account, SYNC_PUSH_LABEL),
-            (Section::Sharing, settings_v2::Page::Account, ADVANCED_SHARING_LABEL),
-            (Section::Api, settings_v2::Page::Apps, SERVICE_LABEL),
-            (Section::Clipboard, settings_v2::Page::Security, CLIPBOARD_MASTER_LABEL),
-            (Section::Updates, settings_v2::Page::About, UPDATE_CHECK_LABEL),
+            (Section::View, settings_v2::Page::Vault, fetch_icons_label()),
+            (Section::Lock, settings_v2::Page::Security, auto_lock_enabled_label()),
+            (Section::Breaches, settings_v2::Page::Security, breach_label()),
+            (Section::Vault, settings_v2::Page::Vault, backend_choice_label()),
+            (Section::Sync, settings_v2::Page::Account, sync_push_label()),
+            (Section::Sharing, settings_v2::Page::Account, advanced_sharing_label()),
+            (Section::Api, settings_v2::Page::Apps, service_label()),
+            (Section::Clipboard, settings_v2::Page::Security, clipboard_master_label()),
+            (Section::Updates, settings_v2::Page::About, update_check_label()),
             (Section::About, settings_v2::Page::About, "Version"),
         ];
         for (section, page, label) in wanted {
@@ -8130,7 +8390,7 @@ mod tests {
         for page in settings_v2::Page::ALL {
             assert!(painted.contains(page.label()), "the tray window's nav has no {:?}", page.label());
         }
-        let back = painted.rect_of(settings_v2::BACK_LABEL).center();
+        let back = painted.rect_of(settings_v2::back_label()).center();
         let (_, action) = run(&click(back), &mut state);
         assert_eq!(action, ChromeAction::Close, "Back did not close the tray window");
     }
@@ -8140,8 +8400,8 @@ mod tests {
     fn a_chord_is_said_as_key_chips() {
         let chord = crate::hotkey::Chord::parse("CTRL+SHIFT+F9");
         assert_eq!(chord_keys(false, chord), ["Ctrl", "Shift", "F9"]);
-        assert_eq!(chord_keys(false, None), [SHORTCUT_NOT_SET]);
-        assert_eq!(chord_keys(true, chord), [SHORTCUT_CAPTURING]);
+        assert_eq!(chord_keys(false, None), [shortcut_not_set()]);
+        assert_eq!(chord_keys(true, chord), [shortcut_capturing()]);
     }
 
     /// The v2 run answers a press on a lit cell too (the read/write pair needs
@@ -8222,27 +8482,27 @@ mod tests {
         // would catch it being drawn on both pages at once.
         assert!(painted.contains("Lock the vault when you step away"));
         assert!(
-            tip_on(Section::Lock, AUTO_LOCK_ENABLED_LABEL).contains(settings_v2::IDLE_LOCK_TIP),
+            tip_on(Section::Lock, auto_lock_enabled_label()).contains(settings_v2::idle_lock_tip()),
             "the idle-lock row has no tip"
         );
         assert!(painted.contains("Lock the vault after"));
         // The descriptions too: a row whose right-hand control squeezes the
         // text column to nothing still paints its title, so asserting only on
         // titles would not notice.
-        assert!(painted.contains(PROMPT_LABEL), "got {:?}", painted.strings());
-        assert!(tip_on(Section::General, PROMPT_LABEL).contains(PROMPT_TIP), "the prompt row has no tip");
+        assert!(painted.contains(prompt_label()), "got {:?}", painted.strings());
+        assert!(tip_on(Section::General, prompt_label()).contains(prompt_tip()), "the prompt row has no tip");
         assert!(
-            PROMPT_TIP.contains("CTRL+ALT+B"),
+            prompt_tip().contains("CTRL+ALT+B"),
             "the description has to say what is left when the prompt is off -- otherwise the \
              toggle reads as \"switch autofill off\", which it never is"
         );
-        assert!(painted.contains(settings_v2::IDLE_MINUTES_SUB), "got {:?}", painted.strings());
+        assert!(painted.contains(settings_v2::idle_minutes_sub()), "got {:?}", painted.strings());
         assert!(
-            tip_on(Section::Lock, AUTO_LOCK_LABEL).contains(settings_v2::IDLE_MINUTES_TIP),
+            tip_on(Section::Lock, auto_lock_label()).contains(settings_v2::idle_minutes_tip()),
             "the minutes row has no tip"
         );
         assert!(
-            settings_v2::IDLE_MINUTES_TIP.contains("One minute is the shortest"),
+            settings_v2::idle_minutes_tip().contains("One minute is the shortest"),
             "the floor has to be stated on screen, not only enforced"
         );
         assert!(
@@ -8503,12 +8763,12 @@ mod tests {
     #[test]
     fn the_breach_row_is_the_first_thing_on_the_breaches_page() {
         let painted = paint(Section::Breaches);
-        let breach = painted.ink_of(BREACH_LABEL).rect;
-        let scan = painted.ink_of(SCAN_SECTION_LABEL).rect;
-        let consent = painted.ink_of(crate::breach_scan::SCAN_CONSENT_NOTE).rect;
+        let breach = painted.ink_of(breach_label()).rect;
+        let scan = painted.ink_of(scan_section_label()).rect;
+        let consent = painted.ink_of(crate::breach_scan::scan_consent_note()).rect;
         // Painted uppercase now: `section_label` is the design's in-card
         // section-label treatment, and it uppercases at the point of drawing.
-        let history = painted.ink_of(&SCAN_HISTORY_LABEL.to_uppercase()).rect;
+        let history = painted.ink_of(&scan_history_label().to_uppercase()).rect;
         // The instrument first: four labels at four distinct, non-empty
         // heights, so `top()` is telling them apart rather than reading one
         // number four times.
@@ -8548,7 +8808,7 @@ mod tests {
         // looked at this page would be blind to.
         let general = paint(Section::General);
         assert!(
-            !general.contains(BREACH_LABEL),
+            !general.contains(breach_label()),
             "the breach row is still painted on General as well, so there are two of it: {:?}",
             general.strings()
         );
@@ -8629,23 +8889,23 @@ mod tests {
     fn the_idle_scan_page_offers_the_button_and_claims_nothing() {
         let painted = paint_scan(crate::breach_scan::ScanStage::Idle, vec![]);
         for text in [
-            BREACH_LABEL,
-            SCAN_SECTION_LABEL,
-            SCAN_IDLE_SUB,
-            SCAN_BUTTON,
-            crate::breach_scan::SCAN_CONSENT_NOTE,
-            &SCAN_HISTORY_LABEL.to_uppercase(),
-            SCAN_NO_HISTORY,
+            breach_label(),
+            scan_section_label(),
+            scan_idle_sub(),
+            scan_button_text(),
+            crate::breach_scan::scan_consent_note(),
+            &scan_history_label().to_uppercase(),
+            scan_no_history(),
         ] {
             assert!(painted.contains(text), "{text:?} is not on the page: {:?}", painted.strings());
         }
         assert!(
-            !painted.contains(SCAN_RUNNING_BUTTON),
+            !painted.contains(scan_running_button()),
             "an idle page paints the running button as well as the idle one"
         );
         // What the scan costs is the tip behind the row's `?` dot.
         assert!(
-            tip_on(Section::Breaches, SCAN_SECTION_LABEL).contains(SCAN_IDLE_TIP),
+            tip_on(Section::Breaches, scan_section_label()).contains(scan_idle_tip()),
             "the idle scan row has no tip saying what leaves the PC"
         );
     }
@@ -8666,7 +8926,7 @@ mod tests {
         // a control that vanishes mid-action reflows the card under the
         // cursor.
         assert!(
-            painted.contains(SCAN_RUNNING_BUTTON) || painted.contains(SCAN_BUTTON),
+            painted.contains(scan_running_button()) || painted.contains(scan_button_text()),
             "the button disappeared while the scan ran: {:?}",
             painted.strings()
         );
@@ -8693,7 +8953,7 @@ mod tests {
     #[test]
     fn a_vault_with_no_passwords_says_so_rather_than_reporting_a_clean_run() {
         let painted = paint_scan(crate::breach_scan::ScanStage::NothingToScan, vec![]);
-        assert!(painted.contains(SCAN_NOTHING_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(scan_nothing_description()), "got {:?}", painted.strings());
         assert!(
             !painted.contains("None was found in a breach."),
             "an unscannable vault was reported as a clean scan"
@@ -8705,7 +8965,7 @@ mod tests {
     #[test]
     fn a_build_that_cannot_scan_says_so_on_the_page() {
         let painted = paint_scan(crate::breach_scan::ScanStage::Unavailable, vec![]);
-        assert!(painted.contains(SCAN_UNAVAILABLE_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(scan_unavailable_description()), "got {:?}", painted.strings());
     }
 
     /// **The history, newest first, with each entry's own outcome under it.**
@@ -8719,7 +8979,7 @@ mod tests {
             crate::breach_scan::ScanStage::Idle,
             vec![newest, older],
         );
-        assert!(!painted.contains(SCAN_NO_HISTORY), "the empty state is drawn over real entries");
+        assert!(!painted.contains(scan_no_history()), "the empty state is drawn over real entries");
         let top = painted.ink_of(&scan_history_when(&newest)).rect;
         let bottom = painted.ink_of(&scan_history_when(&older)).rect;
         assert!(top.height() > 0.0 && bottom.height() > 0.0, "an entry has no box");
@@ -8758,7 +9018,7 @@ mod tests {
         assert!(!state.settings.check_breaches, "the premise: the setting is OFF");
 
         let first = frame(&ctx, &mut state, &[]);
-        let button = first.rect_of(SCAN_BUTTON).center();
+        let button = first.rect_of(scan_button_text()).center();
         frame(&ctx, &mut state, &click(button));
 
         // **The decision, driven rather than described.** With no `ScanEnv`
@@ -8780,7 +9040,7 @@ mod tests {
 
     /// **The long copy, at every width this module paints at.**
     ///
-    /// `BREACH_TIP` is longer than any other row's, so it is the one
+    /// `breach_tip()` is longer than any other row's, so it is the one
     /// that can wrap out of the card or into the row below. Asserted on the
     /// painted galley -- its placed glyphs, its line count and its colour --
     /// rather than on the layout rect the row was allocated, because a row
@@ -8789,9 +9049,9 @@ mod tests {
     #[test]
     fn the_breach_tip_stays_inside_the_pane() {
         assert!(
-            BREACH_TIP.len() > 200,
+            breach_tip().len() > 200,
             "the copy under test is not the long one, so this test is measuring nothing: {}",
-            BREACH_TIP.len()
+            breach_tip().len()
         );
         // Every width the module already paints or measures at: the body's
         // own, and the modal card at both pane sizes `modal_card_rect`'s
@@ -8818,12 +9078,12 @@ mod tests {
             // The longest copy on the page is a hover bubble now, so what
             // has to hold at every width is that the bubble is whole, wraps,
             // and stays inside the window whatever the dot's position.
-            let painted = hover_tip_in(Section::Breaches, Settings::default(), BREACH_LABEL, pane.size());
-            assert!(painted.contains(BREACH_SUB), "the row's sub is missing at width {width}");
-            let ink = painted.ink_of(BREACH_TIP);
+            let painted = hover_tip_in(Section::Breaches, Settings::default(), breach_label(), pane.size());
+            assert!(painted.contains(breach_sub()), "the row's sub is missing at width {width}");
+            let ink = painted.ink_of(breach_tip());
             assert_eq!(
                 ink.rendered.split_whitespace().collect::<Vec<_>>(),
-                BREACH_TIP.split_whitespace().collect::<Vec<_>>(),
+                breach_tip().split_whitespace().collect::<Vec<_>>(),
                 "the tip was elided to fit at width {width}; egui laid {:?}",
                 ink.rendered
             );
@@ -9009,12 +9269,12 @@ mod tests {
     /// their own network are not what this pill decides.
     #[test]
     fn the_direct_icons_row_says_what_it_costs_and_what_it_does_not_govern() {
-        let painted = tip_on(Section::View, DIRECT_ICONS_LABEL);
-        assert!(painted.contains(DIRECT_ICONS_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(DIRECT_ICONS_SUB), "got {:?}", painted.strings());
-        assert!(painted.contains(DIRECT_ICONS_TIP), "got {:?}", painted.strings());
+        let painted = tip_on(Section::View, direct_icons_label());
+        assert!(painted.contains(direct_icons_label()), "got {:?}", painted.strings());
+        assert!(painted.contains(direct_icons_sub()), "got {:?}", painted.strings());
+        assert!(painted.contains(direct_icons_tip()), "got {:?}", painted.strings());
         assert!(
-            DIRECT_ICONS_TIP.contains("Off by default"),
+            direct_icons_tip().contains("Off by default"),
             "the default is stated in the copy, as every other consent row on this page states \
              its own"
         );
@@ -9022,13 +9282,13 @@ mod tests {
         // each site" is a true sentence a reader nods at without
         // understanding what it discloses; this is the sentence that says it.
         assert!(
-            DIRECT_ICONS_TIP.contains("an entry for it exists"),
-            "the copy does not say what ON discloses to each site: {DIRECT_ICONS_TIP:?}"
+            direct_icons_tip().contains("an entry for it exists"),
+            "the copy does not say what ON discloses to each site: {direct_icons_tip:?}", direct_icons_tip = direct_icons_tip()
         );
         assert!(
-            DIRECT_ICONS_TIP.contains("192.168"),
+            direct_icons_tip().contains("192.168"),
             "the copy does not name the addresses this pill does NOT govern, so a user reading \
-             the label would think it did: {DIRECT_ICONS_TIP:?}"
+             the label would think it did: {direct_icons_tip:?}", direct_icons_tip = direct_icons_tip()
         );
         // **The promise matches `favicon::icon_source_for`, in both
         // directions.** ON is the site FIRST and the icon service for the
@@ -9037,15 +9297,15 @@ mod tests {
         // logs, and one who is told only "the icon service is asked" has no
         // idea what the switch is for.
         assert!(
-            DIRECT_ICONS_TIP.contains("asks each site for its own icon first"),
-            "the copy does not say that ON asks the site FIRST: {DIRECT_ICONS_TIP:?}"
+            direct_icons_tip().contains("asks each site for its own icon first"),
+            "the copy does not say that ON asks the site FIRST: {direct_icons_tip:?}", direct_icons_tip = direct_icons_tip()
         );
         assert!(
-            DIRECT_ICONS_TIP
+            direct_icons_tip()
                 .contains("the icon service is asked only about the ones the site itself did not \
                            answer"),
             "the copy does not say the icon service still answers for the sites that did not: \
-             {DIRECT_ICONS_TIP:?}"
+             {direct_icons_tip:?}", direct_icons_tip = direct_icons_tip()
         );
         // **The sentence this row used to carry, forbidden by name.** "the
         // icon service is not asked for any of them" described a direct-ONLY
@@ -9053,9 +9313,9 @@ mod tests {
         // no favicon at a fixed path. A switch whose label overstates its
         // reach is worse than no switch, and this is the exact overstatement.
         assert!(
-            !DIRECT_ICONS_TIP.contains("not asked for any of them"),
+            !direct_icons_tip().contains("not asked for any of them"),
             "the copy still promises the icon service goes unasked, which \
-             `favicon::IconSource::DirectThenProxy` makes false: {DIRECT_ICONS_TIP:?}"
+             `favicon::IconSource::DirectThenProxy` makes false: {direct_icons_tip:?}", direct_icons_tip = direct_icons_tip()
         );
         // **No stray carriage return, and this is not paranoia.** These
         // sources are CRLF and Rust's string line-continuation is a
@@ -9070,31 +9330,31 @@ mod tests {
         // under test here, and this spelling has nothing in it that a
         // line-ending pass can mangle.
         assert!(
-            !DIRECT_ICONS_TIP.contains(char::from(13u8)),
+            !direct_icons_tip().contains(char::from(13u8)),
             "a literal carriage return survived a line continuation into the copy"
         );
         assert!(
-            !DIRECT_ICONS_LABEL.contains(char::from(13u8)),
+            !direct_icons_label().contains(char::from(13u8)),
             "a literal carriage return survived into the label"
         );
         // The control: the same check on a neighbour that has always been
         // fine, so a `contains` that could never be true is not what is
         // passing here.
-        assert!(FETCH_ICONS_TIP.contains("On by default"));
+        assert!(fetch_icons_tip().contains("On by default"));
         // The house rule, as a test: this page never calls anything secure.
         assert!(
-            !DIRECT_ICONS_TIP.to_ascii_lowercase().contains("secure"),
-            "the copy calls something secure: {DIRECT_ICONS_TIP:?}"
+            !direct_icons_tip().to_ascii_lowercase().contains("secure"),
+            "the copy calls something secure: {direct_icons_tip:?}", direct_icons_tip = direct_icons_tip()
         );
         // The instrument: an ink lookup that panics on a double paint, with a
         // real rect, so `contains` above is not reading a zero-size ghost.
-        let ink = painted.ink_of(DIRECT_ICONS_LABEL);
+        let ink = painted.ink_of(direct_icons_label());
         assert!(ink.rect.height() > 0.0 && ink.rect.width() > 0.0, "the label has no box: {:?}", ink.rect);
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(DIRECT_ICONS_TIP);
+        let desc = painted.ink_of(direct_icons_tip());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
         // And it sits under the switch it is a child of, read off the paint.
-        let master = painted.ink_of(FETCH_ICONS_LABEL).rect;
+        let master = painted.ink_of(fetch_icons_label()).rect;
         assert!(master.height() > 0.0 && ink.rect.height() > 0.0);
         assert!(
             master.top() < ink.rect.top(),
@@ -9166,21 +9426,21 @@ mod tests {
     /// a brand with no image is not a blank -- it keeps its word.
     #[test]
     fn the_network_logos_row_says_where_the_images_come_from_and_what_happens_without_them() {
-        let painted = tip_on(Section::View, BRAND_LOGOS_LABEL);
-        assert!(painted.contains(BRAND_LOGOS_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(BRAND_LOGOS_SUB), "got {:?}", painted.strings());
-        assert!(painted.contains(BRAND_LOGOS_TIP), "got {:?}", painted.strings());
+        let painted = tip_on(Section::View, brand_logos_label());
+        assert!(painted.contains(brand_logos_label()), "got {:?}", painted.strings());
+        assert!(painted.contains(brand_logos_sub()), "got {:?}", painted.strings());
+        assert!(painted.contains(brand_logos_tip()), "got {:?}", painted.strings());
         assert!(
-            BRAND_LOGOS_TIP.contains("brand-marks"),
+            brand_logos_tip().contains("brand-marks"),
             "the copy has to name the folder: with none named, a user turns this on, sees no \
              change whatever, and has nothing to act on"
         );
         assert!(
-            BRAND_LOGOS_TIP.contains("Off by default"),
+            brand_logos_tip().contains("Off by default"),
             "the default is stated in the copy, as every other row's is"
         );
         assert!(
-            BRAND_LOGOS_TIP.contains("Nothing is downloaded"),
+            brand_logos_tip().contains("Nothing is downloaded"),
             "on a page whose neighbouring row IS a network request, silence here reads as a \
              second one"
         );
@@ -9254,13 +9514,13 @@ mod tests {
     fn updates_owns_the_check_pill_and_general_does_not() {
         let general = paint(Section::General);
         assert!(
-            !general.contains(UPDATE_CHECK_LABEL),
+            !general.contains(update_check_label()),
             "the automatic-check row is still on General; it belongs above the button it does \
              not govern. Got {:?}",
             general.strings()
         );
         assert!(
-            !general.contains(UPDATE_CHECK_TIP),
+            !general.contains(update_check_tip()),
             "General still carries the update row's copy: {:?}",
             general.strings()
         );
@@ -9271,18 +9531,18 @@ mod tests {
         // they are Lock and View since the split -- and the point of the
         // control is unchanged: the update row is somewhere else, and these
         // two are still somewhere.
-        assert!(paint(Section::Lock).contains(AUTO_LOCK_LABEL));
-        assert!(paint(Section::View).contains(FETCH_ICONS_LABEL));
+        assert!(paint(Section::Lock).contains(auto_lock_label()));
+        assert!(paint(Section::View).contains(fetch_icons_label()));
 
         // And it is on Updates, above the check button rather than below it:
         // the pill is the rule and the button is the exception to it, and a
         // rule stated after its exception explains nothing.
         let updates = paint(Section::Updates);
-        let pill = updates.ink_of(UPDATE_CHECK_LABEL).rect;
+        let pill = updates.ink_of(update_check_label()).rect;
         // Anchored on the flow card's BUTTON, which is what the sentence
         // above is actually about, and what is left to anchor on now that
         // the card has no title of its own (see `status_row`).
-        let flow = updates.ink_of(UPDATE_CHECK_BUTTON).rect;
+        let flow = updates.ink_of(update_check_button()).rect;
         assert!(pill.height() > 0.0 && flow.height() > 0.0);
         assert!(
             pill.top() < flow.top(),
@@ -9301,36 +9561,36 @@ mod tests {
     /// costs. A missed security fix has no symptom.
     #[test]
     fn the_update_check_row_says_what_turning_it_off_costs() {
-        let painted = tip_on(Section::Updates, UPDATE_CHECK_LABEL);
-        assert!(painted.contains(UPDATE_CHECK_LABEL), "got {:?}", painted.strings());
+        let painted = tip_on(Section::Updates, update_check_label());
+        assert!(painted.contains(update_check_label()), "got {:?}", painted.strings());
         // The label is not the button's words. Both are on this page now, a
         // card apart, and two identical strings -- one a switch and one a
         // control it does not gate -- would erase the distinction this page
         // was built to make.
         assert_ne!(
-            UPDATE_CHECK_LABEL, UPDATE_CHECK_BUTTON,
+            update_check_label(), update_check_button(),
             "the automatic-check switch and the manual-check button are painted on one page and \
              must not read as the same thing twice"
         );
-        assert!(painted.contains(UPDATE_CHECK_SUB), "got {:?}", painted.strings());
-        assert!(painted.contains(UPDATE_CHECK_TIP), "got {:?}", painted.strings());
+        assert!(painted.contains(update_check_sub()), "got {:?}", painted.strings());
+        assert!(painted.contains(update_check_tip()), "got {:?}", painted.strings());
         assert!(
-            UPDATE_CHECK_TIP.contains("security"),
+            update_check_tip().contains("security"),
             "the copy has to name what is lost by turning this off; a missed security fix is \
              invisible, so the pane is the only place the user can learn it"
         );
         assert!(
-            UPDATE_CHECK_TIP.contains("On by default"),
+            update_check_tip().contains("On by default"),
             "on-by-default is stated in `Settings::default` and has to be stated on screen too"
         );
-        let ink = painted.ink_of(UPDATE_CHECK_LABEL);
+        let ink = painted.ink_of(update_check_label());
         assert!(
             ink.rect.height() > 0.0 && ink.rect.width() > 0.0,
             "the label has no box: {:?}",
             ink.rect
         );
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(UPDATE_CHECK_TIP);
+        let desc = painted.ink_of(update_check_tip());
         assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
@@ -9340,34 +9600,34 @@ mod tests {
     /// (the credential).
     #[test]
     fn the_site_icons_row_says_the_domain_is_what_is_sent() {
-        let painted = tip_on(Section::View, FETCH_ICONS_LABEL);
-        assert!(painted.contains(FETCH_ICONS_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(FETCH_ICONS_TIP), "got {:?}", painted.strings());
+        let painted = tip_on(Section::View, fetch_icons_label());
+        assert!(painted.contains(fetch_icons_label()), "got {:?}", painted.strings());
+        assert!(painted.contains(fetch_icons_tip()), "got {:?}", painted.strings());
         assert!(
-            FETCH_ICONS_TIP.contains("domain"),
+            fetch_icons_tip().contains("domain"),
             "the copy has to name what is actually sent; \"downloads icons\" describes the \
              feature and hides the cost"
         );
         assert!(
-            FETCH_ICONS_TIP.contains("password"),
+            fetch_icons_tip().contains("password"),
             "the copy has to say what is NOT sent -- \"it sends the website to Bitwarden\" is \
              what a worried reader assumes, and it is wrong"
         );
         assert!(
-            FETCH_ICONS_TIP.contains("On by default"),
+            fetch_icons_tip().contains("On by default"),
             "on-by-default is stated in `Settings::default` and has to be stated on screen too \
              -- this is the one network row here that is on unless it is turned off"
         );
         // The instrument: an ink lookup that panics on a double paint, with a
         // real rect, so `contains` above is not reading a zero-size ghost.
-        let ink = painted.ink_of(FETCH_ICONS_LABEL);
+        let ink = painted.ink_of(fetch_icons_label());
         assert!(
             ink.rect.height() > 0.0 && ink.rect.width() > 0.0,
             "the label has no box: {:?}",
             ink.rect
         );
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(FETCH_ICONS_TIP);
+        let desc = painted.ink_of(fetch_icons_tip());
         assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
@@ -9440,9 +9700,9 @@ mod tests {
     #[test]
     fn the_totp_secret_row_sits_last_on_view_under_the_icon_and_logo_rows() {
         let painted = paint(Section::View);
-        let breach = painted.ink_of(FETCH_ICONS_LABEL).rect;
-        let secret = painted.ink_of(TOTP_SECRET_LABEL).rect;
-        let auto_lock = painted.ink_of(BRAND_LOGOS_LABEL).rect;
+        let breach = painted.ink_of(fetch_icons_label()).rect;
+        let secret = painted.ink_of(totp_secret_label()).rect;
+        let auto_lock = painted.ink_of(brand_logos_label()).rect;
         // The instrument first: three labels at three distinct, non-empty
         // heights, so `top()` is telling them apart rather than reading one
         // number three times.
@@ -9494,24 +9754,24 @@ mod tests {
     /// painted in the clear.
     #[test]
     fn the_totp_secret_row_says_what_it_turns_on_and_that_it_is_off_by_default() {
-        let painted = tip_on(Section::View, TOTP_SECRET_LABEL);
-        assert!(painted.contains(TOTP_SECRET_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(TOTP_SECRET_SUB), "got {:?}", painted.strings());
-        assert!(painted.contains(TOTP_SECRET_TIP), "got {:?}", painted.strings());
+        let painted = tip_on(Section::View, totp_secret_label());
+        assert!(painted.contains(totp_secret_label()), "got {:?}", painted.strings());
+        assert!(painted.contains(totp_secret_sub()), "got {:?}", painted.strings());
+        assert!(painted.contains(totp_secret_tip()), "got {:?}", painted.strings());
         assert!(
-            TOTP_SECRET_LABEL.contains("TOTP secret"),
+            totp_secret_label().contains("TOTP secret"),
             "the label has to name the thing it reveals, not just say \"secret\""
         );
         assert!(
-            TOTP_SECRET_TIP.contains("Off by default"),
+            totp_secret_tip().contains("Off by default"),
             "off-by-default is stated in `Settings::default` and has to be stated on screen too"
         );
         assert!(
-            TOTP_SECRET_TIP.contains("masked"),
+            totp_secret_tip().contains("masked"),
             "turning this on adds a MASKED row; copy that implied a seed appears in the clear would be wrong"
         );
         assert!(
-            TOTP_SECRET_TIP.contains("details screen"),
+            totp_secret_tip().contains("details screen"),
             "the copy has to say WHERE the row appears"
         );
         // **The row is labelled `TOTP` on that screen, and the copy said
@@ -9521,19 +9781,19 @@ mod tests {
         // failure this pins: the user goes looking for a row called "one-time
         // code", does not find one, and concludes the pill did nothing.
         assert!(
-            !TOTP_SECRET_TIP.to_ascii_lowercase().contains("one-time code"),
-            "the details screen labels that row \"TOTP\", not \"one-time code\": {TOTP_SECRET_TIP:?}"
+            !totp_secret_tip().to_ascii_lowercase().contains("one-time code"),
+            "the details screen labels that row \"TOTP\", not \"one-time code\": {totp_secret_tip:?}", totp_secret_tip = totp_secret_tip()
         );
         assert!(
-            TOTP_SECRET_TIP.contains("TOTP code"),
+            totp_secret_tip().contains("TOTP code"),
             "the copy has to name the row it appears under, as that row is labelled"
         );
         // The instrument: an ink lookup that panics on a double paint, with a
         // real rect, so "contains" above is not reading a zero-size ghost.
-        let ink = painted.ink_of(TOTP_SECRET_LABEL);
+        let ink = painted.ink_of(totp_secret_label());
         assert!(ink.rect.height() > 0.0 && ink.rect.width() > 0.0, "the label has no box: {:?}", ink.rect);
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(TOTP_SECRET_TIP);
+        let desc = painted.ink_of(totp_secret_tip());
         assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
@@ -9829,21 +10089,21 @@ mod tests {
     fn the_clipboard_page_paints_every_control_and_its_reasoning() {
         let painted = paint(Section::Clipboard);
         for text in [
-            CLIPBOARD_MASTER_LABEL,
-            CLIPBOARD_MASTER_SUB,
-            CLIPBOARD_ON_LOCK_LABEL,
-            CLIPBOARD_ON_LOCK_SUB,
-            CLIPBOARD_ON_ACCOUNT_LABEL,
-            CLIPBOARD_ON_ACCOUNT_SUB,
-            CLIPBOARD_ON_QUIT_LABEL,
-            CLIPBOARD_ON_QUIT_SUB,
-            CLIPBOARD_INTERVAL_LABEL,
-            CLIPBOARD_INTERVAL_SUB,
-            CLIPBOARD_HISTORY_LABEL,
-            CLIPBOARD_HISTORY_NOTE,
-            CLIPBOARD_RESET_LABEL,
-            CLIPBOARD_RESET_SUB,
-            CLIPBOARD_RESET_BUTTON,
+            clipboard_master_label(),
+            clipboard_master_sub(),
+            clipboard_on_lock_label(),
+            clipboard_on_lock_sub(),
+            clipboard_on_account_label(),
+            clipboard_on_account_sub(),
+            clipboard_on_quit_label(),
+            clipboard_on_quit_sub(),
+            clipboard_interval_label(),
+            clipboard_interval_sub(),
+            clipboard_history_label(),
+            clipboard_history_note(),
+            clipboard_reset_label(),
+            clipboard_reset_sub(),
+            clipboard_reset_button(),
         ] {
             assert!(
                 painted.contains(text),
@@ -9853,13 +10113,13 @@ mod tests {
         }
         // Every explanation is the tip behind its row's `?` dot.
         for (label, tip) in [
-            (CLIPBOARD_MASTER_LABEL, CLIPBOARD_MASTER_TIP),
-            (CLIPBOARD_ON_LOCK_LABEL, CLIPBOARD_ON_LOCK_TIP),
-            (CLIPBOARD_ON_ACCOUNT_LABEL, CLIPBOARD_ON_ACCOUNT_TIP),
-            (CLIPBOARD_ON_QUIT_LABEL, CLIPBOARD_ON_QUIT_TIP),
-            (CLIPBOARD_INTERVAL_LABEL, CLIPBOARD_INTERVAL_TIP),
-            (CLIPBOARD_HISTORY_LABEL, CLIPBOARD_HISTORY_TIP),
-            (CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_TIP),
+            (clipboard_master_label(), clipboard_master_tip()),
+            (clipboard_on_lock_label(), clipboard_on_lock_tip()),
+            (clipboard_on_account_label(), clipboard_on_account_tip()),
+            (clipboard_on_quit_label(), clipboard_on_quit_tip()),
+            (clipboard_interval_label(), clipboard_interval_tip()),
+            (clipboard_history_label(), clipboard_history_tip()),
+            (clipboard_reset_label(), clipboard_reset_tip()),
         ] {
             assert!(tip_on(Section::Clipboard, label).contains(tip), "{label:?} has no tip");
         }
@@ -9883,42 +10143,42 @@ mod tests {
     #[test]
     fn the_clipboard_copy_states_the_floor_the_ceiling_and_what_is_not_switchable() {
         assert!(
-            CLIPBOARD_INTERVAL_TIP.contains("0.5")
-                && CLIPBOARD_INTERVAL_TIP.contains("thirty seconds"),
+            clipboard_interval_tip().contains("0.5")
+                && clipboard_interval_tip().contains("thirty seconds"),
             "the floor has to be stated on screen, in both forms, not only enforced"
         );
         assert!(
-            CLIPBOARD_INTERVAL_TIP.contains("60 minutes"),
+            clipboard_interval_tip().contains("60 minutes"),
             "the ceiling has to be stated on screen, or a user meets it by being refused"
         );
         assert!(
-            CLIPBOARD_INTERVAL_TIP.contains("one decimal place"),
+            clipboard_interval_tip().contains("one decimal place"),
             "the resolution has to be stated, or `1.25` is refused for an unstated reason"
         );
         assert!(
-            CLIPBOARD_MASTER_TIP.contains("Off means"),
+            clipboard_master_tip().contains("Off means"),
             "the master switch's copy has to say what OFF does -- off is the state that \
              withdraws a protection"
         );
         assert!(
-            CLIPBOARD_MASTER_TIP.contains("clipboard history")
-                && CLIPBOARD_HISTORY_TIP.contains("no setting"),
+            clipboard_master_tip().contains("clipboard history")
+                && clipboard_history_tip().contains("no setting"),
             "the history exclusion has to be named as always-on in both places, or this page \
              reads as governing it"
         );
         assert!(
-            CLIPBOARD_ON_QUIT_TIP.contains("crash")
-                && CLIPBOARD_ON_QUIT_TIP.contains("power cut"),
+            clipboard_on_quit_tip().contains("crash")
+                && clipboard_on_quit_tip().contains("power cut"),
             "the quit switch has to say what it cannot cover, or it promises more than \
              PRIVACY.md does"
         );
         assert!(
-            CLIPBOARD_ON_LOCK_TIP.contains("no separate sign-out"),
+            clipboard_on_lock_tip().contains("no separate sign-out"),
             "the lock switch has to say it is also the logout case, since there is no logout \
              switch and a reader will look for one"
         );
         assert!(
-            CLIPBOARD_RESET_SUB.contains("other pages"),
+            clipboard_reset_sub().contains("other pages"),
             "the reset button has to state its scope, or `Reset to default` inside a \
              preferences window is ambiguous between this page and the app"
         );
@@ -9986,10 +10246,10 @@ mod tests {
         // vanished would reflow the card and hide the value it is about to
         // restore.
         for text in [
-            CLIPBOARD_ON_LOCK_LABEL,
-            CLIPBOARD_ON_ACCOUNT_LABEL,
-            CLIPBOARD_ON_QUIT_LABEL,
-            CLIPBOARD_INTERVAL_LABEL,
+            clipboard_on_lock_label(),
+            clipboard_on_account_label(),
+            clipboard_on_quit_label(),
+            clipboard_interval_label(),
         ] {
             assert!(painted.contains(text), "{text:?} vanished when the master switch went off");
         }
@@ -10062,10 +10322,10 @@ mod tests {
     #[test]
     fn a_refused_interval_entry_keeps_the_old_value_and_names_the_reason() {
         for (typed, reason) in [
-            ("soon", CLIPBOARD_ENTRY_NOT_A_NUMBER),
-            ("0.1", CLIPBOARD_ENTRY_BELOW_FLOOR),
-            ("90", CLIPBOARD_ENTRY_ABOVE_CEILING),
-            ("1.25", CLIPBOARD_ENTRY_BETWEEN_STEPS),
+            ("soon", clipboard_entry_not_a_number()),
+            ("0.1", clipboard_entry_below_floor()),
+            ("90", clipboard_entry_above_ceiling()),
+            ("1.25", clipboard_entry_between_steps()),
         ] {
             let ctx = styled_context();
             let mut state = clipboard_state(Settings::default());
@@ -10118,7 +10378,7 @@ mod tests {
         assert!(!state.settings.clear_clipboard);
         assert_eq!(state.settings.clear_clipboard_seconds, 300);
 
-        frame(&ctx, &mut state, &click(first.rect_of(CLIPBOARD_RESET_BUTTON).center()));
+        frame(&ctx, &mut state, &click(first.rect_of(clipboard_reset_button()).center()));
 
         assert!(state.settings.clear_clipboard, "the button is decoration");
         assert!(state.settings.clear_clipboard_on_lock);
@@ -10152,7 +10412,7 @@ mod tests {
             ..Settings::default()
         });
         let first = frame(&ctx, &mut state, &[]);
-        frame(&ctx, &mut state, &click(first.rect_of(CLIPBOARD_RESET_BUTTON).center()));
+        frame(&ctx, &mut state, &click(first.rect_of(clipboard_reset_button()).center()));
         assert!(state.settings.clear_clipboard, "Reset was inert while the page was switched off");
         assert_eq!(state.settings.clear_clipboard_seconds, 60);
     }
@@ -10187,7 +10447,7 @@ mod tests {
         let after = frame(&ctx, &mut state, &click(first.nav_ink_of("Security").rect.center()));
         assert_eq!(state.page, settings_v2::Page::Security, "the nav row did not select");
         assert!(
-            after.contains(CLIPBOARD_MASTER_LABEL),
+            after.contains(clipboard_master_label()),
             "Security should now be the open page; got {:?}",
             after.strings()
         );
@@ -10254,14 +10514,14 @@ mod tests {
     ///
     /// **This is the `bw` page.** `paint_vault_with_hello` publishes no
     /// account status, so `is_self_hosted` answers false and `choose` answers
-    /// `BwServe`. On the built-in client `BACKEND_LABEL` is deliberately
+    /// `BwServe`. On the built-in client `backend_label()` is deliberately
     /// absent; see
     /// `the_row_about_the_subprocess_is_absent_where_there_is_no_subprocess`.
     #[test]
     fn every_setting_that_decides_where_the_vault_comes_from_is_on_the_vault_page() {
         let vault = paint_vault_with_hello(true);
         let gathered =
-            [BACKEND_CHOICE_LABEL, BACKEND_LABEL, DISK_CACHE_LABEL, READ_THROUGH_LABEL];
+            [backend_choice_label(), backend_label(), disk_cache_label(), read_through_label()];
         for label in gathered {
             assert!(
                 vault.contains(label),
@@ -10291,8 +10551,8 @@ mod tests {
         // so "not painted" is a claim about these rows rather than about a
         // paint that produced nothing. The API page's control is the switch
         // it does own, which is also the assertion the next test starts from.
-        assert!(paint(Section::General).contains(PROMPT_LABEL));
-        assert!(paint_tall(Section::Api).contains(SERVICE_LABEL));
+        assert!(paint(Section::General).contains(prompt_label()));
+        assert!(paint_tall(Section::Api).contains(service_label()));
     }
 
     /// **The mirror image, and the half a move gets wrong: the API page
@@ -10324,10 +10584,10 @@ mod tests {
         // because that is what they ARE; `section_label` uppercases at the
         // point of drawing, so a test that reads the paint has to as well.
         for label in [
-            SERVICE_LABEL.to_string(),
-            KEYS_SECTION_LABEL.to_uppercase(),
-            MINT_SECTION_LABEL.to_uppercase(),
-            MINT_BUTTON.to_string(),
+            service_label().to_string(),
+            keys_section_label().to_uppercase(),
+            mint_section_label().to_uppercase(),
+            mint_button().to_string(),
         ] {
             assert!(
                 api.contains(&label),
@@ -10335,7 +10595,7 @@ mod tests {
                 api.strings()
             );
         }
-        assert!(api.contains(REVOKE_BUTTON), "a listed key has no revoke button");
+        assert!(api.contains(revoke_button()), "a listed key has no revoke button");
         assert!(api.contains("Backup script"), "control: the list really drew a row");
 
         // And none of it on Vault -- driven with the same key in the store,
@@ -10348,11 +10608,11 @@ mod tests {
         let painted = tall_frame(&ctx, &mut vault, &[]);
         for label in
             [
-                SERVICE_LABEL.to_string(),
-                KEYS_SECTION_LABEL.to_uppercase(),
-                MINT_SECTION_LABEL.to_uppercase(),
-                MINT_BUTTON.to_string(),
-                REVOKE_BUTTON.to_string(),
+                service_label().to_string(),
+                keys_section_label().to_uppercase(),
+                mint_section_label().to_uppercase(),
+                mint_button().to_string(),
+                revoke_button().to_string(),
             ]
         {
             assert!(
@@ -10365,7 +10625,7 @@ mod tests {
         assert!(!painted.contains("Backup script"), "the key list is still drawn on Vault");
         // The control: the Vault page is not blank, and the store it was
         // handed is the one the API page listed a row from.
-        assert!(painted.contains(DISK_CACHE_LABEL), "control: the Vault page drew its own rows");
+        assert!(painted.contains(disk_cache_label()), "control: the Vault page drew its own rows");
     }
 
     // **`sync_and_account_says_where_the_backend_switch_went` is gone with the
@@ -10425,7 +10685,7 @@ mod tests {
     fn the_row_about_the_subprocess_is_absent_where_there_is_no_subprocess() {
         let direct = paint_vault_for(Some("self"), false);
         assert!(
-            !direct.contains(BACKEND_LABEL),
+            !direct.contains(backend_label()),
             "a self-hosted account with the built-in client is still offered a row about a \
              subprocess it does not have; got {:?}",
             direct.strings()
@@ -10434,7 +10694,7 @@ mod tests {
         // vacuous pass: the page is not blank. The two rows that are true on
         // every backend are still on it.
         assert!(
-            direct.contains(UI_LOADED_LABEL) && direct.contains(DISK_CACHE_LABEL),
+            direct.contains(ui_loaded_label()) && direct.contains(disk_cache_label()),
             "the built-in page painted nothing, so the absence above is about a failed paint \
              and not about the row; got {:?}",
             direct.strings()
@@ -10443,7 +10703,7 @@ mod tests {
         // paragraph was still painted somewhere would be the same lie with no
         // label on it.
         assert!(
-            !direct.contains(BACKEND_SUB),
+            !direct.contains(backend_sub()),
             "the row is hidden but its description is still on the page"
         );
 
@@ -10458,7 +10718,7 @@ mod tests {
         ] {
             let painted = paint_vault_for(server, use_official);
             assert!(
-                painted.contains(BACKEND_LABEL) && painted.contains(BACKEND_SUB),
+                painted.contains(backend_label()) && painted.contains(backend_sub()),
                 "{why} is served by `bw serve`, so this row decides something and must be \
                  drawn saying so; got {:?}",
                 painted.strings()
@@ -10512,14 +10772,14 @@ mod tests {
             [("the `bw` page", &bw, true), ("the built-in page", &built_in, false)]
         {
             assert!(
-                painted.contains(OFFICIAL_CHOICE) && painted.contains(BUILT_IN_CHOICE),
+                painted.contains(official_choice()) && painted.contains(built_in_choice()),
                 "{what} does not offer both clients as peers; got {:?}",
                 painted.strings()
             );
             let (selected, other) = if official {
-                (OFFICIAL_CHOICE, BUILT_IN_CHOICE)
+                (official_choice(), built_in_choice())
             } else {
-                (BUILT_IN_CHOICE, OFFICIAL_CHOICE)
+                (built_in_choice(), official_choice())
             };
             assert_eq!(
                 painted.fill_behind(selected),
@@ -10559,13 +10819,13 @@ mod tests {
             (
                 "the Vault page's backend picker",
                 &vault,
-                vec![OFFICIAL_CHOICE.to_string(), BUILT_IN_CHOICE.to_string()],
+                vec![official_choice().to_string(), built_in_choice().to_string()],
             ),
             ("the Local API page's subject picker", &api, subjects),
             (
                 "the Local API page's access pair",
                 &api,
-                vec![READ_CHOICE.to_string(), WRITE_CHOICE.to_string()],
+                vec![read_choice().to_string(), write_choice().to_string()],
             ),
         ];
         for (what, painted, labels) in runs {
@@ -10662,7 +10922,7 @@ mod tests {
             "the form moved but the run still paints the old subject as the one in force"
         );
         assert_ne!(
-            after.fill_behind(EVERYTHING_CHOICE),
+            after.fill_behind(everything_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "two subjects are painted as chosen at once, so the run says nothing"
         );
@@ -10685,25 +10945,25 @@ mod tests {
         assert!(!state.key_form.write);
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let write = first.box_behind(WRITE_CHOICE).rect.center();
+        let write = first.box_behind(write_choice()).rect.center();
         let both = tall_click(&ctx, &mut state, write);
 
         assert!(state.key_form.write, "pressing `Write` did not grant write");
         assert!(state.key_form.read, "granting write cleared the read grant beside it");
-        assert_eq!(both.fill_behind(READ_CHOICE), crate::kit::tokens::Palette::LIGHT.card);
+        assert_eq!(both.fill_behind(read_choice()), crate::kit::tokens::Palette::LIGHT.card);
         assert_eq!(
-            both.fill_behind(WRITE_CHOICE),
+            both.fill_behind(write_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "both halves are granted and the run shows only one of them"
         );
 
         // And back off again, so the two paints above are telling states
         // apart rather than reporting one constant twice.
-        let read = both.box_behind(READ_CHOICE).rect.center();
+        let read = both.box_behind(read_choice()).rect.center();
         let write_only = tall_click(&ctx, &mut state, read);
         assert!(!state.key_form.read, "pressing a lit cell did not withdraw the grant");
         assert!(state.key_form.write, "withdrawing read withdrew write with it");
-        assert_ne!(write_only.fill_behind(READ_CHOICE), crate::kit::tokens::Palette::LIGHT.card);
+        assert_ne!(write_only.fill_behind(read_choice()), crate::kit::tokens::Palette::LIGHT.card);
     }
 
     /// **The nav's wash is not what a live multiple-choice row is painted
@@ -10774,7 +11034,7 @@ mod tests {
     fn the_built_in_vault_page_names_no_subprocess() {
         let painted = paint_vault_for(Some("self"), false);
         let switch_copy = official_crypto_tip(true);
-        let exempt = [BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE, switch_copy];
+        let exempt = [backend_choice_label(), official_choice(), built_in_choice(), switch_copy];
         let offending: Vec<&str> = painted
             .strings()
             .into_iter()
@@ -10795,12 +11055,12 @@ mod tests {
         //
         // The page really painted something...
         assert!(
-            painted.contains(DISK_CACHE_LABEL),
+            painted.contains(disk_cache_label()),
             "the scan above found nothing because the page drew nothing"
         );
         // ...and the exempt row really is on it, so the filter is excusing a
         // string that is actually there rather than one that never was.
-        for label in [BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE] {
+        for label in [backend_choice_label(), official_choice(), built_in_choice()] {
             assert!(
                 painted.contains(label),
                 "the exempted {label:?} is not on the page, so the exemption is excusing \
@@ -10831,7 +11091,7 @@ mod tests {
         // row's own label, which named the CLI because the pill's ON meant
         // the CLI. The picker's cell is where the CLI is named now, and the
         // rule is the same rule.
-        for label in [BACKEND_LABEL, OFFICIAL_CHOICE] {
+        for label in [backend_label(), official_choice()] {
             assert!(
                 label.contains("Bitwarden CLI"),
                 "{label:?} does not name the program the user will see in Task Manager"
@@ -10839,7 +11099,7 @@ mod tests {
         }
         // ...and it applies to every string this control paints, including
         // the two that are new.
-        for label in [BACKEND_LABEL, BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE] {
+        for label in [backend_label(), backend_choice_label(), official_choice(), built_in_choice()] {
             assert!(
                 !label.to_lowercase().contains("crypto"),
                 "{label:?} names an internal concept the user is not choosing between"
@@ -10853,32 +11113,32 @@ mod tests {
         // pill made the built-in client the unnamed absence of the CLI; the
         // second cell is what stops it being that.
         assert!(
-            BUILT_IN_CHOICE.contains("built-in client"),
-            "{BUILT_IN_CHOICE:?} does not name the second client, so the choice has one \
-             named side and one blank"
+            built_in_choice().contains("built-in client"),
+            "{built_in_choice:?} does not name the second client, so the choice has one \
+             named side and one blank", built_in_choice = built_in_choice()
         );
         // **And the question names neither**, so the two cells are peers
         // rather than a default with an alternative beside it. This is the
         // assertion that fails if somebody folds one client's name back into
         // the row label.
         assert!(
-            !BACKEND_CHOICE_LABEL.contains("Bitwarden CLI")
-                && !BACKEND_CHOICE_LABEL.contains("built-in"),
-            "{BACKEND_CHOICE_LABEL:?} names one of the two answers, which puts it back in \
-             the privileged position the on/off pill gave it"
+            !backend_choice_label().contains("Bitwarden CLI")
+                && !backend_choice_label().contains("built-in"),
+            "{backend_choice_label:?} names one of the two answers, which puts it back in \
+             the privileged position the on/off pill gave it", backend_choice_label = backend_choice_label()
         );
         // The control: these are still four different strings, and the one
         // about keeping it running still says so. Without this, they could
         // collapse and pass every assertion above.
         for pair in [
-            (BACKEND_LABEL, BACKEND_CHOICE_LABEL),
-            (BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE),
-            (OFFICIAL_CHOICE, BUILT_IN_CHOICE),
-            (BACKEND_LABEL, OFFICIAL_CHOICE),
+            (backend_label(), backend_choice_label()),
+            (backend_choice_label(), official_choice()),
+            (official_choice(), built_in_choice()),
+            (backend_label(), official_choice()),
         ] {
             assert_ne!(pair.0, pair.1);
         }
-        assert!(BACKEND_LABEL.contains("running"), "the row no longer says what it decides");
+        assert!(backend_label().contains("running"), "the row no longer says what it decides");
     }
 
 
@@ -10900,7 +11160,7 @@ mod tests {
     fn take_the_backend_switch(ctx: &egui::Context, state: &mut PrefsState, cell: &str) {
         let shown = tall_frame(ctx, state, &[]);
         let asked = tall_click(ctx, state, shown.rect_of(cell).center());
-        let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
+        let yes = asked.ink_of(backend_switch_confirm_button()).rect.center();
         let _ = tall_click(ctx, state, yes);
     }
 
@@ -10930,7 +11190,7 @@ mod tests {
         assert_eq!(state.settings.use_official_bw_crypto, None, "the shipped default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let other_client = first.rect_of(BUILT_IN_CHOICE).center();
+        let other_client = first.rect_of(built_in_choice()).center();
         let asked = tall_click(&ctx, &mut state, other_client);
 
         assert_eq!(
@@ -10961,17 +11221,17 @@ mod tests {
         // itself. Both cells, because a picker that showed BOTH as selected
         // would pass an assertion about either one alone.
         assert_eq!(
-            asked.fill_behind(OFFICIAL_CHOICE),
+            asked.fill_behind(official_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the picker moved before the question was answered"
         );
         assert_ne!(
-            asked.fill_behind(BUILT_IN_CHOICE),
+            asked.fill_behind(built_in_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the cell that was merely proposed is painted as the one in force"
         );
 
-        let no = asked.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center();
+        let no = asked.ink_of(backend_switch_cancel_button()).rect.center();
         let left = tall_click(&ctx, &mut state, no);
         // Still untouched, and untouched is `None`: declining the switch must
         // leave the field exactly as the window received it, which for a
@@ -10981,7 +11241,7 @@ mod tests {
             "saying no switched the backend anyway"
         );
         assert_eq!(
-            left.fill_behind(OFFICIAL_CHOICE),
+            left.fill_behind(official_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the picker moved on a refusal"
         );
@@ -10998,7 +11258,7 @@ mod tests {
         // And the whole thing can be attempted again -- the assertion the
         // never-cleared pending state would fail, and the one that makes the
         // clearing above mean something.
-        let again = tall_click(&ctx, &mut state, left.rect_of(BUILT_IN_CHOICE).center());
+        let again = tall_click(&ctx, &mut state, left.rect_of(built_in_choice()).center());
         assert!(
             again.any_containing("either sign out and back in"),
             "a second press of the other client raises nothing, so the row can only be \
@@ -11015,10 +11275,10 @@ mod tests {
         let cleared = tall_click(
             &ctx,
             &mut state,
-            again.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center(),
+            again.ink_of(backend_switch_cancel_button()).rect.center(),
         );
         let same_client =
-            tall_click(&ctx, &mut state, cleared.rect_of(OFFICIAL_CHOICE).center());
+            tall_click(&ctx, &mut state, cleared.rect_of(official_choice()).center());
         assert!(
             !same_client.any_containing("either sign out and back in"),
             "pressing the client this account is already on raised a confirmation for a \
@@ -11050,8 +11310,8 @@ mod tests {
         );
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let asked = tall_click(&ctx, &mut state, first.rect_of(BUILT_IN_CHOICE).center());
-        let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
+        let asked = tall_click(&ctx, &mut state, first.rect_of(built_in_choice()).center());
+        let yes = asked.ink_of(backend_switch_confirm_button()).rect.center();
         let after = tall_click(&ctx, &mut state, yes);
 
         assert_eq!(
@@ -11061,12 +11321,12 @@ mod tests {
         );
         assert!(state.pending_backend_switch.is_none(), "the question outlived its answer");
         assert_eq!(
-            after.fill_behind(BUILT_IN_CHOICE),
+            after.fill_behind(built_in_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the switch was taken and the picker still shows the old client"
         );
         assert_ne!(
-            after.fill_behind(OFFICIAL_CHOICE),
+            after.fill_behind(official_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the picker shows both clients as the one in force"
         );
@@ -11197,7 +11457,7 @@ mod tests {
         // **Both cells, pressed by name.** The ghosted picker still paints
         // the client in force, so a test that pressed only the other one
         // would miss a control that had gone live on the selected side.
-        for cell in [BUILT_IN_CHOICE, OFFICIAL_CHOICE] {
+        for cell in [built_in_choice(), official_choice()] {
             tall_frame(&ctx, &mut state, &click(first.rect_of(cell).center()));
             assert_eq!(
                 state.settings.use_official_bw_crypto,
@@ -11218,12 +11478,12 @@ mod tests {
         // `bitwarden.com` user they have no client at all, when what is true
         // is that they have this one and cannot change it.
         assert_ne!(
-            first.fill_behind(OFFICIAL_CHOICE),
-            first.fill_behind(BUILT_IN_CHOICE),
+            first.fill_behind(official_choice()),
+            first.fill_behind(built_in_choice()),
             "the ghosted picker does not say which client is serving this account"
         );
         assert!(
-            first.fill_behind(OFFICIAL_CHOICE).a() < 255,
+            first.fill_behind(official_choice()).a() < 255,
             "the ghosted picker's lit cell is painted at full strength, so it reads as live"
         );
     }
@@ -11239,7 +11499,7 @@ mod tests {
         let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
 
-        take_the_backend_switch(&ctx, &mut state, BUILT_IN_CHOICE);
+        take_the_backend_switch(&ctx, &mut state, built_in_choice());
         assert!(
             state.settings.use_official_bw_crypto == Some(false),
             "the row did not move to the built-in client on a self-hosted server"
@@ -11248,7 +11508,7 @@ mod tests {
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
         assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
 
-        take_the_backend_switch(&ctx, &mut state, OFFICIAL_CHOICE);
+        take_the_backend_switch(&ctx, &mut state, official_choice());
         assert_eq!(state.settings.use_official_bw_crypto, Some(true), "and back to the official CLI again");
     }
 
@@ -11305,20 +11565,20 @@ mod tests {
         );
         let first = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
-            first.fill_behind(OFFICIAL_CHOICE),
+            first.fill_behind(official_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the shipped default does not show the official CLI as chosen, so a fresh \
              install offers the built-in client while it is running the official CLI"
         );
         assert_ne!(
-            first.fill_behind(BUILT_IN_CHOICE),
+            first.fill_behind(built_in_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "both cells are painted as chosen, so the control says nothing"
         );
 
         // Pressing the other cell moves to the built-in direct-REST client --
         // the state whose whole cost is the copy under this row.
-        take_the_backend_switch(&ctx, &mut state, BUILT_IN_CHOICE);
+        take_the_backend_switch(&ctx, &mut state, built_in_choice());
         assert!(state.settings.use_official_bw_crypto == Some(false));
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
@@ -11328,19 +11588,19 @@ mod tests {
         );
         let second = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
-            second.fill_behind(BUILT_IN_CHOICE),
+            second.fill_behind(built_in_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "a configuration served by the built-in client does not show it as chosen"
         );
         assert_ne!(
-            second.fill_behind(OFFICIAL_CHOICE),
+            second.fill_behind(official_choice()),
             crate::kit::tokens::Palette::LIGHT.card,
             "the official CLI is still painted as chosen on a vault the built-in client serves"
         );
 
         // ...and back, so the two paints above are telling the states apart
         // rather than reporting one constant twice.
-        take_the_backend_switch(&ctx, &mut state, OFFICIAL_CHOICE);
+        take_the_backend_switch(&ctx, &mut state, official_choice());
         assert_eq!(state.settings.use_official_bw_crypto, Some(true));
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
@@ -11375,8 +11635,8 @@ mod tests {
         // cell is to the LEFT of the built-in client's.
         let painted = tall_frame(&ctx, &mut state, &[]);
         assert!(
-            painted.rect_of(OFFICIAL_CHOICE).center().x
-                < painted.rect_of(BUILT_IN_CHOICE).center().x,
+            painted.rect_of(official_choice()).center().x
+                < painted.rect_of(built_in_choice()).center().x,
             "the cells are drawn in the opposite order to the copy above them"
         );
     }
@@ -11739,7 +11999,7 @@ mod tests {
         live[crate::app::FillShortcut::Totp.index()] = crate::hotkey::HotkeyStatus::Unbound;
         let painted = paint_shortcuts(&settings, live);
         assert!(
-            painted.contains(SHORTCUT_NOT_SET),
+            painted.contains(shortcut_not_set()),
             "a cleared shortcut paints no state at all: {:?}",
             painted.strings()
         );
@@ -11773,7 +12033,7 @@ mod tests {
         // A row is titled with its suffix while its chord is not working,
         // and that is process-wide state this test does not own.
         let titled = |which: crate::app::FillShortcut| {
-            [which.label().to_string(), format!("{}{SHORTCUT_UNAVAILABLE_SUFFIX}", which.label())]
+            [which.label().to_string(), shortcut_unavailable_label(which.label())]
                 .into_iter()
                 .find(|label| page.contains(label))
                 .expect("the shortcut's row")
@@ -11824,7 +12084,7 @@ mod tests {
         );
         let listening = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
         assert!(
-            listening.contains(SHORTCUT_CAPTURING),
+            listening.contains(shortcut_capturing()),
             "a capturing row does not say it is listening: {:?}",
             listening.strings()
         );
@@ -11874,7 +12134,7 @@ mod tests {
         assert_eq!(state.capturing, None);
         assert_eq!(state.settings.shortcuts.username, None, "Backspace did not clear the row");
         let after = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
-        assert!(after.contains(SHORTCUT_NOT_SET), "got {:?}", after.strings());
+        assert!(after.contains(shortcut_not_set()), "got {:?}", after.strings());
     }
 
     /// **The Clear button clears the row**, which is the same thing for the
@@ -11886,7 +12146,7 @@ mod tests {
         let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
         // The first `Clear` in painted order is the picker's row, which is the
         // first row on the page.
-        let at = painted.rect_of(SHORTCUT_CLEAR).center();
+        let at = painted.rect_of(shortcut_clear()).center();
         let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
         assert_eq!(
             state.settings.shortcuts.picker, None,
@@ -12121,7 +12381,7 @@ mod tests {
             "got {:?}",
             painted.strings()
         );
-        assert!(painted.contains(ACCOUNT_STATUS));
+        assert!(painted.contains(account_status()));
     }
 
     // -- Updates: the update card ------------------------------------------
@@ -12265,7 +12525,7 @@ mod tests {
     fn the_about_page_names_the_signed_in_account_and_its_server() {
         let painted = paint_about_account(a_signed_in_account);
 
-        assert!(painted.contains(ACCOUNT_LABEL));
+        assert!(painted.contains(account_label()));
         assert!(
             painted.contains("someone@example.invalid"),
             "the page knows the address and still will not say it: {:?}",
@@ -12277,7 +12537,7 @@ mod tests {
             painted.strings()
         );
         assert!(
-            !painted.contains(ACCOUNT_STATUS),
+            !painted.contains(account_status()),
             "the page is still pointing at the vault window for an answer it has: {:?}",
             painted.strings()
         );
@@ -12297,10 +12557,10 @@ mod tests {
         let unpublished = paint_about_account(|| None);
         let signed_out = paint_about_account(|| Some(AccountStatus::SignedOut));
 
-        assert!(unpublished.contains(ACCOUNT_STATUS), "got {:?}", unpublished.strings());
-        assert!(signed_out.contains(ACCOUNT_SIGNED_OUT), "got {:?}", signed_out.strings());
+        assert!(unpublished.contains(account_status()), "got {:?}", unpublished.strings());
+        assert!(signed_out.contains(account_signed_out()), "got {:?}", signed_out.strings());
         assert!(
-            !unpublished.contains(ACCOUNT_SIGNED_OUT),
+            !unpublished.contains(account_signed_out()),
             "a page nobody has published to must not assert that nobody is signed in: {:?}",
             unpublished.strings()
         );
@@ -12308,7 +12568,7 @@ mod tests {
         // stopped saying the not-asked sentence, so the two assertions above
         // are two different paints rather than one string that never appears.
         assert!(
-            !signed_out.contains(ACCOUNT_STATUS),
+            !signed_out.contains(account_status()),
             "the signed-out row still points at the vault window for an answer it has: {:?}",
             signed_out.strings()
         );
@@ -12327,7 +12587,7 @@ mod tests {
     /// belonged to stopped being reachable and was deleted with it.
     #[test]
     fn the_account_row_says_what_happened_and_not_which_program_did_it() {
-        for note in [ACCOUNT_STATUS, ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE] {
+        for note in [account_status(), account_no_email_note(), account_signed_out_note()] {
             assert!(
                 !note.contains("Bitwarden CLI"),
                 "{note:?} names a program that is not running on the built-in client"
@@ -12342,9 +12602,9 @@ mod tests {
         // this page anything", "nobody is signed in" and "signed in, address
         // not reported" are three different facts, and a row that said the
         // same thing for any two of them would assert one of them falsely.
-        assert_ne!(ACCOUNT_STATUS, ACCOUNT_SIGNED_OUT_NOTE);
-        assert_ne!(ACCOUNT_STATUS, ACCOUNT_NO_EMAIL_NOTE);
-        assert_ne!(ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE);
+        assert_ne!(account_status(), account_signed_out_note());
+        assert_ne!(account_status(), account_no_email_note());
+        assert_ne!(account_no_email_note(), account_signed_out_note());
     }
 
     /// **The row is never blank, in any state.**
@@ -12400,8 +12660,8 @@ mod tests {
             server: None,
         }));
 
-        assert_eq!(value.as_deref(), Some(ACCOUNT_NO_EMAIL));
-        assert!(description.contains(ACCOUNT_NO_EMAIL_NOTE), "got {description:?}");
+        assert_eq!(value.as_deref(), Some(account_no_email()));
+        assert!(description.contains(account_no_email_note()), "got {description:?}");
     }
 
     /// **A `bw status` answer becomes one sentence, in one place.**
@@ -12884,11 +13144,11 @@ mod tests {
         );
 
         assert!(
-            painted.contains(UPDATE_UP_TO_DATE_DESCRIPTION),
+            painted.contains(update_up_to_date_description()),
             "the page must SAY there is no update, not merely fail to claim one: {:?}",
             painted.strings()
         );
-        assert!(painted.contains(UPDATE_CHECK_BUTTON), "got {:?}", painted.strings());
+        assert!(painted.contains(update_check_button()), "got {:?}", painted.strings());
         assert!(
             !painted.strings().iter().any(|t| t.contains(concat!("Update", " available"))),
             "the tray's words are back on the page: {:?}",
@@ -13013,7 +13273,7 @@ mod tests {
 
         assert!(painted.contains("Version 9.9.9 is available."), "got {:?}", painted.strings());
         assert!(painted.contains("Fixed the thing"), "got {:?}", painted.strings());
-        assert!(painted.contains(UPDATE_DOWNLOAD_BUTTON));
+        assert!(painted.contains(update_download_button()));
         // **And the app writes no heading of its own over them.** A release
         // body already opens with `## What's new in <version>`, composed by
         // `.github/workflows/release.yml`, so a heading here made the page
@@ -13039,7 +13299,7 @@ mod tests {
             Settings::default(),
         );
         let status = painted.rect_of("Version 9.9.9 is available.");
-        let button = painted.rect_of(UPDATE_DOWNLOAD_BUTTON);
+        let button = painted.rect_of(update_download_button());
         assert!(
             (status.center().y - button.center().y).abs() <= 1.0,
             "status centred at {} but the button's label at {}",
@@ -13221,7 +13481,7 @@ mod tests {
             Settings::default(),
         );
 
-        let button = painted.rect_of(UPDATE_DOWNLOAD_BUTTON);
+        let button = painted.rect_of(update_download_button());
         assert!(
             button.max.y <= BODY_SIZE.y,
             "the download button was pushed to y={} on a {}-point page that cannot scroll or \
@@ -13251,7 +13511,7 @@ mod tests {
         assert!(painted.contains("Downloading version 9.9.9."), "got {:?}", painted.strings());
         assert!(painted.contains("3.2 MB of 6.0 MB"), "got {:?}", painted.strings());
         assert!(
-            painted.contains(UPDATE_DOWNLOADING_BUTTON),
+            painted.contains(update_downloading_button()),
             "the button must stay put and say what is happening rather than vanishing and \
              reflowing the card under the cursor: {:?}",
             painted.strings()
@@ -13265,9 +13525,9 @@ mod tests {
             Settings::default(),
         );
 
-        assert!(painted.contains(UPDATE_RESTART_BUTTON), "got {:?}", painted.strings());
+        assert!(painted.contains(update_restart_button()), "got {:?}", painted.strings());
         assert!(
-            painted.strings().iter().any(|t| t.contains(UPDATE_READY_DESCRIPTION)),
+            painted.strings().iter().any(|t| t.contains(update_ready_description())),
             "the restart prompt must say what the restart will do: {:?}",
             painted.strings()
         );
@@ -13291,7 +13551,7 @@ mod tests {
             "got {:?}",
             painted.strings()
         );
-        assert!(painted.contains(UPDATE_RETRY_BUTTON));
+        assert!(painted.contains(update_retry_button()));
     }
 
     /// **The manual button is not governed by the automatic setting, and the
@@ -13309,13 +13569,13 @@ mod tests {
         let painted = paint_updates(crate::update_panel::UpdateStage::UpToDate, off);
 
         assert!(
-            painted.contains(UPDATE_CHECK_BUTTON),
+            painted.contains(update_check_button()),
             "the button must still be offered: an explicit click is the user initiating the \
              request. Painted: {:?}",
             painted.strings()
         );
         assert!(
-            painted.contains(UPDATE_AUTOMATIC_OFF_NOTE),
+            painted.contains(update_automatic_off_note()),
             "with automatic checks off, the page must say why the button still works: {:?}",
             painted.strings()
         );
@@ -13327,7 +13587,7 @@ mod tests {
     #[test]
     fn the_automatic_checks_note_is_absent_when_it_would_explain_nothing() {
         let on = paint_updates(crate::update_panel::UpdateStage::UpToDate, Settings::default());
-        assert!(!on.contains(UPDATE_AUTOMATIC_OFF_NOTE), "shown with the setting ON");
+        assert!(!on.contains(update_automatic_off_note()), "shown with the setting ON");
 
         let off = Settings { check_for_updates: false, ..Settings::default() };
         let downloading = paint_updates(
@@ -13339,7 +13599,7 @@ mod tests {
             off,
         );
         assert!(
-            !downloading.contains(UPDATE_AUTOMATIC_OFF_NOTE),
+            !downloading.contains(update_automatic_off_note()),
             "shown under a download already in flight"
         );
     }
@@ -13356,7 +13616,7 @@ mod tests {
             Settings::default(),
         );
 
-        assert!(painted.contains(UPDATE_NOTES_EMPTY), "got {:?}", painted.strings());
+        assert!(painted.contains(update_notes_empty()), "got {:?}", painted.strings());
     }
 
     // -- the numeric control, as pure functions ----------------------------
@@ -13785,7 +14045,7 @@ mod modal_tests {
         let mut state = a_state();
         let (warm_up, _, _) = frame(&ctx, &mut state, &[], true);
         assert!(
-            warm_up.find(MODAL_TITLE).is_none(),
+            warm_up.find(modal_title()).is_none(),
             "the modal painted on its first frame after all -- the warm-up every frame test \
              below runs is no longer needed, and each of them should say so instead: {:?}",
             warm_up.sources()
@@ -13793,16 +14053,16 @@ mod modal_tests {
 
         let (shot, _, _) = frame(&ctx, &mut state, &[], true);
         let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
-        assert_visible(&shot, MODAL_TITLE, card);
+        assert_visible(&shot, modal_title(), card);
         // And the form inside it, not just the shell.
         assert_visible(&shot, settings_v2::Page::General.label(), card);
-        // A row that General still owns. It used to be `AUTO_LOCK_LABEL`,
+        // A row that General still owns. It used to be `auto_lock_label()`,
         // which was the bottom of this page until General was split and
         // auto-lock moved to `Section::Lock`; the claim is unchanged -- the
         // FORM is drawn on the first frame and not only the shell -- so it
         // is made against a row that is still here.
         assert!(
-            shot.find(settings_v2::THEME_LABEL).is_some() || shot.find(settings_v2::KEEP_RUNNING_LABEL).is_some(),
+            shot.find(settings_v2::theme_label()).is_some() || shot.find(settings_v2::keep_running_label()).is_some(),
             "the first frame drew the shell but not the settings form; got {:?}",
             shot.sources()
         );
@@ -13822,7 +14082,7 @@ mod modal_tests {
         let _ = frame(&ctx, &mut state, &[], true);
         let (shot, _, _) = frame(&ctx, &mut state, &[], true);
         let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
-        let title = shot.rect_of(MODAL_TITLE);
+        let title = shot.rect_of(modal_title());
         let close = close_rect(card);
         assert!(
             !title.intersects(close),
@@ -14104,7 +14364,7 @@ mod modal_tests {
         // click can find it.
         let _ = frame(&ctx, &mut state, &[], true);
         let _ = frame(&ctx, &mut state, &[], true);
-        let at_rest = frame(&ctx, &mut state, &[], true).0.rect_of(MODAL_TITLE);
+        let at_rest = frame(&ctx, &mut state, &[], true).0.rect_of(modal_title());
 
         // Grabbed at the LEFT end of the header, well clear of the ✕ that
         // shares the band with it.
@@ -14144,7 +14404,7 @@ mod modal_tests {
         let (moved, action, _) = frame(&ctx, &mut state, &[], true);
         assert_eq!(action, PrefsAction::None, "the drag closed the modal");
         assert_eq!(
-            moved.rect_of(MODAL_TITLE),
+            moved.rect_of(modal_title()),
             at_rest.translate(by),
             "the card's painted header did not follow the drag"
         );

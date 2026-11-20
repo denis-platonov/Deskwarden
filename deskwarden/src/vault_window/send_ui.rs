@@ -10,7 +10,7 @@
 //! revokes one in two steps. **It makes none.** A Send is made from a record
 //! -- `record_ui::draw_export_form`, behind the envelope on a vault item --
 //! and the text composer this screen used to carry went with its `New Send`
-//! button; see [`SCOPE_SUBTEXT`], which says where Sends come from.
+//! button; see [`scope_subtext()`], which says where Sends come from.
 //!
 //! ## The one rule this file exists to keep
 //!
@@ -84,15 +84,20 @@ use crate::theme;
 use eframe::egui::{self, CornerRadius, Margin};
 
 mod shared_page;
+pub mod words;
 
 /// The Shared page's own title. The rail row now says the same word (the
 /// design has one name for the screen), so it no longer proves the PANE drew.
-pub use shared_page::TITLE as SHARED_TITLE;
+pub fn shared_title() -> &'static str {
+    shared_page::title()
+}
 
 /// The Shared page's sub-line: a sentence only the pane paints, which the
 /// window's reachability tests look for to know the PANE drew and not just the
 /// row that leads to it.
-pub use shared_page::SUB as SHARED_SUB;
+pub fn shared_sub() -> &'static str {
+    shared_page::sub()
+}
 
 /// The one line of subtext under the heading. **It is what makes the excluded
 /// scope honest rather than hidden**: this screen shows every Send, including
@@ -101,21 +106,26 @@ pub use shared_page::SUB as SHARED_SUB;
 ///
 /// **A Send is made from a record now**, and this line says where: the
 /// owner, "for simplicity let's just send from the record itself".
-pub const SCOPE_SUBTEXT: &str =
-    "A Send is made from a record: open it and choose Send. Sends made in other Bitwarden apps \
-     are listed here too.";
+pub fn scope_subtext() -> &'static str {
+    crate::i18n::t("sends.scope_subtext")
+}
 
-/// [`SCOPE_SUBTEXT`] once person shares are in the list: design 6c's `.lnote`,
+/// [`scope_subtext()`] once person shares are in the list: design 6c's `.lnote`,
 /// word for word.
-const SHARES_SUBTEXT: &str = "Sends and shares are both made from a record: open it and choose Send \
-     (a link) or Share (a person). Sends made in other Bitwarden apps are listed here too.";
+fn shares_subtext() -> &'static str {
+    crate::i18n::t("sends.shares_subtext")
+}
 
 /// The list's sort, drawn where design 5b draws it: the server lists Sends
 /// newest first, and so does this column.
-pub const NEWEST_LABEL: &str = "Newest";
+pub fn newest_label() -> &'static str {
+    crate::i18n::t("sends.newest_label")
+}
 
 /// The tag drawn on a Send this app could not have created.
-pub const FILE_TAG: &str = "FILE";
+pub fn file_tag() -> &'static str {
+    crate::i18n::t("sends.file_tag")
+}
 
 /// What the tag means, spelled out, when the list actually contains one.
 ///
@@ -129,9 +139,9 @@ pub const FILE_TAG: &str = "FILE";
 ///
 /// Painted only when a file Send is present, so a list of text Sends is not
 /// told about a restriction it has not met.
-pub const FILE_SEND_EXPLANATION: &str = "Deskwarden can send text, not files. This Send holds a \
-                                         file, so you can copy its link or delete it here, but it \
-                                         was made somewhere else.";
+pub fn file_send_explanation() -> &'static str {
+    crate::i18n::t("sends.file_send_explanation")
+}
 
 /// What a Send **read from a link** needs, when reading one fails for want of
 /// the CLI.
@@ -141,30 +151,39 @@ pub const FILE_SEND_EXPLANATION: &str = "Deskwarden can send text, not files. Th
 /// "that link could not be read" goes and checks the link, which is fine.
 /// The second sentence is there because without it the first reads as "Sends
 /// are broken", which is false in three operations out of four.
-pub const RECEIVE_NEEDS_THE_CLI: &str = "Reading a Send from a link needs Bitwarden's command-line \
-                                         tool. Publishing, listing and revoking your own Sends do \
-                                         not.";
+pub fn receive_needs_the_cli() -> &'static str {
+    crate::i18n::t("sends.receive_needs_the_cli")
+}
 
 /// What the pane says when the account genuinely has no Sends. A **claim**,
 /// and only reachable from a fetch that succeeded -- see [`pane_state`].
-pub const EMPTY_HEADLINE: &str = "You have no Sends.";
-pub const EMPTY_DETAIL: &str = "Nothing is published from this account.";
+pub fn empty_headline() -> &'static str {
+    crate::i18n::t("sends.empty_headline")
+}
+pub fn empty_detail() -> &'static str {
+    crate::i18n::t("sends.empty_detail")
+}
 
 /// What the pane says when the fetch failed. Deliberately shares not one word
-/// with [`EMPTY_HEADLINE`]: these two blocks are the pair that must never be
+/// with [`empty_headline()`]: these two blocks are the pair that must never be
 /// mistaken for each other, and the tests below assert the separation over
 /// the glyphs actually painted rather than over the enum.
-pub const FAILED_HEADLINE: &str = "Your Sends could not be listed.";
+pub fn failed_headline() -> &'static str {
+    crate::i18n::t("sends.failed_headline")
+}
 
 /// The extra sentence an **ambiguous** failure gets, on top of the error's own
 /// message. `SendError::is_ambiguous` exists because "could not check" must
 /// never render as success, and the strongest form of that untruth on this
 /// screen is a blank pane that reads as "you have none".
-pub const AMBIGUOUS_DETAIL: &str =
-    "Deskwarden could not check, so this is not a list of nothing \u{2014} you may still have Sends.";
+pub fn ambiguous_detail() -> &'static str {
+    crate::i18n::t("sends.ambiguous_detail")
+}
 
 /// What the pane says while the CLI has not answered yet.
-pub const LOADING_LABEL: &str = "Asking Bitwarden for your Sends\u{2026}";
+pub fn loading_label() -> &'static str {
+    crate::i18n::t("sends.loading_label")
+}
 
 /// One drawn row: everything the pane paints for one Send, and nothing else.
 ///
@@ -288,7 +307,7 @@ pub enum SendPaneState {
         /// `SendError::user_message`'s own wording. Not re-written here: a
         /// second copy is a second thing to keep true.
         message: String,
-        /// `SendError::is_ambiguous`. Adds [`AMBIGUOUS_DETAIL`].
+        /// `SendError::is_ambiguous`. Adds [`ambiguous_detail()`].
         ambiguous: bool,
     },
 }
@@ -562,7 +581,7 @@ pub fn with_sent_facts(
                         let recipient = entry.recipient.trim().to_string();
                         if !recipient.is_empty() {
                             let short = recipient.split('@').next().unwrap_or(&recipient);
-                            row.expiry = format!("to {short} \u{00b7} {}", row.expiry);
+                            row.expiry = crate::i18n::tf("sends.to_recipient_expiry", &[("short", short), ("expiry", &row.expiry.to_string())]);
                         }
                         row.sent = Some(SentFacts {
                             recipient,
@@ -598,7 +617,7 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock, zone: &dyn LocalOffset)
         sent: None,
         id: send.id.clone(),
         name: if send.name.trim().is_empty() {
-            "(no name)".to_string()
+            crate::i18n::t("sends.no_name").to_string()
         } else {
             send.name.clone()
         },
@@ -610,8 +629,8 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock, zone: &dyn LocalOffset)
         max_access_count: send.max_access_count,
         has_password: send.has_password,
         activity: activity_sentence(send, now),
-        expires: date_words(&send.expiration_date, now, zone, NO_EXPIRY_OF_ITS_OWN),
-        deletes: date_words(&send.deletion_date, now, zone, DELETION_DATE_UNKNOWN),
+        expires: date_words(&send.expiration_date, now, zone, no_expiry_of_its_own()),
+        deletes: date_words(&send.deletion_date, now, zone, deletion_date_unknown()),
         extendable: can_extend(send),
     }
 }
@@ -643,9 +662,8 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock, zone: &dyn LocalOffset)
 /// pill would be the labelled empty box in prose.
 pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
     let opened = match send.access_count {
-        0 => "Nobody has opened this link".to_string(),
-        1 => "Opened once".to_string(),
-        n => format!("Opened {n} times"),
+        0 => crate::i18n::t("sends.nobody_opened").to_string(),
+        n => crate::i18n::tn("sends.opened_times", n as u64, &[]),
     };
     match crate::send::send_state(send, now) {
         // Somebody switched the link off -- in another Bitwarden app, since
@@ -654,13 +672,13 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
         // and stops. Not the word "revoke", which on this screen means the
         // Send is gone rather than switched off.
         crate::send::SendState::Revoked => {
-            format!("{opened}. The link was switched off, so it no longer answers.")
+            crate::i18n::tf("sends.activity_revoked", &[("opened", &opened)])
         }
         crate::send::SendState::Used => {
-            format!("{opened}. Every permitted view is spent, so the link is dead.")
+            crate::i18n::tf("sends.activity_used", &[("opened", &opened)])
         }
         crate::send::SendState::Expired => {
-            format!("{opened}. The link ran out of time, so it no longer answers.")
+            crate::i18n::tf("sends.activity_expired", &[("opened", &opened)])
         }
         // Both live states say the same kind of thing -- what has been
         // opened and what is left -- because the first half of the sentence
@@ -676,10 +694,9 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
             // live would otherwise print four billion views left.
             (Some(cap), used) => {
                 let left = cap.saturating_sub(used);
-                let views = if left == 1 { "view" } else { "views" };
-                format!("{opened}. {left} {views} left before the link stops working.")
+                crate::i18n::tn("sends.activity_views_left", left as u64, &[("opened", &opened)])
             }
-            (None, _) => format!("{opened}. The link works, as often as they like."),
+            (None, _) => crate::i18n::tf("sends.activity_unlimited", &[("opened", &opened)]),
         },
     }
 }
@@ -691,7 +708,9 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
 /// **Not "never".** The record still goes on its deletion date and the link
 /// goes with it, so "never" would be the one wrong word available here; the
 /// pane prints this beside a `Deleted` row that gives the actual date.
-pub const NO_EXPIRY_OF_ITS_OWN: &str = "None of its own \u{2014} it lasts until the Send is deleted";
+pub fn no_expiry_of_its_own() -> &'static str {
+    crate::i18n::t("sends.no_expiry_of_its_own")
+}
 
 /// What the detail pane says for a deletion date it could not read.
 ///
@@ -699,7 +718,9 @@ pub const NO_EXPIRY_OF_ITS_OWN: &str = "None of its own \u{2014} it lasts until 
 /// since this screen shipped, for the reason it gives: this app failing to
 /// understand a date is not the same fact as the link being dead. Same rule,
 /// same wording style.
-pub const DELETION_DATE_UNKNOWN: &str = "Unknown";
+pub fn deletion_date_unknown() -> &'static str {
+    crate::i18n::t("sends.deletion_date_unknown")
+}
 
 /// One stored date as the detail pane prints it: the user's own day and time,
 /// then how far off it is, or `absent` when the field is empty or
@@ -752,16 +773,16 @@ fn relative_words(remaining: i64) -> String {
     let hours = magnitude / crate::local_time::MILLIS_PER_HOUR.unsigned_abs();
     let days = magnitude / crate::local_time::MILLIS_PER_DAY.unsigned_abs();
     let amount = if days >= 1 {
-        format!("{days} day{}", if days == 1 { "" } else { "s" })
+        crate::i18n::tn("sends.rel_days", days, &[])
     } else if hours >= 1 {
-        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+        crate::i18n::tn("sends.rel_hours", hours, &[])
     } else {
-        "less than an hour".to_string()
+        crate::i18n::t("sends.rel_under_an_hour").to_string()
     };
     if past {
-        format!("{amount} ago")
+        crate::i18n::tf("sends.rel_ago", &[("amount", &amount)])
     } else {
-        format!("in {amount}")
+        crate::i18n::tf("sends.rel_in", &[("amount", &amount)])
     }
 }
 
@@ -805,18 +826,20 @@ fn relative_words(remaining: i64) -> String {
 pub fn row_subtitle(send: &SendSummary, now: &dyn SendClock) -> String {
     let mut parts: Vec<String> = Vec::new();
     if send.has_password {
-        parts.push(PASSWORD_SEGMENT.to_string());
+        parts.push(password_segment().to_string());
     }
     match (send.max_access_count, send.access_count) {
         // Capped: the design's own "3 of 10 views", which says the remaining
         // budget and the spent one in one phrase.
-        (Some(cap), used) => parts.push(format!("{used} of {cap} views")),
+        (Some(cap), used) => parts.push(crate::i18n::tf(
+            "sends.subtitle_views_of_cap",
+            &[("used", &used.to_string()), ("cap", &cap.to_string())],
+        )),
         // Uncapped and untouched: nothing. "0 views" on a link nobody has
         // opened yet reads as a failure rather than as a beginning, and the
         // state pill beside it already says `Waiting`.
         (None, 0) => {}
-        (None, 1) => parts.push("opened once".to_string()),
-        (None, used) => parts.push(format!("opened {used} times")),
+        (None, used) => parts.push(crate::i18n::tn("sends.subtitle_opened_times", used as u64, &[])),
     }
     if crate::send::send_state(send, now).is_live() {
         parts.push(expiry_words(&send.deletion_date, now));
@@ -826,7 +849,9 @@ pub fn row_subtitle(send: &SendSummary, now: &dyn SendClock) -> String {
 
 /// What the subtitle says about a Send whose link is not the whole
 /// credential.
-pub const PASSWORD_SEGMENT: &str = "Password required";
+pub fn password_segment() -> &'static str {
+    crate::i18n::t("sends.password_segment")
+}
 
 /// Milliseconds in a day. Same constant `send.rs` uses, spelled here because
 /// that one is private to it.
@@ -845,17 +870,17 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// comes to be ignored.
 pub fn expiry_words(deletion_date: &str, now: &dyn SendClock) -> String {
     let Some(at) = parse_iso_utc_millis(deletion_date) else {
-        return "Expiry unknown".to_string();
+        return crate::i18n::t("sends.expiry_unknown").to_string();
     };
     let remaining = at - now.now_unix_millis();
     if remaining <= 0 {
-        return "Expired".to_string();
+        return expired_label().to_string();
     }
     let days = remaining / MILLIS_PER_DAY;
     match days {
-        0 => "Expires today".to_string(),
-        1 => "Expires tomorrow".to_string(),
-        d => format!("Expires in {d} days"),
+        0 => crate::i18n::t("sends.expires_today").to_string(),
+        1 => crate::i18n::t("sends.expires_tomorrow").to_string(),
+        d => crate::i18n::tn("sends.expires_in_days", d as u64, &[]),
     }
 }
 
@@ -1141,9 +1166,9 @@ impl SendDeleteView<'_> {
     /// of its controls and of its row's subtitle.
     fn busy_label(&self) -> &'static str {
         if self.extending {
-            EXTENDING_LABEL
+            extending_label()
         } else {
-            DELETING_LABEL
+            deleting_label()
         }
     }
 }
@@ -1154,44 +1179,66 @@ impl SendDeleteView<'_> {
 /// Named now that [`action_labels`] has to measure the row before the row is
 /// drawn -- a literal in two places is one rewording away from a header
 /// measured for a label it does not carry.
-pub const COPY_LINK_LABEL: &str = "Copy link";
+pub fn copy_link_label() -> &'static str {
+    crate::i18n::t("sends.copy_link_label")
+}
 /// The row's first, non-destructive button.
 /// The confirmation's destructive button. **Deliberately not "Delete"**: the
 /// two steps must not be the same word, or the second click is muscle memory
 /// rather than a decision.
-pub const CONFIRM_LABEL: &str = "Delete permanently";
+pub fn confirm_label() -> &'static str {
+    crate::i18n::t("sends.confirm_label")
+}
 /// The confirmation's way out, drawn in the Delete button's own rectangle.
-pub const CANCEL_LABEL: &str = "Cancel";
+pub fn cancel_label() -> &'static str {
+    crate::i18n::t("sends.cancel_label")
+}
 /// The question the row asks while it is confirming, in place of the expiry.
-pub const CONFIRM_PROMPT: &str = "Revoke this link for good? It cannot be undone.";
+pub fn confirm_prompt() -> &'static str {
+    crate::i18n::t("sends.confirm_prompt")
+}
 /// What a row says while its `bw send delete` is running. It has no buttons
 /// at all in that state, so a second click cannot start a second child.
-pub const DELETING_LABEL: &str = "Revoking\u{2026}";
+pub fn deleting_label() -> &'static str {
+    crate::i18n::t("sends.deleting_label")
+}
 /// What a Send says while its Extend runs, on the same terms as
-/// [`DELETING_LABEL`]: no buttons at all in that state.
-pub const EXTENDING_LABEL: &str = "Extending\u{2026}";
+/// [`deleting_label()`]: no buttons at all in that state.
+pub fn extending_label() -> &'static str {
+    crate::i18n::t("sends.extending_label")
+}
 /// Design §5c's four state words, exactly as the design spells them.
 ///
 /// Public because the paint tests press on them and because the words are the
 /// whole of what a pill says -- a state pill whose label drifted from the
 /// design would be a pill nobody could look up.
-pub const WAITING_LABEL: &str = "Waiting";
+pub fn waiting_label() -> &'static str {
+    crate::i18n::t("sends.waiting_label")
+}
 /// **Not one of §5c's four.** A live link somebody has opened; see
 /// `crate::send::SendState`, where why the owner needed a fifth word is
 /// argued.
-pub const OPENED_LABEL: &str = "Opened";
-pub const USED_LABEL: &str = "Used";
-pub const EXPIRED_LABEL: &str = "Expired";
-pub const REVOKED_LABEL: &str = "Revoked";
+pub fn opened_label() -> &'static str {
+    crate::i18n::t("sends.opened_label")
+}
+pub fn used_label() -> &'static str {
+    crate::i18n::t("sends.used_label")
+}
+pub fn expired_label() -> &'static str {
+    crate::i18n::t("sends.expired_label")
+}
+pub fn revoked_label() -> &'static str {
+    crate::i18n::t("sends.revoked_label")
+}
 
 /// One [`crate::send::SendState`] as the word the design prints for it.
 pub fn state_label(state: crate::send::SendState) -> &'static str {
     match state {
-        crate::send::SendState::Waiting => WAITING_LABEL,
-        crate::send::SendState::Opened => OPENED_LABEL,
-        crate::send::SendState::Used => USED_LABEL,
-        crate::send::SendState::Expired => EXPIRED_LABEL,
-        crate::send::SendState::Revoked => REVOKED_LABEL,
+        crate::send::SendState::Waiting => waiting_label(),
+        crate::send::SendState::Opened => opened_label(),
+        crate::send::SendState::Used => used_label(),
+        crate::send::SendState::Expired => expired_label(),
+        crate::send::SendState::Revoked => revoked_label(),
     }
 }
 
@@ -1225,7 +1272,9 @@ pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
 }
 
 /// What copying a Send's link says (spec section 4).
-pub const LINK_COPIED_TOAST: &str = "Link copied";
+pub fn link_copied_toast() -> &'static str {
+    crate::i18n::t("sends.link_copied_toast")
+}
 
 /// **A record's fields as a row of pills** -- design 5b's `WHAT WAS SHARED`
 /// and the whole-record line of 5a's card both draw one. Blue for an ordinary
@@ -1278,7 +1327,9 @@ pub const SECRET_FIELD_TONE: theme::PillTone = theme::PillTone {
 /// the witness cannot quietly degenerate back into the rail row by somebody
 /// making them match again. See
 /// `vault_window::send_delete_wiring::drive_the_sends_screen_in`.
-pub const SENDS_HEADING: &str = "SHARED";
+pub fn sends_heading() -> &'static str {
+    crate::i18n::t("sends.sends_heading")
+}
 
 // ---------------------------------------------------------------------------
 // Design 5d -- which record a live Send belongs to
@@ -1374,7 +1425,9 @@ pub fn shared_names(
 
 /// The eyebrow over the `Shared with me` list. 5b's own row label, in the
 /// case the design's list strips are drawn in.
-pub const RECEIVED_HEADING: &str = "SHARED WITH ME";
+pub fn received_heading() -> &'static str {
+    crate::i18n::t("sends.received_heading")
+}
 
 /// What the `Shared with me` screen says when nothing has ever been imported.
 ///
@@ -1382,9 +1435,12 @@ pub const RECEIVED_HEADING: &str = "SHARED WITH ME";
 /// no fetch behind this row and therefore no "could not check" -- see
 /// [`crate::receive_history`], whose `load` folds every failure into an empty
 /// history for reasons argued there.
-pub const RECEIVED_EMPTY_HEADLINE: &str = "Nothing has been shared with you yet.";
-pub const RECEIVED_EMPTY_DETAIL: &str =
-    "A Send somebody else gives you is read from its link, and what you import is recorded here.";
+pub fn received_empty_headline() -> &'static str {
+    crate::i18n::t("sends.received_empty_headline")
+}
+pub fn received_empty_detail() -> &'static str {
+    crate::i18n::t("sends.received_empty_detail")
+}
 
 /// The detail pane's standing line while no row is picked.
 ///
@@ -1392,8 +1448,12 @@ pub const RECEIVED_EMPTY_DETAIL: &str =
 /// item." for the same reason: an empty right-hand column reads as a load
 /// that failed, and this screen's whole history is about not letting "we do
 /// not know" and "there is nothing" look alike.
-pub const NOTHING_PICKED: &str = "Pick a Send to see its link, its views and its dates.";
-pub const NOTHING_PICKED_RECEIVED: &str = "Pick a row to see when it arrived and where it went.";
+pub fn nothing_picked() -> &'static str {
+    crate::i18n::t("sends.nothing_picked")
+}
+pub fn nothing_picked_received() -> &'static str {
+    crate::i18n::t("sends.nothing_picked_received")
+}
 /// Which of the two SHARING screens this pane is drawing, and -- for the
 /// account's own Sends -- which of design 5b's sub-filters is in force.
 ///
@@ -1419,25 +1479,25 @@ impl SendView<'_> {
     pub fn heading(&self) -> &'static str {
         match self {
             SendView::Mine(scope) => scope.eyebrow(),
-            SendView::Received(_) => RECEIVED_HEADING,
+            SendView::Received(_) => received_heading(),
         }
     }
 
 }
 
-/// The `Shared with me` screen's own scope line, in [`SCOPE_SUBTEXT`]'s
+/// The `Shared with me` screen's own scope line, in [`scope_subtext()`]'s
 /// spirit: it says where the feature lives rather than leaving its edge to be
 /// discovered.
-pub const RECEIVED_SCOPE_SUBTEXT: &str =
-    "Read a Send from its link with Import a record. What you import is listed here; the record \
-     itself lives in your vault.";
+pub fn received_scope_subtext() -> &'static str {
+    crate::i18n::t("sends.received_scope_subtext")
+}
 
-/// [`RECEIVED_SCOPE_SUBTEXT`] once records from people are in the list:
-/// design 6d's `.lnote`, word for word -- [`SHARES_SUBTEXT`]'s rule on the
+/// [`received_scope_subtext()`] once records from people are in the list:
+/// design 6d's `.lnote`, word for word -- [`shares_subtext()`]'s rule on the
 /// other screen.
-pub const RECEIVED_PEOPLE_SUBTEXT: &str =
-    "Records people share with you arrive here and in your vault, view-only, and change when they \
-     edit them. A Send you read with Import a record is your own copy; it is listed here too.";
+pub fn received_people_subtext() -> &'static str {
+    crate::i18n::t("sends.received_people_subtext")
+}
 
 /// One line of the `Shared with me` list: an import that happened, as this
 /// app is allowed to remember it.
@@ -1466,17 +1526,20 @@ pub struct ReceivedRow {
 /// exceptional**, and saying nothing would leave a row that quietly points at
 /// nothing. It names both innocent explanations, because both are common and
 /// neither is a fault.
-pub const RECEIVED_ITEM_GONE: &str =
-    "The item this created is no longer in your vault \u{2014} it was deleted, or it is in the trash.";
+pub fn received_item_gone() -> &'static str {
+    crate::i18n::t("sends.received_item_gone")
+}
 /// Its opposite, said just as plainly so the two rows read as one question
 /// answered two ways rather than as a warning and a silence.
-pub const RECEIVED_ITEM_PRESENT: &str = "The item this created is still in your vault.";
+pub fn received_item_present() -> &'static str {
+    crate::i18n::t("sends.received_item_present")
+}
 
 /// Every recorded import, newest first, as rows.
 ///
 /// `items` is the LIVE vault list, which is what makes `still_in_vault` mean
 /// what it says: an item in the trash is not in that list, and the wording
-/// [`RECEIVED_ITEM_GONE`] uses names that case rather than claiming the item
+/// [`received_item_gone()`] uses names that case rather than claiming the item
 /// was destroyed.
 ///
 /// A record written by a version that did not store an item id -- or by a
@@ -1501,7 +1564,7 @@ pub fn received_rows(
                 record.item_id.clone()
             },
             name: if record.name.trim().is_empty() {
-                "(no name)".to_string()
+                crate::i18n::t("sends.no_name").to_string()
             } else {
                 record.name.clone()
             },
@@ -1509,7 +1572,7 @@ pub fn received_rows(
                 &iso_from_millis(record.received_at_unix_millis),
                 now,
                 zone,
-                RECEIVED_WHEN_UNKNOWN,
+                received_when_unknown(),
             ),
             still_in_vault: !record.item_id.is_empty()
                 && items.iter().any(|item| item.id == record.item_id),
@@ -1518,7 +1581,9 @@ pub fn received_rows(
 }
 
 /// What a row says when its timestamp could not be read.
-pub const RECEIVED_WHEN_UNKNOWN: &str = "Unknown";
+pub fn received_when_unknown() -> &'static str {
+    crate::i18n::t("sends.received_when_unknown")
+}
 
 /// A stored millisecond instant back into the one date shape this crate
 /// parses.
@@ -1562,19 +1627,21 @@ pub fn rows_in_scope(
 /// What the list column says when the ACCOUNT has Sends but none of them is
 /// on the sub-row in force.
 ///
-/// **Not [`EMPTY_HEADLINE`]**, and the separation is this file's oldest rule
+/// **Not [`empty_headline()`]**, and the separation is this file's oldest rule
 /// applied to a third case: "you have no Sends" is a claim about the account,
 /// "we could not ask" is a claim about this app, and this is a claim about
 /// the filter the user themselves just chose. Printing the account sentence
 /// here would tell somebody who clicked `Used` that they have published
 /// nothing, which is false and alarming in the direction that matters.
 pub fn scope_empty_headline(scope: crate::vault_window::sidebar::SendScope) -> String {
-    format!("No Sends are {}.", scope.label().to_lowercase())
+    crate::i18n::tf("sends.scope_empty_headline", &[("scope", &(scope.label().to_lowercase()).to_string())])
 }
 
 /// The one way back out of an empty sub-row, said rather than left to be
 /// worked out.
-pub const SCOPE_EMPTY_DETAIL: &str = "Your other Sends are still on the Sends row above.";
+pub fn scope_empty_detail() -> &'static str {
+    crate::i18n::t("sends.scope_empty_detail")
+}
 
 /// Draws the whole Sends screen -- spec A 4's **Shared page**, a grid of cards,
 /// and spec B 7's **Send detail modal** over it -- and reports what was
@@ -1682,7 +1749,9 @@ pub const RECORDS_NOUN: &str = "records";
 /// leaving the screen. **Not "Refresh"**, which is what the strip's own button
 /// said before it went: this one sits under a sentence explaining what went
 /// wrong, and "Refresh" under an error reads as a suggestion that nothing did.
-pub const TRY_AGAIN_LABEL: &str = "Try again";
+pub fn try_again_label() -> &'static str {
+    crate::i18n::t("sends.try_again_label")
+}
 
 /// **The records this screen's tiles are drawn from**: the vault's items and
 /// the icon cache's textures, both the window's, both borrowed.
@@ -1763,15 +1832,21 @@ fn paint_send_tile(
 }
 
 /// Spec B 7's caution band: what it says, and its button.
-pub const SEEN_TITLE: &str = "Someone has seen this password";
-pub const SEEN_BODY: &str = "Change it once they're done.";
-pub const CHANGE_PASSWORD: &str = "Change password";
+pub fn seen_title() -> &'static str {
+    crate::i18n::t("sends.seen_title")
+}
+pub fn seen_body() -> &'static str {
+    crate::i18n::t("sends.seen_body")
+}
+pub fn change_password() -> &'static str {
+    crate::i18n::t("sends.change_password")
+}
 
 /// Whether `row` was opened and carried the item's password.
 pub fn password_was_seen(row: &SendRow) -> bool {
     row.state == crate::send::SendState::Opened
         && row.sent.as_ref().is_some_and(|sent| {
-            !sent.item_id.is_empty() && sent.fields.iter().any(|f| f == super::record_ui::PASSWORD_LABEL)
+            !sent.item_id.is_empty() && sent.fields.iter().any(|f| f == super::record_ui::STORED_PASSWORD)
         })
 }
 
@@ -1807,37 +1882,58 @@ fn elided(
 }
 
 /// Design 5b's `Extend`: the Send's dates, `send::EXTEND_BY_DAYS` later.
-pub const EXTEND_LABEL: &str = "Extend";
+pub fn extend_label() -> &'static str {
+    crate::i18n::t("sends.extend_label")
+}
 
 /// What hovering Extend says, with the period in it -- read off the same
 /// constant the arithmetic uses, so the promise and the date cannot differ.
 pub fn extend_hint() -> String {
-    format!(
-        "Keep this link working {} days longer",
-        crate::send::EXTEND_BY_DAYS
-    )
+    crate::i18n::tn("sends.extend_hint", crate::send::EXTEND_BY_DAYS as u64, &[])
 }
 
 /// Design 5b's first header button: the vault item the Send was made from.
-pub const OPEN_RECORD_LABEL: &str = "Open record";
+pub fn open_record_label() -> &'static str {
+    crate::i18n::t("sends.open_record_label")
+}
 /// Design 5b's red header button. **It deletes the Send**, after the
 /// confirmation -- the owner's choice between switching a link off and
 /// taking it down: "Revoke = delete".
-pub const REVOKE_LABEL: &str = "Revoke";
+pub fn revoke_label() -> &'static str {
+    crate::i18n::t("sends.revoke_label")
+}
 /// The header's kind line for a Send this PC made from a record.
-pub const RECORD_SEND_KIND: &str = "Send from a record";
+pub fn record_send_kind() -> &'static str {
+    crate::i18n::t("sends.record_send_kind")
+}
 /// The link card's recipient row.
-pub const RECIPIENT_ROW: &str = "Recipient";
+pub fn recipient_row() -> &'static str {
+    crate::i18n::t("sends.recipient_row")
+}
 /// Design 5b's second card.
-pub const SHARED_CARD_TITLE: &str = "WHAT WAS SHARED";
+pub fn shared_card_title() -> &'static str {
+    crate::i18n::t("sends.shared_card_title")
+}
 /// Design 5b's third card.
-pub const ACTIVITY_CARD_TITLE: &str = "ACTIVITY";
+pub fn activity_card_title() -> &'static str {
+    crate::i18n::t("sends.activity_card_title")
+}
 /// The activity card's views row.
-pub const OPENED_ROW: &str = "Opened";
+pub fn opened_row() -> &'static str {
+    crate::i18n::t("sends.opened_row")
+}
 /// Drawn at the right of a live address: press to copy the link.
-pub const COPY_MARKER: &str = "Copy";
+pub fn copy_marker() -> &'static str {
+    crate::i18n::t("sends.copy_marker")
+}
 /// Every field a record Send can carry, in the order the card names them.
-const ALL_SHARED_FIELDS: [&str; 5] = ["Username", "Password", "Websites", "Notes", "One-time code"];
+const ALL_SHARED_FIELDS: [&str; 5] = [
+    super::record_ui::STORED_USERNAME,
+    super::record_ui::STORED_PASSWORD,
+    super::record_ui::STORED_WEBSITES,
+    super::record_ui::STORED_NOTES,
+    super::record_ui::STORED_TOTP,
+];
 
 /// The sentence after the pills: what did NOT go.
 pub fn not_included(fields: &[String]) -> Option<String> {
@@ -1848,8 +1944,17 @@ pub fn not_included(fields: &[String]) -> Option<String> {
         .collect();
     match left.as_slice() {
         [] => None,
-        [one] => Some(format!("{one} was not included.")),
-        [init @ .., last] => Some(format!("{} and {} were not included.", init.join(", "), last.to_lowercase())),
+        [one] => Some(crate::i18n::tf("sends.not_included_one", &[("field", &super::record_ui::field_label(one))])),
+        [init @ .., last] => {
+            let shown: Vec<String> = init.iter().map(|f| super::record_ui::field_label(f).into_owned()).collect();
+            Some(crate::i18n::tf(
+                "sends.not_included_many",
+                &[
+                    ("fields", &shown.join(", ")),
+                    ("last", &super::record_ui::field_label(last).to_lowercase()),
+                ],
+            ))
+        }
     }
 }
 
@@ -1862,42 +1967,81 @@ pub fn not_included(fields: &[String]) -> Option<String> {
 /// cases where it is something worse. So the headline says what is certainly
 /// true -- somebody opened the link, and whatever was behind it is out -- and
 /// the advice is conditional in the one place where it has to be.
-pub const CAUTION_HEADLINE: &str = "Somebody has opened this link.";
-pub const CAUTION_ADVICE: &str =
-    "Treat whatever it held as known to them. If it was a password, change it.";
+pub fn caution_headline() -> &'static str {
+    crate::i18n::t("sends.caution_headline")
+}
+pub fn caution_advice() -> &'static str {
+    crate::i18n::t("sends.caution_advice")
+}
 
 /// The detail header's subtitle: what kind of Send this is. 5b's slot for
 /// "Send - created ...", carrying the one half of that this client holds.
-pub const TEXT_SEND_KIND: &str = "Text Send";
-pub const FILE_SEND_KIND: &str = "File Send";
+pub fn text_send_kind() -> &'static str {
+    crate::i18n::t("sends.text_send_kind")
+}
+pub fn file_send_kind() -> &'static str {
+    crate::i18n::t("sends.file_send_kind")
+}
 /// Its counterpart on the `Shared with me` detail.
-pub const RECEIVED_KIND: &str = "Shared with you";
+pub fn received_kind() -> &'static str {
+    crate::i18n::t("sends.received_kind")
+}
 
 /// Design 5b's `Link` card and its rows.
-pub const LINK_CARD_TITLE: &str = "LINK";
-pub const ADDRESS_ROW: &str = "Address";
-pub const OPENS_WITH_ROW: &str = "Opens with";
-pub const VIEWS_ROW: &str = "Views";
-pub const EXPIRES_ROW: &str = "Expires";
-pub const DELETED_ROW: &str = "Deleted";
+pub fn link_card_title() -> &'static str {
+    crate::i18n::t("sends.link_card_title")
+}
+pub fn address_row() -> &'static str {
+    crate::i18n::t("sends.address_row")
+}
+pub fn opens_with_row() -> &'static str {
+    crate::i18n::t("sends.opens_with_row")
+}
+pub fn views_row() -> &'static str {
+    crate::i18n::t("sends.views_row")
+}
+pub fn expires_row() -> &'static str {
+    crate::i18n::t("sends.expires_row")
+}
+pub fn deleted_row() -> &'static str {
+    crate::i18n::t("sends.deleted_row")
+}
 /// 5b's own word beside a struck-through address.
-pub const DEAD_MARKER: &str = "dead";
+pub fn dead_marker() -> &'static str {
+    crate::i18n::t("sends.dead_marker")
+}
 /// The `Opens with` row for a Send that has no share password -- 5b's "link
 /// only", said as what the recipient needs rather than as what is missing.
-pub const LINK_ONLY: &str = "The link alone";
+pub fn link_only() -> &'static str {
+    crate::i18n::t("sends.link_only")
+}
 /// The `Views` row for an uncapped Send.
-pub const NO_VIEW_LIMIT: &str = "No limit";
+pub fn no_view_limit() -> &'static str {
+    crate::i18n::t("sends.no_view_limit")
+}
 /// The `Address` row for a Send the server described without one. See
 /// `draw_send_card` on why the control beside it is drawn and dead rather
 /// than absent.
-pub const ADDRESS_MISSING: &str = "This Send reported no link.";
+pub fn address_missing() -> &'static str {
+    crate::i18n::t("sends.address_missing")
+}
 
 /// The `Shared with me` detail's card and its rows.
-pub const RECEIVED_CARD_TITLE: &str = "RECEIVED";
-pub const ARRIVED_ROW: &str = "Arrived";
-pub const IN_VAULT_ROW: &str = "In your vault";
-pub const IN_VAULT_YES: &str = "Yes";
-pub const IN_VAULT_NO: &str = "No longer";
+pub fn received_card_title() -> &'static str {
+    crate::i18n::t("sends.received_card_title")
+}
+pub fn arrived_row() -> &'static str {
+    crate::i18n::t("sends.arrived_row")
+}
+pub fn in_vault_row() -> &'static str {
+    crate::i18n::t("sends.in_vault_row")
+}
+pub fn in_vault_yes() -> &'static str {
+    crate::i18n::t("sends.in_vault_yes")
+}
+pub fn in_vault_no() -> &'static str {
+    crate::i18n::t("sends.in_vault_no")
+}
 
 /// The standing note at the record composer's footer's right-hand end:
 /// **§5a's `Appears in Shared`, in this app's own vocabulary.**
@@ -1912,20 +2056,24 @@ pub const IN_VAULT_NO: &str = "No longer";
 /// It is `pub`, and here beside the Access block rather than in `record_ui`,
 /// because it is a fact about where a Send goes -- the list this file draws --
 /// and not about the card that makes one.
-pub const APPEARS_IN_SENDS: &str = "Appears in Sends";
+pub fn appears_in_sends() -> &'static str {
+    crate::i18n::t("sends.appears_in_sends")
+}
 
 /// The share-password field's placeholder. **It says what an empty box
 /// means**, because empty is both the default and the off position, and a
 /// blank box under the words "Open with" otherwise reads as something the
 /// user has forgotten to fill in. See [`draw_access_block`].
-pub const PASSWORD_HINT: &str = "No password";
+pub fn password_hint() -> &'static str {
+    crate::i18n::t("sends.password_hint")
+}
 
 // `PASSWORD_TOGGLE_LABEL` -- "Require a password to open the link" -- and
 // `LIFETIME_PROMPT` -- "The link stops working after" -- are DELETED here
 // rather than parked, and the deletion is the decision. Both were the old
 // text composer's own captions for two questions that are now asked once, in
-// [`ACCESS_EYEBROW`]'s block, in the row labels [`EXPIRES_LABEL`],
-// [`VIEWS_LABEL`] and [`OPEN_WITH_LABEL`]. Keeping them would have left two
+// [`access_eyebrow()`]'s block, in the row labels [`expires_label()`],
+// [`views_label()`] and [`open_with_label()`]. Keeping them would have left two
 // spellings of one question in one file, which is the defect this pass
 // exists to remove; and a `pub const` raises no dead-code warning in a lib
 // crate, so an unused one sits indefinitely looking like copy somebody still
@@ -1940,19 +2088,29 @@ pub const PASSWORD_HINT: &str = "No password";
 /// [`theme::eyebrow`] deliberately does not uppercase for the caller, so the
 /// constant carries the case the glyphs are painted in and a paint test can
 /// look for it.
-pub const ACCESS_EYEBROW: &str = "ACCESS";
+pub fn access_eyebrow() -> &'static str {
+    crate::i18n::t("sends.access_eyebrow")
+}
 
 /// §5a's first Access row label.
-pub const EXPIRES_LABEL: &str = "Expires";
+pub fn expires_label() -> &'static str {
+    crate::i18n::t("sends.expires_label")
+}
 /// §5a's second Access row label. **The design's own word**, and the right
 /// one: the server counts *accesses*, and "Opens" would promise that a
 /// recipient who loads the page twice has spent two.
-pub const VIEWS_LABEL: &str = "Views";
+pub fn views_label() -> &'static str {
+    crate::i18n::t("sends.views_label")
+}
 /// §5a's third Access row label.
-pub const OPEN_WITH_LABEL: &str = "Open with";
+pub fn open_with_label() -> &'static str {
+    crate::i18n::t("sends.open_with_label")
+}
 
-/// §5a's own word on the link beside [`OPEN_WITH_LABEL`]'s box.
-pub const GENERATE_LABEL: &str = "Generate";
+/// §5a's own word on the link beside [`open_with_label()`]'s box.
+pub fn generate_label() -> &'static str {
+    crate::i18n::t("sends.generate_label")
+}
 
 /// §5a's `font-size: 12px` on that link, and the gap before it.
 const ACCESS_LINK_PX: f32 = 12.0;
@@ -1961,17 +2119,23 @@ const ACCESS_LINK_GAP: f32 = 10.0;
 
 /// The view-limit field's placeholder, and the whole of how the row says its
 /// off position. See [`views_note`].
-pub const VIEWS_HINT: &str = "Any";
+pub fn views_hint() -> &'static str {
+    crate::i18n::t("sends.views_hint")
+}
 
 /// What the Access block says beside the view-limit box when there is no
 /// limit. **Not an empty space**: a blank box with nothing after it is a
 /// field the user is being asked to fill in, and this one is optional.
-pub const NO_VIEW_LIMIT_NOTE: &str = "the link works until it expires";
+pub fn no_view_limit_note() -> &'static str {
+    crate::i18n::t("sends.no_view_limit_note")
+}
 
 /// What it says when there is one. §5a's own phrase, and it is the sentence
 /// that makes the number worth typing: a cap is not "how many people may
 /// read this", it is "after this many, the link is dead".
-pub const VIEW_LIMIT_NOTE: &str = "then the link dies";
+pub fn view_limit_note() -> &'static str {
+    crate::i18n::t("sends.view_limit_note")
+}
 
 /// The most digits the view-limit box will take.
 ///
@@ -2013,8 +2177,8 @@ pub fn view_limit_from(text: &str) -> Option<u32> {
 /// The note beside the view-limit box, for the limit in force.
 pub fn views_note(limit: Option<u32>) -> &'static str {
     match limit {
-        Some(_) => VIEW_LIMIT_NOTE,
-        None => NO_VIEW_LIMIT_NOTE,
+        Some(_) => view_limit_note(),
+        None => no_view_limit_note(),
     }
 }
 
@@ -2103,7 +2267,7 @@ const EXPIRY_CALENDAR_ID: &str = "send-expiry-calendar";
 
 /// One row of the expiry dropdown, named.
 ///
-/// The eight fixed rows are `crate::send::lifetime_label`'s job. The ninth has
+/// The eight fixed rows are `crate::vault_window::send_ui::words::lifetime_label`'s job. The ninth has
 /// no fixed value, so it says what pressing it does -- until a date has
 /// actually been picked, at which point the row says that date, because a row
 /// that still read "a date you pick" beside a calendar showing 14 March would
@@ -2114,11 +2278,11 @@ fn lifetime_row_label(
     zone: &dyn crate::local_time::LocalOffset,
 ) -> String {
     match choice {
-        Some(lifetime) => crate::send::lifetime_label(lifetime, zone),
+        Some(lifetime) => crate::vault_window::send_ui::words::lifetime_label(lifetime, zone),
         None if matches!(current, crate::send::SendLifetime::Until(_)) => {
-            crate::send::lifetime_label(current, zone)
+            crate::vault_window::send_ui::words::lifetime_label(current, zone)
         }
-        None => crate::send::PICK_A_DATE_LABEL.to_string(),
+        None => crate::vault_window::send_ui::words::pick_a_date_label().to_string(),
     }
 }
 
@@ -2178,7 +2342,9 @@ fn pickable_window(
 
 /// The three Access row labels, in the order the block draws them, so
 /// [`access_label_width`] measures exactly the set that is on screen.
-const ACCESS_LABELS: [&str; 3] = [EXPIRES_LABEL, VIEWS_LABEL, OPEN_WITH_LABEL];
+fn access_labels() -> [&'static str; 3] {
+    [expires_label(), views_label(), open_with_label()]
+}
 
 /// §5a's Access label type size.
 const ACCESS_LABEL_PX: f32 = 13.0;
@@ -2211,7 +2377,7 @@ fn access_label_width(ui: &egui::Ui) -> f32 {
     if ACCESS_LABEL_WIDTH + ACCESS_ROW_GAP + EXPIRY_FIELD_WIDTH <= room {
         return ACCESS_LABEL_WIDTH;
     }
-    ACCESS_LABELS
+    access_labels()
         .iter()
         .map(|label| {
             ui.painter()
@@ -2275,12 +2441,18 @@ fn access_row<R>(
 }
 
 /// The Recipient row's label, 5a's own word.
-pub const RECIPIENT_LABEL: &str = "Recipient";
+pub fn recipient_label() -> &'static str {
+    crate::i18n::t("sends.recipient_label")
+}
 /// What the empty box says. Optional, and it says so: a Send needs no
 /// recipient, and naming one only files the Send under that person.
-pub const RECIPIENT_HINT: &str = "Who it is for (optional)";
+pub fn recipient_hint() -> &'static str {
+    crate::i18n::t("sends.recipient_hint")
+}
 /// The eyebrow over the suggestions.
-pub const SUGGESTIONS_EYEBROW: &str = "SENT TO BEFORE";
+pub fn suggestions_eyebrow() -> &'static str {
+    crate::i18n::t("sends.suggestions_eyebrow")
+}
 /// The forget mark at the end of each suggestion.
 pub const FORGET_MARK: &str = "\u{00D7}";
 
@@ -2292,7 +2464,7 @@ const SUGGESTION_ROW_HEIGHT: f32 = 44.0;
 
 /// How many Sends this file holds for a person, beside their address.
 pub fn sent_count_words(count: usize) -> String {
-    format!("{count} sent")
+    crate::i18n::tf("sends.sent_count", &[("count", &count.to_string())])
 }
 
 /// What the Recipient row reports: nothing, or that a suggestion's
@@ -2324,9 +2496,9 @@ pub fn draw_recipient_row(
 ) -> RecipientAnswer {
     let label_width = access_label_width(ui);
     ui.add_space(ACCESS_ROW_SPACING);
-    let field = access_row(ui, RECIPIENT_LABEL, label_width, enabled, |ui| {
+    let field = access_row(ui, recipient_label(), label_width, enabled, |ui| {
         let width = ui.available_width();
-        ui.add_enabled_ui(enabled, |ui| theme::inline_field(ui, recipient, RECIPIENT_HINT, width, false))
+        ui.add_enabled_ui(enabled, |ui| theme::inline_field(ui, recipient, recipient_hint(), width, false))
             .inner
     });
     match draw_people_suggestions(
@@ -2336,7 +2508,7 @@ pub fn draw_recipient_row(
         recipient,
         history,
         enabled,
-        SUGGESTIONS_EYEBROW,
+        suggestions_eyebrow(),
         &|person| sent_count_words(person.send_ids.len()),
     ) {
         Some(email) => RecipientAnswer::Forget(email),
@@ -2533,7 +2705,7 @@ pub(crate) fn draw_people_suggestions(
 /// be this file inventing a third treatment for secrets on a form that has
 /// two already. It is a coherent small feature and it is not this one.
 ///
-/// `now` and `zone` are injected for `crate::send::expiry_wording`'s reason,
+/// `now` and `zone` are injected for `crate::vault_window::send_ui::words::expiry_wording`'s reason,
 /// which is this whole feature's rule: nothing here reads the machine's clock
 /// or its timezone, so every assertion about the sentence under the Expires
 /// row is exact wherever the suite runs.
@@ -2544,7 +2716,7 @@ pub fn draw_access_block(
     now: &dyn SendClock,
     zone: &dyn LocalOffset,
 ) {
-    theme::eyebrow(ui, ACCESS_EYEBROW);
+    theme::eyebrow(ui, access_eyebrow());
     ui.add_space(theme::EYEBROW_GAP);
 
     // Measured ONCE, at the top, and handed to all three rows: the property
@@ -2623,8 +2795,8 @@ pub fn draw_access_block(
             },
         })
         .collect();
-    let current = crate::send::lifetime_label(*controls.lifetime, zone);
-    access_row(ui, EXPIRES_LABEL, label_width, enabled, |ui| {
+    let current = crate::vault_window::send_ui::words::lifetime_label(*controls.lifetime, zone);
+    access_row(ui, expires_label(), label_width, enabled, |ui| {
         // `dropdown_disabled` and not `add_enabled_ui`, for the reason that
         // split exists in this design system (see `toggle_pill` /
         // `toggle_pill_disabled`, and the segmented run before it): the inert
@@ -2652,7 +2824,7 @@ pub fn draw_access_block(
     // `Never` is a choice this form offers rather than one it tolerates.
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(crate::send::expiry_wording(*controls.lifetime, now, zone))
+        egui::RichText::new(crate::vault_window::send_ui::words::expiry_wording(*controls.lifetime, now, zone))
             .size(11.0)
             .color(theme::TEXT_FAINT),
     );
@@ -2697,7 +2869,7 @@ pub fn draw_access_block(
     // by being empty. Everything the box means is `view_limit_from`, which is
     // a pure function and not a rule inside this closure.
     let mut typed = controls.max_access_count.map(|n| n.to_string()).unwrap_or_default();
-    access_row(ui, VIEWS_LABEL, label_width, enabled, |ui| {
+    access_row(ui, views_label(), label_width, enabled, |ui| {
         // `theme::inline_field` and not a bare `egui::TextEdit`, which is what
         // stood here: the bare one wears egui's frame, egui's radius and
         // egui's one-line height, so this row's box and the `Open with` box
@@ -2705,7 +2877,7 @@ pub fn draw_access_block(
         // different-looking controls on one card. See that function.
         let changed = ui
             .add_enabled_ui(enabled, |ui| {
-                theme::inline_field(ui, &mut typed, VIEWS_HINT, VIEW_LIMIT_FIELD_WIDTH, false)
+                theme::inline_field(ui, &mut typed, views_hint(), VIEW_LIMIT_FIELD_WIDTH, false)
             })
             .inner
             .changed();
@@ -2739,7 +2911,7 @@ pub fn draw_access_block(
         .password
         .take()
         .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()));
-    access_row(ui, OPEN_WITH_LABEL, label_width, enabled, |ui| {
+    access_row(ui, open_with_label(), label_width, enabled, |ui| {
         // **§5a's `Generate`**, which this row did not have.
         //
         // The design puts it at the right end of this row and it is the one
@@ -2756,7 +2928,7 @@ pub fn draw_access_block(
         let link = ui
             .painter()
             .layout_no_wrap(
-                GENERATE_LABEL.to_string(),
+                generate_label().to_string(),
                 egui::FontId::proportional(ACCESS_LINK_PX),
                 theme::BLUE,
             )
@@ -2764,10 +2936,10 @@ pub fn draw_access_block(
             .x;
         let room = (ui.available_width() - link - ACCESS_LINK_GAP).max(0.0);
         ui.add_enabled_ui(enabled, |ui| {
-            theme::inline_field(ui, &mut buffer, PASSWORD_HINT, room, true);
+            theme::inline_field(ui, &mut buffer, password_hint(), room, true);
         });
         ui.add_space(ACCESS_LINK_GAP);
-        if enabled && theme::link_label(ui, GENERATE_LABEL, ACCESS_LINK_PX).clicked() {
+        if enabled && theme::link_label(ui, generate_label(), ACCESS_LINK_PX).clicked() {
             // The vault's own generator at its own defaults -- one generator
             // in this app, not a second recipe written here. A refusal (the
             // recipe cannot produce nothing at these defaults) leaves the box
@@ -2823,7 +2995,7 @@ mod tests {
             let tone = super::state_tone(state);
             assert_eq!((tone.fill, tone.ink), (fill, ink), "{state:?}");
         }
-        assert_eq!(super::LINK_COPIED_TOAST, "Link copied");
+        assert_eq!(super::link_copied_toast(), "Link copied");
     }
 
     use super::*;
@@ -4138,11 +4310,11 @@ mod paint_tests {
         for (where_, pane) in access_cards() {
             let mut plan = a_plan();
             let painted = paint_access_at(&mut plan, true, pane);
-            let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+            let chosen = crate::vault_window::send_ui::words::lifetime_label(plan.lifetime, &UTC);
 
             let expires = box_under(&painted, &chosen);
-            let views = box_under(&painted, VIEWS_HINT);
-            let open_with = box_under(&painted, PASSWORD_HINT);
+            let views = box_under(&painted, views_hint());
+            let open_with = box_under(&painted, password_hint());
 
             for (name, rect) in [("Views", views), ("Open with", open_with)] {
                 assert!(
@@ -4206,7 +4378,7 @@ mod paint_tests {
             collect(&clipped.shape, &mut painted);
         }
         assert!(
-            painted.has(ACCESS_EYEBROW),
+            painted.has(access_eyebrow()),
             "the fixture did not draw the Access block at all, so every assertion below would \
              be about an empty card: {:?}",
             painted.text
@@ -4272,7 +4444,7 @@ mod paint_tests {
     #[test]
     fn the_lifetime_picker_is_one_fixed_box_that_states_the_answer() {
         let mut plan = a_plan();
-        let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+        let chosen = crate::vault_window::send_ui::words::lifetime_label(plan.lifetime, &UTC);
         let painted = paint_access(&mut plan, true);
 
         let (shut, _) = painted.control_under(&chosen);
@@ -4295,7 +4467,7 @@ mod paint_tests {
         // segmented run with extra steps, and would overflow for the same
         // reason.
         for other in crate::send::LIFETIME_CHOICES.into_iter().flatten() {
-            let label = crate::send::lifetime_label(other, &UTC);
+            let label = crate::vault_window::send_ui::words::lifetime_label(other, &UTC);
             if label == chosen {
                 continue;
             }
@@ -4384,14 +4556,14 @@ mod paint_tests {
     fn the_picked_date_row_names_itself_and_then_names_the_date() {
         assert_eq!(
             lifetime_row_label(None, crate::send::DEFAULT_LIFETIME, &UTC),
-            crate::send::PICK_A_DATE_LABEL
+            crate::vault_window::send_ui::words::pick_a_date_label()
         );
         let picked = crate::send::SendLifetime::on_local_day(2027, 3, 14, &UTC);
         assert_eq!(lifetime_row_label(None, picked, &UTC), "14 Mar 2027");
         // And a fixed row is never affected by what is in force.
         assert_eq!(
             lifetime_row_label(Some(crate::send::SendLifetime::Never), picked, &UTC),
-            crate::send::NEVER_LABEL
+            crate::vault_window::send_ui::words::never_label()
         );
     }
 
@@ -4450,7 +4622,7 @@ mod paint_tests {
     #[test]
     fn a_publish_in_flight_leaves_the_lifetime_control_inert_and_readable() {
         let mut plan = a_plan();
-        let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+        let chosen = crate::vault_window::send_ui::words::lifetime_label(plan.lifetime, &UTC);
         let live = paint_access(&mut plan, true);
         let (_, live_fill) = live.control_under(&chosen);
         let painted = paint_access(&mut plan, false);
@@ -4530,9 +4702,9 @@ mod paint_tests {
         );
 
         // The note beside the box says which of the two states it is in.
-        assert_eq!(views_note(None), NO_VIEW_LIMIT_NOTE);
-        assert_eq!(views_note(Some(1)), VIEW_LIMIT_NOTE);
-        assert_ne!(NO_VIEW_LIMIT_NOTE, VIEW_LIMIT_NOTE);
+        assert_eq!(views_note(None), no_view_limit_note());
+        assert_eq!(views_note(Some(1)), view_limit_note());
+        assert_ne!(no_view_limit_note(), view_limit_note());
     }
 
     /// **§5a's Access block is whole, with all three of its buildable
@@ -4547,17 +4719,17 @@ mod paint_tests {
         let mut plan = a_plan();
         let painted = paint_access(&mut plan, true);
 
-        assert!(painted.has(ACCESS_EYEBROW), "the ACCESS eyebrow is missing: {:?}", painted.text);
-        for label in [EXPIRES_LABEL, VIEWS_LABEL, OPEN_WITH_LABEL] {
+        assert!(painted.has(access_eyebrow()), "the ACCESS eyebrow is missing: {:?}", painted.text);
+        for label in [expires_label(), views_label(), open_with_label()] {
             assert!(painted.has(label), "the {label:?} row is missing: {:?}", painted.text);
         }
         assert!(
-            painted.has(NO_VIEW_LIMIT_NOTE),
+            painted.has(no_view_limit_note()),
             "the view box is empty and says nothing about what that means: {:?}",
             painted.text
         );
         assert!(
-            painted.has(PASSWORD_HINT),
+            painted.has(password_hint()),
             "the password box is empty and says nothing about what that means: {:?}",
             painted.text
         );
@@ -4619,7 +4791,7 @@ mod paint_tests {
         // And the sub-day lifetime is the one now on screen, spelled by the
         // one function that spells lifetimes.
         assert!(
-            painted.has(&crate::send::lifetime_label(crate::send::SendLifetime::Hours(1), &UTC)),
+            painted.has(&crate::vault_window::send_ui::words::lifetime_label(crate::send::SendLifetime::Hours(1), &UTC)),
             "the one-hour answer is not the one in the shut box: {:?}",
             painted.text
         );
@@ -4642,7 +4814,7 @@ mod paint_tests {
         let mut plan = a_plan();
         plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
         let painted = paint_access(&mut plan, true);
-        assert!(painted.has(OPEN_WITH_LABEL), "control: the password row did not draw");
+        assert!(painted.has(open_with_label()), "control: the password row did not draw");
         assert!(
             !painted.has("share-pw-9271"),
             "the share password was painted in the clear: {:?}",
@@ -4767,7 +4939,7 @@ mod paint_tests {
             has_password: false,
             activity: "Nobody has opened this link. The link works, as often as they like."
                 .to_string(),
-            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
+            expires: no_expiry_of_its_own().to_string(),
             deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
             extendable: true,
         }
@@ -4782,24 +4954,24 @@ mod paint_tests {
     #[test]
     fn the_receive_sentence_says_what_is_missing_without_condemning_what_is_not() {
         assert!(
-            RECEIVE_NEEDS_THE_CLI.contains("command-line tool"),
-            "the sentence does not name the thing that is missing: {RECEIVE_NEEDS_THE_CLI}"
+            receive_needs_the_cli().contains("command-line tool"),
+            "the sentence does not name the thing that is missing: {receive_needs_the_cli}", receive_needs_the_cli = receive_needs_the_cli()
         );
         for kept in ["Publishing", "listing", "revoking"] {
             assert!(
-                RECEIVE_NEEDS_THE_CLI.contains(kept),
+                receive_needs_the_cli().contains(kept),
                 "{kept:?} is not named as still working, so the sentence reads as `Sends need the \
-                 CLI`: {RECEIVE_NEEDS_THE_CLI}"
+                 CLI`: {receive_needs_the_cli}", receive_needs_the_cli = receive_needs_the_cli()
             );
         }
         // The control: the two sentences are not the same sentence, so an
         // assertion satisfied by either is satisfied by the right one.
         assert!(
-            !FILE_SEND_EXPLANATION.contains("command-line"),
+            !file_send_explanation().contains("command-line"),
             "the file sentence and the receive sentence have merged"
         );
         assert!(
-            !RECEIVE_NEEDS_THE_CLI.contains("file"),
+            !receive_needs_the_cli().contains("file"),
             "the receive sentence has picked up the file restriction"
         );
     }
@@ -4809,8 +4981,8 @@ mod paint_tests {
     fn an_empty_account_and_a_failed_fetch_paint_different_words() {
         let size = min_pane_size();
         let (empty, _) = paint(&SendPaneState::Empty, None, size);
-        assert!(empty.has(EMPTY_HEADLINE));
-        assert!(!empty.has(FAILED_HEADLINE));
+        assert!(empty.has(empty_headline()));
+        assert!(!empty.has(failed_headline()));
         assert!(!empty.has("could not"), "the empty state hedged: {:?}", empty.text);
 
         let failed = SendPaneState::Failed {
@@ -4818,13 +4990,13 @@ mod paint_tests {
             ambiguous: false,
         };
         let (failed, _) = paint(&failed, None, size);
-        assert!(failed.has(FAILED_HEADLINE));
+        assert!(failed.has(failed_headline()));
         assert!(
-            !failed.has(EMPTY_HEADLINE),
+            !failed.has(empty_headline()),
             "a failed fetch told the user they have no Sends: {:?}",
             failed.text
         );
-        assert!(failed.has(SendError::Offline.user_message()));
+        assert!(failed.has(&SendError::Offline.user_message()));
         assert!(failed.has("Try again"), "a failure with no way to retry");
     }
 
@@ -4837,8 +5009,8 @@ mod paint_tests {
             ambiguous: true,
         };
         let (painted, _) = paint(&state, None, size);
-        assert!(painted.has(AMBIGUOUS_DETAIL), "painted: {:?}", painted.text);
-        assert!(!painted.has(EMPTY_HEADLINE));
+        assert!(painted.has(ambiguous_detail()), "painted: {:?}", painted.text);
+        assert!(!painted.has(empty_headline()));
 
         let plain = SendPaneState::Failed {
             message: SendError::Offline.user_message().to_string(),
@@ -4846,7 +5018,7 @@ mod paint_tests {
         };
         let (plain, _) = paint(&plain, None, size);
         assert!(
-            !plain.has(AMBIGUOUS_DETAIL),
+            !plain.has(ambiguous_detail()),
             "an unambiguous failure claimed it might have missed some"
         );
     }
@@ -4855,9 +5027,9 @@ mod paint_tests {
     #[test]
     fn a_pane_that_has_not_been_answered_yet_says_so() {
         let (painted, _) = paint(&SendPaneState::Loading, None, min_pane_size());
-        assert!(painted.has(LOADING_LABEL));
-        assert!(!painted.has(EMPTY_HEADLINE));
-        assert!(!painted.has(FAILED_HEADLINE));
+        assert!(painted.has(loading_label()));
+        assert!(!painted.has(empty_headline()));
+        assert!(!painted.has(failed_headline()));
     }
 
     #[test]
@@ -4971,7 +5143,7 @@ mod paint_tests {
         let state = SendPaneState::Failed { message: message.clone(), ambiguous: false };
         let (painted, _) = paint(&state, Some(message.as_str()), min_pane_size());
         assert!(
-            painted.has(FAILED_HEADLINE),
+            painted.has(failed_headline()),
             "the failure was not drawn at all, so the count below would be vacuous"
         );
         assert_eq!(
@@ -5089,8 +5261,8 @@ mod paint_tests {
 
         let forever = pane_state(Some(&Ok(vec![send(never, "")])), &FixedClock(NOW), &UTC);
         let (painted, _) = paint_with(&forever, None, min_pane_size(), SendDeleteView::default());
-        assert_eq!(painted.count_exact(EXTEND_LABEL), 0, "{:?}", painted.text);
-        assert_eq!(painted.in_detail(REVOKE_LABEL), 1, "control: the modal is not up");
+        assert_eq!(painted.count_exact(extend_label()), 0, "{:?}", painted.text);
+        assert_eq!(painted.in_detail(revoke_label()), 1, "control: the modal is not up");
     }
 
     // ---- the records list's shape ----------------------------------------------
@@ -5204,10 +5376,10 @@ mod paint_tests {
     /// rather than muscle memory.
     #[test]
     fn the_two_steps_are_not_labelled_the_same_thing() {
-        assert_ne!(REVOKE_LABEL, CONFIRM_LABEL);
-        assert_ne!(CANCEL_LABEL, CONFIRM_LABEL);
+        assert_ne!(revoke_label(), confirm_label());
+        assert_ne!(cancel_label(), confirm_label());
         assert!(
-            CONFIRM_LABEL.len() > REVOKE_LABEL.len(),
+            confirm_label().len() > revoke_label().len(),
             "the destructive label says no more than the harmless one does"
         );
     }
@@ -5357,20 +5529,20 @@ mod paint_tests {
                 painted.text
             );
             assert!(
-                !painted.has(EMPTY_HEADLINE),
+                !painted.has(empty_headline()),
                 "an empty {scope:?} row told the user their ACCOUNT has no Sends, which is \
                  false: {:?}",
                 painted.text
             );
             assert!(
-                painted.has(SCOPE_EMPTY_DETAIL),
+                painted.has(scope_empty_detail()),
                 "the empty row does not say where the rest of the Sends are: {:?}",
                 painted.text
             );
         }
         // The control: the same account, unfiltered, has a Send.
         let all = paint_scope(&state, SendScope::All);
-        assert!(!all.has(EMPTY_HEADLINE), "control: the fixture account really is empty");
+        assert!(!all.has(empty_headline()), "control: the fixture account really is empty");
         assert_eq!(all.in_list("SAP Production"), 1);
     }
 
@@ -5512,10 +5684,10 @@ mod paint_tests {
     #[test]
     fn an_empty_shared_with_me_says_nothing_has_arrived() {
         let painted = paint_received(&[], None);
-        assert!(painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
-        assert!(painted.has(RECEIVED_EMPTY_DETAIL), "{:?}", painted.text);
+        assert!(painted.has(received_empty_headline()), "{:?}", painted.text);
+        assert!(painted.has(received_empty_detail()), "{:?}", painted.text);
         assert!(
-            !painted.has(EMPTY_HEADLINE),
+            !painted.has(empty_headline()),
             "the received screen borrowed the Sends list's own empty sentence, which is a \
              claim about a different thing: {:?}",
             painted.text
@@ -5679,8 +5851,8 @@ mod paint_tests {
         let state = pane_state(Some(&Ok(sends)), &FixedClock(NOW), &UTC);
         for size in [roomy_pane_size(), min_pane_size()] {
             let (painted, _) = paint(&state, None, size);
-            let live = painted.control_under(WAITING_LABEL).1;
-            let ended = painted.control_under(REVOKED_LABEL).1;
+            let live = painted.control_under(waiting_label()).1;
+            let ended = painted.control_under(revoked_label()).1;
             assert_eq!(
                 live.a(),
                 255,
@@ -5854,8 +6026,8 @@ mod paint_tests {
         }
         // Opened is its own state and its own colours (a live link, seen).
         let painted = paint(&one_row(SendState::Opened), None, min_pane_size()).0;
-        assert_eq!(painted.in_list(OPENED_LABEL), 1, "{:?}", painted.text);
-        assert_eq!(painted.in_list(WAITING_LABEL), 0, "an opened link still says Waiting");
+        assert_eq!(painted.in_list(opened_label()), 1, "{:?}", painted.text);
+        assert_eq!(painted.in_list(waiting_label()), 0, "an opened link still says Waiting");
         assert_ne!(state_tone(SendState::Opened).fill, state_tone(SendState::Waiting).fill);
     }
 
@@ -5864,7 +6036,7 @@ mod paint_tests {
         let state = one_row(crate::send::SendState::Waiting);
         let (painted, _) = paint(&state, None, min_pane_size());
         let card = card_of(&painted, "SAP Production");
-        let (pill, _) = painted.control_under(WAITING_LABEL);
+        let (pill, _) = painted.control_under(waiting_label());
         let name = painted.rects_of_exact("SAP Production")[0];
         assert!(card.contains_rect(pill), "the pill leaves its card: {pill:?} in {card:?}");
         assert!(pill.left() >= name.right(), "the name ends at {} and the pill starts at {}", name.right(), pill.left());
@@ -5890,19 +6062,19 @@ mod paint_tests {
         assert!((a.top() - b.top()).abs() < 0.5 && b.left() > a.right(), "{a:?} {b:?}");
         assert!(c.top() > a.bottom(), "the third card starts a new row: {a:?} {c:?}");
         assert!((b.left() - a.right() - 16.0).abs() < 0.5, "the grid's gap is 16: {a:?} {b:?}");
-        assert!(painted.has(shared_page::TITLE), "the page's title");
-        assert!(painted.has(shared_page::SUB), "the page's sub-line");
+        assert!(painted.has(shared_page::title()), "the page's title");
+        assert!(painted.has(shared_page::sub()), "the page's sub-line");
     }
 
     #[test]
     fn a_live_card_offers_copy_link_and_revoke_and_an_ended_one_offers_neither() {
         let live = paint_picking(&one_row(crate::send::SendState::Waiting), None, min_pane_size(), SendDeleteView::default(), None).0;
-        assert_eq!(live.count_exact(COPY_LINK_LABEL), 1, "{:?}", live.text);
-        assert_eq!(live.count_exact(REVOKE_LABEL), 1, "{:?}", live.text);
+        assert_eq!(live.count_exact(copy_link_label()), 1, "{:?}", live.text);
+        assert_eq!(live.count_exact(revoke_label()), 1, "{:?}", live.text);
         for state in [crate::send::SendState::Used, crate::send::SendState::Expired, crate::send::SendState::Revoked] {
             let ended = paint_picking(&one_row(state), None, min_pane_size(), SendDeleteView::default(), None).0;
-            assert_eq!(ended.count_exact(COPY_LINK_LABEL), 0, "{state:?} offers Copy link on its card");
-            assert_eq!(ended.count_exact(REVOKE_LABEL), 0, "{state:?} offers Revoke on its card");
+            assert_eq!(ended.count_exact(copy_link_label()), 0, "{state:?} offers Copy link on its card");
+            assert_eq!(ended.count_exact(revoke_label()), 0, "{state:?} offers Revoke on its card");
         }
     }
 
@@ -5912,7 +6084,7 @@ mod paint_tests {
         let SendPaneState::Rows(model) = &state else { panic!("not rows") };
         for index in [0usize, 1] {
             let (action, selected) =
-                click_picking_sel(&state, SendDeleteView::default(), None, COPY_LINK_LABEL, index);
+                click_picking_sel(&state, SendDeleteView::default(), None, copy_link_label(), index);
             assert_eq!(action, SendUiAction::CopyLink(model[index].access_url.clone()), "card {index}");
             assert_eq!(selected, None, "Copy link does not also open the modal");
         }
@@ -5922,7 +6094,7 @@ mod paint_tests {
     fn a_cards_revoke_asks_about_that_send_and_opens_its_modal_for_the_answer() {
         let state = rows(4);
         for index in [0usize, 1] {
-            let (action, selected) = click_picking_sel(&state, SendDeleteView::default(), None, REVOKE_LABEL, index);
+            let (action, selected) = click_picking_sel(&state, SendDeleteView::default(), None, revoke_label(), index);
             assert_eq!(action, SendUiAction::AskDelete(format!("id{index}")));
             assert_eq!(selected, Some(format!("id{index}")), "the question is asked in the modal");
         }
@@ -5953,18 +6125,18 @@ mod paint_tests {
             max_access_count: None,
             has_password: false,
             activity: "Nobody has opened this link. The link works, as often as they like.".to_string(),
-            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
+            expires: no_expiry_of_its_own().to_string(),
             deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
             extendable: true,
         }]);
         assert_eq!(
-            click_picking_sel(&state, SendDeleteView::default(), None, COPY_LINK_LABEL, 0).0,
+            click_picking_sel(&state, SendDeleteView::default(), None, copy_link_label(), 0).0,
             SendUiAction::None,
             "a Send with no link put an empty string on the clipboard"
         );
         let (painted, _) = paint(&state, None, min_pane_size());
-        assert!(painted.has(ADDRESS_MISSING), "the missing link is not said: {:?}", painted.text);
-        assert_eq!(painted.in_detail(COPY_LINK_LABEL), 1, "control: the modal was not drawn");
+        assert!(painted.has(address_missing()), "the missing link is not said: {:?}", painted.text);
+        assert_eq!(painted.in_detail(copy_link_label()), 1, "control: the modal was not drawn");
     }
 
     #[test]
@@ -5981,13 +6153,13 @@ mod paint_tests {
             max_access_count: None,
             has_password: false,
             activity: "Nobody has opened this link. The link works, as often as they like.".to_string(),
-            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
+            expires: no_expiry_of_its_own().to_string(),
             deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
             extendable: true,
         }]);
         let (painted, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), None);
-        assert_eq!(painted.count_exact(REVOKE_LABEL), 0, "a card with no id offered Revoke: {:?}", painted.text);
-        assert_eq!(painted.count_exact(COPY_LINK_LABEL), 0, "a card with no id offered actions");
+        assert_eq!(painted.count_exact(revoke_label()), 0, "a card with no id offered Revoke: {:?}", painted.text);
+        assert_eq!(painted.count_exact(copy_link_label()), 0, "a card with no id offered actions");
     }
 
     #[test]
@@ -5997,7 +6169,7 @@ mod paint_tests {
         for index in [0usize, 3, 5] {
             let expected = model[index].access_url.clone();
             assert_eq!(
-                click_nth_picking(&state, SendDeleteView::default(), Some(model[index].id.clone()), COPY_LINK_LABEL, 0),
+                click_nth_picking(&state, SendDeleteView::default(), Some(model[index].id.clone()), copy_link_label(), 0),
                 SendUiAction::CopyLink(expected.clone()),
                 "Copy link did not report {expected} while row {index} was picked"
             );
@@ -6008,11 +6180,11 @@ mod paint_tests {
     fn a_picked_send_can_be_revoked_and_the_first_click_only_asks() {
         let state = rows(6);
         let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
-        assert_eq!(painted.in_detail(REVOKE_LABEL), 1, "the picked Send's modal has no Revoke: {:?}", painted.text);
-        assert!(!painted.has(CONFIRM_LABEL), "the destructive button is painted before anything was asked");
+        assert_eq!(painted.in_detail(revoke_label()), 1, "the picked Send's modal has no Revoke: {:?}", painted.text);
+        assert!(!painted.has(confirm_label()), "the destructive button is painted before anything was asked");
         for nth in [0usize, 5] {
             let action =
-                click_nth_picking(&state, SendDeleteView::default(), Some(format!("id{nth}")), REVOKE_LABEL, 0);
+                click_nth_picking(&state, SendDeleteView::default(), Some(format!("id{nth}")), revoke_label(), 0);
             assert_eq!(action, SendUiAction::AskDelete(format!("id{nth}")), "row {nth}");
         }
     }
@@ -6022,18 +6194,18 @@ mod paint_tests {
         let state = rows(4);
         let armed = SendDeleteView { confirming: Some("id2"), in_flight: None, extending: false };
         let (painted, _) = paint_picking(&state, None, min_pane_size(), armed, Some("id2".to_string()));
-        assert_eq!(painted.count_exact(CONFIRM_LABEL), 1, "{:?}", painted.text);
-        assert_eq!(painted.count_exact(CANCEL_LABEL), 1, "the way out of the confirmation is not painted once");
-        assert_eq!(painted.in_detail(REVOKE_LABEL), 0, "the armed Send kept its Revoke beside the question");
-        assert!(painted.has(CONFIRM_PROMPT), "the question is not asked: {:?}", painted.text);
+        assert_eq!(painted.count_exact(confirm_label()), 1, "{:?}", painted.text);
+        assert_eq!(painted.count_exact(cancel_label()), 1, "the way out of the confirmation is not painted once");
+        assert_eq!(painted.in_detail(revoke_label()), 0, "the armed Send kept its Revoke beside the question");
+        assert!(painted.has(confirm_prompt()), "the question is not asked: {:?}", painted.text);
 
         let (other, _) = paint_picking(&state, None, min_pane_size(), armed, Some("id0".to_string()));
-        assert_eq!(other.count_exact(CONFIRM_LABEL) + other.count_exact(CANCEL_LABEL), 0, "id2's question is over id0");
-        assert_eq!(other.in_detail(REVOKE_LABEL), 1, "the Send that is NOT being asked about lost its Revoke");
-        assert!(!other.has(CONFIRM_PROMPT), "the question followed the selection");
+        assert_eq!(other.count_exact(confirm_label()) + other.count_exact(cancel_label()), 0, "id2's question is over id0");
+        assert_eq!(other.in_detail(revoke_label()), 1, "the Send that is NOT being asked about lost its Revoke");
+        assert!(!other.has(confirm_prompt()), "the question followed the selection");
 
         assert_eq!(
-            click_nth_picking(&state, armed, Some("id2".to_string()), CONFIRM_LABEL, 0),
+            click_nth_picking(&state, armed, Some("id2".to_string()), confirm_label(), 0),
             SendUiAction::ConfirmDelete { id: "id2".to_string(), name: "send-number-2".to_string() },
             "the confirmation answered for a Send other than the one it was asked about"
         );
@@ -6044,14 +6216,14 @@ mod paint_tests {
         let state = rows(3);
         let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: false };
         let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
-        assert_eq!(painted.in_detail(DELETING_LABEL), 1, "the modal does not say anything is happening: {:?}", painted.text);
-        assert_eq!(painted.in_list(DELETING_LABEL), 1, "the card of the Send being revoked does not say so: {:?}", painted.text);
-        for label in [REVOKE_LABEL, OPEN_RECORD_LABEL, CONFIRM_LABEL, EXTEND_LABEL] {
+        assert_eq!(painted.in_detail(deleting_label()), 1, "the modal does not say anything is happening: {:?}", painted.text);
+        assert_eq!(painted.in_list(deleting_label()), 1, "the card of the Send being revoked does not say so: {:?}", painted.text);
+        for label in [revoke_label(), open_record_label(), confirm_label(), extend_label()] {
             assert_eq!(painted.in_detail(label), 0, "{label:?} is offered on a Send already being revoked");
         }
         let card = card_of(&painted, "send-number-0");
         assert!(
-            !painted.rects_of_exact(REVOKE_LABEL).iter().any(|r| card.contains_rect(*r)),
+            !painted.rects_of_exact(revoke_label()).iter().any(|r| card.contains_rect(*r)),
             "the busy card kept its Revoke"
         );
         assert_eq!(painted.in_list("Expires in"), 0, "the card printed its expiry BESIDE the progress word");
@@ -6061,10 +6233,10 @@ mod paint_tests {
     fn extend_reports_the_send_it_was_pressed_on_in_one_step() {
         let state = rows(3);
         let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
-        assert_eq!(painted.in_detail(EXTEND_LABEL), 1, "no Extend on the modal: {:?}", painted.text);
-        assert_eq!(painted.in_list(EXTEND_LABEL), 0, "Extend leaked onto the cards");
+        assert_eq!(painted.in_detail(extend_label()), 1, "no Extend on the modal: {:?}", painted.text);
+        assert_eq!(painted.in_list(extend_label()), 0, "Extend leaked onto the cards");
         assert_eq!(
-            click_nth_with(&state, SendDeleteView::default(), EXTEND_LABEL, 0),
+            click_nth_with(&state, SendDeleteView::default(), extend_label(), 0),
             SendUiAction::Extend { id: "id0".to_string(), name: "send-number-0".to_string() }
         );
     }
@@ -6074,15 +6246,15 @@ mod paint_tests {
         let state = rows(3);
         let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
         let (asking, _) = paint_with(&state, None, min_pane_size(), armed);
-        assert_eq!(asking.in_detail(EXTEND_LABEL), 0, "Extend beside a question about destroying");
-        assert_eq!(asking.count_exact(CANCEL_LABEL), 1, "control: the question is not up");
+        assert_eq!(asking.in_detail(extend_label()), 0, "Extend beside a question about destroying");
+        assert_eq!(asking.count_exact(cancel_label()), 1, "control: the question is not up");
 
         let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: true };
         let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
-        assert_eq!(painted.in_detail(EXTENDING_LABEL), 1, "{:?}", painted.text);
-        assert_eq!(painted.in_list(EXTENDING_LABEL), 1, "{:?}", painted.text);
-        assert_eq!(painted.count_exact(DELETING_LABEL), 0, "an Extend is described as a revoke");
-        for label in [EXTEND_LABEL, REVOKE_LABEL, OPEN_RECORD_LABEL] {
+        assert_eq!(painted.in_detail(extending_label()), 1, "{:?}", painted.text);
+        assert_eq!(painted.in_list(extending_label()), 1, "{:?}", painted.text);
+        assert_eq!(painted.count_exact(deleting_label()), 0, "an Extend is described as a revoke");
+        for label in [extend_label(), revoke_label(), open_record_label()] {
             assert_eq!(painted.in_detail(label), 0, "{label:?} is offered while the Extend runs");
         }
     }
@@ -6090,11 +6262,11 @@ mod paint_tests {
     #[test]
     fn the_modal_says_what_the_link_is_and_what_has_happened_to_it() {
         let (painted, _) = detail_of(a_fully_described_send());
-        for (label, times) in [(ADDRESS_ROW, 1), (OPENS_WITH_ROW, 1), (VIEWS_ROW, 1), (EXPIRES_ROW, 1), (DELETED_ROW, 1), ("Opens", 1), ("Link", 1), ("Includes", 1), ("Activity", 1)] {
+        for (label, times) in [(address_row(), 1), (opens_with_row(), 1), (views_row(), 1), (expires_row(), 1), (deleted_row(), 1), ("Opens", 1), ("Link", 1), ("Includes", 1), ("Activity", 1)] {
             assert_eq!(painted.in_detail(label), times, "the modal does not draw {label:?} {times} time(s): {:?}", painted.text);
         }
         assert!(painted.has("https://send.bitwarden.com/#/g7HqK2"), "the link: {:?}", painted.text);
-        assert_eq!(painted.count_exact(PASSWORD_SEGMENT), 1, "a password Send does not say so: {:?}", painted.text);
+        assert_eq!(painted.count_exact(password_segment()), 1, "a password Send does not say so: {:?}", painted.text);
         assert!(painted.has("3 of 10"), "the count against its cap: {:?}", painted.text);
         let expires = painted.text.iter().find(|t| t.contains("17 Aug 2026")).expect("an expiry date");
         let deletes = painted.text.iter().find(|t| t.contains("20 Aug 2026")).expect("a deletion date");
@@ -6111,21 +6283,21 @@ mod paint_tests {
     #[test]
     fn the_opens_with_row_says_what_the_recipient_needs() {
         let (with, _) = detail_of(a_fully_described_send());
-        assert_eq!(with.count_exact(PASSWORD_SEGMENT), 1);
-        assert_eq!(with.count_exact(LINK_ONLY), 0);
+        assert_eq!(with.count_exact(password_segment()), 1);
+        assert_eq!(with.count_exact(link_only()), 0);
         let (without, _) = detail_of(SendSummary { has_password: false, ..a_fully_described_send() });
-        assert_eq!(without.count_exact(LINK_ONLY), 1, "{:?}", without.text);
-        assert_eq!(without.count_exact(PASSWORD_SEGMENT), 0);
+        assert_eq!(without.count_exact(link_only()), 1, "{:?}", without.text);
+        assert_eq!(without.count_exact(password_segment()), 0);
     }
 
     #[test]
     fn a_dead_links_address_is_struck_through_and_marked() {
         let (live, _) = detail_of(a_fully_described_send());
-        assert_eq!(live.count_exact(DEAD_MARKER), 0, "a live link is marked dead: {:?}", live.text);
+        assert_eq!(live.count_exact(dead_marker()), 0, "a live link is marked dead: {:?}", live.text);
         let used = SendSummary { access_count: 10, ..a_fully_described_send() };
         assert_eq!(crate::send::send_state(&used, &FixedClock(NOW)), crate::send::SendState::Used, "control");
         let (painted, _) = detail_of(used);
-        assert_eq!(painted.count_exact(DEAD_MARKER), 1, "a spent Send still presents its link as working: {:?}", painted.text);
+        assert_eq!(painted.count_exact(dead_marker()), 1, "a spent Send still presents its link as working: {:?}", painted.text);
         assert!(
             painted.struck.iter().any(|t| t.starts_with("https://send.bitwarden.com")),
             "nothing is struck through the dead address: {:?}",
@@ -6164,18 +6336,18 @@ mod paint_tests {
         for size in [roomy_pane_size(), min_pane_size()] {
             let mut window = Session::new(size, Some("id0".to_string()));
             let painted = window.settle(&with_password(crate::send::SendState::Opened), SendDeleteView::default(), &mut PeopleRows::none(), &[]);
-            assert_eq!(painted.in_detail(SEEN_TITLE), 1, "at {}pt: {:?}", size.x, painted.text);
-            let text = painted.dialog_rect_of(SEEN_TITLE);
+            assert_eq!(painted.in_detail(seen_title()), 1, "at {}pt: {:?}", size.x, painted.text);
+            let text = painted.dialog_rect_of(seen_title());
             let (band, fill) = painted.fill_behind(text).expect("the caution has no band behind it");
             assert_eq!(fill, theme::CAUTION_WASH, "the caution is not on the amber ground");
             assert!(band.right() <= size.x + 1.0 && band.left() >= 0.0, "{band:?}");
             assert_eq!(
-                click_nth_picking(&with_password(crate::send::SendState::Opened), SendDeleteView::default(), Some("id0".into()), CHANGE_PASSWORD, 0),
+                click_nth_picking(&with_password(crate::send::SendState::Opened), SendDeleteView::default(), Some("id0".into()), change_password(), 0),
                 SendUiAction::ChangePassword("item-1".into()),
                 "Change password does not open the record's edit"
             );
             let (quiet, _) = paint(&with_password(crate::send::SendState::Waiting), None, size);
-            assert!(!quiet.has(SEEN_TITLE), "a link nobody has opened is warned about anyway");
+            assert!(!quiet.has(seen_title()), "a link nobody has opened is warned about anyway");
         }
     }
 
@@ -6211,7 +6383,7 @@ mod paint_tests {
     fn nothing_picked_draws_no_modal_and_a_stale_pick_draws_none_either() {
         let state = rows(3);
         let (painted, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), None);
-        assert_eq!(painted.in_detail(REVOKE_LABEL) + painted.in_detail(EXTEND_LABEL), 0, "a modal with nothing picked");
+        assert_eq!(painted.in_detail(revoke_label()) + painted.in_detail(extend_label()), 0, "a modal with nothing picked");
         assert_eq!(painted.dialog_text_rects().count(), 0, "{:?}", painted.text);
         let (stale, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), Some("id-that-is-gone".to_string()));
         assert_eq!(stale.dialog_text_rects().count(), 0, "a selection naming a Send that is gone draws a modal: {:?}", stale.text);
@@ -6224,7 +6396,7 @@ mod paint_tests {
         let size = egui::vec2(688.0, 430.0);
         let (painted, _) = paint_picking(&state, None, size, SendDeleteView::default(), Some("id-detail".to_string()));
         let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-        for label in [REVOKE_LABEL, COPY_LINK_LABEL, EXTEND_LABEL] {
+        for label in [revoke_label(), copy_link_label(), extend_label()] {
             let at = painted.dialog_rect_of(label);
             assert!(pane.contains_rect(at), "{label:?} at {at:?} is off a {size:?} window");
         }
@@ -6256,14 +6428,14 @@ mod paint_tests {
         let state = SendPaneState::Rows(vec![summary_row("a text Send", false), summary_row("report.pdf", true)]);
         let size = egui::vec2(688.0, 900.0);
         let (painted, _) = paint_picking(&state, None, size, SendDeleteView::default(), None);
-        let note = painted.rect_of(SCOPE_SUBTEXT).unwrap_or_else(|| panic!("the standing note vanished: {:?}", painted.text));
+        let note = painted.rect_of(scope_subtext()).unwrap_or_else(|| panic!("the standing note vanished: {:?}", painted.text));
         let card = card_of(&painted, "report.pdf");
         assert!(note.top() > card.bottom(), "the note is above the cards: {note:?} {card:?}");
-        assert!(painted.has(FILE_SEND_EXPLANATION), "a file Send was listed with nothing saying what it means");
+        assert!(painted.has(file_send_explanation()), "a file Send was listed with nothing saying what it means");
         let text_only = SendPaneState::Rows(vec![summary_row("a text Send", false)]);
         let (painted, _) = paint_picking(&text_only, None, size, SendDeleteView::default(), None);
-        assert!(!painted.has(FILE_SEND_EXPLANATION), "a list of text Sends was told about a restriction it has not met");
-        assert!(painted.has(SCOPE_SUBTEXT));
+        assert!(!painted.has(file_send_explanation()), "a list of text Sends was told about a restriction it has not met");
+        assert!(painted.has(scope_subtext()));
     }
 
     #[test]
@@ -6282,7 +6454,7 @@ mod paint_tests {
                 let wanted = expected.contains(&name);
                 assert_eq!(painted.in_list(name) == 1, wanted, "under {scope:?} {name:?}: {:?}", painted.text);
             }
-            let title = if scope == SendScope::All { shared_page::TITLE } else { scope.label() };
+            let title = if scope == SendScope::All { shared_page::title() } else { scope.label() };
             assert!(painted.has(title), "the page does not name the {scope:?} cut it shows: {:?}", painted.text);
         }
         let counts = crate::vault_window::sidebar::SendCounts::over([SendState::Waiting, SendState::Used, SendState::Expired, SendState::Revoked]);
@@ -6334,25 +6506,25 @@ mod paint_tests {
 
         let (painted, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
         for words in [
-            share_ui::SHARED_WITH_A_PERSON,
-            share_ui::VIEW_ONLY,
-            share_ui::FOLLOWS_EDITS,
-            share_ui::WHOLE_RECORD,
+            share_ui::shared_with_a_person(),
+            share_ui::view_only(),
+            share_ui::follows_edits(),
+            share_ui::whole_record(),
             "anna@x.io",
             "14 Sep",
-            OPEN_RECORD_LABEL,
-            share_ui::STOP_LABEL,
+            open_record_label(),
+            share_ui::stop_label(),
         ] {
             assert_eq!(painted.in_detail(words), 1, "{words:?} in the modal: {:?}", painted.text);
         }
-        assert_eq!(painted.in_detail(REVOKE_LABEL), 0, "a share has no link to revoke");
+        assert_eq!(painted.in_detail(revoke_label()), 0, "a share has no link to revoke");
 
-        let open = painted.dialog_rect_of(OPEN_RECORD_LABEL).center();
+        let open = painted.dialog_rect_of(open_record_label()).center();
         let (_, action) = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(open));
         assert_eq!(action, SendUiAction::OpenRecord(record.id.clone()));
         assert_eq!(people.asked, None);
 
-        let stop = painted.dialog_rect_of(share_ui::STOP_LABEL).center();
+        let stop = painted.dialog_rect_of(share_ui::stop_label()).center();
         let (_, action) = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(stop));
         assert_eq!(people.asked, Some(PeopleAsk::Stop(key.clone())), "step one asks, and nothing else");
         assert_eq!(action, SendUiAction::None);
@@ -6362,16 +6534,16 @@ mod paint_tests {
     fn a_shares_modal_says_what_went_wrong_at_its_foot() {
         let record = a_record("rec-1", "Acme VPN");
         let shares = [a_share_of(&record, "anna@x.io", PersonState::WaitingAccept)];
-        let mut people = PeopleRows { shares: &shares, notice: Some(share_ui::BUSY.to_string()), ..PeopleRows::none() };
+        let mut people = PeopleRows { shares: &shares, notice: Some(share_ui::busy().to_string()), ..PeopleRows::none() };
         let mut selected = Some(shares[0].key.clone());
         let (painted, _) =
             paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, std::slice::from_ref(&record), TALL_WINDOW, Vec::new());
-        assert_eq!(painted.in_detail(share_ui::BUSY), 1, "no notice: {:?}", painted.text);
-        let notice = painted.dialog_rect_of(share_ui::BUSY);
-        let facts = painted.dialog_rect_of(share_ui::CAN_ROW);
+        assert_eq!(painted.in_detail(share_ui::busy()), 1, "no notice: {:?}", painted.text);
+        let notice = painted.dialog_rect_of(share_ui::busy());
+        let facts = painted.dialog_rect_of(share_ui::can_row());
         assert!(notice.top() > facts.top(), "the sentence is not under the facts");
-        assert_eq!(painted.in_detail(share_ui::FOLLOWS_EDITS), 0);
-        assert_eq!(painted.in_detail(share_ui::STATUS_ROW), 1, "{:?}", painted.text);
+        assert_eq!(painted.in_detail(share_ui::follows_edits()), 0);
+        assert_eq!(painted.in_detail(share_ui::status_row()), 1, "{:?}", painted.text);
     }
 
     #[test]
@@ -6388,8 +6560,8 @@ mod paint_tests {
         let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
         let (painted, _) = paint_sharing(&SendPaneState::Empty, &mut people, &mut None, records, size, Vec::new());
         assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "an account with no Sends still lists its share");
-        assert!(!painted.has(EMPTY_HEADLINE), "{:?}", painted.text);
-        assert!(painted.has(SHARES_SUBTEXT) || painted.has(SCOPE_SUBTEXT), "{:?}", painted.text);
+        assert!(!painted.has(empty_headline()), "{:?}", painted.text);
+        assert!(painted.has(shares_subtext()) || painted.has(scope_subtext()), "{:?}", painted.text);
 
         let waiting_only = paint_scope_with(&a_send_made_from(&record), crate::vault_window::sidebar::SendScope::Waiting, &mut people);
         assert_eq!(waiting_only.in_list("to anna@x.io \u{b7} Shared"), 0, "a share on a Send-state sub-row");
@@ -6424,7 +6596,7 @@ mod paint_tests {
         let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
         let failed = SendPaneState::Failed { message: "bw is not signed in.".to_string(), ambiguous: true };
         for size in [egui::vec2(1028.0, 740.0), min_pane_size()] {
-            for (state, status) in [(&SendPaneState::Loading, LOADING_LABEL), (&failed, TRY_AGAIN_LABEL)] {
+            for (state, status) in [(&SendPaneState::Loading, loading_label()), (&failed, try_again_label())] {
                 let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
                 let (painted, _) = paint_sharing(state, &mut people, &mut None, records, size, Vec::new());
                 assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "{status:?}: the share is not listed: {:?}", painted.text);
@@ -6455,36 +6627,36 @@ mod paint_tests {
         let rows = received_rows(&history, &items, &FixedClock(NOW), &UTC);
 
         let listed = paint_received(&rows, None);
-        assert!(listed.has(shared_page::RECEIVED_TITLE), "the page does not name itself: {:?}", listed.text);
+        assert!(listed.has(shared_page::received_title()), "the page does not name itself: {:?}", listed.text);
         assert_eq!(listed.in_list("SAP Production"), 1);
         assert_eq!(listed.in_list("Office WiFi"), 1);
         assert_eq!(listed.in_list("In your vault"), 1);
         assert_eq!(listed.in_list("Gone"), 1);
         assert_eq!(listed.dialog_text_rects().count(), 0, "a modal with nothing picked");
-        for leaked in [LOADING_LABEL, SCOPE_SUBTEXT] {
+        for leaked in [loading_label(), scope_subtext()] {
             assert!(!listed.has(leaked), "{leaked:?} is drawn on `Shared with me`, which asks the server nothing: {:?}", listed.text);
         }
 
         let present = paint_received(&rows, Some("item-here".to_string()));
-        assert!(present.has(RECEIVED_ITEM_PRESENT), "{:?}", present.text);
-        assert_eq!(present.in_detail(IN_VAULT_YES), 1);
-        assert!(present.has(ARRIVED_ROW));
+        assert!(present.has(received_item_present()), "{:?}", present.text);
+        assert_eq!(present.in_detail(in_vault_yes()), 1);
+        assert!(present.has(arrived_row()));
 
         let gone = paint_received(&rows, Some("item-gone".to_string()));
-        assert!(gone.has(RECEIVED_ITEM_GONE), "{:?}", gone.text);
-        assert_eq!(gone.in_detail(IN_VAULT_NO), 1);
+        assert!(gone.has(received_item_gone()), "{:?}", gone.text);
+        assert_eq!(gone.in_detail(in_vault_no()), 1);
     }
 
     #[test]
     fn an_empty_shared_with_me_says_nothing_has_arrived_and_the_scope_line_is_its_own() {
         let painted = paint_received(&[], None);
-        assert!(painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
-        assert!(painted.has(RECEIVED_SCOPE_SUBTEXT));
+        assert!(painted.has(received_empty_headline()), "{:?}", painted.text);
+        assert!(painted.has(received_scope_subtext()));
     }
 
     #[test]
     fn shared_with_me_puts_records_from_people_above_the_imports_and_opens_them() {
-        use crate::vault_window::share_ui::{ReceivedShareRow, FROM_PEOPLE_EYEBROW, FROM_SENDS_EYEBROW};
+        use crate::vault_window::share_ui::{ReceivedShareRow, from_people_eyebrow, from_sends_eyebrow};
         let history = crate::receive_history::ReceiveHistory {
             entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
         };
@@ -6492,18 +6664,18 @@ mod paint_tests {
         let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
         let painted = paint_received_with(&rows, &people, None);
         let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
-        assert!(top(FROM_PEOPLE_EYEBROW) < top("Acme VPN"));
-        assert!(top("Acme VPN") < top(FROM_SENDS_EYEBROW));
-        assert!(top(FROM_SENDS_EYEBROW) < top("SAP Production"));
+        assert!(top(from_people_eyebrow()) < top("Acme VPN"));
+        assert!(top("Acme VPN") < top(from_sends_eyebrow()));
+        assert!(top(from_sends_eyebrow()) < top("SAP Production"));
         assert!(painted.has("from denis@x.io \u{b7} view-only"), "{:?}", painted.text);
-        assert!(painted.has(RECEIVED_PEOPLE_SUBTEXT) && !painted.has(RECEIVED_SCOPE_SUBTEXT), "{:?}", painted.text);
+        assert!(painted.has(received_people_subtext()) && !painted.has(received_scope_subtext()), "{:?}", painted.text);
         let imports_only = paint_received_with(&rows, &[], None);
-        assert!(imports_only.has(RECEIVED_SCOPE_SUBTEXT) && !imports_only.has(RECEIVED_PEOPLE_SUBTEXT));
+        assert!(imports_only.has(received_scope_subtext()) && !imports_only.has(received_people_subtext()));
 
         let alone = paint_received_with(&[], &people, None);
         assert!(alone.has("Acme VPN"));
-        assert!(!alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
-        assert!(!alone.has(FROM_SENDS_EYEBROW), "an eyebrow over no rows: {:?}", alone.text);
+        assert!(!alone.has(received_empty_headline()), "{:?}", alone.text);
+        assert!(!alone.has(from_sends_eyebrow()), "an eyebrow over no rows: {:?}", alone.text);
 
         // A press on a record from a person opens it in the vault, as the
         // 0.15 row did, and picks nothing (the vault is where it is read).
@@ -6570,18 +6742,18 @@ mod paint_tests {
         let (painted, selected) = paint_received_people(&rows, &mut people, None);
         assert_eq!(selected, None, "nothing is picked for the user");
         let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
-        assert!(top(sharing::PASTE_ACCEPT_LABEL) < top(sharing::FROM_PEOPLE_EYEBROW));
+        assert!(top(sharing::paste_accept_label()) < top(sharing::from_people_eyebrow()));
 
         let mut box_only = PeopleRows { paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
         let (alone, _) = paint_received_people(&[], &mut box_only, None);
-        assert!(alone.has(sharing::PASTE_ACCEPT_LABEL), "{:?}", alone.text);
-        assert!(alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
+        assert!(alone.has(sharing::paste_accept_label()), "{:?}", alone.text);
+        assert!(alone.has(received_empty_headline()), "{:?}", alone.text);
 
         let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "denis@x.io".into(), verified: true }];
         let mut only_waiting = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
         let (painted, _) = paint_received_people(&[], &mut only_waiting, None);
         assert!(painted.has(&sharing::waiting_line("denis@x.io")), "{:?}", painted.text);
-        assert!(!painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
+        assert!(!painted.has(received_empty_headline()), "{:?}", painted.text);
     }
 
     /// **One window across frames**, for what depends on the frame before: a
@@ -6657,10 +6829,10 @@ mod paint_tests {
             let mut window = Session::new(size, Some("id0".to_string()));
             let mut none = PeopleRows::none();
             let before = window.settle(&state, SendDeleteView::default(), &mut none, &[]);
-            let revoke = before.fill_behind(before.dialog_rect_of(REVOKE_LABEL)).expect("Revoke has no button").0;
+            let revoke = before.fill_behind(before.dialog_rect_of(revoke_label())).expect("Revoke has no button").0;
             let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
             let during = window.settle(&state, armed, &mut none, &[]);
-            let cancel = during.fill_behind(during.dialog_rect_of(CANCEL_LABEL)).expect("Cancel has no button").0;
+            let cancel = during.fill_behind(during.dialog_rect_of(cancel_label())).expect("Cancel has no button").0;
             assert!(
                 (revoke.min - cancel.min).length() < 0.5 && (revoke.max - cancel.max).length() < 0.5,
                 "at {}pt Revoke is {revoke:?} and Cancel {cancel:?}: the question grew the dialog and moved the buttons",
@@ -6675,11 +6847,11 @@ mod paint_tests {
         let mut window = Session::new(min_pane_size(), Some("id0".to_string()));
         let mut none = PeopleRows::none();
         let before = window.settle(&state, SendDeleteView::default(), &mut none, &[]);
-        let where_revoke_was = before.dialog_rect_of(REVOKE_LABEL).center();
+        let where_revoke_was = before.dialog_rect_of(revoke_label()).center();
         let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
         let during = window.settle(&state, armed, &mut none, &[]);
         assert!(
-            !during.dialog_rect_of(CONFIRM_LABEL).contains(where_revoke_was),
+            !during.dialog_rect_of(confirm_label()).contains(where_revoke_was),
             "control: the destructive button covers Revoke's place"
         );
         let (_, action) = window.frame(&state, armed, &mut none, &[], press_at(where_revoke_was));
@@ -6703,16 +6875,16 @@ mod paint_tests {
             let mut window = Session::new(size, Some(key.clone()));
             let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
             let at_rest = window.settle(&state, SendDeleteView::default(), &mut people, records);
-            let stop_rect = at_rest.dialog_rect_of(share_ui::STOP_LABEL);
+            let stop_rect = at_rest.dialog_rect_of(share_ui::stop_label());
             assert!(stop_rect.right() <= size.x + 0.5, "Stop sharing runs off a {}pt window", size.x);
 
             people.confirming = Some(key.clone());
             let asking = window.settle(&state, SendDeleteView::default(), &mut people, records);
             assert!(asking.has(&share_ui::stop_question("Acme VPN", "anna@x.io")), "{:?}", asking.text);
-            assert_eq!(asking.in_detail(share_ui::REMOVE_LABEL), 1);
-            assert_eq!(asking.in_detail(OPEN_RECORD_LABEL), 0, "Open record steps back while the question is up");
-            assert_eq!(asking.in_detail(share_ui::STOP_LABEL), 0);
-            let cancel_button = asking.fill_behind(asking.dialog_rect_of(share_ui::CANCEL_BUTTON)).expect("Cancel has no button").0;
+            assert_eq!(asking.in_detail(share_ui::remove_label()), 1);
+            assert_eq!(asking.in_detail(open_record_label()), 0, "Open record steps back while the question is up");
+            assert_eq!(asking.in_detail(share_ui::stop_label()), 0);
+            let cancel_button = asking.fill_behind(asking.dialog_rect_of(share_ui::cancel_button())).expect("Cancel has no button").0;
             let stop_button = at_rest.fill_behind(stop_rect).expect("Stop has no button").0;
             assert!(
                 (cancel_button.min - stop_button.min).length() < 0.51 && (cancel_button.max - stop_button.max).length() < 0.51,
@@ -6720,11 +6892,11 @@ mod paint_tests {
                 size.x
             );
 
-            let remove = asking.dialog_rect_of(share_ui::REMOVE_LABEL).center();
+            let remove = asking.dialog_rect_of(share_ui::remove_label()).center();
             people.asked = None;
             let _ = window.frame(&state, SendDeleteView::default(), &mut people, records, press_at(remove));
             assert_eq!(people.asked, Some(PeopleAsk::ConfirmStop(key.clone())));
-            let cancel = asking.dialog_rect_of(share_ui::CANCEL_BUTTON).center();
+            let cancel = asking.dialog_rect_of(share_ui::cancel_button()).center();
             people.asked = None;
             let _ = window.frame(&state, SendDeleteView::default(), &mut people, records, press_at(cancel));
             assert_eq!(people.asked, Some(PeopleAsk::CancelStop));
@@ -6732,8 +6904,8 @@ mod paint_tests {
             people.confirming = None;
             people.stopping = Some(key.clone());
             let running = window.settle(&state, SendDeleteView::default(), &mut people, records);
-            assert_eq!(running.in_detail(share_ui::STOPPING_LABEL), 1, "{:?}", running.text);
-            for control in [share_ui::STOP_LABEL, share_ui::CANCEL_BUTTON, OPEN_RECORD_LABEL, share_ui::REMOVE_LABEL] {
+            assert_eq!(running.in_detail(share_ui::stopping_label()), 1, "{:?}", running.text);
+            for control in [share_ui::stop_label(), share_ui::cancel_button(), open_record_label(), share_ui::remove_label()] {
                 assert_eq!(running.in_detail(control), 0, "{control:?} is offered while the stop runs");
             }
         }
@@ -8202,7 +8374,7 @@ mod source_pins {
                  (crate::send::SendError::NoVerifiedCli(_) | \
                  crate::send::SendError::SpawnFailed(_)), ) => \
                  RecordImportReport::Failed(format!( \" \", \
-                 crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI, error.user_message() \
+                 crate::vault_window::send_ui::receive_needs_the_cli(), error.user_message() \
                  )), Err(error) => RecordImportReport::Failed(error.user_message().to_string()), }}",
                 "dir", "receive",
             )),
@@ -8343,7 +8515,7 @@ mod source_pins {
         }
     }
 
-    /// **`RECEIVE_NEEDS_THE_CLI` survives for the CLI and is unreachable for
+    /// **`receive_needs_the_cli()` survives for the CLI and is unreachable for
     /// the built-in client.**
     ///
     /// The sentence itself does not move -- a user on `bw serve` is not
@@ -8368,12 +8540,12 @@ mod source_pins {
         // absence below is a statement about live code and not about a needle
         // that matches nothing anywhere.
         assert!(
-            cli.contains("RECEIVE_NEEDS_THE_CLI"),
-            "control: the `bw serve` implementation no longer names RECEIVE_NEEDS_THE_CLI at \
+            cli.contains("receive_needs_the_cli"),
+            "control: the `bw serve` implementation no longer names receive_needs_the_cli at \
              all, so the assertion below is searching text it could never have found"
         );
         assert!(
-            !direct.contains("RECEIVE_NEEDS_THE_CLI"),
+            !direct.contains("receive_needs_the_cli"),
             "the built-in client can reach the sentence that tells a user to install \
              Bitwarden's command-line tool. It does not need one: it reads the link itself"
         );
@@ -9910,7 +10082,6 @@ mod source_pins {
         // are civil-date arithmetic and nothing else.
         "send.rs: pub enum SendLifetime {",
         "send.rs: pub const LIFETIME_CHOICES: [Option<SendLifetime>; 9] = [",
-        "send.rs: pub const PICK_A_DATE_LABEL: &str = \" \";",
         "send.rs: pub const DEFAULT_LIFETIME: SendLifetime = SendLifetime::Hours(24 * 7);",
         "send.rs: pub const NEVER_DELETION_DATE: &str = \" \";",
         "send.rs: pub const MAX_PICKED_MONTHS: u32 = 12;",
@@ -9949,6 +10120,8 @@ mod source_pins {
         // as the CLI path, rather than growing a second copy of the
         // arithmetic that the two backends could then disagree over.
         "send.rs: pub(crate) fn deletion_date(lifetime: SendLifetime, now: &dyn SendClock) -> String {",
+        // The instant behind `deletion_date`, which the Send words file reads to say the day.
+        "send.rs: pub(crate) fn deletion_instant(lifetime: SendLifetime, now: &dyn SendClock) -> Option<i64> {",
         // The enum's own two methods, and the window the calendar offers.
         // `on_local_day` is the single place a picked `(year, month, day)`
         // becomes an instant; `local_day` is the inverse, for a calendar that
@@ -9959,29 +10132,6 @@ mod source_pins {
         "send.rs: pub fn on_local_day(year: i64, month: u32, day: u32, zone: &dyn LocalOffset) -> Self {",
         "send.rs: pub fn local_day(self, now: &dyn SendClock, zone: &dyn LocalOffset) -> Option<(i64, u32, u32)> {",
         "send.rs: pub fn pickable_window(",
-        // **Moved here from `send_ui`, deliberately, and it is the only item
-        // the §5a Access block adds to this wall.** It was the Sends screen's
-        // own `pub fn lifetime_label(days: u8)` while `expiry_wording`, four
-        // lines below, built the same phrase out of its own `format!` -- two
-        // spellings of one duration, agreeing by coincidence. It is now one
-        // function that both screens' cells and that sentence all read.
-        //
-        // It is a door in the sense this list counts and in no other: it
-        // takes an enum and an offset and returns a `String`, reaches no runner, no
-        // invocation and no child, and there is nothing behind it but a
-        // `format!`.
-        "send.rs: pub fn lifetime_label(lifetime: SendLifetime, zone: &dyn LocalOffset) -> String {",
-        // The one word `Never` is named by, beside the function that names
-        // it. A `&str` constant, read by the label and by nothing else.
-        "send.rs: pub const NEVER_LABEL: &str = \" \";",
-        // `zone` was added beside `now` when the sentence stopped naming the
-        // UTC day and started naming the user's own. Both are injected, and
-        // that is the point of both: nothing in `send.rs` reads the machine's
-        // clock or the machine's timezone for itself.
-        "send.rs: pub fn expiry_wording(lifetime: SendLifetime, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
-        // And the one sentence that has no date in it, for the same reason:
-        // a `&str` beside the function that returns it.
-        "send.rs: pub const NEVER_WORDING: &str =",
         "send.rs: pub struct SendInvocation {",
         "send.rs: pub fn args(&self) -> &[String] {",
         "send.rs: pub fn stdin_json_b64(&self) -> &str {",
@@ -10071,7 +10221,6 @@ mod source_pins {
         "send.rs: pub stdout: String,",
         "send.rs: pub stderr: String,",
         "send.rs: pub enum SendError {",
-        "send.rs: pub fn user_message(&self) -> &str {",
         "send.rs: pub fn is_ambiguous(&self) -> bool {",
         "send.rs: pub fn classify_failure(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SendError {",
         "send.rs: pub fn parse_created_send(stdout: &str) -> Result<CreatedSend, SendError> {",

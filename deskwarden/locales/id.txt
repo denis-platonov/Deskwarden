@@ -382,3 +382,5 @@ main.cli_unrecognized_body = Bitwarden CLI yang akan dipakai Deskwarden {headlin
 main.signer_none = Tidak memiliki sertifikat penandatangan.
 main.signer_org = Ditandatangani oleh: {org}
 main.signer_no_org = Sertifikat penandatangannya tidak menyebut organisasi apa pun.
+login.server_eu = UE
+login.server_self_hosted = Dihosting sendiri

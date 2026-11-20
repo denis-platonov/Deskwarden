@@ -25,9 +25,13 @@ use crate::kit::tokens::{self, palette, Role};
 use crate::theme;
 
 /// The nav's heading.
-pub const NAV_HEADING: &str = "Settings";
+pub fn nav_heading() -> &'static str {
+    crate::i18n::t("settings.nav_heading")
+}
 /// The Back affordance at the top of the nav.
-pub const BACK_LABEL: &str = "Back";
+pub fn back_label() -> &'static str {
+    crate::i18n::t("settings.back_label")
+}
 
 pub const NAV_WIDTH: f32 = 232.0;
 const COLUMN_MAX: f32 = 760.0;
@@ -73,36 +77,36 @@ impl Page {
 
     pub fn label(self) -> &'static str {
         match self {
-            Page::General => "General",
-            Page::Autofill => "Autofill",
-            Page::Apps => "Apps",
-            Page::Security => "Security",
-            Page::Vault => "Vault",
-            Page::Generator => "Generator",
-            Page::Notifications => "Notifications",
-            Page::ImportExport => "Import & export",
-            Page::Devices => "Devices",
-            Page::Shortcuts => "Shortcuts",
-            Page::Account => "Account",
-            Page::About => "About",
+            Page::General => crate::i18n::t("settings.page_general"),
+            Page::Autofill => crate::i18n::t("settings.page_autofill"),
+            Page::Apps => crate::i18n::t("settings.page_apps"),
+            Page::Security => crate::i18n::t("settings.page_security"),
+            Page::Vault => crate::i18n::t("settings.page_vault"),
+            Page::Generator => crate::i18n::t("settings.page_generator"),
+            Page::Notifications => crate::i18n::t("settings.page_notifications"),
+            Page::ImportExport => crate::i18n::t("settings.page_import_export"),
+            Page::Devices => crate::i18n::t("settings.page_devices"),
+            Page::Shortcuts => crate::i18n::t("settings.page_shortcuts"),
+            Page::Account => crate::i18n::t("settings.page_account"),
+            Page::About => crate::i18n::t("settings.page_about"),
         }
     }
 
     /// The spec's subtitle, for the pages that have one.
     pub fn subtitle(self) -> Option<String> {
         Some(match self {
-            Page::General => "How Deskwarden starts and looks".into(),
-            Page::Autofill => "What happens when an app asks you to sign in".into(),
-            Page::Apps => "Programs on this PC that ask Deskwarden for your vault".into(),
-            Page::Security => "Keep your vault safe".into(),
-            Page::Vault => "How items are shown and organised".into(),
-            Page::Generator => "Defaults for new passwords".into(),
-            Page::Notifications => "When Deskwarden should tell you something".into(),
-            Page::ImportExport => "Move passwords in and out".into(),
-            Page::Devices => "Where your account is signed in".into(),
+            Page::General => crate::i18n::t("settings.subtitle_general").into(),
+            Page::Autofill => crate::i18n::t("settings.subtitle_autofill").into(),
+            Page::Apps => crate::i18n::t("settings.subtitle_apps").into(),
+            Page::Security => crate::i18n::t("settings.subtitle_security").into(),
+            Page::Vault => crate::i18n::t("settings.subtitle_vault").into(),
+            Page::Generator => crate::i18n::t("settings.subtitle_generator").into(),
+            Page::Notifications => crate::i18n::t("settings.subtitle_notifications").into(),
+            Page::ImportExport => crate::i18n::t("settings.subtitle_import_export").into(),
+            Page::Devices => crate::i18n::t("settings.subtitle_devices").into(),
             Page::Shortcuts => return None,
             Page::Account => return None,
-            Page::About => format!("Deskwarden {}", env!("CARGO_PKG_VERSION")),
+            Page::About => crate::i18n::tf("settings.subtitle_about", &[("version", env!("CARGO_PKG_VERSION"))]),
         })
     }
 
@@ -163,10 +167,10 @@ fn draw_nav(ui: &mut Ui, nav: Rect, state: &mut PrefsState, page: &mut Page) -> 
     let mut back = false;
     ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
         ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
-        back = nav_row(ui, icon::glyph::BACK, BACK_LABEL, false, 36.0);
+        back = nav_row(ui, icon::glyph::BACK, back_label(), false, 36.0);
         ui.add_space(8.0);
         egui::Frame::new().inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 14 }).show(ui, |ui| {
-            ui.label(tokens::job(HEADING, NAV_HEADING, p.ink));
+            ui.label(tokens::job(HEADING, nav_heading(), p.ink));
         });
         egui::ScrollArea::vertical().id_salt("settings-nav").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
@@ -241,14 +245,14 @@ fn body(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
         Page::Generator => generator(ui, state),
         Page::Notifications => not_yet(
             ui,
-            "Notification choices are not available yet",
-            "Arrives in a later release",
+            crate::i18n::t("settings.notifications_unavailable"),
+            crate::i18n::t("settings.arrives_later"),
         ),
         Page::ImportExport => import_export(ui),
         Page::Devices => not_yet(
             ui,
-            "The device list is not available yet",
-            "Arrives in a later release",
+            crate::i18n::t("settings.devices_unavailable"),
+            crate::i18n::t("settings.arrives_later"),
         ),
         Page::Shortcuts => shortcuts(ui, state),
         Page::Account => account(ui, state),
@@ -261,38 +265,36 @@ fn body(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
 // ---------------------------------------------------------------------------
 
 fn general(ui: &mut Ui, state: &mut PrefsState) {
-    group(ui, Some("Startup"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_startup")), |ui| {
         card(ui, |ui| {
             startup_rows(ui, state);
             if state.startup.is_some() {
                 kit_card::row_rule(ui);
             }
-            value_row(ui, KEEP_RUNNING_LABEL, "", KEEP_RUNNING_TIP, KEEP_RUNNING_VALUE);
+            value_row(ui, keep_running_label(), "", keep_running_tip(), keep_running_value());
         });
     });
-    group(ui, Some("Look"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_look")), |ui| {
         card(ui, |ui| {
             use crate::kit::tokens::{SidebarStyle, TextSize, ThemeChoice};
             let now = if state.settings.sidebar_style == SidebarStyle::Navy { 0 } else { 1 };
-            if let Some(picked) = segment_row(ui, prefs::SIDEBAR_STYLE_LABEL, "", "", &["Navy", "Light"], now) {
+            if let Some(picked) = segment_row(ui, prefs::sidebar_style_label(), "", "", &[crate::i18n::t("settings.sidebar_navy"), crate::i18n::t("settings.sidebar_light")], now) {
                 state.settings.sidebar_style = if picked == 0 { SidebarStyle::Navy } else { SidebarStyle::Light };
             }
             kit_card::row_rule(ui);
             let themes = [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System];
             let now = themes.iter().position(|t| *t == state.settings.theme).unwrap_or(0);
-            if let Some(picked) = segment_row(ui, THEME_LABEL, "", "", &["Light", "Dark", "System"], now) {
+            if let Some(picked) = segment_row(ui, theme_label(), "", "", &[crate::i18n::t("settings.theme_light"), crate::i18n::t("settings.theme_dark"), crate::i18n::t("settings.theme_system")], now) {
                 state.settings.theme = themes[picked];
             }
             kit_card::row_rule(ui);
             let sizes = [TextSize::Default, TextSize::Large, TextSize::Larger];
             let now = sizes.iter().position(|t| *t == state.settings.text_size).unwrap_or(0);
-            if let Some(picked) = segment_row(ui, TEXT_SIZE_LABEL, "", "", &["Default", "Large", "Larger"], now) {
+            if let Some(picked) = segment_row(ui, text_size_label(), "", "", &[crate::i18n::t("settings.text_default"), crate::i18n::t("settings.text_large"), crate::i18n::t("settings.text_larger")], now) {
                 state.settings.text_size = sizes[picked];
             }
             kit_card::row_rule(ui);
-            if button_row(ui, LANGUAGE_LABEL, "", "", LANGUAGE_VALUE, false) {
-                crate::kit::toast::show(ui.ctx(), LANGUAGE_TOAST);
-            }
+            super::language_picker::language_row(ui, &mut state.settings, language_label());
         });
     });
 }
@@ -305,10 +307,10 @@ fn startup_rows(ui: &mut Ui, state: &mut PrefsState) {
         return;
     };
     let mut open = now.open_at_sign_in;
-    switch_row(ui, OPEN_AT_SIGN_IN_LABEL, "", "", &mut open, true);
+    switch_row(ui, open_at_sign_in_label(), "", "", &mut open, true);
     kit_card::row_rule(ui);
     let mut tray = if now.open_at_sign_in { now.in_tray } else { state.tray_when_opened };
-    switch_row(ui, START_IN_TRAY_LABEL, "", "", &mut tray, now.open_at_sign_in);
+    switch_row(ui, start_in_tray_label(), "", "", &mut tray, now.open_at_sign_in);
     let wanted = crate::autostart_repair::Startup { open_at_sign_in: open, in_tray: tray };
     if open == now.open_at_sign_in && (tray == now.in_tray || !now.open_at_sign_in) {
         return;
@@ -319,55 +321,84 @@ fn startup_rows(ui: &mut Ui, state: &mut PrefsState) {
     if (state.startup_sink)(wanted) {
         state.startup = Some(wanted);
     } else {
-        crate::kit::toast::show(ui.ctx(), STARTUP_FAILED_TOAST);
+        crate::kit::toast::show(ui.ctx(), startup_failed_toast());
     }
 }
 
 /// The Startup rows' wording (spec C 2.4).
-pub const OPEN_AT_SIGN_IN_LABEL: &str = "Open when I sign in to Windows";
-pub const START_IN_TRAY_LABEL: &str = "Start in the system tray";
+pub fn open_at_sign_in_label() -> &'static str {
+    crate::i18n::t("settings.open_at_sign_in_label")
+}
+pub fn start_in_tray_label() -> &'static str {
+    crate::i18n::t("settings.start_in_tray_label")
+}
 /// Closing the window only ever hides it: the tray keeps autofill running.
-pub const KEEP_RUNNING_LABEL: &str = "Keep running when I close the window";
+pub fn keep_running_label() -> &'static str {
+    crate::i18n::t("settings.keep_running_label")
+}
 /// The design's tip for this row, word for word.
-const KEEP_RUNNING_TIP: &str = "Autofill only works while Deskwarden is running. Closing the window just hides it.";
-const KEEP_RUNNING_VALUE: &str = "Always";
-const STARTUP_FAILED_TOAST: &str = "Could not change the Windows startup entry";
+fn keep_running_tip() -> &'static str {
+    crate::i18n::t("settings.keep_running_tip")
+}
+fn keep_running_value() -> &'static str {
+    crate::i18n::t("settings.keep_running_value")
+}
+fn startup_failed_toast() -> &'static str {
+    crate::i18n::t("settings.startup_failed_toast")
+}
 /// The Security rows' wording (spec C 2.4).
-pub const IDLE_LOCK_TIP: &str = "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
-pub const IDLE_MINUTES_SUB: &str = "Minutes of no activity";
-pub const IDLE_MINUTES_TIP: &str = "One minute is the shortest.";
-pub const LOCK_ON_SLEEP_LABEL: &str = "Lock when the computer sleeps";
-pub const LOCK_ON_SCREEN_LOCK_LABEL: &str = "Lock when I lock my screen";
-pub const HIDE_ON_SHARE_LABEL: &str = "Hide passwords while I share my screen";
+pub fn idle_lock_tip() -> &'static str {
+    crate::i18n::t("settings.idle_lock_tip")
+}
+pub fn idle_minutes_sub() -> &'static str {
+    crate::i18n::t("settings.idle_minutes_sub")
+}
+pub fn idle_minutes_tip() -> &'static str {
+    crate::i18n::t("settings.idle_minutes_tip")
+}
+pub fn lock_on_sleep_label() -> &'static str {
+    crate::i18n::t("settings.lock_on_sleep_label")
+}
+pub fn lock_on_screen_lock_label() -> &'static str {
+    crate::i18n::t("settings.lock_on_screen_lock_label")
+}
+pub fn hide_on_share_label() -> &'static str {
+    crate::i18n::t("settings.hide_on_share_label")
+}
 /// The design's tip, kept to what the app does: the whole window (not only
 /// the passwords) stays out of the shared picture.
-const HIDE_ON_SHARE_TIP: &str = "The whole window stays out of Teams, Zoom or Meet screen sharing, even if you press reveal.";
+fn hide_on_share_tip() -> &'static str {
+    crate::i18n::t("settings.hide_on_share_tip")
+}
 /// The Look rows' wording (spec C 2.4).
-pub const THEME_LABEL: &str = "Theme";
-pub const TEXT_SIZE_LABEL: &str = "Text size";
-pub const LANGUAGE_LABEL: &str = "Language";
-const LANGUAGE_VALUE: &str = "English";
-/// Spec D6: English only, and a toast for the click.
-pub const LANGUAGE_TOAST: &str = "More languages are on the way";
+pub fn theme_label() -> &'static str {
+    crate::i18n::t("settings.theme_label")
+}
+pub fn text_size_label() -> &'static str {
+    crate::i18n::t("settings.text_size_label")
+}
+pub fn language_label() -> &'static str {
+    crate::i18n::t("settings.language_label")
+}
 
 fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
-    group(ui, Some("Suggestions"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_suggestions")), |ui| {
         card(ui, |ui| {
-            switch_row(ui, prefs::PROMPT_LABEL, "", prefs::PROMPT_TIP, &mut state.settings.prompt_on_match, true);
+            switch_row(ui, prefs::prompt_label(), "", prefs::prompt_tip(), &mut state.settings.prompt_on_match, true);
         });
     });
-    group(ui, Some("Sign-in steps"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_sign_in_steps")), |ui| {
         card(ui, |ui| {
-            if button_row(ui, DEFAULT_STEPS_LABEL, DEFAULT_STEPS_SUB, "", DEFAULT_STEPS_VALUE, false) {
-                crate::kit::toast::show(ui.ctx(), DEFAULT_STEPS_TOAST);
+            if button_row(ui, default_steps_label(), default_steps_sub(), "", default_steps_value(), false) {
+                crate::kit::toast::show(ui.ctx(), default_steps_toast());
             }
         });
     });
-    group(ui, Some("Shortcut"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_shortcut")), |ui| {
         card(ui, |ui| {
             // The spec's wording: the keys joined by a space (`Ctrl Alt B`).
             let chord = prefs::chord_keys(false, state.settings.shortcuts.picker).join(" ");
-            if button_row(ui, FILL_SHORTCUT_LABEL, FILL_SHORTCUT_SUB, "", &chord, false) {
+            if button_row(ui, fill_shortcut_label(), fill_shortcut_sub(), "", &chord, false) {
                 *page = Page::Shortcuts;
             }
         });
@@ -377,69 +408,81 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
 /// Autofill > Sign-in steps: what an app sign-in types when its login stores
 /// no sequence of its own (`key_sequence::DEFAULT_SEQUENCE`). Read-only; the
 /// steps of one login are edited on that login's Edit page.
-pub const DEFAULT_STEPS_LABEL: &str = "Default sign-in steps";
-const DEFAULT_STEPS_VALUE: &str = "Standard";
+pub fn default_steps_label() -> &'static str {
+    crate::i18n::t("settings.default_steps_label")
+}
+fn default_steps_value() -> &'static str {
+    crate::i18n::t("settings.default_steps_value")
+}
 /// The design says "Username, Tab, password, Enter"; the standard steps here
 /// type no Enter, so the sub says what they really type.
-const DEFAULT_STEPS_SUB: &str = "Username, Tab, password";
-pub const DEFAULT_STEPS_TOAST: &str = "Change steps for one login from its Edit page";
+fn default_steps_sub() -> &'static str {
+    crate::i18n::t("settings.default_steps_sub")
+}
+pub fn default_steps_toast() -> &'static str {
+    crate::i18n::t("settings.default_steps_toast")
+}
 
 /// The Autofill page's pointer at the Shortcuts page.
-pub const FILL_SHORTCUT_LABEL: &str = "Fill shortcut";
-const FILL_SHORTCUT_SUB: &str = "Works in any app, even without the panel";
+pub fn fill_shortcut_label() -> &'static str {
+    crate::i18n::t("settings.fill_shortcut_label")
+}
+fn fill_shortcut_sub() -> &'static str {
+    crate::i18n::t("settings.fill_shortcut_sub")
+}
 
 fn apps(ui: &mut Ui, state: &mut PrefsState) {
-    group(ui, Some("Local API"), |ui| prefs::api_cards(ui, state));
+    group(ui, Some(crate::i18n::t("settings.group_local_api")), |ui| prefs::api_cards(ui, state));
 }
 
 fn security(ui: &mut Ui, state: &mut PrefsState) {
     super::security_score::draw(ui);
-    group(ui, Some("Locking"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_locking")), |ui| {
         // One card in this page's row style: the idle lock, its minutes,
         // and the two away events (the 0.x Lock card's rows, folded in).
         card(ui, |ui| {
-            switch_row(ui, prefs::AUTO_LOCK_ENABLED_LABEL, "", IDLE_LOCK_TIP, &mut state.settings.auto_lock_enabled, true);
+            switch_row(ui, prefs::auto_lock_enabled_label(), "", idle_lock_tip(), &mut state.settings.auto_lock_enabled, true);
             kit_card::row_rule(ui);
             let enabled = state.settings.auto_lock_enabled;
             let stepper_w = prefs::STEPPER_STEP_WIDTH * 2.0 + prefs::STEPPER_VALUE_WIDTH;
-            row(ui, prefs::AUTO_LOCK_LABEL, IDLE_MINUTES_SUB, IDLE_MINUTES_TIP, !enabled, stepper_w, |ui| {
+            row(ui, prefs::auto_lock_label(), idle_minutes_sub(), idle_minutes_tip(), !enabled, stepper_w, |ui| {
                 state.settings.auto_lock_minutes =
                     prefs::minutes_stepper(ui, state.settings.auto_lock_minutes, &mut state.auto_lock_text, enabled);
             });
             kit_card::row_rule(ui);
             let s = &mut state.settings;
-            switch_row(ui, LOCK_ON_SLEEP_LABEL, "", "", &mut s.lock_on_sleep, true);
+            switch_row(ui, lock_on_sleep_label(), "", "", &mut s.lock_on_sleep, true);
             kit_card::row_rule(ui);
-            switch_row(ui, LOCK_ON_SCREEN_LOCK_LABEL, "", "", &mut s.lock_on_screen_lock, true);
+            switch_row(ui, lock_on_screen_lock_label(), "", "", &mut s.lock_on_screen_lock, true);
         });
     });
-    group(ui, Some("Privacy"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_privacy")), |ui| {
         prefs::draw_clipboard(ui, state);
         card(ui, |ui| {
-            switch_row(ui, HIDE_ON_SHARE_LABEL, "", HIDE_ON_SHARE_TIP, &mut state.settings.hide_on_screen_share, true);
+            switch_row(ui, hide_on_share_label(), "", hide_on_share_tip(), &mut state.settings.hide_on_screen_share, true);
         });
     });
-    group(ui, Some("Breaches"), |ui| prefs::draw_breaches(ui, state));
+    group(ui, Some(crate::i18n::t("settings.group_breaches")), |ui| prefs::draw_breaches(ui, state));
 }
 
 fn vault(ui: &mut Ui, state: &mut PrefsState) {
-    group(ui, Some("Display"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_display")), |ui| {
         card(ui, |ui| {
             let s = &mut state.settings;
-            switch_row(ui, prefs::FETCH_ICONS_LABEL, "", prefs::FETCH_ICONS_TIP, &mut s.fetch_icons, true);
+            switch_row(ui, prefs::fetch_icons_label(), "", prefs::fetch_icons_tip(), &mut s.fetch_icons, true);
             kit_card::row_rule(ui);
             let icons_on = s.fetch_icons;
-            switch_row(ui, prefs::DIRECT_ICONS_LABEL, prefs::DIRECT_ICONS_SUB, prefs::DIRECT_ICONS_TIP, &mut s.fetch_icons_direct, icons_on);
+            switch_row(ui, prefs::direct_icons_label(), prefs::direct_icons_sub(), prefs::direct_icons_tip(), &mut s.fetch_icons_direct, icons_on);
             kit_card::row_rule(ui);
             let direct_on = icons_on && s.fetch_icons_direct;
-            switch_row(ui, prefs::LAN_TLS_LABEL, prefs::LAN_TLS_SUB, prefs::LAN_TLS_TIP, &mut s.icons_ignore_tls_on_private_hosts, direct_on);
+            switch_row(ui, prefs::lan_tls_label(), prefs::lan_tls_sub(), prefs::lan_tls_tip(), &mut s.icons_ignore_tls_on_private_hosts, direct_on);
             kit_card::row_rule(ui);
-            switch_row(ui, prefs::BRAND_LOGOS_LABEL, prefs::BRAND_LOGOS_SUB, prefs::BRAND_LOGOS_TIP, &mut s.use_brand_logos, true);
+            switch_row(ui, prefs::brand_logos_label(), prefs::brand_logos_sub(), prefs::brand_logos_tip(), &mut s.use_brand_logos, true);
             kit_card::row_rule(ui);
-            switch_row(ui, prefs::TOTP_SECRET_LABEL, prefs::TOTP_SECRET_SUB, prefs::TOTP_SECRET_TIP, &mut s.reveal_totp_seed, true);
+            switch_row(ui, prefs::totp_secret_label(), prefs::totp_secret_sub(), prefs::totp_secret_tip(), &mut s.reveal_totp_seed, true);
         });
     });
-    group(ui, Some("Opening the vault"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_opening_the_vault")), |ui| {
         prefs::draw_backend_card(ui, state);
         prefs::draw_disk_cache_card(ui, state);
     });
@@ -451,20 +494,20 @@ fn generator(ui: &mut Ui, state: &mut PrefsState) {
             let g = &mut state.settings.generator;
             let modes = [GeneratorMode::Password, GeneratorMode::Passphrase, GeneratorMode::Pin];
             let now = modes.iter().position(|m| *m == g.mode).unwrap_or(0);
-            if let Some(picked) = segment_row(ui, "Make new passwords as", "", "", &["Password", "Passphrase", "PIN"], now) {
+            if let Some(picked) = segment_row(ui, crate::i18n::t("settings.generator_mode_label"), "", "", &[crate::i18n::t("settings.mode_password"), crate::i18n::t("settings.mode_passphrase"), crate::i18n::t("settings.mode_pin")], now) {
                 g.mode = modes[picked];
             }
             kit_card::row_rule(ui);
             let length = match g.mode {
-                GeneratorMode::Password => format!("{} characters", g.length),
-                GeneratorMode::Passphrase => format!("{} words", g.words),
-                GeneratorMode::Pin => format!("{} digits", g.pin_length),
+                GeneratorMode::Password => crate::i18n::tf("settings.length_characters", &[("count", &g.length.to_string())]),
+                GeneratorMode::Passphrase => crate::i18n::tf("settings.length_words", &[("count", &g.words.to_string())]),
+                GeneratorMode::Pin => crate::i18n::tf("settings.length_digits", &[("count", &g.pin_length.to_string())]),
             };
-            value_row(ui, "Length", "", "", &length);
+            value_row(ui, crate::i18n::t("settings.length_label"), "", "", &length);
             kit_card::row_rule(ui);
-            switch_row(ui, "Include symbols", "", "", &mut g.symbols, true);
+            switch_row(ui, crate::i18n::t("settings.include_symbols_label"), "", "", &mut g.symbols, true);
             kit_card::row_rule(ui);
-            switch_row(ui, "Avoid look-alike characters", "", "", &mut g.avoid_lookalikes, true);
+            switch_row(ui, crate::i18n::t("settings.avoid_lookalikes_label"), "", "", &mut g.avoid_lookalikes, true);
         });
     });
 }
@@ -475,40 +518,40 @@ fn shortcuts(ui: &mut Ui, state: &mut PrefsState) {
 }
 
 fn account(ui: &mut Ui, state: &mut PrefsState) {
-    group(ui, Some("Account"), |ui| prefs::card(ui, |ui| prefs::account_row(ui, (state.account_source)())));
-    group(ui, Some("Sync"), |ui| prefs::draw_sync_poll_card(ui, state));
-    group(ui, Some("Sharing"), |ui| prefs::draw_sharing_card(ui, state));
+    group(ui, Some(crate::i18n::t("settings.group_account")), |ui| prefs::card(ui, |ui| prefs::account_row(ui, (state.account_source)())));
+    group(ui, Some(crate::i18n::t("settings.group_sync")), |ui| prefs::draw_sync_poll_card(ui, state));
+    group(ui, Some(crate::i18n::t("settings.group_sharing")), |ui| prefs::draw_sharing_card(ui, state));
 }
 
 fn about(ui: &mut Ui, state: &mut PrefsState) {
     group(ui, None, |ui| {
         card(ui, |ui| {
-            value_row(ui, "Version", "Unofficial, and unaffiliated with Bitwarden, Inc.", "", &prefs::version_line());
+            value_row(ui, crate::i18n::t("settings.about_version_label"), crate::i18n::t("settings.about_version_sub"), "", &prefs::version_line());
         });
     });
-    group(ui, Some("Updates"), |ui| prefs::draw_updates(ui, state));
-    group(ui, Some("Support"), |ui| {
+    group(ui, Some(crate::i18n::t("settings.group_updates")), |ui| prefs::draw_updates(ui, state));
+    group(ui, Some(crate::i18n::t("settings.group_support")), |ui| {
         card(ui, |ui| {
-            if button_row(ui, HELP_LABEL, "", "", "Open", false) {
+            if button_row(ui, help_label(), "", "", crate::i18n::t("settings.button_open"), false) {
                 crate::vault_window::webbrowser_open(HELP_URL);
             }
             kit_card::row_rule(ui);
-            if button_row(ui, FEEDBACK_LABEL, "", "", "Write", false) {
+            if button_row(ui, feedback_label(), "", "", crate::i18n::t("settings.button_write"), false) {
                 crate::vault_window::webbrowser_open(FEEDBACK_URL);
             }
             kit_card::row_rule(ui);
             // The Store asks for the policy to be reachable from inside the app.
-            if button_row(ui, PRIVACY_LABEL, "", "", "Open", false) {
+            if button_row(ui, privacy_label(), "", "", crate::i18n::t("settings.button_open"), false) {
                 crate::vault_window::webbrowser_open(PRIVACY_URL);
             }
             kit_card::row_rule(ui);
-            if button_row(ui, LOGS_LABEL, "", LOGS_TIP, "Copy", false) {
+            if button_row(ui, logs_label(), "", logs_tip(), crate::i18n::t("settings.button_copy"), false) {
                 match log_location() {
                     Some(path) => {
                         ui.ctx().copy_text(path);
-                        crate::kit::toast::show(ui.ctx(), LOGS_COPIED_TOAST);
+                        crate::kit::toast::show(ui.ctx(), logs_copied_toast());
                     }
-                    None => crate::kit::toast::show(ui.ctx(), LOGS_MISSING_TOAST),
+                    None => crate::kit::toast::show(ui.ctx(), logs_missing_toast()),
                 }
             }
         });
@@ -516,18 +559,32 @@ fn about(ui: &mut Ui, state: &mut PrefsState) {
 }
 
 /// About > Support (spec C 2.4). Both open the project's pages in the browser.
-pub const HELP_LABEL: &str = "Help center";
-pub const FEEDBACK_LABEL: &str = "Send feedback";
-pub const LOGS_LABEL: &str = "Diagnostic logs";
+pub fn help_label() -> &'static str {
+    crate::i18n::t("settings.help_label")
+}
+pub fn feedback_label() -> &'static str {
+    crate::i18n::t("settings.feedback_label")
+}
+pub fn logs_label() -> &'static str {
+    crate::i18n::t("settings.logs_label")
+}
 const HELP_URL: &str = "https://github.com/denis-platonov/deskwarden#readme";
 const FEEDBACK_URL: &str = "https://github.com/denis-platonov/deskwarden/issues/new";
-pub const PRIVACY_LABEL: &str = "Privacy policy";
+pub fn privacy_label() -> &'static str {
+    crate::i18n::t("settings.privacy_label")
+}
 const PRIVACY_URL: &str = "https://github.com/denis-platonov/deskwarden/blob/main/PRIVACY.md";
 /// The design's tip says logs never hold passwords; this screen cannot vouch
 /// for every line, so the tip says what the button really does.
-const LOGS_TIP: &str = "Copies where the log file is, not what is in it. Read it before you share it.";
-pub const LOGS_COPIED_TOAST: &str = "Log file location copied";
-pub const LOGS_MISSING_TOAST: &str = "There is no log file yet";
+fn logs_tip() -> &'static str {
+    crate::i18n::t("settings.logs_tip")
+}
+pub fn logs_copied_toast() -> &'static str {
+    crate::i18n::t("settings.logs_copied_toast")
+}
+pub fn logs_missing_toast() -> &'static str {
+    crate::i18n::t("settings.logs_missing_toast")
+}
 
 /// Where `deskwarden.log` is, as text, when there is one. **The path, never
 /// the file**: a log is written by many parts of the app and this screen
@@ -545,10 +602,10 @@ fn import_export(ui: &mut Ui) {
         card(ui, |ui| {
             if button_row(
                 ui,
-                "Import from another app",
-                "1Password, Keeper, LastPass, Chrome or a CSV file",
-                "Bitwarden and Edge exports work too.",
-                "Import\u{2026}",
+                crate::i18n::t("settings.import_label"),
+                crate::i18n::t("settings.import_sub"),
+                crate::i18n::t("settings.import_tip"),
+                crate::i18n::t("settings.import_button"),
                 false,
             ) {
                 crate::vault_window::sidebar::request_shell(ui.ctx(), crate::vault_window::sidebar::ShellRequest::OpenImport);
@@ -693,7 +750,7 @@ mod tests {
             assert!(at >= last, "{label} is out of order in the nav");
             last = at;
         }
-        assert!(painted.text(NAV_HEADING).is_some());
+        assert!(painted.text(nav_heading()).is_some());
     }
 
     #[test]
@@ -709,7 +766,7 @@ mod tests {
     #[test]
     fn back_asks_the_window_to_leave() {
         let mut fixture = Fixture::new(Page::General);
-        assert_eq!(fixture.click_text(BACK_LABEL), ScreenAction::Back);
+        assert_eq!(fixture.click_text(back_label()), ScreenAction::Back);
     }
 
     #[test]
@@ -737,29 +794,29 @@ mod tests {
     #[test]
     fn every_existing_preference_is_reachable_on_some_page() {
         let wanted: &[(&str, &str)] = &[
-            (prefs::SIDEBAR_STYLE_LABEL, "sidebar style"),
-            (prefs::PROMPT_LABEL, "autofill prompts"),
-            (prefs::SERVICE_LABEL, "local API"),
-            (prefs::AUTO_LOCK_ENABLED_LABEL, "auto-lock"),
-            (prefs::AUTO_LOCK_LABEL, "auto-lock minutes"),
-            (prefs::CLIPBOARD_MASTER_LABEL, "clipboard clearing"),
-            (prefs::CLIPBOARD_ON_LOCK_LABEL, "clear on lock"),
-            (prefs::BREACH_LABEL, "breach check"),
-            (prefs::SCAN_BUTTON, "breach scan"),
-            (prefs::FETCH_ICONS_LABEL, "site icons"),
-            (prefs::DIRECT_ICONS_LABEL, "direct icons"),
-            (prefs::LAN_TLS_LABEL, "lan tls"),
-            (prefs::BRAND_LOGOS_LABEL, "card logos"),
-            (prefs::TOTP_SECRET_LABEL, "totp secret"),
-            (prefs::UI_LOADED_LABEL, "open instantly"),
-            (prefs::BACKEND_CHOICE_LABEL, "backend choice"),
-            (prefs::DISK_CACHE_LABEL, "disk cache"),
-            (prefs::SYNC_PUSH_LABEL, "live updates"),
-            (prefs::SYNC_POLL_ENABLED_LABEL, "polling"),
-            (prefs::ADVANCED_SHARING_LABEL, "advanced sharing"),
-            (prefs::UPDATE_CHECK_LABEL, "automatic update check"),
-            (prefs::UPDATE_CHECK_BUTTON, "update check"),
-            (prefs::ACCOUNT_LABEL, "account row"),
+            (prefs::sidebar_style_label(), "sidebar style"),
+            (prefs::prompt_label(), "autofill prompts"),
+            (prefs::service_label(), "local API"),
+            (prefs::auto_lock_enabled_label(), "auto-lock"),
+            (prefs::auto_lock_label(), "auto-lock minutes"),
+            (prefs::clipboard_master_label(), "clipboard clearing"),
+            (prefs::clipboard_on_lock_label(), "clear on lock"),
+            (prefs::breach_label(), "breach check"),
+            (prefs::scan_button_text(), "breach scan"),
+            (prefs::fetch_icons_label(), "site icons"),
+            (prefs::direct_icons_label(), "direct icons"),
+            (prefs::lan_tls_label(), "lan tls"),
+            (prefs::brand_logos_label(), "card logos"),
+            (prefs::totp_secret_label(), "totp secret"),
+            (prefs::ui_loaded_label(), "open instantly"),
+            (prefs::backend_choice_label(), "backend choice"),
+            (prefs::disk_cache_label(), "disk cache"),
+            (prefs::sync_push_label(), "live updates"),
+            (prefs::sync_poll_enabled_label(), "polling"),
+            (prefs::advanced_sharing_label(), "advanced sharing"),
+            (prefs::update_check_label(), "automatic update check"),
+            (prefs::update_check_button(), "update check"),
+            (prefs::account_label(), "account row"),
         ];
         let mut seen = std::collections::HashSet::new();
         for page in Page::ALL {
@@ -783,7 +840,7 @@ mod tests {
         let mut fixture = Fixture::new(Page::Autofill);
         assert!(fixture.state.settings.prompt_on_match);
         let painted = fixture.settle();
-        let title = painted.text(prefs::PROMPT_LABEL).expect("the row").2;
+        let title = painted.text(prefs::prompt_label()).expect("the row").2;
         let switch = Pos2::new(title.min.x + 740.0, title.center().y);
         // The switch is at the card's right edge; find it by its column.
         let column = painted.rects.iter().filter(|r| (r.rect.width() - 50.0).abs() < 0.5).map(|r| r.rect.center()).next().expect("a 50 px switch track");
@@ -826,7 +883,7 @@ mod tests {
     #[test]
     fn the_about_page_has_the_support_rows_and_https_links() {
         let painted = Fixture::new(Page::About).settle();
-        for label in [HELP_LABEL, FEEDBACK_LABEL, PRIVACY_LABEL, LOGS_LABEL] {
+        for label in [help_label(), feedback_label(), privacy_label(), logs_label()] {
             assert!(painted.text(label).is_some(), "{label} is not drawn");
         }
         for url in [HELP_URL, FEEDBACK_URL, PRIVACY_URL] {
@@ -843,10 +900,10 @@ mod tests {
         store.state.updates_from_store = Some(notice);
         let painted = store.settle();
         assert!(painted.text(notice).is_some(), "the Store notice is not drawn");
-        assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_none(), "a Store build offers the update switch");
+        assert!(painted.text(prefs::update_check_label()).is_none(), "a Store build offers the update switch");
 
         let painted = Fixture::new(Page::About).settle();
-        assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_some(), "the update switch is gone");
+        assert!(painted.text(prefs::update_check_label()).is_some(), "the update switch is gone");
     }
 
     /// The production constructor takes the edition from the updater.
@@ -863,8 +920,8 @@ mod tests {
         let copy = painted.texts.iter().rfind(|(t, _, _)| t == "Copy").expect("a Copy button").2.center();
         fixture.frame(click_at(copy));
         let toast = crate::kit::toast::current(&fixture.ctx).expect("a toast");
-        assert!(toast == LOGS_COPIED_TOAST || toast == LOGS_MISSING_TOAST, "{toast}");
-        assert_eq!(log_location().is_some(), toast == LOGS_COPIED_TOAST);
+        assert!(toast == logs_copied_toast() || toast == logs_missing_toast(), "{toast}");
+        assert_eq!(log_location().is_some(), toast == logs_copied_toast());
     }
 
     #[test]
@@ -872,10 +929,10 @@ mod tests {
         assert_eq!(crate::key_sequence::DEFAULT_SEQUENCE, "{USERNAME}{TAB}{PASSWORD}");
         let mut fixture = Fixture::new(Page::Autofill);
         let painted = fixture.settle();
-        assert!(painted.text(DEFAULT_STEPS_LABEL).is_some());
-        let at = painted.texts.iter().find(|(t, _, _)| t == DEFAULT_STEPS_VALUE).expect("the value button").2.center();
+        assert!(painted.text(default_steps_label()).is_some());
+        let at = painted.texts.iter().find(|(t, _, _)| t == default_steps_value()).expect("the value button").2.center();
         fixture.frame(click_at(at));
-        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(DEFAULT_STEPS_TOAST));
+        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(default_steps_toast()));
     }
 
     /// The `?` dot nearest the row titled `title`.
@@ -896,14 +953,14 @@ mod tests {
         // title. Keep running is the design's own example, word for word.
         let mut fixture = Fixture::new(Page::General);
         let idle = fixture.settle();
-        assert!(idle.text(KEEP_RUNNING_TIP).is_none(), "the tip is painted without a hover");
-        let title = idle.texts.iter().find(|(t, _, _)| t == KEEP_RUNNING_LABEL).expect("the title").2;
-        let dot = dot_after(&idle, KEEP_RUNNING_LABEL);
+        assert!(idle.text(keep_running_tip()).is_none(), "the tip is painted without a hover");
+        let title = idle.texts.iter().find(|(t, _, _)| t == keep_running_label()).expect("the title").2;
+        let dot = dot_after(&idle, keep_running_label());
         assert!(dot.x > title.right(), "the dot is not after the title: {dot:?} vs {title:?}");
         assert!((dot.y - title.center().y).abs() < 10.0, "the dot is not on the title's line");
         fixture.frame(hover_at(dot));
         let shown = fixture.settle();
-        assert!(shown.text(KEEP_RUNNING_TIP).is_some(), "hovering the dot showed nothing");
+        assert!(shown.text(keep_running_tip()).is_some(), "hovering the dot showed nothing");
         // A row with no tip paints no dot of its own.
         let mut fixture = Fixture::new(Page::Generator);
         assert!(fixture.settle().texts.iter().all(|(t, _, _)| t != "?"), "the Generator rows carry no tips");
@@ -930,8 +987,8 @@ mod tests {
                     // painted here without a hover) or a status or empty
                     // state, which the allow-list below names.
                     let allowed = [
-                        crate::breach_scan::SCAN_CONSENT_NOTE,
-                        prefs::KEYS_NONE,
+                        crate::breach_scan::scan_consent_note(),
+                        prefs::keys_none(),
                     ];
                     assert!(
                         allowed.contains(&text.as_str()),
@@ -951,7 +1008,7 @@ mod tests {
         fixture.state.settings.fetch_icons_direct = true;
         fixture.settle();
         let painted = fixture.settle();
-        let at = painted.text(prefs::DIRECT_ICONS_LABEL).expect("the child row").2;
+        let at = painted.text(prefs::direct_icons_label()).expect("the child row").2;
         // Click where its switch is: the right edge of the same row.
         let rect = painted.rects.iter().filter(|r| (r.rect.width() - 50.0).abs() < 0.5 && (r.rect.center().y - at.center().y).abs() < 90.0).map(|r| r.rect.center()).next().expect("its switch");
         fixture.frame(click_at(rect));
@@ -992,10 +1049,10 @@ mod tests {
     fn the_startup_rows_are_not_drawn_without_the_registry() {
         let mut fixture = Fixture::new(Page::General);
         let painted = fixture.settle();
-        assert!(painted.text(OPEN_AT_SIGN_IN_LABEL).is_none(), "a switch connected to nothing");
-        assert!(painted.text(START_IN_TRAY_LABEL).is_none());
+        assert!(painted.text(open_at_sign_in_label()).is_none(), "a switch connected to nothing");
+        assert!(painted.text(start_in_tray_label()).is_none());
         // The always-true row is honest without it.
-        assert!(painted.text(KEEP_RUNNING_LABEL).is_some());
+        assert!(painted.text(keep_running_label()).is_some());
         assert!(painted.text("Always").is_some());
     }
 
@@ -1003,7 +1060,7 @@ mod tests {
     fn turning_open_at_sign_in_on_writes_the_logon_entry() {
         let mut fixture = with_registry(false, false, recording_sink);
         let painted = fixture.settle();
-        assert!(painted.text(OPEN_AT_SIGN_IN_LABEL).is_some());
+        assert!(painted.text(open_at_sign_in_label()).is_some());
         let first = switches(&painted)[0];
         fixture.frame(click_at(first));
         let written = WRITTEN.with(|w| w.borrow().clone());
@@ -1034,7 +1091,7 @@ mod tests {
         let painted = fixture.settle();
         fixture.frame(click_at(switches(&painted)[0]));
         assert_eq!(fixture.state.startup, Some(crate::autostart_repair::Startup { open_at_sign_in: false, in_tray: false }));
-        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(STARTUP_FAILED_TOAST));
+        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(startup_failed_toast()));
     }
 
     #[test]
@@ -1051,7 +1108,7 @@ mod tests {
         let mut fixture = Fixture::new(Page::General);
         assert_eq!(fixture.state.settings.theme, ThemeChoice::Light);
         let painted = fixture.settle();
-        assert!(painted.text(THEME_LABEL).is_some() && painted.text(TEXT_SIZE_LABEL).is_some());
+        assert!(painted.text(theme_label()).is_some() && painted.text(text_size_label()).is_some());
         for (text, check) in [("Dark", 0), ("System", 1), ("Larger", 2)] {
             let painted = fixture.settle();
             let at = painted.texts.iter().find(|(t, _, _)| t == text).unwrap_or_else(|| panic!("no {text}")).2.center();
@@ -1069,10 +1126,10 @@ mod tests {
     fn the_security_page_has_the_lock_and_share_switches() {
         let mut fixture = Fixture::new(Page::Security);
         let painted = fixture.settle();
-        for label in [LOCK_ON_SLEEP_LABEL, LOCK_ON_SCREEN_LOCK_LABEL, HIDE_ON_SHARE_LABEL] {
+        for label in [lock_on_sleep_label(), lock_on_screen_lock_label(), hide_on_share_label()] {
             assert!(painted.text(label).is_some(), "no {label}");
         }
-        let at = painted.text(LOCK_ON_SLEEP_LABEL).unwrap().2;
+        let at = painted.text(lock_on_sleep_label()).unwrap().2;
         let switch = painted
             .rects
             .iter()
@@ -1084,14 +1141,65 @@ mod tests {
         assert!(!fixture.state.settings.lock_on_sleep);
     }
 
+    /// With no language chosen the row says so, and opening it lists the
+    /// system default first and then every language by its own name.
     #[test]
-    fn the_language_row_says_english_and_its_click_says_more_are_coming() {
-        let mut fixture = Fixture::new(Page::General);
-        let painted = fixture.settle();
-        assert!(painted.text(LANGUAGE_LABEL).is_some());
-        let at = painted.text("English").expect("the button").2.center();
-        fixture.frame(click_at(at));
-        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some("More languages are on the way"));
+    fn the_language_row_offers_the_system_default_and_every_language_by_its_own_name() {
+        crate::i18n::with_language("en", || {
+            let mut fixture = Fixture::new(Page::General);
+            let painted = fixture.settle();
+            assert!(painted.text(language_label()).is_some());
+            let system = crate::i18n::t("settings.language_system");
+            assert!(painted.text(system).is_some(), "the closed row names the system default");
+            assert!(painted.text("Deutsch").is_none(), "the menu is closed until it is clicked");
+            fixture.click_text(system);
+            assert!(super::super::language_picker::is_open(&fixture.ctx));
+            let open = fixture.settle();
+            for locale in crate::i18n::available() {
+                assert!(open.text(locale.native_name).is_some(), "the menu does not list {}", locale.english_name);
+            }
+        });
+    }
+
+    /// Choosing a language writes it to the settings and changes the language
+    /// in force; choosing the system default stores `None`.
+    #[test]
+    fn choosing_a_language_persists_it_and_changes_the_language_in_force() {
+        crate::i18n::with_language("en", || {
+            let mut fixture = Fixture::new(Page::General);
+            let system = crate::i18n::t("settings.language_system");
+            fixture.click_text(system);
+            fixture.click_text("Deutsch");
+            assert_eq!(fixture.state.settings.language.as_deref(), Some("de"));
+            assert_eq!(crate::i18n::current().tag, "de");
+            assert!(!super::super::language_picker::is_open(&fixture.ctx), "choosing closes the menu");
+            let painted = fixture.settle();
+            assert!(painted.text("Deutsch").is_some(), "the row now names the chosen language");
+
+            fixture.click_text("Deutsch");
+            fixture.click_text(system);
+            assert_eq!(fixture.state.settings.language, None, "the system default is stored as no choice");
+            assert_eq!(crate::i18n::current().tag, crate::i18n::system_default().tag);
+        });
+    }
+
+    /// Esc, and a click elsewhere, close the menu without choosing.
+    #[test]
+    fn the_language_menu_closes_without_choosing_on_escape() {
+        crate::i18n::with_language("en", || {
+            let mut fixture = Fixture::new(Page::General);
+            fixture.click_text(crate::i18n::t("settings.language_system"));
+            assert!(super::super::language_picker::is_open(&fixture.ctx));
+            fixture.frame(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            assert!(!super::super::language_picker::is_open(&fixture.ctx));
+            assert_eq!(fixture.state.settings.language, None);
+        });
     }
     #[test]
     fn the_screen_paints_its_ground_and_cards_from_the_palette() {

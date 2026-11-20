@@ -169,7 +169,10 @@ pub fn notice_for(detail: &str) -> Notice {
     };
     let heading = format!("{}. ", crate::vault_window::preflight::refused_heading());
     let rest = rest.strip_prefix(heading.as_str()).unwrap_or(rest);
-    Notice { title, body: sentence(rest) }
+    // The refusal is written in English (it is a log line too); the card says
+    // it in the language in force, or as it arrived if it is not one we know.
+    let body = crate::injector::words::localize(rest).unwrap_or_else(|| rest.to_string());
+    Notice { title, body: sentence(&body) }
 }
 
 /// `text`, trimmed, with a capital first letter and a closing full stop.

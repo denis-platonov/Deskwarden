@@ -572,7 +572,7 @@ pub fn download_label(done: u64, total: Option<u64>) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     let mb = |b: u64| format!("{:.1} MB", b as f64 / MB);
     match total {
-        Some(t) if t > 0 => format!("{} of {}", mb(done), mb(t)),
+        Some(t) if t > 0 => crate::i18n::tf("prefs.download_progress", &[("done", &mb(done)), ("total", &mb(t))]),
         _ => mb(done),
     }
 }

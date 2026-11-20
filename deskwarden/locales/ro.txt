@@ -384,3 +384,5 @@ main.cli_unrecognized_body = Bitwarden CLI pe care Deskwarden este pe punctul s�
 main.signer_none = Nu are certificat de semnatar.
 main.signer_org = Este semnat de: {org}
 main.signer_no_org = Certificatul lui de semnatar nu numește nicio organizație.
+login.server_eu = UE
+login.server_self_hosted = Găzduit propriu

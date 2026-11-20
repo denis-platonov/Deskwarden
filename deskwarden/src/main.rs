@@ -394,6 +394,9 @@ fn main() {
     // conditional.
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
+    // The language the daemon's own words (tray, cards, message boxes) are in:
+    // the saved one, else the Windows UI language, else English.
+    deskwarden::i18n::init(settings.language.as_deref());
     // **A test profile does not start without its account list.** The
     // default copy runs on with no account of its own (`NoAccountList`, in
     // the account block below) and leaves the Bitwarden CLI on its own
@@ -3239,7 +3242,7 @@ fn main() {
                 // `SwitchOutcome`, and reporting each in its own arm is how
                 // one of them quietly stops raising the failure the other one
                 // does.
-                let reported: Option<(String, SwitchOutcome)> =
+                let reported: Option<(AccountAction, SwitchOutcome)> =
                     if let Some(target) = switch_target.as_ref() {
                     // **`switchable()`, not `all()`.** `all()` still reports
                     // the active account and still reports duplicate ids, and
@@ -3283,7 +3286,7 @@ fn main() {
                                     );
                                 }
                             }
-                            Some((format!("switch to {}", account_label(&to)), outcome))
+                            Some((AccountAction::SwitchTo(account_label(&to).to_string()), outcome))
                         }
                         _ => {
                             log::warn!(
@@ -3317,7 +3320,7 @@ fn main() {
                                 },
                                 &mut resettle,
                             );
-                            Some(("add an account".to_string(), outcome))
+                            Some((AccountAction::Add, outcome))
                         }
                         _ => {
                             log::warn!("cannot add an account: this app has none to add one to");
@@ -4243,9 +4246,37 @@ fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_R
     }
 }
 
-/// How every account action that lands in a [`SwitchOutcome`] is reported —
-/// `what` naming the request in the words the message box will use ("add an
-/// account", "switch to ana@example.com").
+/// What an account menu asked for, so that the log line and the message box
+/// each word it themselves: the log line in English (a log line is for whoever
+/// reads the file), the box in the language in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountAction {
+    /// Switch to the account with this label (`ana@example.com`).
+    SwitchTo(String),
+    /// Sign in a further account.
+    Add,
+}
+
+impl AccountAction {
+    /// The log-voice phrase: "switch to ana@example.com", "add an account".
+    fn phrase(&self) -> String {
+        match self {
+            Self::SwitchTo(label) => format!("switch to {label}"),
+            Self::Add => "add an account".to_string(),
+        }
+    }
+
+    /// The first line of a failure box: "Could not switch to ana@example.com."
+    fn could_not(&self) -> String {
+        match self {
+            Self::SwitchTo(label) => deskwarden::i18n::tf("account.could_not_switch", &[("account", label)]),
+            Self::Add => deskwarden::i18n::t("account.could_not_add").to_string(),
+        }
+    }
+}
+
+/// How every account action that lands in a [`SwitchOutcome`] is reported --
+/// `what` naming the request.
 ///
 /// One function since the vault window's account menu grew the same two actions
 /// the tray's Accounts submenu has. Reporting each in its own arm is how one of
@@ -4259,32 +4290,31 @@ fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_R
 /// cancelled — `add_account` answers the same variant for the refused gate, and
 /// a message box saying "cancelled" for a `relativeDataDir` block would be
 /// naming something that never happened.
-fn report_account_action(what: &str, outcome: SwitchOutcome) {
+fn report_account_action(what: &AccountAction, outcome: SwitchOutcome) {
+    let phrase = what.phrase();
     match outcome {
         // Nothing to say: the app is where the user wanted it.
-        SwitchOutcome::Switched => log::info!("{what}: done"),
+        SwitchOutcome::Switched => log::info!("{phrase}: done"),
         SwitchOutcome::Declined => {
-            log::info!("the request to {what} was cancelled; nothing changed")
+            log::info!("the request to {phrase} was cancelled; nothing changed")
         }
         SwitchOutcome::RolledBack { reason } => {
-            log::warn!("could not {what}: {reason}");
+            log::warn!("could not {phrase}: {reason}");
             message_box(
                 "Deskwarden",
                 &format!(
-                    "Could not {what}.\n\n{reason}\n\nYou are still signed in to the account \
-                     you were on.",
+                    "{}\n\n{reason}\n\n{}",
+                    what.could_not(),
+                    deskwarden::i18n::t("account.still_on_previous")
                 ),
                 MB_ICONERROR | MB_OK,
             );
         }
         SwitchOutcome::StoodDown { reason } => {
-            log::error!("could not {what}, and could not go back: {reason}");
+            log::error!("could not {phrase}, and could not go back: {reason}");
             message_box(
                 "Deskwarden",
-                &format!(
-                    "Could not {what}.\n\n{reason}\n\nAutofill is stood down. Use the tray's \
-                     \"Sync\" to bring it back.",
-                ),
+                &format!("{}\n\n{reason}\n\n{}", what.could_not(), deskwarden::i18n::t("account.stood_down")),
                 MB_ICONERROR | MB_OK,
             );
         }
@@ -8445,10 +8475,15 @@ impl VaultOps for RealVaultOps<'_> {
                             message_box(
                                 "Deskwarden",
                                 &format!(
-                                    "Could not switch to {}.\n\n{reason}\n\nYou are still signed \
-                                     in to {}.",
-                                    account_label(&to),
-                                    account_label(&from)
+                                    "{}\n\n{reason}\n\n{}",
+                                    deskwarden::i18n::tf(
+                                        "account.could_not_switch",
+                                        &[("account", account_label(&to))]
+                                    ),
+                                    deskwarden::i18n::tf(
+                                        "account.still_on_account",
+                                        &[("account", account_label(&from))]
+                                    )
                                 ),
                                 MB_ICONERROR | MB_OK,
                             );
@@ -8498,7 +8533,7 @@ impl VaultOps for RealVaultOps<'_> {
                         },
                         &mut resettle,
                     );
-                    report_account_action("add an account", outcome);
+                    report_account_action(&AccountAction::Add, outcome);
                 }
                 _ => log::warn!("cannot add an account: this app has none to add one to"),
             }
@@ -12034,6 +12069,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
 
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
+    deskwarden::i18n::init(settings.language.as_deref());
     // This process is the one that makes the copies, so it is the one whose
     // clearing timers matter. The daemon configures its own separately.
     deskwarden::clipboard::configure(settings.clipboard_clearing());
@@ -13840,11 +13876,17 @@ fn apply_edited_settings(
         settings.cache_vault_to_disk,
         edited.cache_vault_to_disk,
     ) && edited.cache_vault_to_disk;
+    let language_changed = settings.language != edited.language;
     *settings = settings::Settings { cache_vault_to_disk: keep_disk_cache, ..edited };
     if let Err(e) = settings.persist_preferences(settings_path) {
         log::warn!("could not save settings: {e}");
     }
     deskwarden::clipboard::configure(settings.clipboard_clearing());
+    // A language chosen in Settings is live in the tray and the cards at once,
+    // without a restart; the window that chose it re-initialised itself.
+    if language_changed {
+        deskwarden::i18n::init(settings.language.as_deref());
+    }
 }
 
 fn disk_cache_dir(config_dir: &Path, active_account: Option<&Account>) -> std::path::PathBuf {
@@ -27386,7 +27428,7 @@ mod tests {
         #[test]
         fn every_outcome_of_a_tray_account_action_is_reported() {
             let production = production_half_of_this_file();
-            let head = concat!("fn report_account", "_action(what: &str, outcome: SwitchOutcome) {");
+            let head = concat!("fn report_account", "_action(what: &AccountAction, outcome: SwitchOutcome) {");
             let block = production
                 .split_once(head)
                 .unwrap_or_else(|| {

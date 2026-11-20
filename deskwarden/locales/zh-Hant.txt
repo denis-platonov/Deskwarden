@@ -362,3 +362,5 @@ main.cli_unrecognized_body = Deskwarden 即將使用的 Bitwarden CLI：{headlin
 main.signer_none = 它沒有簽署者憑證。
 main.signer_org = 簽署者：{org}
 main.signer_no_org = 其簽署者憑證未標明組織。
+login.server_eu = EU
+login.server_self_hosted = 自行裝載

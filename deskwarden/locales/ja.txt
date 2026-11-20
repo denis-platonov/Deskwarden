@@ -362,3 +362,5 @@ main.cli_unrecognized_body = Deskwarden が使用しようとしている Bitwar
 main.signer_none = 署名者の証明書がありません。
 main.signer_org = 署名者： {org}
 main.signer_no_org = 署名者の証明書に組織名がありません。
+login.server_eu = EU
+login.server_self_hosted = セルフホスト

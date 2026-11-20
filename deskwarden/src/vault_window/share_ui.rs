@@ -43,64 +43,80 @@ use super::detail::ShareControl;
 // ---- the words (mock 6e's STATUS LINES) -----------------------------------------
 
 /// The header's Share tooltip (mock 6b's hover).
-pub(crate) const SHARE_TOOLTIP: &str = "Share with a person \u{b7} view-only";
+pub(crate) fn share_tooltip() -> &'static str {
+    crate::i18n::t("share.share_tooltip")
+}
 /// A sharing request from a window with no line to the daemon -- said on the
 /// card by [`request`]. It no longer ends "This sends a link instead": no
 /// Share-shaped control opens a Send any more (final review, I3), so the
 /// sentence says only what is missing.
-pub(crate) const SHARING_UNAVAILABLE: &str = "Sharing with a person needs direct sync with a self-hosted server.";
+pub(crate) fn sharing_unavailable() -> &'static str {
+    crate::i18n::t("share.sharing_unavailable")
+}
 /// The greyed Share control's hover on a server too old to share
 /// (`server-too-old`, official-path spec §2): a route sharing needs answered
 /// as missing. Any server can be updated, so the sentence names none.
-pub(crate) const SHARE_TOO_OLD_TOOLTIP: &str = "Sharing with a person needs a newer server.";
+pub(crate) fn share_too_old_tooltip() -> &'static str {
+    crate::i18n::t("share.share_too_old_tooltip")
+}
 /// The Share dialog's warning where people a record is shared with can list
 /// each other (official-path spec §3.4) --
 /// [`SharingView::roster_visible_to_recipients`].
-pub(crate) const ROSTER_VISIBLE_WARNING: &str = "On this server, people you share with can see each other's email addresses.";
+pub(crate) fn roster_visible_warning() -> &'static str {
+    crate::i18n::t("share.roster_visible_warning")
+}
 /// A "Share anyway" with no fingerprint behind it -- see
 /// [`SharingPane::share_anyway`]. The card never builds one (it offers the
 /// button only beside a fingerprint it fetched), so this is the sentence a
 /// wiring mistake would show, rather than a confirm the user never checked.
-pub(crate) const CHECK_FINGERPRINT_FIRST: &str = "Show their fingerprint and compare it before sharing anyway.";
+pub(crate) fn check_fingerprint_first() -> &'static str {
+    crate::i18n::t("share.check_fingerprint_first")
+}
 /// A worker that panicked: the call's own kind of failure, in words.
-pub(crate) const PANICKED: &str = "Sharing stopped unexpectedly. Try again.";
+pub(crate) fn panicked() -> &'static str {
+    crate::i18n::t("share.panicked")
+}
 /// A write asked for while another is still out -- see [`request`], which
 /// says this rather than dropping the second one without a word.
-pub(crate) const BUSY: &str = "Another sharing change is still running. Try again when it finishes.";
+pub(crate) fn busy() -> &'static str {
+    crate::i18n::t("share.busy")
+}
 /// A Show fingerprint while another is out -- [`request`]'s answer to it,
 /// said rather than dropped. The card greys every Show while one is out, so
 /// this is the sentence a wiring mistake would show.
-pub(crate) const FINGERPRINT_BUSY: &str = "A fingerprint is still on its way. Try again when it arrives.";
+pub(crate) fn fingerprint_busy() -> &'static str {
+    crate::i18n::t("share.fingerprint_busy")
+}
 
 pub(crate) fn shared_toast(email: &str) -> String {
-    format!("Shared with {email}. It is in their vault now.")
+    crate::i18n::tf("share.toast_shared", &[("email", email)])
 }
 
 pub(crate) fn waiting_toast(email: &str, record: &str) -> String {
-    format!("{email} was added. {record} appears in their vault once they accept.")
+    crate::i18n::tf("share.toast_waiting", &[("email", email), ("record", record)])
 }
 
 /// Share anyway went through: the record is on its way to the key whose
 /// fingerprint was compared.
 pub(crate) fn confirmed_toast(email: &str) -> String {
-    format!("Shared with {email} on their new key.")
+    crate::i18n::tf("share.toast_confirmed", &[("email", email)])
 }
 
 /// Stop receiving went through: every record from them has left the vault.
 pub(crate) fn stopped_receiving_toast(from: &str) -> String {
-    format!("Stopped receiving from {from}.")
+    crate::i18n::tf("share.toast_stopped_receiving", &[("from", from)])
 }
 
 /// A Re-invite went through.
 pub(crate) fn reinvited_toast(email: &str) -> String {
-    format!("Invitation sent to {email}.")
+    crate::i18n::tf("share.toast_reinvited", &[("email", email)])
 }
 
 /// A share the server left as a pending invitation, said as a toast when no
 /// dialog is open to say it. It claims nothing about an account
 /// (official-path spec §3.4).
 pub(crate) fn invited_toast(email: &str) -> String {
-    format!("Waiting for {email} to accept.")
+    crate::i18n::tf("share.toast_invited", &[("email", email)])
 }
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -122,7 +138,7 @@ pub struct PersonLine {
     /// The view's [`crate::rest::sharing::PersonEntry::authenticated`]: their
     /// collection's name was written under the org key. `false` is a person
     /// known only from a plaintext name the server could have written -- the
-    /// card shows them, says so ([`UNVERIFIED_PREFIX`]), and offers Stop
+    /// card shows them, says so ([`unverified_prefix()`]), and offers Stop
     /// alone: Re-invite and Share anyway are grants (final review, I1).
     pub(crate) authenticated: bool,
 }
@@ -131,7 +147,9 @@ pub struct PersonLine {
 /// name opens with. Shown rather than hidden: the record is filed where the
 /// server says, so the row is who may see it, and Stop is the way to take it
 /// back.
-pub(crate) const UNVERIFIED_PREFIX: &str = "Not verified \u{b7} Deskwarden didn't name this person \u{b7} ";
+pub(crate) fn unverified_prefix() -> &'static str {
+    crate::i18n::t("share.unverified_prefix")
+}
 
 impl PersonLine {
     pub(crate) fn pill(&self) -> theme::SharePillKind {
@@ -178,9 +196,8 @@ fn day(millis: i64, zone: &dyn LocalOffset) -> String {
 /// is claimed, because the server's setting is invisible to a client.
 fn invited_ago(at: i64, now_ms: i64) -> String {
     match (now_ms - at).max(0) / MILLIS_PER_DAY {
-        0 => "invited today".to_string(),
-        1 => "invited 1 day ago".to_string(),
-        days => format!("invited {days} days ago"),
+        0 => crate::i18n::t("share.invited_today").to_string(),
+        days => crate::i18n::tn("share.invited_days_ago", days as u64, &[]),
     }
 }
 
@@ -213,21 +230,23 @@ pub(crate) fn person_lines(
         .map(|person| {
             let line = match person.state {
                 PersonState::Shared => match since(history, item_id, &person.email) {
-                    Some(at) => format!("Shared \u{b7} since {}", day(at, zone)),
-                    None => "Shared".to_string(),
+                    Some(at) => crate::i18n::tf("share.line_shared_since", &[("day", &day(at, zone))]),
+                    None => crate::i18n::t("share.line_shared").to_string(),
                 },
                 // Invited and Accepted read alike (official-path spec §3.4):
                 // the accept is the person's, and an Accepted one is
                 // confirmed on the next pass.
                 PersonState::WaitingAccept | PersonState::Invited => match since(history, item_id, &person.email) {
-                    Some(at) => format!("Waiting to accept \u{b7} {}", invited_ago(at, now_ms)),
-                    None => "Waiting to accept".to_string(),
+                    Some(at) => {
+                        crate::i18n::tf("share.line_waiting_since", &[("when", &invited_ago(at, now_ms))])
+                    }
+                    None => crate::i18n::t("share.line_waiting").to_string(),
                 },
-                PersonState::KeyChanged => "Their key changed. Check the fingerprint before sharing.".to_string(),
-                PersonState::WaitingSignIn => "Waiting for them to sign in once to a Bitwarden app".to_string(),
-                PersonState::Gone => "No longer receiving this".to_string(),
+                PersonState::KeyChanged => crate::i18n::t("share.line_key_changed").to_string(),
+                PersonState::WaitingSignIn => crate::i18n::t("share.line_waiting_sign_in").to_string(),
+                PersonState::Gone => crate::i18n::t("share.line_gone").to_string(),
             };
-            let line = if person.authenticated { line } else { format!("{UNVERIFIED_PREFIX}{line}") };
+            let line = if person.authenticated { line } else { format!("{}{line}", unverified_prefix()) };
             PersonLine { email: person.email.clone(), state: person.state, line, authenticated: person.authenticated }
         })
         .collect()
@@ -237,11 +256,11 @@ pub(crate) fn person_lines(
 /// for [`share_rows`].
 pub(crate) fn short_state(state: PersonState) -> &'static str {
     match state {
-        PersonState::Shared => "Shared",
-        PersonState::WaitingAccept | PersonState::Invited => "Waiting to accept",
-        PersonState::KeyChanged => "Key changed",
-        PersonState::WaitingSignIn => "Waiting for a first sign-in",
-        PersonState::Gone => "Not receiving",
+        PersonState::Shared => crate::i18n::t("share.short_shared"),
+        PersonState::WaitingAccept | PersonState::Invited => crate::i18n::t("share.short_waiting"),
+        PersonState::KeyChanged => crate::i18n::t("share.short_key_changed"),
+        PersonState::WaitingSignIn => crate::i18n::t("share.short_waiting_sign_in"),
+        PersonState::Gone => crate::i18n::t("share.short_gone"),
     }
 }
 
@@ -252,9 +271,9 @@ pub(crate) fn short_state(state: PersonState) -> &'static str {
 /// - Sharing available: [`ShareControl::Share`] -- unless the record cannot
 ///   be shared from here. One in another (real) organisation draws nothing:
 ///   it is that organisation's to share. One with attachments is greyed with
-///   the engine's own sentence ([`crate::rest::sharing::HAS_ATTACHMENTS`]),
+///   the engine's own sentence ([`crate::rest::sharing::has_attachments_text()`]),
 ///   rather than refused after the user has typed an address.
-/// - `server-too-old`: greyed, with [`SHARE_TOO_OLD_TOOLTIP`] -- sharing is
+/// - `server-too-old`: greyed, with [`share_too_old_tooltip()`] -- sharing is
 ///   a thing this server will do once updated.
 /// - `bw-serve`, `not-loaded`, any other reason, no view yet, no line to the
 ///   daemon, a received record: **nothing**. It used to offer a Send where
@@ -274,7 +293,7 @@ pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &Vau
     }
     if !view.available {
         return match view.reason.as_deref() {
-            Some(crate::rest::sharing::REASON_TOO_OLD) => Some(ShareControl::Disabled(SHARE_TOO_OLD_TOOLTIP)),
+            Some(crate::rest::sharing::REASON_TOO_OLD) => Some(ShareControl::Disabled(share_too_old_tooltip())),
             _ => None,
         };
     }
@@ -287,7 +306,7 @@ pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &Vau
     }
     let attached = item.other.get("attachments").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty());
     if attached {
-        return Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS));
+        return Some(ShareControl::Disabled(crate::rest::sharing::has_attachments_text()));
     }
     Some(ShareControl::Share)
 }
@@ -903,7 +922,7 @@ pub(crate) fn spawn_sharing_call(
     client: SharingClient,
     call: SharingCall,
 ) {
-    let on_panic = call.failed(PANICKED);
+    let on_panic = call.failed(panicked());
     std::thread::spawn(move || {
         let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&client, call))).unwrap_or(on_panic);
         let _ = tx.send(report);
@@ -928,7 +947,7 @@ pub(crate) fn spawn_sharing_call(
 /// daemon hashes a key it holds -- so it may run beside a write, and its
 /// report leaves `busy` and the view alone (see [`apply`]). It has a slot of
 /// its own instead, [`SharingPane::fingerprinting`]: a second while one is
-/// out is refused with [`FINGERPRINT_BUSY`].
+/// out is refused with [`fingerprint_busy()`].
 #[must_use]
 pub(crate) fn request(
     pane: &mut SharingPane,
@@ -939,23 +958,23 @@ pub(crate) fn request(
 ) -> bool {
     if let SharingCall::Confirm { email, key_sha256 } = &call {
         if !pane.was_shown(email, key_sha256) {
-            pane.say(CHECK_FINGERPRINT_FIRST.to_string(), None);
+            pane.say(check_fingerprint_first().to_string(), None);
             return false;
         }
     }
     let Some(client) = client else {
-        pane.say(SHARING_UNAVAILABLE.to_string(), None);
+        pane.say(sharing_unavailable().to_string(), None);
         return false;
     };
     match &call {
         SharingCall::View => pane.begin_view(),
         SharingCall::Fingerprint(_) if pane.fingerprinting.is_some() => {
-            pane.say(FINGERPRINT_BUSY.to_string(), None);
+            pane.say(fingerprint_busy().to_string(), None);
             return false;
         }
         SharingCall::Fingerprint(email) => pane.fingerprinting = Some(normalise_email(email)),
         _ if pane.busy => {
-            pane.say(BUSY.to_string(), None);
+            pane.say(busy().to_string(), None);
             return false;
         }
         SharingCall::Stop { item_id, email } => {
@@ -1061,7 +1080,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
         SharingReport::Fingerprint { email, result } => {
             pane.fingerprinting = None;
             // The slot the refusal was about is free: its sentence is spent.
-            if pane.notice.as_deref() == Some(FINGERPRINT_BUSY) {
+            if pane.notice.as_deref() == Some(fingerprint_busy()) {
                 pane.notice = None;
             }
             let email = normalise_email(&email);
@@ -1135,7 +1154,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                     dialog.in_flight = false;
                     dialog.adopt = Some(question);
                 }
-                None => fail(pane, format!("{item_name} wasn't shared with {email}: Deskwarden needs you to choose an organisation. Share it again to choose.")),
+                None => fail(pane, crate::i18n::tf("share.adoption_not_asked", &[("item_name", &item_name.to_string()), ("email", &email.to_string())])),
             }
         }
         SharingReport::Stopped { email, result } => {
@@ -1152,7 +1171,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                     if let (Some((old, _)), Some(new)) = (stopped, moved_to) {
                         pane.moved_home = Some((old, new));
                     }
-                    toast(pane, format!("Stopped sharing with {email}."));
+                    toast(pane, crate::i18n::tf("share.toast_stopped_sharing", &[("email", &email.to_string())]));
                 }
                 Err(sentence) => fail(pane, sentence),
             }
@@ -1180,7 +1199,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
         SharingReport::LinkAccepted(result) => match result {
             Ok(()) => {
                 pane.paste = Zeroizing::default();
-                toast(pane, LINK_ACCEPTED.to_string());
+                toast(pane, link_accepted().to_string());
             }
             Err(sentence) => fail(pane, sentence),
         },
@@ -1233,11 +1252,11 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
     // on the card, and in an open dialog that was told it -- rather than
     // standing beside a slot that is no longer busy. A sentence this report
     // put up is a different one and stays.
-    if pane.notice.as_deref() == Some(BUSY) {
+    if pane.notice.as_deref() == Some(busy()) {
         pane.notice = None;
         pane.notice_record = None;
     }
-    if let Some(dialog) = pane.dialog.as_mut().filter(|d| d.error.as_deref() == Some(BUSY)) {
+    if let Some(dialog) = pane.dialog.as_mut().filter(|d| d.error.as_deref() == Some(busy())) {
         dialog.error = None;
     }
 }
@@ -1324,41 +1343,73 @@ pub(crate) fn people_sharing<'a>(
 // called, not copied -- and only what 6a draws that 5a does not (the share
 // mark on the title, the access sentence, the no-account band) is new here.
 
-pub(crate) const SHARE_BUTTON: &str = "Share";
-pub(crate) const CANCEL_BUTTON: &str = "Cancel";
-pub(crate) const DONE_BUTTON: &str = "Done";
+pub(crate) fn share_button() -> &'static str {
+    crate::i18n::t("share.share_button")
+}
+pub(crate) fn cancel_button() -> &'static str {
+    crate::i18n::t("share.cancel_button")
+}
+pub(crate) fn done_button() -> &'static str {
+    crate::i18n::t("share.done_button")
+}
 /// The organisation question's answers (official-path spec §3.1, fix round
 /// 1): the owner's plain Yes and No, under a question that says what each
 /// does.
-pub(crate) const ADOPT_YES: &str = "Yes";
-pub(crate) const ADOPT_NO: &str = "No";
+pub(crate) fn adopt_yes() -> &'static str {
+    crate::i18n::t("share.adopt_yes")
+}
+pub(crate) fn adopt_no() -> &'static str {
+    crate::i18n::t("share.adopt_no")
+}
 /// The line under the question: what Deskwarden checked, what it cannot,
 /// and what each answer does. Group access is the part a roster does not
 /// show (`rest::sharing::roster_says_mine`), so the user's Yes is the check.
-const ADOPT_BODY: &str = "Only you can see everything in it, but Deskwarden can't tell who made it, and access given \
-     through a group doesn't show here. Say Yes only if you made it yourself, in the web vault or on another PC. \
-     No shares from a new organisation instead.";
+fn adopt_body() -> &'static str {
+    crate::i18n::t("share.adopt_body")
+}
 /// The administrator's button on the no-account band. An invite code is
 /// NodeWarden's way in for a new account (plan decision 4: no email is sent),
 /// minted for the one pending invitation the share just left.
-pub(crate) const MAKE_CODE_BUTTON: &str = "Create an invite code";
-pub(crate) const COPY_CODE_BUTTON: &str = "Copy";
+pub(crate) fn make_code_button() -> &'static str {
+    crate::i18n::t("share.make_code_button")
+}
+pub(crate) fn copy_code_button() -> &'static str {
+    crate::i18n::t("share.copy_code_button")
+}
 /// What the copy confirmation calls the code: "Invite code copied".
-pub(crate) const INVITE_CODE_LABEL: &str = "Invite code";
-const RECORD_EYEBROW: &str = "RECORD";
-const WITH_EYEBROW: &str = "WITH";
-const WITH_HINT: &str = "Their email address";
+pub(crate) fn invite_code_label() -> &'static str {
+    crate::i18n::t("share.invite_code_label")
+}
+fn record_eyebrow() -> &'static str {
+    crate::i18n::t("share.record_eyebrow")
+}
+fn with_eyebrow() -> &'static str {
+    crate::i18n::t("share.with_eyebrow")
+}
+fn with_hint() -> &'static str {
+    crate::i18n::t("share.with_hint")
+}
 /// 6a's eyebrow over the suggestions: the Send composer's `SENT TO BEFORE`,
 /// renamed because this list is fed by shares as well as Sends.
-const SUGGESTIONS_EYEBROW: &str = "SHARED WITH BEFORE";
+fn suggestions_eyebrow() -> &'static str {
+    crate::i18n::t("share.suggestions_eyebrow")
+}
 /// 6a's footer note. `Sent` is the rail's own word for the list a share is
 /// filed in (`sidebar::SENDS_ROW_LABEL`).
-const APPEARS_IN_SENT: &str = "Appears in Shared";
+fn appears_in_sent() -> &'static str {
+    crate::i18n::t("share.appears_in_sent")
+}
 /// The footer note while a share is out -- mock 6e's `Stopping…` idiom.
-const SHARING_NOW: &str = "Sharing\u{2026}";
+fn sharing_now() -> &'static str {
+    crate::i18n::t("share.sharing_now")
+}
 /// The footer note while a code is being made.
-const MAKING_CODE: &str = "Making a code\u{2026}";
-const PASSWORD_HINT: &str = "Your master password";
+fn making_code() -> &'static str {
+    crate::i18n::t("share.making_code")
+}
+fn password_hint() -> &'static str {
+    crate::i18n::t("share.password_hint")
+}
 /// 6a's `.modal { width: 560px }`: 5a's card, narrower by the Access block it
 /// does not have. Wide enough that `theme::form_card_pad_x` gives every band
 /// the design's 18 (its threshold is 470).
@@ -1390,17 +1441,13 @@ fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
         ..plain.clone()
     };
     let mut job = egui::text::LayoutJob::default();
-    job.append("They get ", 0.0, plain.clone());
-    job.append("view-only", 0.0, strong);
-    job.append(
-        &format!(
-            " access: they can see, copy and autofill it, but not edit, delete or share it on. \
-             When you edit {record}, their copy changes too. You can stop sharing at any time \
-             from the record."
-        ),
-        0.0,
-        plain,
-    );
+    // One sentence with its bold run marked `**..**`, so a translation can put
+    // the bold words wherever its grammar wants them.
+    let sentence = crate::i18n::tf("share.view_only_note", &[("record", record)]);
+    for (i, part) in sentence.split("**").enumerate() {
+        let format = if i % 2 == 1 { strong.clone() } else { plain.clone() };
+        job.append(part, 0.0, format);
+    }
     job.wrap.max_width = width;
     job
 }
@@ -1416,14 +1463,9 @@ fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
 /// ever true for -- is told about the invite code a newcomer there needs,
 /// and that they can make it here.
 fn invited_band(email: &str, record: &str, admin: bool) -> (String, String) {
-    let head = format!("Waiting for {email} to accept.");
-    let code = if admin {
-        "If they have no account on this server yet, they need an invite code to sign up. You are \
-         this server's administrator, so you can create one below and give it to them. "
-    } else {
-        ""
-    };
-    let body = format!("{code}{record} reaches their vault once they accept, and you can re-invite them from the record.");
+    let head = crate::i18n::tf("share.toast_invited", &[("email", email)]);
+    let code = if admin { crate::i18n::t("share.invite_code_admin_note") } else { "" };
+    let body = crate::i18n::tf("share.invited_body", &[("code", code), ("record", record)]);
     (head, body)
 }
 
@@ -1436,9 +1478,12 @@ pub(crate) fn invite_text(code: &InviteCode) -> &str {
 /// A suggestion's count, by kind (mock 6a: "2 shared", "3 sent").
 fn person_count_words(person: &crate::sent_history::Person) -> String {
     match (person.sent, person.shared) {
-        (0, shared) => format!("{shared} shared"),
+        (0, shared) => crate::i18n::tf("share.count_shared", &[("shared", &shared.to_string())]),
         (sent, 0) => super::send_ui::sent_count_words(sent),
-        (sent, shared) => format!("{shared} shared, {sent} sent"),
+        (sent, shared) => crate::i18n::tf(
+            "share.count_shared_and_sent",
+            &[("shared", &shared.to_string()), ("sent", &sent.to_string())],
+        ),
     }
 }
 
@@ -1491,11 +1536,11 @@ pub(crate) fn draw_share_modal(
     let forget_up = ctx.memory(|m| {
         m.areas().is_visible(&egui::LayerId::new(theme::SCRIM_ORDER, egui::Id::new(FORGET_SCRIM)))
     });
-    let title = format!("Share {}", dialog.item_name);
+    let title = crate::i18n::tf("share.dialog_title", &[("name", &dialog.item_name.to_string())]);
     let (outcome, ()) = Dialog::new(SHARE_ID, MODAL_WIDTH).title(&title).esc_closes(!busy && !forget_up).show(ctx, |ui| {
         let p = crate::kit::tokens::palette(ui.ctx());
         ui.spacing_mut().item_spacing.y = 0.0;
-        crate::kit::card::section_label(ui, RECORD_EYEBROW, p.text_ghost);
+        crate::kit::card::section_label(ui, record_eyebrow(), p.text_ghost);
         ui.add_space(8.0);
         super::record_ui::record_chip(ui, &dialog.item_name, &super::record_ui::chip_subtitle(item, folder));
         ui.add_space(22.0);
@@ -1504,13 +1549,13 @@ pub(crate) fn draw_share_modal(
         // invitation (6a's fourth state draws the address greyed): the answer
         // on the band is about that address, and editing it under the band
         // would make the two disagree.
-        crate::kit::card::section_label(ui, WITH_EYEBROW, p.text_ghost);
+        crate::kit::card::section_label(ui, with_eyebrow(), p.text_ghost);
         ui.add_space(8.0);
         let editable = !busy && dialog.invited.is_none() && dialog.adopt.is_none();
         let width = ui.available_width();
         let field_id = egui::Id::new((SHARE_ID, "with"));
         let field = if editable {
-            crate::kit::input::text(ui, field_id, &mut dialog.email, WITH_HINT, false, width)
+            crate::kit::input::text(ui, field_id, &mut dialog.email, with_hint(), false, width)
         } else {
             let rect = crate::kit::input::text_disabled(ui, &dialog.email, width, crate::kit::input::SIGN_IN);
             ui.interact(rect, field_id, egui::Sense::hover())
@@ -1526,7 +1571,7 @@ pub(crate) fn draw_share_modal(
             &mut dialog.email,
             history,
             editable,
-            SUGGESTIONS_EYEBROW,
+            suggestions_eyebrow(),
             &person_count_words,
         ) {
             action = ShareDialogAction::Forget(email);
@@ -1557,7 +1602,7 @@ pub(crate) fn draw_share_modal(
         // (`SharingView::roster_visible_to_recipients`).
         if view.is_some_and(|v| v.roster_visible_to_recipients) {
             ui.add_space(14.0);
-            crate::kit::modal::note(ui, crate::kit::modal::Tone::Caution, ROSTER_VISIBLE_WARNING);
+            crate::kit::modal::note(ui, crate::kit::modal::Tone::Caution, roster_visible_warning());
         }
         // The last attempt's sentence -- the engine's refusal (a record with
         // attachments, in the trash, in another organisation, waiting to come
@@ -1575,18 +1620,18 @@ pub(crate) fn draw_share_modal(
         }
         if let Some(question) = &dialog.adopt {
             ui.add_space(18.0);
-            question_band(ui, &question.sentence(), ADOPT_BODY);
+            question_band(ui, &question.sentence(), adopt_body());
         }
 
         // **The answers, then a standing note** -- and the note says what is
         // running while something is.
         ui.add_space(22.0);
         let note = if dialog.in_flight {
-            SHARING_NOW
+            sharing_now()
         } else if dialog.minting {
-            MAKING_CODE
+            making_code()
         } else {
-            APPEARS_IN_SENT
+            appears_in_sent()
         };
         use crate::kit::controls::{self, ButtonKind, ButtonSize};
         const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
@@ -1596,14 +1641,14 @@ pub(crate) fn draw_share_modal(
             ui.add_enabled_ui(enabled, |ui| controls::button_filling(ui, kind, ANSWER, label)).inner.clicked()
         };
         if dialog.invited.is_some() {
-            if answer(ui, !busy, ButtonKind::Primary, DONE_BUTTON) {
+            if answer(ui, !busy, ButtonKind::Primary, done_button()) {
                 action = ShareDialogAction::Done;
             }
         } else {
             let (first, second) = if dialog.adopt.is_some() {
-                (ADOPT_YES, ADOPT_NO)
+                (adopt_yes(), adopt_no())
             } else {
-                (SHARE_BUTTON, CANCEL_BUTTON)
+                (share_button(), cancel_button())
             };
             let ready = if dialog.adopt.is_some() { !busy } else { !busy && !dialog.email.trim().is_empty() };
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -1743,13 +1788,13 @@ fn invited_block(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     ui.label(egui::RichText::new(invite_text(code)).size(14.0).monospace().color(p.ink));
-                    if controls::button(ui, ButtonKind::Outline, controls::SMALL, COPY_CODE_BUTTON, None).clicked() {
+                    if controls::button(ui, ButtonKind::Outline, controls::SMALL, copy_code_button(), None).clicked() {
                         asked = Some(ShareDialogAction::CopyCode);
                     }
                 });
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new(format!("Give it to {email}. They enter it when they sign up."))
+                    egui::RichText::new(crate::i18n::tf("share.give_invite_code", &[("email", email)]))
                         .size(14.0)
                         .color(p.caution_ink),
                 );
@@ -1767,7 +1812,7 @@ fn invited_block(
                                 id,
                                 &mut dialog.password,
                                 &mut revealed,
-                                PASSWORD_HINT,
+                                password_hint(),
                                 PASSWORD_BOX_WIDTH,
                                 crate::kit::input::SIGN_IN,
                             )
@@ -1776,7 +1821,7 @@ fn invited_block(
                     ui.data_mut(|d| d.insert_temp(reveal_id, revealed));
                     let can = !dialog.minting && !dialog.password.is_empty();
                     let pressed = ui
-                        .add_enabled_ui(can, |ui| controls::button(ui, ButtonKind::Outline, controls::SMALL, MAKE_CODE_BUTTON, None))
+                        .add_enabled_ui(can, |ui| controls::button(ui, ButtonKind::Outline, controls::SMALL, make_code_button(), None))
                         .inner
                         .clicked();
                     let entered = can && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1943,33 +1988,62 @@ pub(crate) fn say_refusal_in_dialog(pane: &mut SharingPane) {
 // Send, so the two blocks of one card cannot come to disagree about where a
 // control sits or how tall an entry is.
 
-pub(crate) const STOP_LABEL: &str = "Stop sharing";
+pub(crate) fn stop_label() -> &'static str {
+    crate::i18n::t("share.stop_label")
+}
 /// Stop sharing's hover, on the SHARING card and on a share's Sent detail.
-pub(crate) const STOP_HOVER: &str = "Take this record out of their vault";
-pub(crate) const REINVITE_LABEL: &str = "Re-invite";
-pub(crate) const SHARE_ANYWAY_LABEL: &str = "Share anyway";
-pub(crate) const SHOW_FINGERPRINT: &str = "Show fingerprint";
-pub(crate) const HIDE_FINGERPRINT: &str = "Hide fingerprint";
+pub(crate) fn stop_hover() -> &'static str {
+    crate::i18n::t("share.stop_hover")
+}
+pub(crate) fn reinvite_label() -> &'static str {
+    crate::i18n::t("share.reinvite_label")
+}
+pub(crate) fn share_anyway_label() -> &'static str {
+    crate::i18n::t("share.share_anyway_label")
+}
+pub(crate) fn show_fingerprint() -> &'static str {
+    crate::i18n::t("share.show_fingerprint")
+}
+pub(crate) fn hide_fingerprint_text() -> &'static str {
+    crate::i18n::t("share.hide_fingerprint")
+}
 /// The fingerprint box's own Hide, at the right of its eyebrow (mock 6b).
-const HIDE_SHORT: &str = "Hide";
+fn hide_short() -> &'static str {
+    crate::i18n::t("share.hide_short")
+}
 /// Where Show fingerprint stood, while its answer is on the way.
-pub(crate) const FETCHING_FINGERPRINT: &str = "Fetching fingerprint\u{2026}";
-pub(crate) const REMOVE_LABEL: &str = "Remove from their vault";
+pub(crate) fn fetching_fingerprint() -> &'static str {
+    crate::i18n::t("share.fetching_fingerprint")
+}
+pub(crate) fn remove_label() -> &'static str {
+    crate::i18n::t("share.remove_label")
+}
 /// Mock 6e's "Stop sharing, running".
-pub(crate) const STOPPING_LABEL: &str = "Stopping\u{2026}";
-pub(crate) const STOP_HINT: &str =
-    "Anything they already copied stays with them. If that matters, change the password afterwards.";
+pub(crate) fn stopping_label() -> &'static str {
+    crate::i18n::t("share.stopping_label")
+}
+pub(crate) fn stop_hint() -> &'static str {
+    crate::i18n::t("share.stop_hint")
+}
 /// A greyed Share anyway's hover: what it is waiting for.
-const SHARE_ANYWAY_HOVER: &str = "Show their fingerprint and compare it first";
-const PEOPLE_BLOCK_LABEL: &str = "People";
-const FINGERPRINT_EYEBROW: &str = "FINGERPRINT";
+fn share_anyway_hover() -> &'static str {
+    crate::i18n::t("share.share_anyway_hover")
+}
+fn people_block_label() -> &'static str {
+    crate::i18n::t("share.people_block_label")
+}
+fn fingerprint_eyebrow() -> &'static str {
+    crate::i18n::t("share.fingerprint_eyebrow")
+}
 /// 6b's `.chead .side`, which the SHARING card wears once it lists people.
-pub(crate) const SHARING_SIDE: &str = "people: view-only, updates when you edit";
+pub(crate) fn sharing_side() -> &'static str {
+    crate::i18n::t("share.sharing_side")
+}
 /// 6b's `.cnote`, which speaks for both blocks -- and so replaces 5d's own
 /// note once the card lists people.
-pub(crate) const PEOPLE_NOTE: &str = "A person keeps a view-only copy in their own vault that follows your edits, \
-    until you stop sharing. A Send is a link: anyone who has it can open it until it expires or you \
-    revoke it.";
+pub(crate) fn people_note() -> &'static str {
+    crate::i18n::t("share.people_note")
+}
 
 /// `.cblock`: `padding: 12px 16px 6px`, and a `border-bottom` in the row
 /// rule's grey.
@@ -2046,15 +2120,12 @@ const TOAST_STACK_GAP: f32 = 8.0;
 
 /// Mock 6b's red question, with the record and the person in it.
 pub(crate) fn stop_question(record: &str, email: &str) -> String {
-    format!("Stop sharing {record} with {email}? It leaves their vault at once.")
+    crate::i18n::tf("share.stop_question", &[("record", record), ("email", email)])
 }
 
 /// What a shown fingerprint is to be compared with (mock 6b).
 fn fingerprint_note(email: &str) -> String {
-    format!(
-        "This should match the phrase {email} sees under Account \u{203a} Fingerprint phrase. If it \
-         does not, stop sharing: the record went to a key that is not theirs."
-    )
+    crate::i18n::tf("share.fingerprint_note", &[("email", email)])
 }
 
 /// **A changed key's fingerprint says what to do before Share anyway.** The
@@ -2064,11 +2135,7 @@ fn fingerprint_note(email: &str) -> String {
 /// read off this screen and the other person's screen alike proves nothing
 /// unless the two people say it to each other.
 pub(crate) fn key_changed_note(email: &str) -> String {
-    format!(
-        "Their key changed. Before you share anyway, compare these words with {email} by phone or \
-         in person: they see theirs under Account \u{203a} Fingerprint phrase. If the words do not \
-         match, do not share."
-    )
+    crate::i18n::tf("share.key_changed_note", &[("email", email)])
 }
 
 /// Two addresses name one person: the view's, the pane's and a report's are
@@ -2321,7 +2388,7 @@ pub(crate) fn draw_people_block(
     people: &super::detail::PeopleSharing<'_>,
     action: &mut super::detail::DetailAction,
 ) {
-    sharing_block(ui, BlockMark::Person, PEOPLE_BLOCK_LABEL, |ui| {
+    sharing_block(ui, BlockMark::Person, people_block_label(), |ui| {
         for (index, person) in people.people.iter().enumerate() {
             // `.pe + .pe`: a rule between two people, none over the first.
             if index > 0 {
@@ -2355,21 +2422,21 @@ fn person_entry(
     // Rightmost first, the order the controls are laid in: 6b reads
     // `Re-invite, Stop sharing` left to right, and Share anyway -- a changed
     // key's, which the mock does not draw -- goes before them both.
-    let mut resting = vec![STOP_LABEL];
+    let mut resting = vec![stop_label()];
     if person.reinvite() {
-        resting.push(REINVITE_LABEL);
+        resting.push(reinvite_label());
     }
     if person.share_anyway() {
-        resting.push(SHARE_ANYWAY_LABEL);
+        resting.push(share_anyway_label());
     }
     let room = controls_room(ui, &resting);
     // One fetch at a time (`SharingPane::fingerprinting`): the person being
     // fetched says so where their link was, and every other Show greys.
     let link = person.fingerprint().then(|| match (shown, people.fingerprinting) {
-        (Some(_), _) => (HIDE_FINGERPRINT, true),
-        (None, Some(who)) if same_person(who, email) => (FETCHING_FINGERPRINT, false),
-        (None, Some(_)) => (SHOW_FINGERPRINT, false),
-        (None, None) => (SHOW_FINGERPRINT, true),
+        (Some(_), _) => (hide_fingerprint_text(), true),
+        (None, Some(who)) if same_person(who, email) => (fetching_fingerprint(), false),
+        (None, Some(_)) => (show_fingerprint(), false),
+        (None, None) => (show_fingerprint(), true),
     });
     let mut link_pressed = false;
     sharing_entry(
@@ -2384,32 +2451,32 @@ fn person_entry(
             if stopping {
                 // No widget of any kind while the stop runs: the Send's
                 // revoke rule, for the same reason.
-                ui.label(egui::RichText::new(STOPPING_LABEL).size(12.0).color(theme::TEXT_MUTED));
+                ui.label(egui::RichText::new(stopping_label()).size(12.0).color(theme::TEXT_MUTED));
                 return;
             }
             if confirming {
-                if theme::row_button(ui, CANCEL_BUTTON).clicked() {
+                if theme::row_button(ui, cancel_button()).clicked() {
                     *action = DetailAction::CancelStopSharing;
                 }
                 return;
             }
-            if theme::row_button_danger(ui, STOP_LABEL)
-                .on_hover_text(STOP_HOVER)
+            if theme::row_button_danger(ui, stop_label())
+                .on_hover_text(stop_hover())
                 .clicked()
             {
                 *action = DetailAction::StopSharing(email.to_string());
             }
             if person.reinvite()
-                && theme::row_button(ui, REINVITE_LABEL).on_hover_text("Send them a fresh invitation").clicked()
+                && theme::row_button(ui, reinvite_label()).on_hover_text(crate::i18n::t("share.reinvite_hover")).clicked()
             {
                 *action = DetailAction::Reinvite(email.to_string());
             }
             if person.share_anyway() {
                 let ready = shown.is_some();
                 let pressed = ui
-                    .add_enabled_ui(ready, |ui| theme::row_button(ui, SHARE_ANYWAY_LABEL))
+                    .add_enabled_ui(ready, |ui| theme::row_button(ui, share_anyway_label()))
                     .inner
-                    .on_disabled_hover_text(SHARE_ANYWAY_HOVER)
+                    .on_disabled_hover_text(share_anyway_hover())
                     .clicked();
                 if ready && pressed {
                     *action = DetailAction::ShareAnyway(email.to_string());
@@ -2424,11 +2491,11 @@ fn person_entry(
         entry_extra(ui, |ui| {
             ui.add(egui::Label::new(theme::semibold(stop_question(record, email), 14.0).color(theme::ERROR)).wrap());
             ui.add_space(QUESTION_HINT_GAP);
-            ui.add(egui::Label::new(egui::RichText::new(STOP_HINT).size(11.0).color(theme::TEXT_FAINT)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(stop_hint()).size(11.0).color(theme::TEXT_FAINT)).wrap());
             ui.add_space(QUESTION_BUTTON_GAP);
             // Cancel wins an ambiguous frame, as on the Send's revoke: the
             // safe answer to one on a destructive control is not to destroy.
-            if theme::destructive_button(ui, REMOVE_LABEL).clicked() && *action != DetailAction::CancelStopSharing {
+            if theme::destructive_button(ui, remove_label()).clicked() && *action != DetailAction::CancelStopSharing {
                 *action = DetailAction::ConfirmStopSharing(email.to_string());
             }
         });
@@ -2456,9 +2523,9 @@ fn fingerprint_box(ui: &mut egui::Ui, phrase: &str, note: &str) -> bool {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = egui::vec2(0.0, FP_GAP);
             ui.horizontal(|ui| {
-                ui.label(theme::letterspaced(FINGERPRINT_EYEBROW, FP_SMALL_SIZE, theme::BOLD, FP_EYEBROW_TRACKING, theme::BLUE_DEEP));
+                ui.label(theme::letterspaced(fingerprint_eyebrow(), FP_SMALL_SIZE, theme::BOLD, FP_EYEBROW_TRACKING, theme::BLUE_DEEP));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let link = egui::Label::new(theme::semibold(HIDE_SHORT, FP_SMALL_SIZE).color(theme::BLUE_DEEP)).sense(egui::Sense::click());
+                    let link = egui::Label::new(theme::semibold(hide_short(), FP_SMALL_SIZE).color(theme::BLUE_DEEP)).sense(egui::Sense::click());
                     let response = ui.add(link);
                     if response.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2562,28 +2629,56 @@ pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, clear_of: O
 /// for a Send's id -- `send_ui`'s detail tells the two apart by it.
 pub(crate) const SHARE_KEY_PREFIX: &str = "share:";
 /// 6c's header, beside the share pill.
-pub(crate) const SHARED_WITH_A_PERSON: &str = "Shared with a person";
-/// 6c's PERSON rows. `Since` falls back to [`SINCE_UNKNOWN`] for a share this
+pub(crate) fn shared_with_a_person() -> &'static str {
+    crate::i18n::t("share.shared_with_a_person")
+}
+/// 6c's PERSON rows. `Since` falls back to [`since_unknown()`] for a share this
 /// PC holds no record of -- made on another PC, or before the sent history
 /// kept shares. "On another PC" would be a guess; this is what is known.
-pub(crate) const SHARED_WITH_ROW: &str = "Shared with";
-pub(crate) const SINCE_ROW: &str = "Since";
-pub(crate) const SINCE_UNKNOWN: &str = "Not recorded on this PC";
-pub(crate) const ACCESS_ROW: &str = "Access";
-pub(crate) const VIEW_ONLY: &str = "View-only";
-pub(crate) const THEIR_COPY_ROW: &str = "Their copy";
-pub(crate) const FOLLOWS_EDITS: &str = "Follows your edits";
+pub(crate) fn shared_with_row() -> &'static str {
+    crate::i18n::t("share.shared_with_row")
+}
+pub(crate) fn since_row() -> &'static str {
+    crate::i18n::t("share.since_row")
+}
+pub(crate) fn since_unknown() -> &'static str {
+    crate::i18n::t("share.since_unknown")
+}
+pub(crate) fn access_row() -> &'static str {
+    crate::i18n::t("share.access_row")
+}
+pub(crate) fn view_only() -> &'static str {
+    crate::i18n::t("share.view_only")
+}
+pub(crate) fn their_copy_row() -> &'static str {
+    crate::i18n::t("share.their_copy_row")
+}
+pub(crate) fn follows_edits() -> &'static str {
+    crate::i18n::t("share.follows_edits")
+}
 /// A person who does not hold the record yet (or any more) has no copy to
 /// follow anything, so their row says where they stand instead.
-pub(crate) const STATUS_ROW: &str = "Status";
+pub(crate) fn status_row() -> &'static str {
+    crate::i18n::t("share.status_row")
+}
 /// 6c's WHAT THEY SEE: the whole record, and 6c's Access hint split at its
 /// own sentence boundary into what they can and cannot do -- one fact per
 /// row, on the card's one label column, in the mock's words.
-pub(crate) const WHOLE_RECORD: &str = "The whole record, now and after every edit.";
-pub(crate) const CAN_ROW: &str = "They can";
-pub(crate) const CAN_VALUE: &str = "See, copy and autofill it";
-pub(crate) const CANNOT_ROW: &str = "They cannot";
-pub(crate) const CANNOT_VALUE: &str = "Edit, delete or share it on";
+pub(crate) fn whole_record() -> &'static str {
+    crate::i18n::t("share.whole_record")
+}
+pub(crate) fn can_row() -> &'static str {
+    crate::i18n::t("share.can_row")
+}
+pub(crate) fn can_value() -> &'static str {
+    crate::i18n::t("share.can_value")
+}
+pub(crate) fn cannot_row() -> &'static str {
+    crate::i18n::t("share.cannot_row")
+}
+pub(crate) fn cannot_value() -> &'static str {
+    crate::i18n::t("share.cannot_value")
+}
 
 /// **A share in the Sent list**: one record, one person (mock 6c).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2683,7 +2778,7 @@ pub(crate) fn share_rows(
                     name: item.name.clone(),
                     email: person.email.clone(),
                     state: person.state,
-                    subtitle: format!("to {} \u{b7} {}", person.email, short_state(person.state)),
+                    subtitle: crate::i18n::tf("share.row_subtitle", &[("email", &person.email.to_string()), ("state", (short_state(person.state)))]),
                     since: at.map(|at| day(at, zone)),
                 },
             ));
@@ -2738,7 +2833,7 @@ pub struct PeopleRows<'a> {
     pub(crate) waiting: &'a [crate::rest::sharing::WaitingEntry],
     /// **A sharing write is out** ([`SharingPane::is_busy`]): Paste's Accept
     /// is drawn greyed and senses nothing, rather than being pressed only for
-    /// [`request`] to refuse it with [`BUSY`].
+    /// [`request`] to refuse it with [`busy()`].
     pub(crate) busy: bool,
 }
 
@@ -2810,8 +2905,12 @@ pub(crate) enum PeopleAsk {
 /// click has already opened the record in the vault.
 pub(crate) const RECEIVED_KEY_PREFIX: &str = "recv:";
 /// Mock 6d's two `.lgroup` eyebrows over Shared with me's list.
-pub(crate) const FROM_PEOPLE_EYEBROW: &str = "FROM PEOPLE";
-pub(crate) const FROM_SENDS_EYEBROW: &str = "IMPORTED FROM SENDS";
+pub(crate) fn from_people_eyebrow() -> &'static str {
+    crate::i18n::t("share.from_people_eyebrow")
+}
+pub(crate) fn from_sends_eyebrow() -> &'static str {
+    crate::i18n::t("share.from_sends_eyebrow")
+}
 const GROUP_EYEBROW_INSET: f32 = 4.0;
 
 /// A record someone shares with this account, in Shared with me.
@@ -2842,9 +2941,9 @@ pub struct ReceivedShareRow {
 /// claim (official-path spec §4.3).
 pub(crate) fn received_subtitle(row: &ReceivedShareRow) -> String {
     if row.verified {
-        format!("from {} \u{b7} view-only", row.from)
+        crate::i18n::tf("share.received_subtitle", &[("from", &row.from)])
     } else {
-        format!("from {} \u{b7} unverified \u{b7} view-only", row.from)
+        crate::i18n::tf("share.received_subtitle_unverified", &[("from", &row.from)])
     }
 }
 
@@ -2900,14 +2999,20 @@ pub(crate) fn received_share_rows(view: Option<&SharingView>, items: &[VaultItem
 // none, and an invitation nobody answers expires.
 
 /// The paste box's hint, and its button.
-pub(crate) const PASTE_HINT: &str = "Paste an invite link";
-pub(crate) const PASTE_ACCEPT_LABEL: &str = "Accept";
+pub(crate) fn paste_hint() -> &'static str {
+    crate::i18n::t("share.paste_hint")
+}
+pub(crate) fn paste_accept_label() -> &'static str {
+    crate::i18n::t("share.paste_accept_label")
+}
 /// A pasted link was accepted. The records arrive once the sharer's daemon
 /// confirms. Nothing names the sharer until a whole read lists the org --
 /// the link's org name is a claim (`Sharing::accept_link`), and the listing
 /// marks it unverified unless a roster names the owner -- so this toast is
 /// the whole answer until then.
-pub(crate) const LINK_ACCEPTED: &str = "Invitation accepted. The records arrive once the person sharing them finishes.";
+pub(crate) fn link_accepted() -> &'static str {
+    crate::i18n::t("share.link_accepted")
+}
 /// The paste row: one kit text field (50) high.
 pub(crate) const PASTE_ROW_HEIGHT: f32 = 50.0;
 const PASTE_BUTTON_GAP: f32 = 8.0;
@@ -2920,7 +3025,7 @@ const WAITING_LINE_SIZE: f32 = 12.0;
 /// confirmed. The sharer's daemon confirms on its next pass; until then the
 /// org shows this account nothing, and this line is why.
 pub(crate) fn waiting_line(from: &str) -> String {
-    format!("Waiting for {from} to finish sharing")
+    crate::i18n::tf("share.waiting_line", &[("from", from)])
 }
 
 /// **Who a [`waiting_line`] names**: the sharer, and `(unverified)` after
@@ -2939,7 +3044,7 @@ pub(crate) fn named_sharer(from: &str, verified: bool) -> String {
     if verified {
         from.to_string()
     } else {
-        format!("{from} (unverified)")
+        crate::i18n::tf("share.sharer_unverified", &[("from", from)])
     }
 }
 
@@ -2967,10 +3072,10 @@ pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<
     if let Some(buffer) = people.paste.as_mut() {
         let (row, _) = ui.allocate_exact_size(egui::vec2(width, PASTE_ROW_HEIGHT), egui::Sense::hover());
         use crate::kit::controls::{self, ButtonKind};
-        let button_width = controls::button_width(ui.ctx(), ButtonKind::Primary, controls::ROW, PASTE_ACCEPT_LABEL, false);
+        let button_width = controls::button_width(ui.ctx(), ButtonKind::Primary, controls::ROW, paste_accept_label(), false);
         let field = egui::Rect::from_min_size(row.min, egui::vec2((width - button_width - PASTE_BUTTON_GAP).max(0.0), PASTE_ROW_HEIGHT));
         let mut field_ui = ui.new_child(egui::UiBuilder::new().max_rect(field));
-        let _ = crate::kit::input::text(&mut field_ui, egui::Id::new("record-paste-invite"), buffer, PASTE_HINT, false, field.width());
+        let _ = crate::kit::input::text(&mut field_ui, egui::Id::new("record-paste-invite"), buffer, paste_hint(), false, field.width());
         let button = egui::Rect::from_min_size(
             egui::pos2(field.right() + PASTE_BUTTON_GAP, row.center().y - controls::ROW.height / 2.0),
             egui::vec2(button_width, controls::ROW.height),
@@ -2978,7 +3083,7 @@ pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<
         let enabled = !people.busy && !buffer.trim().is_empty();
         let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(button));
         let pressed = button_ui
-            .add_enabled_ui(enabled, |ui| controls::button(ui, ButtonKind::Primary, controls::ROW, PASTE_ACCEPT_LABEL, None).clicked())
+            .add_enabled_ui(enabled, |ui| controls::button(ui, ButtonKind::Primary, controls::ROW, paste_accept_label(), None).clicked())
             .inner;
         if pressed {
             people.asked = Some(PeopleAsk::AcceptLink);
@@ -3005,17 +3110,23 @@ pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<
 }
 
 /// The join question's body, and its two answers (fix round 1, M2).
-pub(crate) const JOIN_BODY: &str = "The link doesn't say what access you'll have.";
-pub(crate) const JOIN_YES_LABEL: &str = "Yes";
-pub(crate) const JOIN_NO_LABEL: &str = "No";
+pub(crate) fn join_body() -> &'static str {
+    crate::i18n::t("share.join_body")
+}
+pub(crate) fn join_yes_label() -> &'static str {
+    crate::i18n::t("share.join_yes_label")
+}
+pub(crate) fn join_no_label() -> &'static str {
+    crate::i18n::t("share.join_no_label")
+}
 
 /// `Join "Shared by denis@example.com"?` -- the organisation's name as the
 /// link carries it, quoted because it is the link's claim and not the
 /// server's word; "this organisation" for a link that carries none.
 pub(crate) fn join_title(name: Option<&str>) -> String {
     match name {
-        Some(name) => format!("Join \"{name}\"?"),
-        None => "Join this organisation?".to_string(),
+        Some(name) => crate::i18n::tf("share.join_title_named", &[("name", name)]),
+        None => crate::i18n::t("share.join_title").to_string(),
     }
 }
 
@@ -3065,9 +3176,9 @@ pub(crate) fn draw_join_confirm(ctx: &egui::Context, title: &str) -> Option<bool
         JOIN_ID,
         480.0,
         title,
-        Some(JOIN_BODY),
-        (JOIN_YES_LABEL, ButtonKind::Primary),
-        (JOIN_NO_LABEL, ButtonKind::Outline),
+        Some(join_body()),
+        (join_yes_label(), ButtonKind::Primary),
+        (join_no_label(), ButtonKind::Outline),
     ) {
         Confirmed::Pressed(Side::Left) => Some(true),
         Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(false),
@@ -3079,11 +3190,15 @@ pub(crate) fn draw_join_confirm(ctx: &egui::Context, title: &str) -> Option<bool
 pub(crate) const JOIN_ID: &str = "record-join";
 
 /// The leave question's two answers.
-pub(crate) const STOP_RECEIVING_LABEL: &str = "Stop receiving";
-pub(crate) const KEEP_RECEIVING_LABEL: &str = "Keep";
+pub(crate) fn stop_receiving_label() -> &'static str {
+    crate::i18n::t("share.stop_receiving_label")
+}
+pub(crate) fn keep_receiving_label() -> &'static str {
+    crate::i18n::t("share.keep_receiving_label")
+}
 
 pub(crate) fn stop_receiving_title(from: &str) -> String {
-    format!("Stop receiving from {from}?")
+    crate::i18n::tf("share.stop_receiving_title", &[("from", from)])
 }
 
 ///
@@ -3092,10 +3207,7 @@ pub(crate) fn stop_receiving_title(from: &str) -> String {
 /// decline -- so "They can invite you again later" promised a question that
 /// never comes.
 pub(crate) fn stop_receiving_body(from: &str) -> String {
-    format!(
-        "Every record {from} shares with you leaves your vault now. On this server they can add you back \
-         directly, without asking you first."
-    )
+    crate::i18n::tf("share.stop_receiving_body", &[("from", from)])
 }
 
 /// **"Stop receiving from X?"** -- every record from them leaves this vault,
@@ -3118,8 +3230,8 @@ pub(crate) fn draw_leave_confirm(ctx: &egui::Context, from: &str) -> Option<bool
         480.0,
         &title,
         Some(&body),
-        (STOP_RECEIVING_LABEL, ButtonKind::Danger),
-        (KEEP_RECEIVING_LABEL, ButtonKind::Outline),
+        (stop_receiving_label(), ButtonKind::Danger),
+        (keep_receiving_label(), ButtonKind::Outline),
     ) {
         Confirmed::Pressed(Side::Left) => Some(true),
         Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(false),
@@ -3218,7 +3330,7 @@ mod tests {
         assert_eq!(share_control(Some(&on), true, &item("mine")), Some(ShareControl::Share));
         assert_eq!(
             share_control(Some(&SharingView::unavailable(REASON_TOO_OLD)), true, &item("mine")),
-            Some(ShareControl::Disabled(SHARE_TOO_OLD_TOOLTIP)),
+            Some(ShareControl::Disabled(share_too_old_tooltip())),
             "server-too-old: greyed, saying why"
         );
         // "not-nodewarden" is a reason an older daemon could still answer
@@ -3251,7 +3363,7 @@ mod tests {
         let mine = item(serde_json::json!({ "id": "in-mine", "name": "x", "organizationId": "my-sharing-org" }));
         assert_eq!(share_control(Some(&on), true, &mine), Some(ShareControl::Share), "already in the sharing org");
         let attached = item(serde_json::json!({ "id": "p1", "name": "x", "attachments": [{ "id": "a1" }] }));
-        assert_eq!(share_control(Some(&on), true, &attached), Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS)));
+        assert_eq!(share_control(Some(&on), true, &attached), Some(ShareControl::Disabled(crate::rest::sharing::has_attachments_text())));
         let empty = item(serde_json::json!({ "id": "p2", "name": "x", "attachments": [] }));
         assert_eq!(share_control(Some(&on), true, &empty), Some(ShareControl::Share), "an empty list is no attachment");
     }
@@ -3362,16 +3474,16 @@ mod tests {
         let ctx = egui::Context::default();
         let forged = SharingCall::Confirm { email: "eve@x.io".into(), key_sha256: "ffff".into() };
         assert!(!request(&mut pane, None, &ctx, &tx, forged));
-        assert_eq!(pane.notice.as_deref(), Some(CHECK_FINGERPRINT_FIRST));
+        assert_eq!(pane.notice.as_deref(), Some(check_fingerprint_first()));
         assert!(pane.fingerprint.is_some(), "a refused forgery spends nothing");
         let unseen = SharingCall::Confirm { email: "bob@x.io".into(), key_sha256: "ab12".into() };
         assert!(!request(&mut pane, None, &ctx, &tx, unseen));
-        assert_eq!(pane.notice.as_deref(), Some(CHECK_FINGERPRINT_FIRST));
+        assert_eq!(pane.notice.as_deref(), Some(check_fingerprint_first()));
         assert!(rx.try_recv().is_err(), "nothing was started");
 
         let call = pane.share_anyway("eve@x.io").expect("a Confirm");
         assert!(!request(&mut pane, None, &ctx, &tx, call));
-        assert_eq!(pane.notice.as_deref(), Some(SHARING_UNAVAILABLE), "the matching Confirm reaches the line check");
+        assert_eq!(pane.notice.as_deref(), Some(sharing_unavailable()), "the matching Confirm reaches the line check");
         assert!(pane.fingerprint.is_some(), "nothing was sent, so nothing was spent");
 
         let call = pane.share_anyway("eve@x.io").expect("a Confirm");
@@ -3457,7 +3569,7 @@ mod tests {
     fn a_call_that_fails_outright_reports_as_its_own_kind() {
         let mut pane = SharingPane::default();
         pane.begin_view();
-        apply(&mut pane, SharingCall::View.failed(PANICKED), 0.0);
+        apply(&mut pane, SharingCall::View.failed(panicked()), 0.0);
         assert!(!pane.wants_view(0.0), "a failed read is not retried every frame");
         pane.invalidate();
         assert!(pane.wants_view(0.0), "the next change asks again: the read is not stuck in flight");
@@ -3469,17 +3581,17 @@ mod tests {
             dialog.password.push_str("hunter2");
         }
         let mint = SharingCall::InviteCode { email: "carol@x.io".into(), password: Zeroizing::new("hunter2".into()) };
-        apply(&mut pane, mint.failed(PANICKED), 1.0);
+        apply(&mut pane, mint.failed(panicked()), 1.0);
         let dialog = pane.dialog.as_ref().expect("the dialog stays");
         assert!(!dialog.minting);
         assert!(dialog.password.is_empty(), "the typed password is wiped whatever the answer");
-        assert_eq!(dialog.error.as_deref(), Some(PANICKED));
+        assert_eq!(dialog.error.as_deref(), Some(panicked()));
 
         let stop = SharingCall::Stop { item_id: "r1".into(), email: "anna@x.io".into() };
         pane.stopping = Some(("r1".into(), "anna@x.io".into()));
-        apply(&mut pane, stop.failed(PANICKED), 2.0);
+        apply(&mut pane, stop.failed(panicked()), 2.0);
         assert!(pane.stopping_for("r1").is_none());
-        assert_eq!(pane.notice.as_deref(), Some(PANICKED));
+        assert_eq!(pane.notice.as_deref(), Some(panicked()));
     }
 
     /// The rail's numbers: one per record in Shared with me. (The dot is
@@ -3535,7 +3647,7 @@ mod tests {
         assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("anna@x.io".into())));
         let stop = SharingCall::Stop { item_id: "r1".into(), email: "bob@x.io".into() };
         assert!(!request(&mut pane, Some(&line), &ctx, &tx, stop), "a second write is refused");
-        assert_eq!(pane.notice.as_deref(), Some(BUSY));
+        assert_eq!(pane.notice.as_deref(), Some(busy()));
         assert!(pane.stopping_for("r1").is_none(), "a refused stop raises no spinner");
         assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Fingerprint("anna@x.io".into())), "a read runs beside the write");
 
@@ -3702,7 +3814,7 @@ mod tests {
         assert!(has("Share Acme VPN"), "{texts:?}");
         assert!(has("RECORD") && has("WITH"));
         assert!(has("They get view-only access"));
-        assert!(has(SHARE_BUTTON) && has(CANCEL_BUTTON));
+        assert!(has(share_button()) && has(cancel_button()));
         assert!(has("Appears in Shared"), "6a's footer note: {texts:?}");
         assert!(!texts.iter().any(|(t, _)| t.to_lowercase().contains("organi")), "the dialog names an organisation: {texts:?}");
     }
@@ -3712,7 +3824,7 @@ mod tests {
     fn share_submits_only_with_an_address() {
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), None, Vec::new());
-        let at = texts.iter().find(|(t, _)| t == SHARE_BUTTON).map(|(_, r)| r.center()).expect("the Share button");
+        let at = texts.iter().find(|(t, _)| t == share_button()).map(|(_, r)| r.center()).expect("the Share button");
         let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(at));
         assert_eq!(action, ShareDialogAction::None, "an empty address does not submit");
         dialog.email = "anna@example.com".into();
@@ -3741,12 +3853,12 @@ mod tests {
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
         let has = |needle: &str| texts.iter().any(|(t, _)| t.contains(needle));
         assert!(has("Waiting for carol@example.com to accept."), "{texts:?}");
-        assert!(has(MAKE_CODE_BUTTON));
-        assert!(has(DONE_BUTTON));
-        assert!(!has(SHARE_BUTTON) || !texts.iter().any(|(t, _)| t == SHARE_BUTTON), "Done replaces Share and Cancel");
+        assert!(has(make_code_button()));
+        assert!(has(done_button()));
+        assert!(!has(share_button()) || !texts.iter().any(|(t, _)| t == share_button()), "Done replaces Share and Cancel");
         let plain = SharingView { available: true, ..SharingView::default() };
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&plain), Vec::new());
-        assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON), "only an administrator can mint");
+        assert!(!texts.iter().any(|(t, _)| t == make_code_button()), "only an administrator can mint");
     }
 
     /// **The Share dialog warns where recipients can see each other**
@@ -3756,10 +3868,10 @@ mod tests {
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
         let official = SharingView { available: true, roster_visible_to_recipients: true, ..SharingView::default() };
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&official), Vec::new());
-        assert!(texts.iter().any(|(t, _)| t == ROSTER_VISIBLE_WARNING), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == roster_visible_warning()), "{texts:?}");
         let hidden = SharingView { available: true, roster_visible_to_recipients: false, ..SharingView::default() };
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&hidden), Vec::new());
-        assert!(!texts.iter().any(|(t, _)| t == ROSTER_VISIBLE_WARNING), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == roster_visible_warning()), "{texts:?}");
     }
 
     /// **An administrator is offered a code only for somebody with no
@@ -3770,7 +3882,7 @@ mod tests {
         let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
-        assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == make_code_button()), "{texts:?}");
     }
 
     /// **The invited band claims no account either way** (official-path spec
@@ -3800,9 +3912,9 @@ mod tests {
         dialog.invite_code = Some(InviteCode { code: "K7Q2-99XA".into(), link: None, expires_at: None });
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
         assert!(texts.iter().any(|(t, _)| t.contains("K7Q2-99XA")), "{texts:?}");
-        assert!(texts.iter().any(|(t, _)| t == COPY_CODE_BUTTON));
-        assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON));
-        let at = texts.iter().find(|(t, _)| t == COPY_CODE_BUTTON).map(|(_, r)| r.center()).expect("Copy");
+        assert!(texts.iter().any(|(t, _)| t == copy_code_button()));
+        assert!(!texts.iter().any(|(t, _)| t == make_code_button()));
+        let at = texts.iter().find(|(t, _)| t == copy_code_button()).map(|(_, r)| r.center()).expect("Copy");
         let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), click(at));
         assert_eq!(action, ShareDialogAction::CopyCode);
         assert_eq!(dialog.invite_code.as_ref().map(invite_text), Some("K7Q2-99XA"));
@@ -3824,10 +3936,10 @@ mod tests {
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), None, Vec::new());
         let has = |needle: &str| texts.iter().any(|(t, _)| t.contains(needle));
         assert!(has("Use the organisation \u{201c}Shared by me@x.io\u{201d} (0f1e2d3c) for sharing? Deskwarden did not create it."), "{texts:?}");
-        assert!(texts.iter().any(|(t, _)| t == ADOPT_YES) && texts.iter().any(|(t, _)| t == ADOPT_NO), "{texts:?}");
-        assert!(!texts.iter().any(|(t, _)| t == SHARE_BUTTON), "Yes and No replace Share: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == adopt_yes()) && texts.iter().any(|(t, _)| t == adopt_no()), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == share_button()), "Yes and No replace Share: {texts:?}");
         let at = |label: &str| texts.iter().find(|(t, _)| t == label).map(|(_, r)| r.center()).expect("the button");
-        let (yes, no) = (at(ADOPT_YES), at(ADOPT_NO));
+        let (yes, no) = (at(adopt_yes()), at(adopt_no()));
         let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(yes));
         assert_eq!(action, ShareDialogAction::Adopt);
         let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(no));
@@ -3932,7 +4044,7 @@ mod tests {
         assert_eq!(left, ShareDialogAction::None);
         let dialog = pane.dialog.as_ref().expect("the dialog stays open");
         assert!(!dialog.in_flight, "no line to the daemon: the spinner is down");
-        assert_eq!(dialog.error.as_deref(), Some(SHARING_UNAVAILABLE));
+        assert_eq!(dialog.error.as_deref(), Some(sharing_unavailable()));
         assert!(pane.notice.is_none(), "said once, in the dialog");
 
         let line = dead_line();
@@ -3941,7 +4053,7 @@ mod tests {
         let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::Submit, Some(&line), &ctx, &tx);
         let dialog = pane.dialog.as_ref().expect("the dialog stays open");
         assert!(!dialog.in_flight, "a second write: the spinner is down");
-        assert_eq!(dialog.error.as_deref(), Some(BUSY));
+        assert_eq!(dialog.error.as_deref(), Some(busy()));
 
         let mut dialog = pane.dialog.take().expect("the dialog");
         dialog.invited = Some("carol@x.io".into());
@@ -3950,7 +4062,7 @@ mod tests {
         let dialog = pane.dialog.as_ref().expect("the dialog stays open");
         assert!(!dialog.minting, "a refused mint: the spinner is down");
         assert!(dialog.password.is_empty(), "the password is gone whatever the answer");
-        assert_eq!(dialog.error.as_deref(), Some(BUSY));
+        assert_eq!(dialog.error.as_deref(), Some(busy()));
         let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
     }
 
@@ -4172,12 +4284,12 @@ mod tests {
         let (_, texts) = block_frame(people, Vec::new());
         let count = |needle: &str| texts.iter().filter(|(t, _)| t == needle).count();
         assert_eq!(count("anna@x.io"), 1);
-        assert_eq!(count(STOP_LABEL), 2);
-        assert_eq!(count(REINVITE_LABEL), 1, "only carol's invite can be renewed");
-        assert_eq!(count(SHOW_FINGERPRINT), 1, "only anna's key is held");
+        assert_eq!(count(stop_label()), 2);
+        assert_eq!(count(reinvite_label()), 1, "only carol's invite can be renewed");
+        assert_eq!(count(show_fingerprint()), 1, "only anna's key is held");
         assert_eq!(count("Shared"), 1);
         assert_eq!(count("Invited"), 1, "carol's pill");
-        assert_eq!(count(PEOPLE_BLOCK_LABEL), 1, "the stacked label over the entries");
+        assert_eq!(count(people_block_label()), 1, "the stacked label over the entries");
         assert_eq!(count("A"), 1, "anna's avatar carries her initial: {texts:?}");
         assert_eq!(count("C"), 1, "carol's avatar carries hers");
     }
@@ -4191,22 +4303,22 @@ mod tests {
         let people_lines = lines();
         let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(at_rest, Vec::new());
-        let stop = texts.iter().find(|(t, _)| t == STOP_LABEL).map(|(_, r)| r.center()).expect("Stop sharing");
+        let stop = texts.iter().find(|(t, _)| t == stop_label()).map(|(_, r)| r.center()).expect("Stop sharing");
         assert_eq!(block_frame(at_rest, click(stop)).0, DetailAction::StopSharing("anna@x.io".into()));
 
         let asking = super::super::detail::PeopleSharing { people: &people_lines, confirming: Some("anna@x.io"), ..Default::default() };
         let (_, texts) = block_frame(asking, Vec::new());
         assert!(texts.iter().any(|(t, _)| t == &stop_question("Acme VPN", "anna@x.io")), "{texts:?}");
-        assert!(texts.iter().any(|(t, _)| t == STOP_HINT), "the note that a copy stays with them");
-        let remove = texts.iter().find(|(t, _)| t == REMOVE_LABEL).map(|(_, r)| r.center()).expect("the red button");
+        assert!(texts.iter().any(|(t, _)| t == stop_hint()), "the note that a copy stays with them");
+        let remove = texts.iter().find(|(t, _)| t == remove_label()).map(|(_, r)| r.center()).expect("the red button");
         assert_eq!(block_frame(asking, click(remove)).0, DetailAction::ConfirmStopSharing("anna@x.io".into()));
-        let cancel = texts.iter().find(|(t, _)| t == CANCEL_BUTTON).map(|(_, r)| r.center()).expect("Cancel");
+        let cancel = texts.iter().find(|(t, _)| t == cancel_button()).map(|(_, r)| r.center()).expect("Cancel");
         assert_eq!(block_frame(asking, click(cancel)).0, DetailAction::CancelStopSharing);
         // **Cancel is where Stop sharing was**, so a second rapid click on
         // Stop lands on the way out and never on the red button below.
         assert_eq!(block_frame(asking, click(stop)).0, DetailAction::CancelStopSharing, "a second click where Stop was");
         assert!(remove.y > stop.y, "the question went above the row, which moves it");
-        assert_eq!(texts.iter().filter(|(t, _)| t == STOP_LABEL).count(), 1, "only carol's Stop is offered while anna's is asked");
+        assert_eq!(texts.iter().filter(|(t, _)| t == stop_label()).count(), 1, "only carol's Stop is offered while anna's is asked");
     }
 
     /// While a stop runs, the row says so and offers nothing -- mock 6e's
@@ -4217,7 +4329,7 @@ mod tests {
         let people_lines = lines();
         let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(at_rest, Vec::new());
-        let stop = centre_of(&texts, STOP_LABEL);
+        let stop = centre_of(&texts, stop_label());
         let running = super::super::detail::PeopleSharing {
             people: &people_lines,
             confirming: Some("anna@x.io"),
@@ -4226,8 +4338,8 @@ mod tests {
         };
         let (action, texts) = block_frame(running, click(stop));
         assert_eq!(action, DetailAction::None);
-        assert!(texts.iter().any(|(t, _)| t == STOPPING_LABEL), "{texts:?}");
-        assert!(!texts.iter().any(|(t, _)| t == REMOVE_LABEL || t == CANCEL_BUTTON), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == stopping_label()), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == remove_label() || t == cancel_button()), "{texts:?}");
     }
 
     /// The fingerprint, once fetched, is shown under the person with the
@@ -4243,13 +4355,13 @@ mod tests {
         };
         let (_, texts) = block_frame(people, Vec::new());
         assert!(texts.iter().any(|(t, _)| t == "turban-deftly-anime-chatroom-unselfish"));
-        assert!(texts.iter().any(|(t, _)| t == HIDE_FINGERPRINT));
+        assert!(texts.iter().any(|(t, _)| t == hide_fingerprint_text()));
         assert!(texts.iter().any(|(t, _)| t.contains("Account \u{203a} Fingerprint phrase")));
-        let hide = centre_of(&texts, HIDE_FINGERPRINT);
+        let hide = centre_of(&texts, hide_fingerprint_text());
         assert_eq!(block_frame(people, click(hide)).0, DetailAction::HideFingerprint);
         let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(at_rest, Vec::new());
-        let show = centre_of(&texts, SHOW_FINGERPRINT);
+        let show = centre_of(&texts, show_fingerprint());
         assert_eq!(block_frame(at_rest, click(show)).0, DetailAction::ShowFingerprint("anna@x.io".into()));
     }
 
@@ -4265,12 +4377,12 @@ mod tests {
         ];
         let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(at_rest, Vec::new());
-        let eves = texts.iter().filter(|(t, _)| t == SHOW_FINGERPRINT).map(|(_, r)| r.center()).next_back().expect("eve's Show");
+        let eves = texts.iter().filter(|(t, _)| t == show_fingerprint()).map(|(_, r)| r.center()).next_back().expect("eve's Show");
         let fetching = super::super::detail::PeopleSharing { people: &people_lines, fingerprinting: Some("anna@x.io"), ..Default::default() };
         let (action, texts) = block_frame(fetching, click(eves));
         assert_eq!(action, DetailAction::None, "a second Show while one is out");
-        assert_eq!(texts.iter().filter(|(t, _)| t == FETCHING_FINGERPRINT).count(), 1, "{texts:?}");
-        assert_eq!(texts.iter().filter(|(t, _)| t == SHOW_FINGERPRINT).count(), 1, "eve's, greyed");
+        assert_eq!(texts.iter().filter(|(t, _)| t == fetching_fingerprint()).count(), 1, "{texts:?}");
+        assert_eq!(texts.iter().filter(|(t, _)| t == show_fingerprint()).count(), 1, "eve's, greyed");
     }
 
     /// **A changed key is shared anyway only after its fingerprint is on
@@ -4289,9 +4401,9 @@ mod tests {
         let unchecked = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(unchecked, Vec::new());
         assert!(texts.iter().any(|(t, _)| t == "Key changed"), "the pill: {texts:?}");
-        let anyway = centre_of(&texts, SHARE_ANYWAY_LABEL);
+        let anyway = centre_of(&texts, share_anyway_label());
         assert_eq!(block_frame(unchecked, click(anyway)).0, DetailAction::None, "no fingerprint seen yet");
-        assert!(texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT));
+        assert!(texts.iter().any(|(t, _)| t == show_fingerprint()));
 
         let someone_elses = super::super::detail::PeopleSharing {
             people: &people_lines,
@@ -4309,7 +4421,7 @@ mod tests {
         assert!(texts.iter().any(|(t, _)| t == "cobalt-hinge-lantern-mossy-quill"));
         assert!(texts.iter().any(|(t, _)| t == &key_changed_note("eve@x.io")), "{texts:?}");
         assert!(key_changed_note("eve@x.io").contains("by phone or in person"));
-        let anyway = centre_of(&texts, SHARE_ANYWAY_LABEL);
+        let anyway = centre_of(&texts, share_anyway_label());
         assert_eq!(block_frame(checked, click(anyway)).0, DetailAction::ShareAnyway("eve@x.io".into()));
     }
 
@@ -4327,8 +4439,8 @@ mod tests {
         let people = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(people, Vec::new());
         assert!(texts.iter().any(|(t, _)| t == "Invited"));
-        assert!(!texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT), "no key is held for an invitation");
-        let reinvite = centre_of(&texts, REINVITE_LABEL);
+        assert!(!texts.iter().any(|(t, _)| t == show_fingerprint()), "no key is held for an invitation");
+        let reinvite = centre_of(&texts, reinvite_label());
         assert_eq!(block_frame(people, click(reinvite)).0, DetailAction::Reinvite("carol@x.io".into()));
     }
 
@@ -4351,12 +4463,12 @@ mod tests {
         assert_eq!(lines.len(), 2, "both are shown");
         for line in &lines {
             assert!(!line.authenticated && !line.reinvite() && !line.share_anyway(), "{line:?}");
-            assert!(line.line.starts_with(UNVERIFIED_PREFIX), "{line:?}");
+            assert!(line.line.starts_with(unverified_prefix()), "{line:?}");
         }
         let people = super::super::detail::PeopleSharing { people: &lines, ..Default::default() };
         let (_, texts) = block_frame(people, Vec::new());
-        assert!(!texts.iter().any(|(t, _)| t == REINVITE_LABEL || t == SHARE_ANYWAY_LABEL), "{texts:?}");
-        assert!(texts.iter().any(|(t, _)| t == STOP_LABEL), "Stop is still offered: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == reinvite_label() || t == share_anyway_label()), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == stop_label()), "Stop is still offered: {texts:?}");
     }
 
     /// **A fingerprint is a read with its own one-at-a-time slot**: asking
@@ -4376,7 +4488,7 @@ mod tests {
         assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing."), "a read clears no sentence");
         assert_eq!(pane.fingerprinting.as_deref(), Some("anna@x.io"));
         assert!(!request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Fingerprint("eve@x.io".into())), "one at a time");
-        assert_eq!(pane.notice.as_deref(), Some(FINGERPRINT_BUSY));
+        assert_eq!(pane.notice.as_deref(), Some(fingerprint_busy()));
         assert_eq!(pane.fingerprinting.as_deref(), Some("anna@x.io"), "the refused one took nothing over");
         let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
         match &report {
@@ -4385,7 +4497,7 @@ mod tests {
         }
         apply(&mut pane, report, 0.0);
         assert!(pane.fingerprinting.is_none(), "answered, even with a failure: the slot is free");
-        assert_ne!(pane.notice.as_deref(), Some(FINGERPRINT_BUSY), "the busy sentence went with the slot");
+        assert_ne!(pane.notice.as_deref(), Some(fingerprint_busy()), "the busy sentence went with the slot");
         // The refused read started no thread: had it, the slot would have
         // named eve, and its report could be waiting already. No wait here --
         // the slot is the evidence.
@@ -4398,22 +4510,22 @@ mod tests {
     #[test]
     fn a_busy_sentence_goes_when_the_slot_it_was_about_frees() {
         let mut pane = SharingPane::default();
-        pane.say(BUSY.to_string(), None);
-        pane.dialog = Some(ShareDialog { error: Some(BUSY.to_string()), ..ShareDialog::opening("r1", "Acme VPN") });
+        pane.say(busy().to_string(), None);
+        pane.dialog = Some(ShareDialog { error: Some(busy().to_string()), ..ShareDialog::opening("r1", "Acme VPN") });
         apply(&mut pane, SharingReport::Reinvited { email: "bob@x.io".into(), result: Ok(()) }, 0.0);
         assert!(pane.notice.is_none(), "the write finished; 'still running' is no longer true");
         assert!(pane.dialog.as_ref().is_some_and(|d| d.error.is_none()));
 
-        pane.say(BUSY.to_string(), None);
+        pane.say(busy().to_string(), None);
         apply(&mut pane, SharingReport::Reinvited { email: "bob@x.io".into(), result: Err("no".into()) }, 1.0);
         assert_eq!(pane.notice.as_deref(), Some("no"), "the answer's own sentence stays");
 
-        pane.say(FINGERPRINT_BUSY.to_string(), None);
+        pane.say(fingerprint_busy().to_string(), None);
         apply(&mut pane, SharingReport::Fingerprint { email: "anna@x.io".into(), result: Ok(fingerprint("ab12")) }, 2.0);
         assert!(pane.notice.is_none());
-        pane.say(BUSY.to_string(), None);
+        pane.say(busy().to_string(), None);
         apply(&mut pane, SharingReport::Fingerprint { email: "anna@x.io".into(), result: Ok(fingerprint("ab12")) }, 3.0);
-        assert_eq!(pane.notice.as_deref(), Some(BUSY), "a read frees no write slot, so the write's busy stands");
+        assert_eq!(pane.notice.as_deref(), Some(busy()), "a read frees no write slot, so the write's busy stands");
     }
 
     /// **Share anyway and Re-invite say how they went**: a toast naming the
@@ -4431,10 +4543,10 @@ mod tests {
         assert_eq!(pane.notice.as_deref(), Some("Couldn't re-invite."));
         // A panicked worker reports as the call's own kind, so the toast's
         // person is still known and the slot is still freed.
-        let panicked = SharingCall::Reinvite("carol@x.io".into()).failed(PANICKED);
-        assert!(matches!(&panicked, SharingReport::Reinvited { email, .. } if email == "carol@x.io"));
-        let panicked = SharingCall::Confirm { email: "eve@x.io".into(), key_sha256: "ab".into() }.failed(PANICKED);
-        assert!(matches!(&panicked, SharingReport::Confirmed { email, .. } if email == "eve@x.io"));
+        let first = SharingCall::Reinvite("carol@x.io".into()).failed(panicked());
+        assert!(matches!(&first, SharingReport::Reinvited { email, .. } if email == "carol@x.io"));
+        let second = SharingCall::Confirm { email: "eve@x.io".into(), key_sha256: "ab".into() }.failed(panicked());
+        assert!(matches!(&second, SharingReport::Confirmed { email, .. } if email == "eve@x.io"));
     }
 
     /// **A fingerprint shown for a state that has moved is dropped** when
@@ -4498,9 +4610,9 @@ mod tests {
         // A refusal is about no record: it shows on any card, and is never
         // routed away -- a later refusal does not inherit the stop's record.
         assert!(!request(&mut pane, None, &ctx, &tx, SharingCall::Reinvite("x@x.io".into())));
-        assert_eq!(pane.notice_for("r1"), Some(SHARING_UNAVAILABLE));
+        assert_eq!(pane.notice_for("r1"), Some(sharing_unavailable()));
         route_stray_notice(&mut pane, "r1", 3.0);
-        assert_eq!(pane.notice.as_deref(), Some(SHARING_UNAVAILABLE));
+        assert_eq!(pane.notice.as_deref(), Some(sharing_unavailable()));
     }
 
     /// **The re-prompt question is asked of every record a membership
@@ -4681,7 +4793,7 @@ mod tests {
     fn the_paste_row_asks_to_accept_the_link_it_holds() {
         let mut people = PeopleRows { paste: Some(Zeroizing::new(String::new())), ..PeopleRows::none() };
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_paste_and_waiting(ui, &mut people, 376.0));
-        let accept = texts.iter().find(|(t, _)| t == PASTE_ACCEPT_LABEL).map(|(_, r)| r.center()).expect("Accept");
+        let accept = texts.iter().find(|(t, _)| t == paste_accept_label()).map(|(_, r)| r.center()).expect("Accept");
         let _ = ui_frame(400.0, click(accept), |ui| draw_paste_and_waiting(ui, &mut people, 376.0));
         assert_eq!(people.asked, None, "an empty box asks nothing");
 
@@ -4767,7 +4879,7 @@ mod tests {
         for clipped in &output.shapes {
             collect_texts(&clipped.shape, &mut texts);
         }
-        for said in [stop_receiving_title("denis@x.io"), stop_receiving_body("denis@x.io"), STOP_RECEIVING_LABEL.to_string(), KEEP_RECEIVING_LABEL.to_string()] {
+        for said in [stop_receiving_title("denis@x.io"), stop_receiving_body("denis@x.io"), stop_receiving_label().to_string(), keep_receiving_label().to_string()] {
             assert!(texts.iter().any(|(t, _)| *t == said), "{said:?} is not on the question: {texts:?}");
         }
         let escape = vec![egui::Event::Key {
@@ -4825,7 +4937,7 @@ mod tests {
         for clipped in &output.shapes {
             collect_texts(&clipped.shape, &mut texts);
         }
-        for said in [title.as_str(), JOIN_BODY, JOIN_YES_LABEL, JOIN_NO_LABEL] {
+        for said in [title.as_str(), join_body(), join_yes_label(), join_no_label()] {
             assert!(texts.iter().any(|(t, _)| t == said), "{said:?} is not on the question: {texts:?}");
         }
         let escape = vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }];
@@ -4843,7 +4955,7 @@ mod tests {
         let mut pane = SharingPane { paste: Zeroizing::new(link.into()), join_asking: Some("Join?".into()), ..SharingPane::default() };
         let (tx, _rx) = mpsc::channel();
         assert!(!send_pasted_link(&mut pane, None, &egui::Context::default(), &tx), "no line to the daemon");
-        assert_eq!(pane.notice.as_deref(), Some(SHARING_UNAVAILABLE));
+        assert_eq!(pane.notice.as_deref(), Some(sharing_unavailable()));
         assert_eq!(pane.join_asking, None, "the question goes either way");
         assert_eq!(pane.paste.as_str(), link);
         pane.busy = true;
@@ -4861,11 +4973,11 @@ mod tests {
     fn a_pasted_links_answer_is_said_and_frees_the_slot() {
         let mut pane = SharingPane { busy: true, ..SharingPane::default() };
         apply(&mut pane, SharingReport::LinkAccepted(Ok(())), 0.0);
-        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some(LINK_ACCEPTED));
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some(link_accepted()));
         assert!(!pane.is_busy());
         pane.busy = true;
-        apply(&mut pane, SharingCall::AcceptLink(Zeroizing::new("x".into())).failed(PANICKED), 1.0);
-        assert_eq!(pane.notice.as_deref(), Some(PANICKED));
+        apply(&mut pane, SharingCall::AcceptLink(Zeroizing::new("x".into())).failed(panicked()), 1.0);
+        assert_eq!(pane.notice.as_deref(), Some(panicked()));
         assert!(!pane.is_busy());
     }
 
@@ -4879,8 +4991,8 @@ mod tests {
         assert!(!pane.is_busy());
         let call = SharingCall::Leave { organization_id: "org-denis".into(), from: "denis@x.io".into() };
         pane.busy = true;
-        apply(&mut pane, call.failed(PANICKED), 1.0);
-        assert_eq!(pane.notice.as_deref(), Some(PANICKED));
+        apply(&mut pane, call.failed(panicked()), 1.0);
+        assert_eq!(pane.notice.as_deref(), Some(panicked()));
         assert!(!pane.is_busy());
     }
 

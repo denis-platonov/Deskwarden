@@ -361,3 +361,5 @@ main.cli_unrecognized_body = Bitwarden CLI, ki ga Deskwarden namerava uporabiti,
 main.signer_none = Nima potrdila podpisnika.
 main.signer_org = Podpisal: {org}
 main.signer_no_org = Potrdilo podpisnika ne navaja organizacije.
+login.server_eu = EU
+login.server_self_hosted = Lasten strežnik

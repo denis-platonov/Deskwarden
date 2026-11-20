@@ -346,7 +346,7 @@ impl SharingClient {
     /// any request, as [`Self::share`] refuses one.
     pub fn stop(&self, item_id: &str, email: &str) -> Result<Option<String>, String> {
         if !crate::rest::api::is_url_path_safe(item_id) {
-            return Err(crate::rest::sharing::STOP_FAILED_PREFIX.to_string());
+            return Err(crate::rest::sharing::stop_failed_prefix().to_string());
         }
         let data = self.post(&format!("/sharing/item/{item_id}/stop"), serde_json::json!({ "email": email }))?;
         Ok(data.get("movedTo").and_then(serde_json::Value::as_str).map(str::to_string))
@@ -819,9 +819,9 @@ mod tests {
         server
             .mock("POST", "/sharing/invite-code")
             .with_status(400)
-            .with_body(serde_json::json!({ "success": false, "message": crate::rest::sharing::NOT_ADMIN }).to_string())
+            .with_body(serde_json::json!({ "success": false, "message": crate::rest::sharing::not_admin() }).to_string())
             .create();
-        assert_eq!(client.invite_code("carol@example.com", "master").err().as_deref(), Some(crate::rest::sharing::NOT_ADMIN));
+        assert_eq!(client.invite_code("carol@example.com", "master").err().as_deref(), Some(crate::rest::sharing::not_admin()));
     }
 
     /// **What the daemon writes is what a window reads**, and nothing else is.

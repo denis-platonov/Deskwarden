@@ -737,6 +737,8 @@ enum Surface {
     /// Settings > Vault with the `?` tip of the TOTP-secrets row open, the way
     /// the design shows it on hover.
     SettingsVaultTip,
+    /// General with the Language menu open.
+    SettingsLanguageMenu,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -1066,6 +1068,7 @@ const ALL: &[Surface] = &[
     Surface::SettingsSecurityBreaches,
     Surface::SettingsVaultBackend,
     Surface::SettingsVaultTip,
+    Surface::SettingsLanguageMenu,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -1227,6 +1230,7 @@ impl Surface {
             Surface::SettingsSecurityBreaches => "settings_security_breaches",
             Surface::SettingsVaultBackend => "settings_vault_backend",
             Surface::SettingsVaultTip => "settings_vault_tip",
+            Surface::SettingsLanguageMenu => "settings_language_menu",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1490,7 +1494,8 @@ impl Surface {
             | Surface::SettingsSecurityPrivacy
             | Surface::SettingsSecurityBreaches
             | Surface::SettingsVaultBackend
-            | Surface::SettingsVaultTip => egui::vec2(1280.0 - 252.0, 820.0),
+            | Surface::SettingsVaultTip
+            | Surface::SettingsLanguageMenu => egui::vec2(1280.0 - 252.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1712,6 +1717,7 @@ fn main() -> eframe::Result {
             Surface::SettingsSecurityBreaches,
             Surface::SettingsVaultBackend,
             Surface::SettingsVaultTip,
+            Surface::SettingsLanguageMenu,
         ]
     } else if list {
         vec![Surface::VaultList]
@@ -2304,7 +2310,8 @@ impl eframe::App for Preview {
             | Surface::SettingsSecurityPrivacy
             | Surface::SettingsSecurityBreaches
             | Surface::SettingsVaultBackend
-            | Surface::SettingsVaultTip) => {
+            | Surface::SettingsVaultTip
+            | Surface::SettingsLanguageMenu) => {
                 self.draw_settings_page(root, surface);
             }
             Surface::ModalNewItem => {
@@ -3073,6 +3080,9 @@ impl Preview {
             // No pointer to hover with: hold the bubble open on the row the
             // design would be hovered on.
             prefs_ui::pin_row_tip(root.ctx(), "Show TOTP secrets on the details screen");
+        }
+        if matches!(surface, Surface::SettingsLanguageMenu) {
+            prefs_ui::language_picker::open(root.ctx());
         }
         let _ = draw(root, &mut state, &mut page);
     }

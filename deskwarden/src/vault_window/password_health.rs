@@ -2208,7 +2208,10 @@ mod tests {
     /// row that no longer exists.
     #[test]
     fn the_breach_setting_is_named_where_it_actually_is() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/prefs_ui.rs");
+        // The row and the nav section are named in the English catalog now
+        // (`prefs.breach_label`, `prefs.section_breaches`), which `prefs_ui.rs`
+        // reads by key; the catalog is where their words live.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales/en.txt");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
         let label = breach_setting_location()
@@ -2217,7 +2220,7 @@ mod tests {
             .expect("the location string quotes the row's label");
         assert_eq!(label, "Check passwords against known breaches", "control: the parse");
         assert!(
-            text.contains(&format!("{label:?}")),
+            text.contains(&format!("prefs.breach_label = {label}")),
             "`prefs_ui.rs` has no row labelled {label:?} any more, so \
              `breach_setting_location()` sends the user to a preference that is not there"
         );
@@ -2233,7 +2236,7 @@ mod tests {
             .expect("the location string names a page between two chevrons");
         assert_eq!(page, "Breaches", "control: the parse");
         assert!(
-            text.contains(&format!("=> {page:?},")),
+            text.contains(&format!("prefs.section_breaches = {page}")),
             "`prefs_ui.rs` has no nav section labelled {page:?}, so \
              `breach_setting_location()` names a page that is not in that window"
         );

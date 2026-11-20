@@ -108,6 +108,7 @@
 //! MB). See [`Locale::fonts`].
 
 pub mod catalog;
+pub mod edge;
 pub mod plural;
 mod system;
 
@@ -303,11 +304,33 @@ pub fn set_language(tag: &str) -> bool {
 ///
 /// Called once, early, by every process that draws anything (the daemon and
 /// each `--ui` window), before the first string is asked for.
+///
+/// Also the call the Settings language picker makes when a language is chosen
+/// (`None` is "System default (Windows)"). A thread that is inside
+/// [`with_language`] moves only its own override -- that is what lets a test
+/// choose a language without every test beside it reading it -- and every other
+/// thread moves the process.
 pub fn init(saved: Option<&str>) -> &'static Locale {
     let chosen = choose(saved, &system::preferred_languages());
-    ACTIVE.store(chosen, Ordering::Relaxed);
+    let on_this_thread = THREAD_OVERRIDE.with(|o| {
+        let overridden = o.get().is_some();
+        if overridden {
+            o.set(Some(chosen));
+        }
+        overridden
+    });
+    if !on_this_thread {
+        ACTIVE.store(chosen, Ordering::Relaxed);
+    }
     log::info!("language: {}", LOCALES[chosen].tag);
     &LOCALES[chosen]
+}
+
+/// The language the app shows when no language is chosen: the first Windows UI
+/// language that has a catalog, else English. What "System default (Windows)"
+/// in the Settings picker means.
+pub fn system_default() -> &'static Locale {
+    &LOCALES[choose(None, &system::preferred_languages())]
 }
 
 /// [`init`]'s decision, apart from the two things it reads.
