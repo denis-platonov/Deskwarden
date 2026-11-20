@@ -329,7 +329,9 @@ pub enum UriMatchChoice {
 /// It says the value is there and that this app is not the one that set it,
 /// rather than reading blank -- a control whose closed state is empty reads as
 /// one that failed to load, which is [`BRAND_UNSET`]'s own argument.
-pub const UNRECOGNISED_MATCH_LABEL: &str = "Set in another app";
+pub fn unrecognised_match_label() -> &'static str {
+    crate::i18n::t("edit.unrecognised_match_label")
+}
 
 impl UriMatchChoice {
     /// The rows the dropdown offers, in Bitwarden's own order with `Default`
@@ -355,14 +357,14 @@ impl UriMatchChoice {
     /// rather than as what is missing.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Default => "Default",
-            Self::BaseDomain => "Base domain",
-            Self::Host => "Host",
-            Self::StartsWith => "Starts with",
-            Self::Exact => "Exact",
-            Self::RegularExpression => "Regular expression",
-            Self::Never => "Never",
-            Self::Unrecognised => UNRECOGNISED_MATCH_LABEL,
+            Self::Default => crate::i18n::t("edit.match_default"),
+            Self::BaseDomain => crate::i18n::t("edit.match_base_domain"),
+            Self::Host => crate::i18n::t("edit.match_host"),
+            Self::StartsWith => crate::i18n::t("edit.match_starts_with"),
+            Self::Exact => crate::i18n::t("edit.match_exact"),
+            Self::RegularExpression => crate::i18n::t("edit.match_regex"),
+            Self::Never => crate::i18n::t("edit.match_never"),
+            Self::Unrecognised => unrecognised_match_label(),
         }
     }
 
@@ -914,8 +916,7 @@ pub fn running_app_rows() -> Vec<AppWindowRow> {
 /// no-op this crate keeps being patched for.
 pub fn window_row_refusal(row: &AppWindowRow) -> Option<&'static str> {
     crate::window_watch::is_host_process(&row.exe_name).then_some(
-        "Windows is not saying which app is inside this window. Restore it from the taskbar \
-         and refresh.",
+        crate::i18n::t("edit.window_refusal"),
     )
 }
 
@@ -1421,12 +1422,14 @@ pub enum AppPathRow {
     NotApplicable(&'static str),
 }
 
-pub const APP_PATH_STORE_APP: &str = "Not applicable \u{2014} Store app";
+pub fn app_path_store_app() -> &'static str {
+    crate::i18n::t("edit.app_path_store_app")
+}
 
 /// See [`AppPathRow`].
 pub fn app_path_row(hosted: bool) -> AppPathRow {
     if hosted {
-        AppPathRow::NotApplicable(APP_PATH_STORE_APP)
+        AppPathRow::NotApplicable(app_path_store_app())
     } else {
         AppPathRow::Editable
     }
@@ -1583,24 +1586,24 @@ impl Section {
     /// rail has to print the same word the card does and a rail that said
     /// `Login credentials` over an identity form would be furniture from
     /// another screen.
-    pub const fn title(self, kind: ItemKind) -> &'static str {
+    pub fn title(self, kind: ItemKind) -> &'static str {
         match self {
-            Section::Item => "Item",
+            Section::Item => crate::i18n::t("edit.sec_item"),
             Section::Details => match kind {
-                ItemKind::Login => "Login credentials",
-                ItemKind::Card => "Card details",
-                ItemKind::Identity => "Identity",
-                ItemKind::SecureNote => "Note",
-                ItemKind::SshKey => "Key",
-                ItemKind::Unknown(_) => "Contents",
+                ItemKind::Login => crate::i18n::t("edit.sec_login"),
+                ItemKind::Card => crate::i18n::t("edit.sec_card"),
+                ItemKind::Identity => crate::i18n::t("edit.sec_identity"),
+                ItemKind::SecureNote => crate::i18n::t("edit.sec_note"),
+                ItemKind::SshKey => crate::i18n::t("edit.sec_key"),
+                ItemKind::Unknown(_) => crate::i18n::t("edit.sec_contents"),
             },
-            Section::OneTimeCode => "2FA code",
-            Section::Autofill => "Fills in",
-            Section::FillRule => "Sign-in steps",
-            Section::CustomFields => "Custom fields",
-            Section::Notes => "Notes",
-            Section::Sharing => "Sharing",
-            Section::History => "About",
+            Section::OneTimeCode => crate::i18n::t("edit.sec_2fa"),
+            Section::Autofill => crate::i18n::t("edit.sec_fills_in"),
+            Section::FillRule => crate::i18n::t("edit.sec_steps"),
+            Section::CustomFields => crate::i18n::t("edit.sec_custom"),
+            Section::Notes => crate::i18n::t("edit.sec_notes"),
+            Section::Sharing => crate::i18n::t("edit.sec_sharing"),
+            Section::History => crate::i18n::t("edit.sec_about"),
         }
     }
 
@@ -1712,19 +1715,19 @@ impl ChangeUnit {
     /// The word 8a's rail prints for this unit.
     fn label(self) -> &'static str {
         match self {
-            ChangeUnit::Name => "Name",
-            ChangeUnit::Folder => "Folder",
-            ChangeUnit::Username => "Username",
-            ChangeUnit::Password => "Password",
-            ChangeUnit::Totp => "One-time code",
-            ChangeUnit::Card => "Card details",
-            ChangeUnit::Identity => "Identity",
-            ChangeUnit::SshKey => "Key",
-            ChangeUnit::Note => "Note",
-            ChangeUnit::App => "Matched app",
-            ChangeUnit::Sequence => "Keystrokes",
-            ChangeUnit::Fields => "Custom fields",
-            ChangeUnit::Uris => "Websites",
+            ChangeUnit::Name => crate::i18n::t("edit.chg_name"),
+            ChangeUnit::Folder => crate::i18n::t("edit.chg_folder"),
+            ChangeUnit::Username => crate::i18n::t("field.username"),
+            ChangeUnit::Password => crate::i18n::t("field.password"),
+            ChangeUnit::Totp => crate::i18n::t("edit.chg_totp"),
+            ChangeUnit::Card => crate::i18n::t("edit.sec_card"),
+            ChangeUnit::Identity => crate::i18n::t("edit.sec_identity"),
+            ChangeUnit::SshKey => crate::i18n::t("edit.sec_key"),
+            ChangeUnit::Note => crate::i18n::t("edit.sec_note"),
+            ChangeUnit::App => crate::i18n::t("edit.chg_app"),
+            ChangeUnit::Sequence => crate::i18n::t("edit.chg_keystrokes"),
+            ChangeUnit::Fields => crate::i18n::t("edit.sec_custom"),
+            ChangeUnit::Uris => crate::i18n::t("edit.chg_websites"),
         }
     }
 
@@ -2061,10 +2064,10 @@ mod char_classes {
         /// sample for one class can never be looked up from two places.
         pub fn name(self) -> &'static str {
             match self {
-                Self::Uppercase => "Uppercase",
-                Self::Lowercase => "Lowercase",
-                Self::Number => "Digits",
-                Self::Special => "Symbols",
+                Self::Uppercase => crate::i18n::t("edit.cls_upper"),
+                Self::Lowercase => crate::i18n::t("edit.cls_lower"),
+                Self::Number => crate::i18n::t("edit.cls_digits"),
+                Self::Special => crate::i18n::t("edit.cls_symbols"),
             }
         }
     }
@@ -2180,12 +2183,12 @@ impl Separator {
     /// able to tell apart at a glance.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Hyphen => "Hyphen  -",
-            Self::Underscore => "Underscore  _",
-            Self::Period => "Period  .",
-            Self::Comma => "Comma  ,",
-            Self::Space => "Space",
-            Self::None => "None",
+            Self::Hyphen => crate::i18n::t("edit.sep_hyphen"),
+            Self::Underscore => crate::i18n::t("edit.sep_underscore"),
+            Self::Period => crate::i18n::t("edit.sep_period"),
+            Self::Comma => crate::i18n::t("edit.sep_comma"),
+            Self::Space => crate::i18n::t("edit.sep_space"),
+            Self::None => crate::i18n::t("edit.sep_none"),
         }
     }
 
@@ -2962,7 +2965,7 @@ impl EditDraft {
     /// Save, the way [`Self::sequence_fault`] is.
     pub fn pin_name_fault(&self) -> Option<&'static str> {
         (self.kind == ItemKind::Card && self.fields.iter().any(FieldDraft::claims_card_pin))
-            .then_some(PIN_NAME_REFUSAL)
+            .then_some(pin_name_refusal())
     }
 
     /// Records this draft's current content as its opening state, so
@@ -4146,24 +4149,24 @@ impl IdentityField {
     /// what they just added.
     pub fn label(self) -> &'static str {
         match self {
-            IdentityField::Title => "Title",
-            IdentityField::FirstName => "First name",
-            IdentityField::MiddleName => "Middle name",
-            IdentityField::LastName => "Last name",
-            IdentityField::Email => "Email",
-            IdentityField::Phone => "Phone",
-            IdentityField::Username => "Username",
-            IdentityField::Company => "Company",
-            IdentityField::Address1 => "Address",
-            IdentityField::Address2 => "Address 2",
-            IdentityField::Address3 => "Address 3",
-            IdentityField::City => "City",
-            IdentityField::State => "State",
-            IdentityField::PostalCode => "Postal code",
-            IdentityField::Country => "Country",
-            IdentityField::Ssn => "SSN",
-            IdentityField::PassportNumber => "Passport number",
-            IdentityField::LicenseNumber => "Licence number",
+            IdentityField::Title => crate::i18n::t("field.title"),
+            IdentityField::FirstName => crate::i18n::t("field.first_name"),
+            IdentityField::MiddleName => crate::i18n::t("field.middle_name"),
+            IdentityField::LastName => crate::i18n::t("field.last_name"),
+            IdentityField::Email => crate::i18n::t("field.email"),
+            IdentityField::Phone => crate::i18n::t("field.phone"),
+            IdentityField::Username => crate::i18n::t("field.username"),
+            IdentityField::Company => crate::i18n::t("field.company"),
+            IdentityField::Address1 => crate::i18n::t("field.address"),
+            IdentityField::Address2 => crate::i18n::t("field.address2"),
+            IdentityField::Address3 => crate::i18n::t("field.address3"),
+            IdentityField::City => crate::i18n::t("field.city"),
+            IdentityField::State => crate::i18n::t("field.state"),
+            IdentityField::PostalCode => crate::i18n::t("field.postal_code"),
+            IdentityField::Country => crate::i18n::t("field.country"),
+            IdentityField::Ssn => crate::i18n::t("field.ssn"),
+            IdentityField::PassportNumber => crate::i18n::t("field.passport_number"),
+            IdentityField::LicenseNumber => crate::i18n::t("field.licence_number"),
         }
     }
 
@@ -4378,23 +4381,23 @@ impl Slot {
     /// "CVV" would be two names for one box.
     pub fn label(self) -> &'static str {
         match self {
-            Slot::Username => "Username",
-            Slot::Password => "Password",
-            Slot::Totp => TOTP_LABEL,
-            Slot::Websites => WEBSITE_LABEL,
-            Slot::CardholderName => "Cardholder name",
-            Slot::CardBrand => "Brand",
-            Slot::CardNumber => "Number",
-            Slot::CardExpMonth => "Expiry month",
-            Slot::CardExpYear => "Expiry year",
-            Slot::CardCode => "Security code",
-            Slot::CardBank => BANK_LABEL,
-            Slot::CardBillingZip => BILLING_ZIP_LABEL,
+            Slot::Username => crate::i18n::t("field.username"),
+            Slot::Password => crate::i18n::t("field.password"),
+            Slot::Totp => totp_label(),
+            Slot::Websites => website_label_text(),
+            Slot::CardholderName => crate::i18n::t("field.cardholder_name"),
+            Slot::CardBrand => crate::i18n::t("field.brand"),
+            Slot::CardNumber => crate::i18n::t("field.number"),
+            Slot::CardExpMonth => crate::i18n::t("edit.expiry_month"),
+            Slot::CardExpYear => crate::i18n::t("edit.expiry_year"),
+            Slot::CardCode => crate::i18n::t("field.security_code"),
+            Slot::CardBank => bank_label(),
+            Slot::CardBillingZip => billing_zip_label(),
             Slot::Identity(field) => field.label(),
-            Slot::Note => "Note",
-            Slot::SshPrivateKey => "Private key",
-            Slot::SshPublicKey => "Public key",
-            Slot::SshFingerprint => "Fingerprint",
+            Slot::Note => crate::i18n::t("edit.sec_note"),
+            Slot::SshPrivateKey => crate::i18n::t("detail.private_key"),
+            Slot::SshPublicKey => crate::i18n::t("detail.public_key"),
+            Slot::SshFingerprint => crate::i18n::t("detail.fingerprint"),
         }
     }
 }
@@ -4585,15 +4588,33 @@ pub fn swatch_choice(index: usize) -> crate::item_icon::IconChoice {
     crate::item_icon::IconChoice::Colour { bg: bg.into(), fg: fg.into() }
 }
 
-pub const AVATAR_REFRESH: &str = "Refresh icon";
-pub const AVATAR_REFRESH_SUB: &str = "Fetch the website's icon again";
-pub const AVATAR_UPLOAD: &str = "Upload image";
-pub const AVATAR_UPLOAD_SUB: &str = "PNG, JPG or SVG";
-pub const AVATAR_APP: &str = "Use the app's icon";
-pub const AVATAR_APP_NONE: &str = "Add an app first";
-pub const AVATAR_APP_FIRST_TOAST: &str = "Add an app under Fills in first";
-pub const AVATAR_COLOUR: &str = "COLOUR";
-pub const AVATAR_REMOVE: &str = "Remove image";
+pub fn avatar_refresh() -> &'static str {
+    crate::i18n::t("edit.avatar_refresh")
+}
+pub fn avatar_refresh_sub() -> &'static str {
+    crate::i18n::t("edit.avatar_refresh_sub")
+}
+pub fn avatar_upload() -> &'static str {
+    crate::i18n::t("edit.avatar_upload")
+}
+pub fn avatar_upload_sub() -> &'static str {
+    crate::i18n::t("edit.avatar_upload_sub")
+}
+pub fn avatar_app() -> &'static str {
+    crate::i18n::t("edit.avatar_app")
+}
+pub fn avatar_app_none() -> &'static str {
+    crate::i18n::t("edit.avatar_app_none")
+}
+pub fn avatar_app_first_toast() -> &'static str {
+    crate::i18n::t("edit.avatar_app_first_toast")
+}
+pub fn avatar_colour() -> &'static str {
+    crate::i18n::t("edit.avatar_colour")
+}
+pub fn avatar_remove() -> &'static str {
+    crate::i18n::t("edit.avatar_remove")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AvatarRow {
@@ -4614,7 +4635,9 @@ pub(crate) fn avatar_row_id(row: AvatarRow) -> egui::Id {
 }
 
 /// Spec B 1.4 I.
-pub const MOVE_TO_TRASH: &str = "Move to trash";
+pub fn move_to_trash() -> &'static str {
+    crate::i18n::t("edit.move_to_trash")
+}
 
 pub(crate) fn move_to_trash_id() -> egui::Id {
     egui::Id::new("edit-move-to-trash")
@@ -4664,13 +4687,15 @@ pub fn assignable_folders(folders: &[Folder]) -> Vec<&Folder> {
 /// otpauth:// link, or the base32 key a site shows beside its QR code. Not
 /// a code." That is where a user about to paste the wrong thing is
 /// looking.
-pub const TOTP_LABEL: &str = "Authenticator";
+pub fn totp_label() -> &'static str {
+    crate::i18n::t("edit.totp_label")
+}
 
 /// What the box is for, in the words the user would have been given by the
 /// site they are setting up.
-pub const TOTP_HINT: &str =
-    "The secret behind the 6-digit codes \u{2014} an otpauth:// link, or the base32 key a site \
-     shows beside its QR code. Not a code.";
+pub fn totp_hint() -> &'static str {
+    crate::i18n::t("edit.totp_hint")
+}
 
 /// What the row says while an item is being **created**.
 ///
@@ -4678,7 +4703,13 @@ pub const TOTP_HINT: &str =
 /// create form would be silently discarded on Save. Same reason, same
 /// treatment and same wording pattern as [`FIELDS_CREATE_NOTICE`]; offering
 /// it needs a `vault_bridge` change.
+// English only: a `const` alias in `send_ui`'s tests reads it. Phase 2 of the translation
+// work removes this constant when `send_ui` has moved to [`totp_create_notice`].
 pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+
+pub fn totp_create_notice() -> &'static str {
+    crate::i18n::t("edit.totp_create_notice")
+}
 
 /// 8a's `Replace by scanning`, and the `Add` that stands in its place on a
 /// record with no second factor yet.
@@ -4691,23 +4722,33 @@ pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved
 /// **No scan-frame icon on the Replace**, which 8a draws. This app has no
 /// 12-point scan glyph and inventing one for a single button is the kind of
 /// drawing `kind_mark` refuses elsewhere; the word says the whole thing.
-pub const TOTP_REPLACE_BUTTON: &str = "Replace";
-pub const TOTP_ADD_BUTTON: &str = "Add 2FA code";
+pub fn totp_replace_button() -> &'static str {
+    crate::i18n::t("edit.totp_replace_button")
+}
+pub fn totp_add_button() -> &'static str {
+    crate::i18n::t("edit.totp_add_button")
+}
 /// The empty 2FA row's one button (spec B 1.4 B): 50 high, radius 14, 16 bold.
 const TOTP_ROW_BUTTON: crate::kit::controls::ButtonSize =
     crate::kit::controls::ButtonSize { height: 50.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
 
 /// Spec B 1.4 C: the toast after Remove.
-pub const TOTP_REMOVED_TOAST: &str = "2FA code removed";
+pub fn totp_removed_toast() -> &'static str {
+    crate::i18n::t("edit.totp_removed_toast")
+}
 
 /// Spec B 1.4 E: the notes box's placeholder.
-pub const NOTES_PLACEHOLDER: &str = "Anything worth remembering";
+pub fn notes_placeholder() -> &'static str {
+    crate::i18n::t("edit.notes_placeholder")
+}
 
 /// What the `One-time code` card's greyed box says when the item has no seed.
 ///
 /// Short, because it shares its line with a button: the sentence under the
 /// row still spells out what a seed is.
-pub const TOTP_EMPTY_NOTE: &str = "No one-time code yet";
+pub fn totp_empty_note() -> &'static str {
+    crate::i18n::t("edit.totp_empty_note")
+}
 
 /// What the `One-time code` card's box says when the item has no seed.
 ///
@@ -4715,7 +4756,9 @@ pub const TOTP_EMPTY_NOTE: &str = "No one-time code yet";
 /// has to say what belongs in the box rather than leaving a blank one under a
 /// heading. The wording is `TOTP_HINT`'s subject in one line -- the sentence
 /// under the box still spells it out in full.
-pub const TOTP_EMPTY_HINT: &str = "Paste an otpauth:// link or a base32 key";
+pub fn totp_empty_hint() -> &'static str {
+    crate::i18n::t("edit.totp_empty_hint")
+}
 
 /// The label above the login's first website box.
 ///
@@ -4723,7 +4766,9 @@ pub const TOTP_EMPTY_HINT: &str = "Paste an otpauth:// link or a base32 key";
 /// AUTOFILL TARGETS card labels its row `copy_shortcut_label(CopyShortcut::Url)`,
 /// which is `"Website"`. `the_edit_form_and_the_read_pane_call_a_website_the_same_thing`
 /// holds the two together rather than trusting this comment.
-pub const WEBSITE_LABEL: &str = "Website";
+pub fn website_label_text() -> &'static str {
+    crate::i18n::t("edit.website_label")
+}
 
 /// The label above the second and subsequent website boxes: `"Website 2"`,
 /// `"Website 3"`, ...
@@ -4733,7 +4778,7 @@ pub const WEBSITE_LABEL: &str = "Website";
 /// [`WEBSITE_FIRST_NOTE`] -- and a second spelling of it is a second thing
 /// that can start counting from zero.
 pub fn website_label(index: usize) -> String {
-    if index == 0 { WEBSITE_LABEL.to_string() } else { format!("{WEBSITE_LABEL} {}", index + 1) }
+    if index == 0 { website_label_text().to_string() } else { format!("{} {}", website_label_text(), index + 1) }
 }
 
 /// The note under a login's websites, drawn only when there is more than one.
@@ -4742,8 +4787,9 @@ pub fn website_label(index: usize) -> String {
 /// `favicon::icon_domain_for` and the read pane's AUTOFILL TARGETS card both
 /// read `login.uris.first()`. Drawn only when it can matter, because a
 /// sentence about "the first" over a single box is noise.
-pub const WEBSITE_FIRST_NOTE: &str =
-    "The first one is what this item's page shows and where its icon comes from.";
+pub fn website_first_note() -> &'static str {
+    crate::i18n::t("edit.website_first_note")
+}
 
 // **The websites block draws no note.** It carried one saying that the
 // match type is the browser extension's business and not this program's --
@@ -4758,7 +4804,9 @@ pub const WEBSITE_FIRST_NOTE: &str =
 /// [`UriDraft::new`] -- and the leading `+` is part of the label rather than
 /// a drawn mark, which is what 8a sets: a plus glyph the bundled face really
 /// carries, on the same line as the words it belongs to.
-pub const WEBSITE_ADD_BUTTON: &str = "Add";
+pub fn website_add_button() -> &'static str {
+    crate::i18n::t("edit.website_add_button")
+}
 
 /// What the ✕ at the end of a website row says on hover.
 ///
@@ -4773,7 +4821,9 @@ pub const WEBSITE_ADD_BUTTON: &str = "Add";
 /// leaves its unmodelled keys in place on purpose (see
 /// [`UriDraft::survives`]), so emptying the box is not the same gesture as
 /// removing the entry and must not look like it.
-pub const WEBSITE_REMOVE_BUTTON: &str = "Remove website";
+pub fn website_remove_button() -> &'static str {
+    crate::i18n::t("edit.website_remove_button")
+}
 
 /// What the websites block says instead of boxes on a CREATE.
 ///
@@ -4781,13 +4831,17 @@ pub const WEBSITE_REMOVE_BUTTON: &str = "Remove website";
 /// TOTP seed and the card's two namespaced fields, and the same treatment for
 /// the same reason: a live box whose contents Save discards is worse than a
 /// greyed one that says when it will work. See [`TOTP_CREATE_NOTICE`].
-pub const WEBSITE_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+pub fn website_create_notice() -> &'static str {
+    crate::i18n::t("edit.website_create_notice")
+}
 
 /// What the brand dropdown shows when the card has no brand at all.
 ///
 /// Not an empty combo box: a control whose closed state is blank reads as one
 /// that failed to load rather than one nobody has answered.
-pub const BRAND_UNSET: &str = "Not set";
+pub fn brand_unset() -> &'static str {
+    crate::i18n::t("edit.brand_unset")
+}
 
 /// Wide enough for the longest row the dropdown offers -- "Diners Club",
 /// since American Express is now stored and shown under Bitwarden's own
@@ -4800,11 +4854,15 @@ const BRAND_COMBO_WIDTH: f32 = 160.0;
 /// The caption of the card's **number row**, which carries the brand chooser
 /// in front of the number box -- the owner's "brand with number" on one line.
 /// `Card`, because the row is the card itself: which network, which digits.
-pub const CARD_ROW_LABEL: &str = "Card";
+pub fn card_row_label() -> &'static str {
+    crate::i18n::t("edit.card_row_label")
+}
 
 /// The caption of the row that carries the expiry, the security code and the
 /// PIN. `Expires`, the read pane's own word for the same date.
-pub const EXPIRES_ROW_LABEL: &str = "Expires";
+pub fn expires_row_label() -> &'static str {
+    crate::i18n::t("edit.expires_row_label")
+}
 
 /// What joins the month box to the year box: a card prints `10/29`.
 pub const EXPIRY_JOIN: &str = "/";
@@ -4812,7 +4870,9 @@ pub const EXPIRY_JOIN: &str = "/";
 /// The inline caption in front of the security-code box on the `Expires` row.
 /// `Code`, as the read pane says it, for the reason given there: the long
 /// form does not fit beside its neighbours.
-pub const CARD_CODE_LABEL: &str = "Code";
+pub fn card_code_label() -> &'static str {
+    crate::i18n::t("edit.card_code_label")
+}
 
 /// The inline caption in front of the PIN box -- and the name of the custom
 /// field the PIN is stored on (`vault_bridge::CARD_PIN_FIELD`), so the form,
@@ -4823,27 +4883,38 @@ pub const CARD_PIN_LABEL: &str = crate::vault_bridge::CARD_PIN_FIELD;
 ///
 /// It says **bank**, not "domain": the user is choosing an institution, and
 /// the domain is how this app happens to find its icon.
-pub const BANK_LABEL: &str = "Bank";
+pub fn bank_label() -> &'static str {
+    crate::i18n::t("edit.bank_label")
+}
 
 /// Why the row is a picker and not a box the user can type in.
-pub const BANK_HINT: &str =
-    "Chosen from the sites already in your vault, so the icon can always be found. Picking one \
-     asks that site for its icon; your card details are never sent.";
+pub fn bank_hint() -> &'static str {
+    crate::i18n::t("edit.bank_hint")
+}
 
 /// The picker's own button, and the row that closes it again.
-pub const BANK_CHOOSE: &str = "Choose a bank\u{2026}";
-pub const BANK_CLEAR: &str = "Clear";
-pub const BANK_CLOSE_LIST: &str = "Close list";
+pub fn bank_choose() -> &'static str {
+    crate::i18n::t("edit.bank_choose")
+}
+pub fn bank_clear() -> &'static str {
+    crate::i18n::t("edit.bank_clear")
+}
+pub fn bank_close_list() -> &'static str {
+    crate::i18n::t("edit.bank_close_list")
+}
 
 /// What the picker says when the vault has offered it nothing.
 ///
 /// It names the cause, because "no banks" over a vault full of logins is the
 /// sort of empty state a user reads as a broken control.
-pub const BANK_NO_CHOICES: &str =
-    "No sites in your vault have a web address to take an icon from yet.";
+pub fn bank_no_choices() -> &'static str {
+    crate::i18n::t("edit.bank_no_choices")
+}
 
 /// The label above the billing postcode box.
-pub const BILLING_ZIP_LABEL: &str = "Billing ZIP / postcode";
+pub fn billing_zip_label() -> &'static str {
+    crate::i18n::t("edit.billing_zip_label")
+}
 
 /// What the two card custom-field rows say while an item is being
 /// **created**.
@@ -4851,7 +4922,9 @@ pub const BILLING_ZIP_LABEL: &str = "Billing ZIP / postcode";
 /// [`NewItem`] carries no `fields` at all, so either value typed into a
 /// create form would be silently discarded on Save. Same reason, same
 /// treatment and same wording as [`TOTP_CREATE_NOTICE`].
-pub const CARD_FIELD_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+pub fn card_field_create_notice() -> &'static str {
+    crate::i18n::t("edit.card_field_create_notice")
+}
 
 // ---------------------------------------------------------------------------
 // The edit form's custom-fields block.
@@ -4861,7 +4934,9 @@ pub const CARD_FIELD_CREATE_NOTICE: &str = "Can be added once this item has been
 // ---------------------------------------------------------------------------
 
 /// The block's heading. Sentence case, like [`APP_BLOCK_HEADING`].
-pub const FIELDS_BLOCK_HEADING: &str = "Custom fields";
+pub fn fields_block_heading() -> &'static str {
+    crate::i18n::t("edit.fields_block_heading")
+}
 
 /// Shown when the item has no field this form draws a row for.
 ///
@@ -4872,34 +4947,46 @@ pub const FIELDS_BLOCK_HEADING: &str = "Custom fields";
 /// **It does not suggest a PIN**: a card has a PIN box of its own, and a
 /// custom field named `PIN` on a card is refused (`PIN_NAME_REFUSAL`), so a
 /// sentence offering one would advise the user into that refusal.
-pub const FIELDS_NONE_NOTICE: &str =
-    "This item has no custom fields of its own yet. Add one to store anything Bitwarden has no \
-     box for \u{2014} a recovery code, an account number.";
+pub fn fields_none_notice() -> &'static str {
+    crate::i18n::t("edit.fields_none_notice")
+}
 
 /// The two Add buttons. Two, rather than one button and a type combo box,
 /// because the choice is what the field IS and the user makes it once: a
 /// combo box that defaults to text is a hidden field one forgotten click away
 /// from being a visible one, and this form cannot change a field's type after
 /// the fact (see [`FieldRole`]).
-pub const FIELD_ADD_TEXT_BUTTON: &str = "Add a field\u{2026}";
-pub const FIELD_ADD_HIDDEN_BUTTON: &str = "Add a hidden field\u{2026}";
+pub fn field_add_text_button() -> &'static str {
+    crate::i18n::t("edit.field_add_text_button")
+}
+pub fn field_add_hidden_button() -> &'static str {
+    crate::i18n::t("edit.field_add_hidden_button")
+}
 
 /// A row's two labels, and its remove.
-pub const FIELD_NAME_LABEL: &str = "Field name";
-pub const FIELD_VALUE_LABEL: &str = "Value";
+pub fn field_name_label() -> &'static str {
+    crate::i18n::t("edit.field_name_label")
+}
+pub fn field_value_label() -> &'static str {
+    crate::i18n::t("edit.field_value_label")
+}
 /// The hidden row's value label says so, because the masked box alone looks
 /// exactly like a text box the user happens not to be able to read.
-pub const FIELD_HIDDEN_VALUE_LABEL: &str = "Hidden value";
-pub const FIELD_REMOVE_BUTTON: &str = "Remove field";
+pub fn field_hidden_value_label() -> &'static str {
+    crate::i18n::t("edit.field_hidden_value_label")
+}
+pub fn field_remove_button() -> &'static str {
+    crate::i18n::t("edit.field_remove_button")
+}
 
 /// What a [`FieldRole::Preserved`] row says instead of offering boxes.
 ///
 /// It is *listed*, not hidden: a field the form silently omitted would look
 /// deleted, and the next thing the user would do is add it back by hand -- as
 /// a text field, losing the type this notice exists to protect.
-pub const FIELD_PRESERVED_NOTICE: &str =
-    "Deskwarden cannot edit this kind of field and leaves it exactly as it is. Change it in the \
-     Bitwarden web vault or app.";
+pub fn field_preserved_notice() -> &'static str {
+    crate::i18n::t("edit.field_preserved_notice")
+}
 
 /// What the block says while an item is being **created**.
 ///
@@ -4907,8 +4994,9 @@ pub const FIELD_PRESERVED_NOTICE: &str =
 /// create form would be silently discarded on Save -- the same failure
 /// `form_body` withholds an SSH key's boxes on an *edit* to avoid, in the
 /// other direction. Saying so is the honest form of not offering it.
-pub const FIELDS_CREATE_NOTICE: &str =
-    "Custom fields can be added once this item has been saved.";
+pub fn fields_create_notice() -> &'static str {
+    crate::i18n::t("edit.fields_create_notice")
+}
 
 /// The custom-fields block. Returns nothing: every effect it has is on
 /// `fields`, which it owns for the duration of the call.
@@ -4938,7 +5026,9 @@ pub const FIELDS_CREATE_NOTICE: &str =
 /// another website -- and this one reveals a row the item type already has
 /// and this item happens not to use. Two controls captioned "Add a field..."
 /// on one form would be one phrase for two different gestures.
-pub const SLOT_ADD_BUTTON: &str = "Add\u{2026}";
+pub fn slot_add_button() -> &'static str {
+    crate::i18n::t("edit.slot_add_button")
+}
 
 /// The gap between two buttons that sit side by side on the form. The cards
 /// zero egui's own spacing, so a row of buttons without it drew them touching.
@@ -4951,8 +5041,9 @@ const BUTTON_GAP: f32 = 8.0;
 /// it is gone the next time the item is opened. A user who cannot see that
 /// has to discover it, and the discovery looks like the form losing their
 /// work.
-pub const SLOT_ADD_HINT: &str =
-    "Pick a field to fill in. One left empty is not saved, and goes away again.";
+pub fn slot_add_hint() -> &'static str {
+    crate::i18n::t("edit.slot_add_hint")
+}
 
 /// The chip that takes an optional row off the form.
 ///
@@ -4970,7 +5061,9 @@ pub const SLOT_ADD_HINT: &str =
 /// (see [`field_with_remove`]), and the Card row -- brand and number, both
 /// floor -- carries one that clears the two (see [`CardDraft::clear_card`])
 /// and leaves the row where it is.
-pub const SLOT_REMOVE_BUTTON: &str = "Remove";
+pub fn slot_remove_button() -> &'static str {
+    crate::i18n::t("edit.slot_remove_button")
+}
 
 /// **One row on a per-kind card: §8a's label column, the row's control, and
 /// the Remove chip when the row is an optional one.** Answers whether the chip
@@ -4998,7 +5091,7 @@ fn slot_row<R>(
     removable: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> bool {
-    row_with_chip(ui, label, removable.then_some(SLOT_REMOVE_BUTTON), add)
+    row_with_chip(ui, label, removable.then_some(slot_remove_button()), add)
 }
 
 /// [`slot_row`] with the chip's caption spelled out.
@@ -5079,12 +5172,12 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
     // The form's own button rather than egui's bare `selectable_label`, which
     // drew an unframed word at its own inset beside framed buttons everywhere
     // else on the form.
-    if crate::kit::controls::row_button(ui, SLOT_ADD_BUTTON).clicked() {
+    if crate::kit::controls::row_button(ui, slot_add_button()).clicked() {
         *open = !*open;
     }
     if *open {
         ui.add_space(6.0);
-        ui.label(RichText::new(SLOT_ADD_HINT).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(slot_add_hint()).size(11.0).color(theme::TEXT_FAINT));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
@@ -5108,7 +5201,7 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
 /// most of what they wanted: "has this password been changed before, and how
 /// often" is answerable without a single date.
 pub fn history_button(count: usize) -> String {
-    format!("Password history ({count})")
+    crate::i18n::tf("edit.history_button", &[("count", &count.to_string())])
 }
 
 /// **The credentials card's password history: §8a's `Password history (3)`,
@@ -5423,8 +5516,8 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
         // caption sitting alone above a grey box read as a live label over a
         // dead field; in the label column it is one row among eight and the
         // grey box carries the whole message.
-        theme::section_row(ui, WEBSITE_LABEL, |ui| {
-            theme::section_disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
+        theme::section_row(ui, website_label_text(), |ui| {
+            theme::section_disabled_text_field(ui, website_create_notice());
         });
         return;
     }
@@ -5471,7 +5564,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
                         },
                         |ui| {
                             website_match_combo(ui, row_id, choice);
-                            if theme::close_glyph_with_id(ui, website_remove_id(row_id), WEBSITE_REMOVE_BUTTON)
+                            if theme::close_glyph_with_id(ui, website_remove_id(row_id), website_remove_button())
                                 .clicked()
                             {
                                 remove = Some(i);
@@ -5490,7 +5583,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
     // noise; over three it is the only thing on screen that says which box
     // the rest of the app acts on.
     if uris.len() > 1 {
-        ui.label(RichText::new(WEBSITE_FIRST_NOTE).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(website_first_note()).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
         ui.add_space(6.0);
     }
     // **8a's link, in 8a's place: under the rows, left-aligned to the FIELD
@@ -5520,17 +5613,17 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
             ui.ctx(),
             crate::kit::controls::ButtonKind::Tinted,
             size,
-            WEBSITE_ADD_BUTTON,
+            website_add_button(),
             false,
         );
         let width = (ui.available_width() - button - ui.spacing().item_spacing.x).max(120.0);
-        let field = crate::kit::input::text(ui, typed_id, typed, FILLS_IN_ADD_PLACEHOLDER, false, width);
+        let field = crate::kit::input::text(ui, typed_id, typed, fills_in_add_placeholder(), false, width);
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let clicked = crate::kit::controls::button(
             ui,
             crate::kit::controls::ButtonKind::Tinted,
             size,
-            WEBSITE_ADD_BUTTON,
+            website_add_button(),
             None,
         )
         .clicked();
@@ -5582,21 +5675,21 @@ fn avatar_menu(
         response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
     };
     if refreshable
-        && row(ui, AvatarRow::Refresh, AVATAR_REFRESH, Some(AVATAR_REFRESH_SUB), crate::kit::icon::glyph::GEN, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45))
+        && row(ui, AvatarRow::Refresh, avatar_refresh(), Some(avatar_refresh_sub()), crate::kit::icon::glyph::GEN, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45))
     {
         picked = Some(AvatarRow::Refresh);
     }
-    if row(ui, AvatarRow::Upload, AVATAR_UPLOAD, Some(AVATAR_UPLOAD_SUB), crate::kit::icon::glyph::CAMERA, theme::BLUE_WASH, theme::BLUE) {
+    if row(ui, AvatarRow::Upload, avatar_upload(), Some(avatar_upload_sub()), crate::kit::icon::glyph::CAMERA, theme::BLUE_WASH, theme::BLUE) {
         picked = Some(AvatarRow::Upload);
     }
-    let from = app.map(|name| format!("From {name}"));
-    if row(ui, AvatarRow::App, AVATAR_APP, Some(from.as_deref().unwrap_or(AVATAR_APP_NONE)), crate::kit::icon::glyph::APPS, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45)) {
+    let from = app.map(|name| crate::i18n::tf("edit.avatar_from", &[("name", name)]));
+    if row(ui, AvatarRow::App, avatar_app(), Some(from.as_deref().unwrap_or(avatar_app_none())), crate::kit::icon::glyph::APPS, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45)) {
         picked = Some(AvatarRow::App);
     }
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(12.0);
-        ui.label(egui::RichText::new(AVATAR_COLOUR).size(12.0).color(egui::Color32::from_rgb(0x9b, 0x97, 0x97)).family(egui::FontFamily::Name(theme::EXTRABOLD.into())));
+        ui.label(egui::RichText::new(avatar_colour()).size(12.0).color(egui::Color32::from_rgb(0x9b, 0x97, 0x97)).family(egui::FontFamily::Name(theme::EXTRABOLD.into())));
     });
     ui.horizontal_wrapped(|ui| {
         ui.add_space(12.0);
@@ -5621,7 +5714,7 @@ fn avatar_menu(
     if removable {
         let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
         ui.painter().rect_filled(line.shrink2(egui::vec2(4.0, 0.0)), 0.0, egui::Color32::from_rgb(0xf1, 0xef, 0xec));
-        if row(ui, AvatarRow::Remove, AVATAR_REMOVE, None, crate::kit::icon::glyph::TRASH, theme::DANGER_WASH, theme::ERROR) {
+        if row(ui, AvatarRow::Remove, avatar_remove(), None, crate::kit::icon::glyph::TRASH, theme::DANGER_WASH, theme::ERROR) {
             picked = Some(AvatarRow::Remove);
         }
     }
@@ -5644,7 +5737,7 @@ fn move_to_trash_button(ui: &mut egui::Ui) -> bool {
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        MOVE_TO_TRASH,
+        move_to_trash(),
         egui::FontId::new(16.0, egui::FontFamily::Name(theme::BOLD.into())),
         theme::ERROR,
     );
@@ -5726,7 +5819,7 @@ fn custom_fields_block(
     // one. [`FIELDS_BLOCK_HEADING`] is still the string the card is titled
     // with, so nothing that looked for those words has lost them.
     if creating {
-        ui.label(RichText::new(FIELDS_CREATE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(fields_create_notice()).size(11.0).color(theme::TEXT_FAINT));
         return;
     }
 
@@ -5734,7 +5827,7 @@ fn custom_fields_block(
     // here -- see those variants -- so "has no fields" is about the rows the
     // user can see, not about the vector's length.
     if !fields.iter().any(|f| !matches!(f.role, FieldRole::Internal | FieldRole::CardPin)) {
-        ui.label(RichText::new(FIELDS_NONE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(fields_none_notice()).size(11.0).color(theme::TEXT_FAINT));
         ui.add_space(6.0);
     }
 
@@ -5758,16 +5851,16 @@ fn custom_fields_block(
                 // blank label.
                 theme::field_label(
                     ui,
-                    if field.name.is_empty() { "(unnamed field)" } else { &field.name },
+                    if field.name.is_empty() { crate::i18n::t("detail.unnamed_field") } else { &field.name },
                 );
                 ui.label(
-                    RichText::new(FIELD_PRESERVED_NOTICE).size(11.0).color(theme::TEXT_FAINT),
+                    RichText::new(field_preserved_notice()).size(11.0).color(theme::TEXT_FAINT),
                 );
                 ui.add_space(10.0);
             }
             FieldRole::Text | FieldRole::Hidden => {
                 let hidden = field.role == FieldRole::Hidden;
-                theme::field_label(ui, FIELD_NAME_LABEL);
+                theme::field_label(ui, field_name_label());
                 // A scope of its own, because every row draws the same
                 // widgets: two boxes and a button. Without one egui gives all
                 // of them one id and the focus jumps between rows as the user
@@ -5801,13 +5894,13 @@ fn custom_fields_block(
                         if card && field.claims_card_pin() {
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new(PIN_NAME_REFUSAL).size(12.0).color(theme::ERROR),
+                                RichText::new(pin_name_refusal()).size(12.0).color(theme::ERROR),
                             );
                         }
                         ui.add_space(4.0);
                         theme::field_label(
                             ui,
-                            if hidden { FIELD_HIDDEN_VALUE_LABEL } else { FIELD_VALUE_LABEL },
+                            if hidden { field_hidden_value_label() } else { field_value_label() },
                         );
                         // A hidden field is a secret and gets the password box
                         // -- masked, with the same reveal toggle.
@@ -5820,7 +5913,7 @@ fn custom_fields_block(
                             theme::section_text_field(ui, &mut field.value, false);
                         }
                         ui.add_space(4.0);
-                        if crate::kit::controls::row_button(ui, FIELD_REMOVE_BUTTON).clicked() {
+                        if crate::kit::controls::row_button(ui, field_remove_button()).clicked() {
                             remove = Some(i);
                         }
                     },
@@ -5841,10 +5934,10 @@ fn custom_fields_block(
     // for the same reason.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
-        if crate::kit::controls::row_button(ui, FIELD_ADD_TEXT_BUTTON).clicked() {
+        if crate::kit::controls::row_button(ui, field_add_text_button()).clicked() {
             fields.push(FieldDraft::new_of(FieldRole::Text));
         }
-        if crate::kit::controls::row_button(ui, FIELD_ADD_HIDDEN_BUTTON).clicked() {
+        if crate::kit::controls::row_button(ui, field_add_hidden_button()).clicked() {
             fields.push(FieldDraft::new_of(FieldRole::Hidden));
         }
     });
@@ -5866,9 +5959,13 @@ fn custom_fields_block(
 /// The block's heading. Sentence case, matching every other `field_label` on
 /// this form rather than the read pane's uppercase card headings -- this is a
 /// group of fields in a form, not a card.
-pub const APP_BLOCK_HEADING: &str = "Matched app";
+pub fn app_block_heading() -> &'static str {
+    crate::i18n::t("edit.app_block_heading")
+}
 
-const APP_PATH_LABEL: &str = "Program file";
+fn app_path_label() -> &'static str {
+    crate::i18n::t("edit.app_path_label")
+}
 /// The arguments row's caption.
 ///
 /// **`CLI` and not `Command-line`**, because the column is
@@ -5877,7 +5974,9 @@ const APP_PATH_LABEL: &str = "Program file";
 /// beside a one-line box is the one row on the card whose label column is
 /// taller than its control. The owner, with that row screenshotted: "CLI args
 /// so it fits into one line".
-const APP_ARGS_LABEL: &str = "CLI arguments";
+fn app_args_label() -> &'static str {
+    crate::i18n::t("edit.app_args_label")
+}
 
 // **The arguments box draws no hint.** It said what the box is for and
 // named the browser-profile case; the owner: "remove both". The label
@@ -5886,9 +5985,13 @@ const APP_ARGS_LABEL: &str = "CLI arguments";
 
 /// The arguments row for a Microsoft Store app. There is no command line to
 /// pass: nothing is started by path (see [`AppPathRow`]).
-const APP_ARGS_STORE_APP: &str = APP_PATH_STORE_APP;
+fn app_args_store_app() -> &'static str {
+    app_path_store_app()
+}
 
-const APP_WINDOW_LABEL: &str = "Window title";
+fn app_window_label() -> &'static str {
+    crate::i18n::t("edit.app_window_label")
+}
 
 /// 8a's `+ Pick a running window`, verbatim.
 ///
@@ -5897,7 +6000,9 @@ const APP_WINDOW_LABEL: &str = "Window title";
 /// [`APP_PICK_HINT`]. The words change with the control because the design
 /// names the thing it opens (8b's card is a list of WINDOWS, and always was;
 /// the old caption said "app", which is what the window is a window of).
-pub const APP_PICK_LINK: &str = "Pick a window";
+pub fn app_pick_link() -> &'static str {
+    crate::i18n::t("edit.app_pick_link")
+}
 
 /// The grey run after the link. 8a says `or type a process name`.
 ///
@@ -5908,7 +6013,9 @@ pub const APP_PICK_LINK: &str = "Pick a window";
 /// `AppMatch::launchable_path`'s file-name tie-back, and leaves a binding
 /// that matches but cannot be opened. So the hint points at the row that
 /// really takes typing.
-pub const APP_PICK_HINT: &str = "or set the program file below";
+pub fn app_pick_hint() -> &'static str {
+    crate::i18n::t("edit.app_pick_hint")
+}
 
 /// What the ✕ at the end of the app row says on hover -- and the words the
 /// control it replaced had ON it.
@@ -5921,7 +6028,9 @@ pub const APP_PICK_HINT: &str = "or set the program file below";
 /// and that it is a mark rather than a caption, which is why the sentence
 /// has to survive as the hover text (`theme::close_glyph_titled` paints two
 /// line segments and no glyph).
-pub const APP_REMOVE_BUTTON: &str = "Remove app match";
+pub fn app_remove_button() -> &'static str {
+    crate::i18n::t("edit.app_remove_button")
+}
 
 /// 8a's `30px` monogram tile at the head of a `Native apps` row.
 ///
@@ -5937,7 +6046,9 @@ const APP_TILE: f32 = 30.0;
 /// Spelled once so the tests cannot measure a control the form no longer
 /// draws under the name they were written with -- the same reason the test
 /// module keeps a `BROWSE` beside it.
-pub const APP_BROWSE_BUTTON: &str = "Browse\u{2026}";
+pub fn app_browse_button() -> &'static str {
+    crate::i18n::t("edit.app_browse_button")
+}
 
 /// 8a's highlighted row: `border-radius: 8px`, a `1px` edge, `padding: 8px
 /// 10px`.
@@ -5966,7 +6077,9 @@ const APP_EXE_CHIP_GAP: f32 = 8.0;
 const APP_FIELD_INSET: f32 = 10.0;
 
 /// The grey word between the unbound row's two links.
-const APP_ADD_OR: &str = "or";
+fn app_add_or() -> &'static str {
+    crate::i18n::t("edit.app_add_or")
+}
 
 /// The unbound row's SECOND door: the one that opens the `Program file` box
 /// instead of 8b's card.
@@ -5981,7 +6094,9 @@ const APP_ADD_OR: &str = "or";
 /// `a path` and not `a process name`, for [`APP_PICK_HINT`]'s reason: the box
 /// this opens takes a program FILE, and a process name typed into it produces
 /// a binding that matches but cannot be opened.
-const APP_ADD_PATH_LINK: &str = "enter a path";
+fn app_add_path_link() -> &'static str {
+    crate::i18n::t("edit.app_add_path_link")
+}
 
 /// What the unbound row used to offer, as one control.
 ///
@@ -6003,7 +6118,9 @@ const APP_ADD_PATH_LINK: &str = "enter a path";
 /// bind an item was the tray's "Add app..." picker (`picker_ui::run_picker`),
 /// a different window that writes straight to the vault, so on the edit form
 /// the feature was simply absent.
-pub const APP_ADD_BUTTON: &str = "+ Add an app\u{2026}";
+pub fn app_add_button() -> &'static str {
+    crate::i18n::t("edit.app_add_button")
+}
 
 /// Which of the unbound row's two links was pressed.
 ///
@@ -6035,9 +6152,9 @@ enum AppAddChoice {
 /// It said what a binding IS rather than naming the mechanism, the same way
 /// [`AppPathRow`]'s Store-app row refuses the word "hosted": the user's
 /// question there is "what would this do for me", not "what field is unset".
-pub const APP_NONE_NOTICE: &str =
-    "Nothing is bound yet. Point this item at a program and Deskwarden can open it and type \
-     into it.";
+pub fn app_none_notice() -> &'static str {
+    crate::i18n::t("edit.app_none_notice")
+}
 
 /// What the removed state used to say, before it became the add row.
 ///
@@ -6052,9 +6169,9 @@ pub const APP_NONE_NOTICE: &str =
 /// `clicking_remove_stages_the_removal_rather_than_performing_it` reads it to
 /// say the removed row no longer explains itself in prose.
 #[cfg(test)]
-const APP_REMOVED_NOTICE: &str =
-    "This app will stop filling from this item when you save. Undo, or Cancel the edit, to keep \
-     it.";
+fn app_removed_notice() -> &'static str {
+    crate::i18n::t("edit.app_removed_notice")
+}
 
 // ---------------------------------------------------------------------------
 // The keystroke sequence builder.
@@ -6072,35 +6189,42 @@ const APP_REMOVED_NOTICE: &str =
 // is this file's standing rule.
 // ---------------------------------------------------------------------------
 
-const APP_SEQUENCE_LABEL: &str = "Keystrokes";
+fn app_sequence_label() -> &'static str {
+    crate::i18n::t("edit.app_sequence_label")
+}
 
 /// Why this exists, in the terms of the case that motivates it. Multi-screen
 /// sign-ins are named because they are what a plain user-name-Tab-password
 /// fill cannot do, and "nothing happens" on such a page is exactly the symptom
 /// a user would otherwise be left to guess at.
-const APP_SEQUENCE_HINT: &str =
-    "What Deskwarden types into this app. Add a wait and an Enter for sign-ins that ask for \
-     the address on one screen and the password on the next.";
+fn app_sequence_hint() -> &'static str {
+    crate::i18n::t("edit.app_sequence_hint")
+}
 
 /// What the block says when the item stores no sequence. **It names the
 /// default rather than showing an empty row**: the chips below it are real,
 /// they are what would be typed, and a blank space where they sit would read
 /// as "nothing will be typed", which is the one thing an empty sequence does
 /// not mean (see [`key_sequence::DEFAULT_SEQUENCE`]).
-pub(crate) const APP_SEQUENCE_DEFAULT_NOTICE: &str =
-    "Default \u{2014} username, Tab, password. Add or remove a step to change it.";
+pub(crate) fn app_sequence_default_notice() -> &'static str {
+    crate::i18n::t("edit.app_sequence_default_notice")
+}
 
 /// 8a's caption for the `Fill rule` card's first row.
 ///
 /// `Sequence`, where this card used to write `Keystrokes` over the row as a
 /// `field_label`. The design puts it in the row's own 130-point label column
 /// like every other row on the form, and the word it puts there is this one.
-pub const SEQUENCE_ROW_LABEL: &str = "Sequence";
+pub fn sequence_row_label() -> &'static str {
+    crate::i18n::t("edit.sequence_row_label")
+}
 
 /// 8a's control at the end of that row: `height: 30px; padding: 0 10px; border:
 /// 1px solid #d7d3d3; border-radius: 7px; font-size: 12px`, which is this
 /// app's `theme::row_button` exactly.
-pub const SEQUENCE_EDIT_BUTTON: &str = "Edit sequence";
+pub fn sequence_edit_button() -> &'static str {
+    crate::i18n::t("edit.sequence_edit_button")
+}
 
 /// Which of 8a's four chip treatments a step wears.
 ///
@@ -6318,8 +6442,12 @@ fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'
 /// run this card must NOT paint any more: an absence asserted against a
 /// literal stops meaning anything the moment the literal is edited.
 #[cfg(test)]
-const APP_SEQUENCE_OPEN: &str = "Change what it types\u{2026}";
-const APP_SEQUENCE_CLOSE: &str = "Done";
+fn app_sequence_open() -> &'static str {
+    crate::i18n::t("edit.app_sequence_open")
+}
+fn app_sequence_close() -> &'static str {
+    crate::i18n::t("edit.app_sequence_close")
+}
 
 /// The shut block's one line: the steps, in words, in order.
 ///
@@ -6332,7 +6460,7 @@ pub fn sequence_summary(sequence: &str) -> String {
     let steps: Vec<String> = view.tokens.iter().map(|t| t.chip_label()).collect();
     let joined = steps.join(" \u{b7} ");
     if view.is_default {
-        format!("{joined}  (default)")
+        crate::i18n::tf("edit.default_joined", &[("steps", &joined)])
     } else {
         joined
     }
@@ -6340,8 +6468,12 @@ pub fn sequence_summary(sequence: &str) -> String {
 
 /// The eye's two captions. The word says what the click does next, not what
 /// the pane is doing now.
-const APP_SEQUENCE_REVEAL: &str = "Show what it types";
-const APP_SEQUENCE_HIDE: &str = "Hide what it types";
+fn app_sequence_reveal() -> &'static str {
+    crate::i18n::t("edit.app_sequence_reveal")
+}
+fn app_sequence_hide() -> &'static str {
+    crate::i18n::t("edit.app_sequence_hide")
+}
 
 /// The wait box's starting value, in seconds. One second is the shortest wait
 /// that is any use against a page navigation and the most common thing typed,
@@ -6351,7 +6483,9 @@ const DEFAULT_WAIT_SECONDS: &str = "1";
 /// What the eye shows about the item when the eye is shut. Deliberately not a
 /// count of characters or a masked run of dots -- neither is information, and
 /// a dotted run invites the reading that the dots are the password's length.
-const APP_SEQUENCE_HIDDEN_NOTE: &str = "Values are hidden.";
+fn app_sequence_hidden_note() -> &'static str {
+    crate::i18n::t("edit.app_sequence_hidden_note")
+}
 
 /// The chips a sequence is drawn as, and whether they are the item's own or
 /// the default standing in for a stored value it does not have.
@@ -6494,11 +6628,11 @@ impl StepKind {
     /// column, which is the whole of what the design asks of it.
     pub fn badge(self) -> &'static str {
         match self {
-            Self::Key => "KEY",
-            Self::Text => "TEXT",
-            Self::Wait => "WAIT",
-            Self::Rate => "RATE",
-            Self::Raw => "RAW",
+            Self::Key => crate::i18n::t("edit.badge_key"),
+            Self::Text => crate::i18n::t("edit.badge_text"),
+            Self::Wait => crate::i18n::t("edit.badge_wait"),
+            Self::Rate => crate::i18n::t("edit.badge_rate"),
+            Self::Raw => crate::i18n::t("edit.badge_raw"),
         }
     }
 }
@@ -6515,7 +6649,9 @@ pub const SECRET_MASK: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\
 
 /// The note on a step whose payload is a secret. Says why the column is empty
 /// of information rather than leaving the mask to be read as the value.
-pub const SECRET_NOTE: &str = "hidden \u{2014} never shown here";
+pub fn secret_note() -> &'static str {
+    crate::i18n::t("edit.secret_note")
+}
 
 /// The note on a step that carries no note of its own. An em dash, which is
 /// what the design draws in the same cell.
@@ -6587,7 +6723,7 @@ fn rate_note(rate: Option<u32>) -> String {
     let ms = rate.unwrap_or_else(|| {
         u32::try_from(crate::injector::sequence::DEFAULT_RATE.as_millis()).unwrap_or(u32::MAX)
     });
-    format!("{ms} ms/char")
+    crate::i18n::tf("edit.ms_per_char", &[("ms", &ms.to_string())])
 }
 
 /// The step list for `sequence`, as drawn.
@@ -6623,16 +6759,16 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
                 } else {
                     String::new()
                 };
-                let aside = if secret { SECRET_NOTE.to_string() } else { none() };
+                let aside = if secret { secret_note().to_string() } else { none() };
                 (StepKind::Text, payload, secret, rate_note(rate), aside)
             }
             Token::Key(_) => (StepKind::Key, none(), false, dash(), none()),
             Token::Delay(_) => (StepKind::Wait, none(), false, dash(), none()),
             Token::DelayRate(ms) => {
                 rate = Some(*ms);
-                (StepKind::Rate, none(), false, dash(), RATE_NOTE.to_string())
+                (StepKind::Rate, none(), false, dash(), rate_note_text().to_string())
             }
-            Token::Modifier(_) => (StepKind::Key, none(), false, dash(), MODIFIER_NOTE.to_string()),
+            Token::Modifier(_) => (StepKind::Key, none(), false, dash(), modifier_note().to_string()),
             Token::Grouping(_) | Token::Unknown(_) => (StepKind::Raw, none(), false, dash(), none()),
         };
         rows.push(StepRow {
@@ -6654,10 +6790,14 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
 }
 
 /// The note on a `{DELAY=n}` row.
-pub const RATE_NOTE: &str = "sets the typing speed from here on";
+pub fn rate_note_text() -> &'static str {
+    crate::i18n::t("edit.rate_note")
+}
 
 /// The note on a bare modifier, which is held for the key that follows it.
-pub const MODIFIER_NOTE: &str = "held for the next key";
+pub fn modifier_note() -> &'static str {
+    crate::i18n::t("edit.modifier_note")
+}
 
 /// A non-secret field's value, for the revealed payload column.
 ///
@@ -6779,9 +6919,9 @@ fn acts(tokens: &[Token]) -> usize {
 pub fn duration_label(d: Duration) -> String {
     let ms = d.as_millis();
     if ms < 1000 {
-        format!("{ms} ms")
+        crate::i18n::tf("time.ms", &[("ms", &ms.to_string())])
     } else {
-        format!("{}.{} s", ms / 1000, (ms % 1000) / 100)
+        crate::i18n::tf("time.seconds_decimal", &[("whole", &(ms / 1000).to_string()), ("tenth", &((ms % 1000) / 100).to_string())])
     }
 }
 
@@ -6793,40 +6933,47 @@ pub fn duration_label(d: Duration) -> String {
 /// in the band it sits beside a heading that says what is being counted, and
 /// the rows under it say what each wait is.
 pub fn tally_short(tally: &SequenceTally) -> String {
-    let unit = if tally.steps == 1 { "step" } else { "steps" };
-    format!("{} {unit} \u{b7} {}", tally.steps, duration_label(tally.total))
+    crate::i18n::tn("edit.tally_short", tally.steps as u64, &[("duration", &duration_label(tally.total))])
 }
 
 /// [`tally_short`] with the edit form's "total" after it. One spelling of the
 /// count and the duration, so the two surfaces cannot disagree about either.
 pub fn tally_label(tally: &SequenceTally) -> String {
-    format!("{} total", tally_short(tally))
+    crate::i18n::tf("edit.tally_total", &[("short", &tally_short(tally))])
 }
 
 /// The design's budget pair, **against the crate's real limits** rather than
 /// the illustrative 512/64 in the picture.
 pub fn budget_label(tally: &SequenceTally) -> String {
-    format!(
-        "{} of {} total \u{b7} {} of {} in one burst",
-        duration_label(tally.total),
-        duration_label(crate::injector::sequence::MAX_SEQUENCE),
-        duration_label(tally.burst),
-        duration_label(crate::injector::sequence::MAX_BURST),
+    crate::i18n::tf(
+        "edit.budget",
+        &[
+            ("total", &duration_label(tally.total)),
+            ("max_total", &duration_label(crate::injector::sequence::MAX_SEQUENCE)),
+            ("burst", &duration_label(tally.burst)),
+            ("max_burst", &duration_label(crate::injector::sequence::MAX_BURST)),
+        ],
     )
 }
 
 /// What the summary says when the runner refuses the sequence outright, so the
 /// line is never blank. The reason itself is already above, in
 /// [`sequence_warning`]'s words.
-pub const TALLY_REFUSED: &str = "won't run \u{2014} see above";
+pub fn tally_refused() -> &'static str {
+    crate::i18n::t("edit.tally_refused")
+}
 
 // ---------------------------------------------------------------------------
 // 4c -- the template view, and the bridge
 // ---------------------------------------------------------------------------
 
 /// The two captions of the Steps/Template toggle.
-pub const VIEW_STEPS: &str = "Steps";
-pub const VIEW_TEMPLATE: &str = "Template";
+pub fn view_steps() -> &'static str {
+    crate::i18n::t("edit.view_steps")
+}
+pub fn view_template() -> &'static str {
+    crate::i18n::t("edit.view_template")
+}
 
 /// The insert chips, **in the grammar `key_sequence` really parses**.
 ///
@@ -6908,14 +7055,14 @@ pub fn template_fault(template: &str) -> Option<&'static str> {
     (key_sequence::render(&tokens) != template).then_some(TEMPLATE_UNPARSED)
 }
 
-/// The note under an empty template box. Names the default rather than leaving
-/// a blank field reading as "types nothing" -- the same correction
-/// [`APP_SEQUENCE_DEFAULT_NOTICE`] makes on the steps side.
-pub const TEMPLATE_EMPTY_NOTE: &str =
-    "Empty means the default: {USERNAME}{TAB}{PASSWORD}. Type a template to change it.";
+// The note under an empty template box (`edit.template_empty_note`) names the default
+// rather than leaving a blank field reading as "types nothing" -- the same correction
+// [`APP_SEQUENCE_DEFAULT_NOTICE`] makes on the steps side.
 
 /// The line above the parsed step list in the template view.
-pub const TEMPLATE_READS_AS: &str = "Reads as";
+pub fn template_reads_as() -> &'static str {
+    crate::i18n::t("edit.template_reads_as")
+}
 
 /// The field buttons this form offers, for the item **as it is being edited**.
 ///
@@ -7044,7 +7191,9 @@ pub fn sequence_refusal(
 /// already names the offending construct ("uses {PICKCHARS}, which this build
 /// cannot type"), and the editor saying it differently from the notification
 /// the user gets at fill time would be two vocabularies for one fact.
-const SEQUENCE_REFUSED_PREFIX: &str = "This will not run \u{2014} ";
+fn sequence_refused_prefix() -> &'static str {
+    crate::i18n::t("edit.sequence_refused_prefix")
+}
 
 /// The warning line for `sequence`, or `None` when it would type fine.
 ///
@@ -7054,7 +7203,7 @@ const SEQUENCE_REFUSED_PREFIX: &str = "This will not run \u{2014} ";
 /// where the user has never opened this block to see why.
 pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<String> {
     let refusal = sequence_refusal(&sequence_view(sequence).tokens, source)?;
-    Some(format!("{SEQUENCE_REFUSED_PREFIX}{}", refusal.message()))
+    Some(format!("{}{}", sequence_refused_prefix(), refusal.message()))
 }
 
 // ---------------------------------------------------------------------------
@@ -7205,7 +7354,9 @@ const PICKER_BAND_PAD_Y: i8 = 14;
 /// RE-point a binding that exists.** It is the design's own words for the act
 /// the card performs -- this item gains a target -- and the alternative was a
 /// caption that changed under the user between two openings of one card.
-const PICKER_TITLE: &str = "Add a native app";
+fn picker_title() -> &'static str {
+    crate::i18n::t("edit.picker_title")
+}
 /// The header band's right-hand readout: `font-size: 12px; color: #9b9797`.
 const PICKER_COUNT_PX: f32 = 12.0;
 
@@ -7236,7 +7387,9 @@ const PICKER_CHIP_PAD_Y: f32 = 2.0;
 const PICKER_CHIP_RADIUS: u8 = 5;
 
 /// The chip's words, which are 8b's own.
-const PICKER_TAKEN_CHIP: &str = "already a target";
+fn picker_taken_chip() -> &'static str {
+    crate::i18n::t("edit.picker_taken_chip")
+}
 
 /// 8b's refused row, `opacity: 0.5`.
 ///
@@ -7343,7 +7496,9 @@ pub fn preview_app_window_picker(ctx: &egui::Context, windows: Vec<AppWindowRow>
 /// 8b's `Match this window by`, `text-transform: uppercase` already applied,
 /// with its `letter-spacing: 0.1em` -- 1.1 points at 11px, which is what
 /// `theme::letterspaced` wants, `RichText` having no em to give it.
-const PICKER_MATCH_CAPTION: &str = "MATCH THIS WINDOW BY";
+fn picker_match_caption() -> &'static str {
+    crate::i18n::t("edit.picker_match_caption")
+}
 const PICKER_MATCH_CAPTION_PX: f32 = 11.0;
 const PICKER_MATCH_CAPTION_TRACKING: f32 = 1.1;
 
@@ -7354,17 +7509,27 @@ const PICKER_MATCH_GAP_X: f32 = 9.0;
 /// What the band says before a row has been chosen. 8b always has a selection;
 /// this card opens with none, and the band keeps its place rather than
 /// appearing from nowhere on the first click.
-const PICKER_MATCH_NONE: &str = "Choose a window above.";
+fn picker_match_none() -> &'static str {
+    crate::i18n::t("edit.picker_match_none")
+}
 
 /// The two rules this build really has, and the fact beside each.
 ///
 /// Neither is a setting. Which one applies is decided by the row --
 /// [`AppWindowRow::hosted`], copied into [`AppMatch::hosted`] by
 /// [`AppMatchDraft::choose_window`] -- and the band is reporting it.
-const PICKER_RULE_PROCESS: &str = "Process name";
-const PICKER_RULE_PROCESS_NOTE: &str = "every window this program opens";
-const PICKER_RULE_HOSTED: &str = "Process and window title";
-const PICKER_RULE_HOSTED_NOTE: &str = "a Store app has no other name to match";
+fn picker_rule_process() -> &'static str {
+    crate::i18n::t("edit.picker_rule_process")
+}
+fn picker_rule_process_note() -> &'static str {
+    crate::i18n::t("edit.picker_rule_process_note")
+}
+fn picker_rule_hosted() -> &'static str {
+    crate::i18n::t("edit.picker_rule_hosted")
+}
+fn picker_rule_hosted_note() -> &'static str {
+    crate::i18n::t("edit.picker_rule_hosted_note")
+}
 
 /// The footer's three controls.
 ///
@@ -7378,11 +7543,19 @@ const PICKER_RULE_HOSTED_NOTE: &str = "a Store app has no other name to match";
 /// come to more than the band, so the count wrapped onto a line of its own and
 /// was not in the corner at all. The count is the better of the two there --
 /// it is what `Refresh` changes, which is what the sentence was trying to say.
-const PICKER_ADD: &str = "Add target";
-const PICKER_CANCEL: &str = "Cancel";
-const PICKER_REFRESH: &str = "Refresh";
+fn picker_add() -> &'static str {
+    crate::i18n::t("edit.picker_add")
+}
+fn picker_cancel() -> &'static str {
+    crate::i18n::t("edit.picker_cancel")
+}
+fn picker_refresh() -> &'static str {
+    crate::i18n::t("edit.picker_refresh")
+}
 /// What the list says when the desktop offered nothing.
-const PICKER_EMPTY: &str = "No open windows to choose from.";
+fn picker_empty() -> &'static str {
+    crate::i18n::t("edit.picker_empty")
+}
 
 /// 8b's greyed row carries its refusal in the subtitle, after the executable
 /// and a `\u{b7}` -- `deskwarden.exe \u{b7} can't target itself`.
@@ -7396,15 +7569,13 @@ const PICKER_EMPTY: &str = "No open windows to choose from.";
 /// [`window_row_refusal`] has already answered `Some`: there is no second
 /// condition to get wrong. `the_refused_row_says_its_refusal_twice` measures
 /// exactly that.
-const PICKER_REFUSAL_SHORT: &str = "can't tell which app this is";
+fn picker_refusal_short() -> &'static str {
+    crate::i18n::t("edit.picker_refusal_short")
+}
 
 /// The header band's count, in 8b's own words (`6 windows open`).
 fn picker_count(n: usize) -> String {
-    if n == 1 {
-        "1 window open".to_string()
-    } else {
-        format!("{n} windows open")
-    }
+    crate::i18n::tn("edit.picker_count", n as u64, &[])
 }
 
 /// 8b's card, opened by [`APP_PICK_LINK`] on the app row.
@@ -7478,7 +7649,7 @@ fn app_window_picker(
 fn picker_header(ui: &mut egui::Ui) {
     egui::Frame::new().inner_margin(Margin { left: 30, right: 70, top: 28, bottom: 20 }).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(theme::extrabold(PICKER_TITLE, 26.0).color(theme::INK));
+        ui.label(theme::extrabold(picker_title(), 26.0).color(theme::INK));
     });
 }
 
@@ -7553,7 +7724,7 @@ fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft, apps: &mut AppIdentit
                 }
                 if app.windows.is_empty() {
                     ui.label(
-                        RichText::new(PICKER_EMPTY).size(PICKER_COUNT_PX).color(theme::TEXT_FAINT),
+                        RichText::new(picker_empty()).size(PICKER_COUNT_PX).color(theme::TEXT_FAINT),
                     );
                 }
             });
@@ -7621,7 +7792,7 @@ fn picker_row(
                 let trailing = if selected {
                     picker_keycap_width(ui)
                 } else if taken {
-                    picker_chip_width(ui, PICKER_TAKEN_CHIP)
+                    picker_chip_width(ui, picker_taken_chip())
                 } else {
                     0.0
                 };
@@ -7676,7 +7847,7 @@ fn picker_row(
                     });
                 } else if taken {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        picker_chip(ui, PICKER_TAKEN_CHIP, dim(theme::TEXT_FAINT));
+                        picker_chip(ui, picker_taken_chip(), dim(theme::TEXT_FAINT));
                     });
                 }
             });
@@ -7704,10 +7875,10 @@ fn picker_row(
 /// or that the window's title is part of its match.
 fn picker_subtitle(row: &AppWindowRow, refused: bool) -> String {
     if refused {
-        return format!("{} \u{b7} {PICKER_REFUSAL_SHORT}", row.exe_name);
+        return crate::i18n::tf("edit.picker_refused", &[("exe", &row.exe_name), ("why", picker_refusal_short())]);
     }
     if row.hosted {
-        return format!("{} \u{b7} matched by its title", row.exe_name);
+        return crate::i18n::tf("edit.picker_hosted", &[("exe", &row.exe_name)]);
     }
     row.exe_name.clone()
 }
@@ -7780,7 +7951,7 @@ fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = PICKER_MATCH_GAP_Y;
             ui.label(theme::letterspaced(
-                PICKER_MATCH_CAPTION,
+                picker_match_caption(),
                 PICKER_MATCH_CAPTION_PX,
                 theme::BOLD,
                 PICKER_MATCH_CAPTION_TRACKING,
@@ -7788,16 +7959,16 @@ fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
             ));
             let Some(row) = picked else {
                 ui.label(
-                    RichText::new(PICKER_MATCH_NONE)
+                    RichText::new(picker_match_none())
                         .size(PICKER_NAME_PX)
                         .color(theme::TEXT_GHOST),
                 );
                 return;
             };
             let (rule, value, note) = if row.hosted {
-                (PICKER_RULE_HOSTED, row.title.clone(), PICKER_RULE_HOSTED_NOTE)
+                (picker_rule_hosted(), row.title.clone(), picker_rule_hosted_note())
             } else {
-                (PICKER_RULE_PROCESS, row.exe_name.clone(), PICKER_RULE_PROCESS_NOTE)
+                (picker_rule_process(), row.exe_name.clone(), picker_rule_process_note())
             };
             // Wrapped, like every other row on this form: an unwrapped one does
             // not shrink to fit and pushes the card past the pane (`aae9429`).
@@ -7826,7 +7997,7 @@ fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, 
         // the bottom right at the owner's word), over the two answers.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            pressed.2 = controls::button(ui, ButtonKind::Outline, controls::SMALL, PICKER_REFRESH, None).clicked();
+            pressed.2 = controls::button(ui, ButtonKind::Outline, controls::SMALL, picker_refresh(), None).clicked();
             // The count sits at the line's right end: pushed by a measured
             // space (a right-to-left layout nested in a horizontal one is laid
             // against whatever the row had before it, and in a wrapping parent
@@ -7845,10 +8016,10 @@ fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, 
             // nothing is the drawn-and-dead control this file refuses
             // everywhere else.
             pressed.0 = columns[0]
-                .add_enabled_ui(staged, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, PICKER_ADD))
+                .add_enabled_ui(staged, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, picker_add()))
                 .inner
                 .clicked();
-            pressed.1 = controls::button_filling(&mut columns[1], ButtonKind::Outline, ANSWER, PICKER_CANCEL).clicked();
+            pressed.1 = controls::button_filling(&mut columns[1], ButtonKind::Outline, ANSWER, picker_cancel()).clicked();
         });
     });
     pressed
@@ -7866,9 +8037,9 @@ fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, 
 /// row, as on the login form".
 fn field_with_remove(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui, f32)) -> bool {
     let mut clicked = false;
-    row_with_buttons(ui, &[SLOT_REMOVE_BUTTON], |ui, room| {
+    row_with_buttons(ui, &[slot_remove_button()], |ui, room| {
         field(ui, room);
-        clicked = crate::kit::controls::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked();
+        clicked = crate::kit::controls::row_button_danger(ui, slot_remove_button()).clicked();
     });
     clicked
 }
@@ -7918,7 +8089,7 @@ fn number_badge(ui: &mut egui::Ui, net: crate::kit::logos::Net) {
 fn brand_combo(ui: &mut egui::Ui, card: &mut CardDraft) -> f32 {
     ui.scope(|ui| {
         form_combo(ui, "card-brand")
-            .selected_text(if card.brand.is_empty() { BRAND_UNSET } else { card.brand.as_str() })
+            .selected_text(if card.brand.is_empty() { brand_unset() } else { card.brand.as_str() })
             .width(BRAND_COMBO_WIDTH)
             .show_ui(ui, |ui| {
                 for brand in CARD_BRANDS {
@@ -7971,17 +8142,17 @@ fn expires_row(ui: &mut egui::Ui, card: &mut CardDraft, creating: bool, ink: egu
         inline_caption(ui, EXPIRY_JOIN, ink);
         theme::section_text_field_within(ui, &mut card.exp_year, false, year);
         let code = digits_box_width(ui, 4, theme::REVEAL_FIELD_PAD_RIGHT);
-        keep_together(ui, caption_width(ui, CARD_CODE_LABEL) + gap + code);
-        inline_caption(ui, CARD_CODE_LABEL, ink);
+        keep_together(ui, caption_width(ui, card_code_label()) + gap + code);
+        inline_caption(ui, card_code_label(), ink);
         theme::section_password_field_within(ui, &mut card.code, &mut card.reveal_code, code);
 
         keep_together(ui, caption_width(ui, CARD_PIN_LABEL) + gap + PIN_FLOOR);
         inline_caption(ui, CARD_PIN_LABEL, ink);
         let room = ui.available_size_before_wrap().x.max(PIN_FLOOR);
         if creating {
-            let rect = theme::section_disabled_text_field_within(ui, CARD_FIELD_CREATE_NOTICE, room);
+            let rect = theme::section_disabled_text_field_within(ui, card_field_create_notice(), room);
             ui.interact(rect, ui.id().with("card-pin-create"), egui::Sense::hover())
-                .on_hover_text(CARD_FIELD_CREATE_NOTICE);
+                .on_hover_text(card_field_create_notice());
         } else {
             theme::section_password_field_within(ui, &mut card.pin, &mut card.reveal_pin, room);
         }
@@ -8134,11 +8305,11 @@ fn bank_choice_text(card: &CardDraft, index: usize) -> String {
 /// rather than as a picker with nothing in it.
 fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
     let mut cleared = false;
-    row_with_buttons(ui, &[BANK_CLEAR], |ui, room| {
+    row_with_buttons(ui, &[bank_clear()], |ui, room| {
         let name = card.bank_label();
         let picker = dropdown_button(
             ui,
-            name.as_deref().unwrap_or(BANK_CHOOSE),
+            name.as_deref().unwrap_or(bank_choose()),
             room,
             card.bank_picking,
         );
@@ -8150,14 +8321,14 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
         if picker.clicked() {
             card.bank_picking = !card.bank_picking;
         }
-        cleared = crate::kit::controls::row_button_danger(ui, BANK_CLEAR).clicked();
+        cleared = crate::kit::controls::row_button_danger(ui, bank_clear()).clicked();
     });
 
     if !card.bank_picking {
         return cleared;
     }
     ui.add_space(6.0);
-    if crate::kit::controls::row_button(ui, BANK_CLOSE_LIST).clicked() {
+    if crate::kit::controls::row_button(ui, bank_close_list()).clicked() {
         card.bank_picking = false;
     }
     ui.add_space(6.0);
@@ -8183,7 +8354,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
                 }
             }
             if card.bank_choices.is_empty() {
-                ui.label(RichText::new(BANK_NO_CHOICES).size(12.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(bank_no_choices()).size(12.0).color(theme::TEXT_FAINT));
             }
         });
     // After the loop, so the immutable borrow of `bank_choices` is over
@@ -8336,7 +8507,7 @@ pub(crate) fn sequence_steps(
                         }),
                     );
                     if !row.understood {
-                        label.on_hover_text(SEQUENCE_UNKNOWN_TIP);
+                        label.on_hover_text(sequence_unknown_tip());
                     }
                     if !row.payload.is_empty() {
                         // A mask is not a value and must not be drawn like
@@ -8416,7 +8587,7 @@ pub(crate) fn view_toggle_compact_height(ui: &egui::Ui) -> f32 {
     use crate::kit::tokens::{self, Role};
     let style = compact_toggle_style();
     let role = Role { size: style.font_px, face: theme::BOLD, tracking_em: 0.0 };
-    let text = ui.ctx().fonts_mut(|f| f.layout_job(tokens::job(role, "Steps", egui::Color32::BLACK)).size().y);
+    let text = ui.ctx().fonts_mut(|f| f.layout_job(tokens::job(role, crate::i18n::t("edit.view_steps_measure"), egui::Color32::BLACK)).size().y);
     text + style.pad.y * 2.0 + 8.0
 }
 
@@ -8442,8 +8613,8 @@ fn view_toggle_run(
     run: impl Fn(&mut egui::Ui, &[theme::Segment<'_>]) -> Option<usize>,
 ) -> Option<bool> {
     let cells = [
-        theme::Segment { label: VIEW_STEPS, selected: !template_view },
-        theme::Segment { label: VIEW_TEMPLATE, selected: template_view },
+        theme::Segment { label: view_steps(), selected: !template_view },
+        theme::Segment { label: view_template(), selected: template_view },
     ];
     // **A press on the cell already in force is reported and then dropped.**
     // `segmented_control` hands back every press, including the one that asks
@@ -8458,9 +8629,9 @@ fn view_toggle_run(
 }
 
 /// The tip on a step this build carries but does not understand.
-pub(crate) const SEQUENCE_UNKNOWN_TIP: &str =
-    "Deskwarden does not know this step. It is kept exactly as it is so another password \
-     manager can still read it.";
+pub(crate) fn sequence_unknown_tip() -> &'static str {
+    crate::i18n::t("edit.sequence_unknown_tip")
+}
 
 /// The move/remove controls. ASCII captions on purpose: the app's own font is
 /// a Latin text face, and an arrow glyph it has no coverage for is a control
@@ -8490,7 +8661,7 @@ fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
                 PreviewPart::Key(symbol) => (format!("[{symbol}]"), theme::TEXT_FAINT),
                 PreviewPart::Wait(label) => (format!("[{label}]"), theme::TEXT_FAINT),
                 PreviewPart::Unresolved(why) => (why.clone(), theme::ERROR),
-                PreviewPart::Pending => ("[fetching code]".to_string(), theme::TEXT_FAINT),
+                PreviewPart::Pending => (crate::i18n::t("edit.fetching_code").to_string(), theme::TEXT_FAINT),
                 PreviewPart::Opaque(raw) => (raw.clone(), theme::TEXT_FAINT),
             };
             ui.label(RichText::new(text).size(12.0).color(color));
@@ -8554,8 +8725,8 @@ fn app_sequence_block(
         return opened;
     }
     if !app.sequence_open {
-        theme::section_row(ui, SEQUENCE_ROW_LABEL, |ui| {
-            row_with_buttons(ui, &[SEQUENCE_EDIT_BUTTON], |ui, room| {
+        theme::section_row(ui, sequence_row_label(), |ui| {
+            row_with_buttons(ui, &[sequence_edit_button()], |ui, room| {
                 // **`set_width`, not `set_max_width`.** `row_with_buttons`
                 // measures the button, hands the field what is left, and
                 // expects the field to CLAIM it -- every other row on this
@@ -8568,7 +8739,7 @@ fn app_sequence_block(
                     ui.set_width(room);
                     sequence_chip_row(ui, &app.sequence, source);
                 });
-                if crate::kit::controls::row_button(ui, SEQUENCE_EDIT_BUTTON).clicked() {
+                if crate::kit::controls::row_button(ui, sequence_edit_button()).clicked() {
                     // **On a saved item this opens design 4a's own screen.**
                     //
                     // The rule is one thing and had two editors: a three-column
@@ -8593,14 +8764,14 @@ fn app_sequence_block(
         return opened;
     }
 
-    theme::field_label(ui, APP_SEQUENCE_LABEL);
+    theme::field_label(ui, app_sequence_label());
 
-    ui.label(RichText::new(APP_SEQUENCE_HINT).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(app_sequence_hint()).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(6.0);
 
     if view.is_default {
         ui.label(
-            RichText::new(APP_SEQUENCE_DEFAULT_NOTICE).size(11.0).color(theme::TEXT_FAINT),
+            RichText::new(app_sequence_default_notice()).size(11.0).color(theme::TEXT_FAINT),
         );
         ui.add_space(4.0);
     }
@@ -8613,7 +8784,7 @@ fn app_sequence_block(
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
         let summary = match sequence_tally(&app.sequence, source) {
             Some(tally) => tally_label(&tally),
-            None => TALLY_REFUSED.to_string(),
+            None => tally_refused().to_string(),
         };
         ui.label(theme::semibold(summary, 11.0).color(theme::TEXT_SECONDARY));
         if let Some(wants_template) = view_toggle(ui, app.template_view) {
@@ -8653,7 +8824,7 @@ fn app_sequence_block(
             if rehearse_button(ui).clicked() {
                 action = Some(EditAction::Rehearse);
             }
-            if crate::kit::controls::row_button(ui, APP_SEQUENCE_CLOSE).clicked() {
+            if crate::kit::controls::row_button(ui, app_sequence_close()).clicked() {
                 app.sequence_open = false;
                 app.previewing = false;
             }
@@ -8663,7 +8834,7 @@ fn app_sequence_block(
     }
 
     // -- the palette: nothing here is typed from memory --------------------
-    ui.label(RichText::new("Add a value").size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_value")).size(11.0).color(theme::TEXT_FAINT));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for field in palette {
@@ -8673,7 +8844,7 @@ fn app_sequence_block(
         }
         if palette.is_empty() {
             ui.label(
-                RichText::new("This item has no fields to reference yet.")
+                RichText::new(crate::i18n::t("seq.no_fields"))
                     .size(11.0)
                     .color(theme::TEXT_FAINT),
             );
@@ -8681,7 +8852,7 @@ fn app_sequence_block(
     });
     ui.add_space(6.0);
 
-    ui.label(RichText::new("Add a key").size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_key")).size(11.0).color(theme::TEXT_FAINT));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
@@ -8693,11 +8864,11 @@ fn app_sequence_block(
     ui.add_space(6.0);
 
     // -- literal text: `2134{TOTP}` is why this box exists ------------------
-    ui.label(RichText::new("Add text").size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_text")).size(11.0).color(theme::TEXT_FAINT));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         ui.add(egui::TextEdit::singleline(&mut app.literal_draft).desired_width(120.0));
-        let add = crate::kit::controls::row_button(ui, "Add text");
+        let add = crate::kit::controls::row_button(ui, crate::i18n::t("edit.add_text"));
         if add.clicked() {
             // Escaping is this app's job, not the user's: they typed a `+`,
             // they get a `+`. See `key_sequence::escape_literal`.
@@ -8710,7 +8881,7 @@ fn app_sequence_block(
     ui.add_space(6.0);
 
     // -- the wait, in the seconds the user asked for -----------------------
-    ui.label(RichText::new("Add a wait").size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_wait")).size(11.0).color(theme::TEXT_FAINT));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         // Only a number goes in -- `key_sequence::only_a_number`, the same
@@ -8718,15 +8889,15 @@ fn app_sequence_block(
         if ui.add(egui::TextEdit::singleline(&mut app.wait_draft).desired_width(48.0)).changed() {
             app.wait_draft = key_sequence::only_a_number(&app.wait_draft);
         }
-        ui.label(RichText::new("seconds").size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(crate::i18n::t("seq.wait_unit")).size(11.0).color(theme::TEXT_FAINT));
         let addable = key_sequence::wait_ms_from_seconds(&app.wait_draft).is_some();
-        if ui.add_enabled(addable, egui::Button::new("Add wait")).clicked() {
+        if ui.add_enabled(addable, egui::Button::new(crate::i18n::t("edit.add_wait_button"))).clicked() {
             if let Some(next) = sequence_with_wait(&app.sequence, &app.wait_draft) {
                 app.sequence = next;
             }
         }
         if !addable {
-            ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+            ui.label(RichText::new(wait_refusal()).size(11.0).color(theme::TEXT_FAINT));
         }
     });
     ui.add_space(8.0);
@@ -8743,15 +8914,15 @@ fn app_sequence_block(
         if rehearse_button(ui).clicked() {
             action = Some(EditAction::Rehearse);
         }
-        let caption = if app.previewing { APP_SEQUENCE_HIDE } else { APP_SEQUENCE_REVEAL };
+        let caption = if app.previewing { app_sequence_hide() } else { app_sequence_reveal() };
         if crate::kit::controls::row_button(ui, caption).clicked() {
             app.previewing = !app.previewing;
         }
-        if !view.is_default && crate::kit::controls::row_button(ui, "Use the default").clicked() {
+        if !view.is_default && crate::kit::controls::row_button(ui, crate::i18n::t("seq.use_default")).clicked() {
             // The empty string, not the default's own spelling: see `store`.
             app.sequence = String::new();
         }
-        if crate::kit::controls::row_button(ui, APP_SEQUENCE_CLOSE).clicked() {
+        if crate::kit::controls::row_button(ui, app_sequence_close()).clicked() {
             app.sequence_open = false;
             // Shutting the builder shuts the eye with it. A reveal that
             // survived being scrolled past and came back open later would be
@@ -8763,7 +8934,7 @@ fn app_sequence_block(
     if app.previewing {
         sequence_preview(ui, &key_sequence::resolve_preview(&view.tokens, source));
     } else {
-        ui.label(RichText::new(APP_SEQUENCE_HIDDEN_NOTE).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(app_sequence_hidden_note()).size(11.0).color(theme::TEXT_FAINT));
     }
     ui.add_space(10.0);
     action
@@ -8783,10 +8954,12 @@ fn app_sequence_block(
 /// prose pushed the eye and Close below the fold. What could not be dropped is
 /// the word that makes the button safe to press on an item that matters, so
 /// that is what the caption says.
-pub const APP_SEQUENCE_REHEARSE: &str = "Rehearse with fake data";
+pub fn app_sequence_rehearse() -> &'static str {
+    crate::i18n::t("edit.app_sequence_rehearse")
+}
 
 fn rehearse_button(ui: &mut egui::Ui) -> egui::Response {
-    crate::kit::controls::row_button(ui, APP_SEQUENCE_REHEARSE)
+    crate::kit::controls::row_button(ui, app_sequence_rehearse())
 }
 
 /// **4c -- the template view.** The same sequence as one editable line, with
@@ -8964,7 +9137,7 @@ pub(crate) fn template_editor(
 
     if template_draft.is_empty() {
         ui.add_space(TEMPLATE_GAP);
-        ui.label(RichText::new(TEMPLATE_EMPTY_NOTE).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(crate::i18n::tf("edit.template_empty_note", &[("default", "{USERNAME}{TAB}{PASSWORD}")])).size(11.0).color(theme::TEXT_FAINT));
     }
 
     // **The refusal, in the field that caused it.** Save is off while this is
@@ -8984,7 +9157,7 @@ pub(crate) fn template_editor(
         ui.spacing_mut().item_spacing = egui::vec2(TEMPLATE_CHIP_GAP, TEMPLATE_CHIP_GAP);
         ui.add(
             egui::Label::new(theme::letterspaced(
-                TEMPLATE_INSERT_CAPTION,
+                template_insert_caption(),
                 TEMPLATE_CAPTION_PX,
                 theme::BOLD,
                 TEMPLATE_CAPTION_PX * TEMPLATE_CAPTION_TRACKING,
@@ -9446,7 +9619,9 @@ const TEMPLATE_CHIP_PAD_X: f32 = 9.0;
 const TEMPLATE_CHIP_PAD_Y: f32 = 4.0;
 const TEMPLATE_CAPTION_PX: f32 = 11.0;
 const TEMPLATE_CAPTION_TRACKING: f32 = 0.08;
-const TEMPLATE_INSERT_CAPTION: &str = "INSERT";
+fn template_insert_caption() -> &'static str {
+    crate::i18n::t("edit.template_insert_caption")
+}
 
 
 /// `sequence` with the edit a step row's controls asked for applied.
@@ -9464,19 +9639,26 @@ pub(crate) fn apply_chip_edit(sequence: &str, edit: ChipEdit) -> String {
 
 /// Save's caption while the keystroke template will not parse. Names the thing
 /// to go and fix, the same way "Save (needs a name)" does.
-pub const SAVE_TEMPLATE_BLOCKED: &str = "Save (fix the template)";
+pub fn save_template_blocked() -> &'static str {
+    crate::i18n::t("edit.save_template_blocked")
+}
 
 /// Save's caption while a card's custom field is named `PIN` -- see
 /// [`EditDraft::pin_name_fault`].
-pub const SAVE_PIN_NAME_BLOCKED: &str = "Save (rename the PIN field)";
+pub fn save_pin_name_blocked() -> &'static str {
+    crate::i18n::t("edit.save_pin_name_blocked")
+}
 
 /// Why a card's custom field may not be called `PIN`, said under it and
 /// beside Save.
-pub const PIN_NAME_REFUSAL: &str =
-    "This card has its own PIN box, on the Expires row. Give this field another name.";
+pub fn pin_name_refusal() -> &'static str {
+    crate::i18n::t("edit.pin_name_refusal")
+}
 
 /// The refusal under the wait box, said as the rule rather than as "invalid".
-const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
+fn wait_refusal() -> &'static str {
+    crate::i18n::t("edit.wait_refusal")
+}
 
 pub(crate) fn palette_button(label: &str) -> egui::Button<'static> {
     egui::Button::new(theme::semibold(label.to_string(), 12.0).color(theme::INK))
@@ -9551,7 +9733,7 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
     // the card changed layout depending on whether the item happened to be
     // bound.
     let mut chose = None;
-    theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
+    theme::section_row(ui, app_block_heading(), |ui| {
         // **The row's height is the field's**, so the links sit on the line
         // the caption beside them is on.
         //
@@ -9568,11 +9750,11 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
         // pane, and a run that cannot fall to a second line pushes the card
         // out instead (`aae9429`).
         ui.horizontal_wrapped(|ui| {
-            if theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked() {
+            if theme::action_link(ui, app_pick_link(), TARGET_LINK_PX).clicked() {
                 chose = Some(AppAddChoice::Pick);
             }
-            link_row_note(ui, APP_ADD_OR);
-            if theme::action_link(ui, APP_ADD_PATH_LINK, TARGET_LINK_PX).clicked() {
+            link_row_note(ui, app_add_or());
+            if theme::action_link(ui, app_add_path_link(), TARGET_LINK_PX).clicked() {
                 chose = Some(AppAddChoice::Path);
             }
         });
@@ -9641,9 +9823,9 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
 /// the picker that fills it.
 fn app_rule_label(hosted: bool) -> &'static str {
     if hosted {
-        PICKER_RULE_HOSTED
+        picker_rule_hosted()
     } else {
-        PICKER_RULE_PROCESS
+        picker_rule_process()
     }
 }
 
@@ -9664,9 +9846,9 @@ fn app_rule_label(hosted: bool) -> &'static str {
 /// keyed on.
 fn app_fresh_note(app: &AppMatchDraft) -> String {
     if app.hosted && !app.title.is_empty() {
-        format!("Window title is \"{}\" \u{2014} just added from the picker", app.title)
+        crate::i18n::tf("edit.fresh_title", &[("title", &app.title)])
     } else {
-        format!("Matched by {} \u{2014} just added from the picker", app.process)
+        crate::i18n::tf("edit.fresh_process", &[("process", &app.process)])
     }
 }
 
@@ -9927,10 +10109,10 @@ fn app_target_row(
                         // and take it away", with the way in first. Lit
                         // while those settings are open.
                         let settings =
-                            theme::tune_mark(ui, TARGET_SETTINGS_MARK, open, APP_SETTINGS_TIP)
+                            theme::tune_mark(ui, TARGET_SETTINGS_MARK, open, app_settings_tip())
                                 .clicked();
                         picker_chip(ui, rule, theme::TEXT_FAINT);
-                        let remove = theme::close_glyph_titled(ui, APP_REMOVE_BUTTON).clicked();
+                        let remove = theme::close_glyph_titled(ui, app_remove_button()).clicked();
                         TargetPress { remove, settings }
                     },
                 );
@@ -10003,7 +10185,9 @@ fn field_column_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) 
 /// What the mark says when the pointer rests on it. It names what is under
 /// it, because a drawn mark with no word on it has only this to say what it
 /// does -- `theme::close_glyph`'s "Dismiss" is the precedent.
-const APP_SETTINGS_TIP: &str = "Program file and command line for this app";
+fn app_settings_tip() -> &'static str {
+    crate::i18n::t("edit.app_settings_tip")
+}
 
 fn app_block(
     ui: &mut egui::Ui,
@@ -10060,7 +10244,7 @@ fn app_block(
     // feature shipped, and two words for one thing on two panes is worse than
     // departing from the design's noun. See [`APP_BLOCK_HEADING`].
     let mut press = TargetPress::default();
-    theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
+    theme::section_row(ui, app_block_heading(), |ui| {
         press = app_target_row(ui, app, &name, icon.as_ref());
     });
     if press.settings {
@@ -10110,7 +10294,7 @@ fn app_block(
             // called when the app was captured, and it is the only thing that can
             // identify a suspended Store app. Typing over it would be typing a new
             // identity for something that is not there to check it against.
-            theme::section_row(ui, APP_WINDOW_LABEL, |ui| {
+            theme::section_row(ui, app_window_label(), |ui| {
                 theme::section_disabled_text_field(ui, &app.title);
             });
         }
@@ -10123,7 +10307,7 @@ fn app_block(
         // not do that. So it keeps a row of its own, with its Browse under the
         // box rather than beside it -- see the comment on the editable arm.
         let path_row = app_path_row(app.hosted);
-        theme::section_row(ui, APP_PATH_LABEL, |ui| {
+        theme::section_row(ui, app_path_label(), |ui| {
             match path_row {
                 AppPathRow::Editable => {
                     // **Browse at the end of the line, the way every other button
@@ -10147,7 +10331,7 @@ fn app_block(
                     // exactly the remainder, and below `FIELD_FLOOR` the row wraps
                     // rather than pushing the card past the pane -- which is the
                     // narrow case the old comment was really about.
-                    row_with_buttons(ui, &[APP_BROWSE_BUTTON], |ui, room| {
+                    row_with_buttons(ui, &[app_browse_button()], |ui, room| {
                         if theme::section_text_field_within(ui, &mut app.path, false, room).changed() {
                             // `process` is re-derived on every keystroke, which is
                             // what keeps `launchable_path`'s file-name tie-back
@@ -10159,7 +10343,7 @@ fn app_block(
                         // the box beside it is `theme::SECTION_FIELD_HEIGHT`, 28
                         // points, which is `ROW_BUTTON_HEIGHT_2B`, where
                         // `secondary_button` is 32.
-                        if crate::kit::controls::row_button(ui, APP_BROWSE_BUTTON).clicked() {
+                        if crate::kit::controls::row_button(ui, app_browse_button()).clicked() {
                             action = Some(EditAction::PickAppFile);
                         }
                     });
@@ -10180,7 +10364,7 @@ fn app_block(
             ui.label(RichText::new(warning).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
         }
 
-        theme::section_row(ui, APP_ARGS_LABEL, |ui| match path_row {
+        theme::section_row(ui, app_args_label(), |ui| match path_row {
             AppPathRow::Editable => {
                 theme::section_text_field(ui, &mut app.args, false);
             }
@@ -10188,7 +10372,7 @@ fn app_block(
             // give it. Disabled for the same reason the path box is, and saying so
             // in the same words.
             AppPathRow::NotApplicable(_) => {
-                theme::section_disabled_text_field(ui, APP_ARGS_STORE_APP);
+                theme::section_disabled_text_field(ui, app_args_store_app());
             }
         });
     }
@@ -10218,8 +10402,8 @@ fn app_block(
         // fall onto two lines on a 298-point pane rather than push the card
         // out (`aae9429`).
         ui.horizontal_wrapped(|ui| {
-            pick = theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
-            link_row_note(ui, APP_PICK_HINT);
+            pick = theme::action_link(ui, app_pick_link(), TARGET_LINK_PX).clicked();
+            link_row_note(ui, app_pick_hint());
         });
     });
     if pick {
@@ -10388,7 +10572,9 @@ fn note_form_overflow(ctx: &egui::Context, overflowed: bool) {
 }
 
 /// The label the generator's options disclosure wears.
-const GENERATOR_OPTIONS: &str = "Options";
+fn generator_options_text() -> &'static str {
+    crate::i18n::t("edit.generator_options")
+}
 
 /// The hint under the character-class chips when one of them is the last one
 /// standing.
@@ -10398,7 +10584,9 @@ const GENERATOR_OPTIONS: &str = "Options";
 /// is on screen -- but a chip that quietly ignores a click is a control the
 /// user is entitled to think is broken. The greyed chip says "not this one"
 /// and this says why.
-const LAST_CLASS_HINT: &str = "A password has to come from somewhere.";
+fn last_class_hint() -> &'static str {
+    crate::i18n::t("edit.last_class_hint")
+}
 
 /// The generator's options, drawn under its control row when the disclosure
 /// is open.
@@ -10419,7 +10607,7 @@ const LAST_CLASS_HINT: &str = "A password has to come from somewhere.";
 fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
     if generator.passphrase {
-        theme::field_label(ui, "Between words");
+        theme::field_label(ui, crate::i18n::t("edit.gen_between_words"));
         ui.horizontal_wrapped(|ui| {
             form_combo(ui, "generator-separator")
                 .selected_text(generator.separator.label())
@@ -10432,17 +10620,17 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
         });
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.selectable_label(generator.capitalize, "Capitalise").clicked() {
+            if ui.selectable_label(generator.capitalize, crate::i18n::t("edit.gen_capitalise")).clicked() {
                 generator.capitalize = !generator.capitalize;
             }
-            if ui.selectable_label(generator.include_number, "Include a number").clicked() {
+            if ui.selectable_label(generator.include_number, crate::i18n::t("edit.gen_include_number")).clicked() {
                 generator.include_number = !generator.include_number;
             }
         });
         return;
     }
 
-    theme::field_label(ui, "Use these characters");
+    theme::field_label(ui, crate::i18n::t("edit.gen_use_characters"));
     ui.horizontal_wrapped(|ui| {
         for class in CharClass::ALL {
             let on = generator.classes.is_on(class);
@@ -10459,7 +10647,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     });
     if CharClass::ALL.iter().any(|class| generator.classes.is_last_on(*class)) {
         ui.add_space(2.0);
-        ui.label(RichText::new(LAST_CLASS_HINT).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(last_class_hint()).size(11.0).color(theme::TEXT_FAINT));
     }
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
@@ -10486,7 +10674,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     });
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        if ui.selectable_label(generator.avoid_ambiguous, AVOID_AMBIGUOUS).clicked() {
+        if ui.selectable_label(generator.avoid_ambiguous, avoid_ambiguous()).clicked() {
             generator.avoid_ambiguous = !generator.avoid_ambiguous;
         }
     });
@@ -10547,18 +10735,27 @@ pub(crate) fn edit_title_id() -> egui::Id {
 }
 
 /// Save with no name (spec B 1.1).
-pub const NAME_FIRST_TOAST: &str = "Give it a name first";
+pub fn name_first_toast() -> &'static str {
+    crate::i18n::t("edit.name_first_toast")
+}
 
 /// "New login", "Editing card" (spec B 1.1).
 pub(crate) fn edit_kind_label(kind: ItemKind, creating: bool) -> String {
-    let label = kind.label();
-    let mut chars = label.chars();
-    let lowered = match chars.next() {
-        // "SSH key" keeps its capitals; every other kind is a common noun.
-        Some(first) if !label.starts_with("SSH") => first.to_lowercase().chain(chars).collect(),
-        _ => label.clone(),
+    let text = match (kind, creating) {
+        (ItemKind::Login, true) => crate::i18n::t("edit.new_login"),
+        (ItemKind::Login, false) => crate::i18n::t("edit.editing_login"),
+        (ItemKind::Card, true) => crate::i18n::t("edit.new_card"),
+        (ItemKind::Card, false) => crate::i18n::t("edit.editing_card"),
+        (ItemKind::Identity, true) => crate::i18n::t("edit.new_identity"),
+        (ItemKind::Identity, false) => crate::i18n::t("edit.editing_identity"),
+        (ItemKind::SecureNote, true) => crate::i18n::t("edit.new_note"),
+        (ItemKind::SecureNote, false) => crate::i18n::t("edit.editing_note"),
+        (ItemKind::SshKey, true) => crate::i18n::t("edit.new_ssh"),
+        (ItemKind::SshKey, false) => crate::i18n::t("edit.editing_ssh"),
+        (ItemKind::Unknown(_), true) => crate::i18n::t("edit.new_unknown"),
+        (ItemKind::Unknown(_), false) => crate::i18n::t("edit.editing_unknown"),
     };
-    if creating { format!("New {lowered}") } else { format!("Editing {lowered}") }
+    text.to_string()
 }
 
 /// Spec B 1.1's header bar: Back, the 64pt avatar with its camera badge and
@@ -10591,7 +10788,7 @@ fn edit_header(
     let back_ink = if back.hovered() { p.blue } else { p.text_icon };
     ui.painter().rect(back_rect, egui::CornerRadius::same(13), p.card, egui::Stroke::new(1.0, if back.hovered() { p.blue } else { p.border }), egui::StrokeKind::Inside);
     kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(back_rect.center(), egui::Vec2::splat(20.0)), kit::icon::glyph::BACK, 2.2, back_ink);
-    kit::tips::hint(ui, &back, "Close without saving", &["Esc"]);
+    kit::tips::hint(ui, &back, crate::i18n::t("edit.close_without_saving"), &["Esc"]);
 
     // The avatar and its camera badge; either opens the icon menu.
     let avatar = if show_avatar {
@@ -10621,7 +10818,7 @@ fn edit_header(
     let avatar_response = ui
         .interact(avatar.union(badge), edit_control_id(EditControl::Avatar), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    kit::tips::hint(ui, &avatar_response, "Change image", &[]);
+    kit::tips::hint(ui, &avatar_response, crate::i18n::t("edit.change_image"), &[]);
     // Spec B 1.2's menu. Each choice is written to the saved item at once
     // (0.15's rule for icons), so a new item has none to offer yet.
     if let Some(saved) = item {
@@ -10644,7 +10841,7 @@ fn edit_header(
                         AvatarRow::Refresh => action = EditAction::RefreshIcon,
                         AvatarRow::Upload => action = EditAction::SelectIcon,
                         AvatarRow::App if app.is_some() => action = EditAction::UseAppIcon,
-                        AvatarRow::App => kit::toast::show(ui.ctx(), AVATAR_APP_FIRST_TOAST),
+                        AvatarRow::App => kit::toast::show(ui.ctx(), avatar_app_first_toast()),
                         AvatarRow::Swatch(index) => action = EditAction::SetIconColour(index),
                         AvatarRow::Remove => action = EditAction::ClearIcon,
                     }
@@ -10658,8 +10855,8 @@ fn edit_header(
     // The header's Save is always "Save": the longer labels ("Save (needs a
     // name)") squeezed the title to nothing on a narrow editor. The reason
     // is the button's hint, and the footer sentence still says it.
-    let save_w = controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, SAVE_BUTTON, false);
-    let cancel_w = controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, CANCEL_BUTTON, false);
+    let save_w = controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, save_button(), false);
+    let cancel_w = controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, cancel_button(), false);
     let save_rect = egui::Rect::from_min_size(egui::pos2(row.right() - save_w, row.center().y - 24.0), egui::vec2(save_w, 48.0));
     let cancel_rect = if show_cancel {
         egui::Rect::from_min_size(egui::pos2(save_rect.left() - 12.0 - cancel_w, save_rect.top()), egui::vec2(cancel_w, 48.0))
@@ -10668,9 +10865,9 @@ fn edit_header(
     };
     let cancel_clicked = if show_cancel {
         let mut cancel_ui = ui.new_child(egui::UiBuilder::new().max_rect(cancel_rect));
-        let cancel = controls::button(&mut cancel_ui, controls::ButtonKind::Outline, controls::LARGE, CANCEL_BUTTON, None);
+        let cancel = controls::button(&mut cancel_ui, controls::ButtonKind::Outline, controls::LARGE, cancel_button(), None);
         let _ = ui.interact(cancel.rect, edit_control_id(EditControl::Cancel), egui::Sense::hover());
-        kit::tips::hint(ui, &cancel, "Close without saving", &["Esc"]);
+        kit::tips::hint(ui, &cancel, crate::i18n::t("edit.close_without_saving"), &["Esc"]);
         cancel.clicked()
     } else {
         false
@@ -10681,7 +10878,7 @@ fn edit_header(
     if !draft.name.trim().is_empty() && !(draft.is_saveable() && creatable) {
         save_ui.disable();
     }
-    let save = controls::button(&mut save_ui, controls::ButtonKind::Primary, controls::LARGE, SAVE_BUTTON, None);
+    let save = controls::button(&mut save_ui, controls::ButtonKind::Primary, controls::LARGE, save_button(), None);
     let _ = ui.interact(save.rect, edit_control_id(EditControl::Save), egui::Sense::hover());
     kit::tips::hint(ui, &save, save_label(draft), &["Mod", "S"]);
 
@@ -10695,7 +10892,7 @@ fn edit_header(
     }
     if save.clicked() {
         if draft.name.trim().is_empty() {
-            kit::toast::show(&ctx, NAME_FIRST_TOAST);
+            kit::toast::show(&ctx, name_first_toast());
             ctx.memory_mut(|m| m.request_focus(edit_title_id()));
         } else if draft.is_saveable() && creatable {
             action = EditAction::Save;
@@ -10713,7 +10910,7 @@ fn edit_header(
     ui.painter().galley(egui::pos2(left, top), kind_galley.clone(), p.text_label);
     // The pencil follows the name (with room for the field's own margins)
     // rather than waiting at the far edge of a wide header.
-    let shown = if draft.name.is_empty() { if creating { "Give it a name" } else { "Untitled" } } else { draft.name.as_str() };
+    let shown = if draft.name.is_empty() { if creating { crate::i18n::t("edit.give_name") } else { crate::i18n::t("edit.untitled") } } else { draft.name.as_str() };
     let name_w = ctx.fonts_mut(|f| {
         f.layout_no_wrap(
             shown.to_owned(),
@@ -10743,7 +10940,7 @@ fn edit_header(
             .id(edit_title_id())
             .font(egui::FontId::new(28.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
             .text_color(p.ink)
-            .hint_text(if creating { "Give it a name" } else { "Untitled" })
+            .hint_text(if creating { crate::i18n::t("edit.give_name") } else { crate::i18n::t("edit.untitled") })
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 2)))
             .desired_width(field.width()),
     );
@@ -10764,7 +10961,7 @@ fn edit_header(
     let pencil_response = ui.interact(pencil, ui.id().with("edit-title-pencil"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     ui.painter().rect_filled(pencil, egui::CornerRadius::same(9), p.blue_wash);
     kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(pencil.center(), egui::Vec2::splat(15.0)), kit::icon::glyph::EDIT, 2.0, p.blue);
-    kit::tips::hint(ui, &pencil_response, "Rename", &["F2"]);
+    kit::tips::hint(ui, &pencil_response, crate::i18n::t("edit.rename"), &["F2"]);
     if pencil_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::F2)) {
         ctx.memory_mut(|m| m.request_focus(edit_title_id()));
     }
@@ -10937,18 +11134,18 @@ fn history_rows(
     // not to invent either of them.
     let stamp = |key: &str| item.other.get(key).and_then(|v| v.as_str()).map(str::to_string);
     if let Some(created) = stamp("creationDate") {
-        rows.push(("Created", detail::history_label(Some(&created))));
+        rows.push((crate::i18n::t("edit.row_created"), detail::history_label(Some(&created))));
     }
     if let Some(updated) = stamp("revisionDate") {
-        rows.push(("Last changed", detail::history_label(Some(&updated))));
+        rows.push((crate::i18n::t("edit.row_last_changed"), detail::history_label(Some(&updated))));
     }
     // 8a's `3 previous`, as a count rather than a link: the previous
     // passwords are drawn in full on the credentials card above, so a link
     // here would scroll to something already on screen.
     if previous_passwords > 0 {
-        rows.push(("Password changed", previous_password_count(previous_passwords)));
+        rows.push((crate::i18n::t("edit.row_password_changed"), previous_password_count(previous_passwords)));
     }
-    rows.push(("Filled", fill_count_label(fills)));
+    rows.push((crate::i18n::t("edit.row_filled"), fill_count_label(fills)));
     rows
 }
 
@@ -10958,19 +11155,16 @@ const HISTORY_ROW_GAP: f32 = 8.0;
 
 /// 8a's `3 previous`, with the word agreeing with the number.
 fn previous_password_count(previous: usize) -> String {
-    match previous {
-        1 => "1 previous password".to_string(),
-        n => format!("{n} previous passwords"),
-    }
+    crate::i18n::tn("edit.previous_passwords", previous as u64, &[])
 }
 
 /// 8a's `41 times`, with the word agreeing with the number and saying so
 /// plainly when there are none -- `0 times` reads as a broken counter.
 fn fill_count_label(fills: u32) -> String {
     match fills {
-        0 => "Never".to_string(),
-        1 => "Once".to_string(),
-        n => format!("{n} times"),
+        0 => crate::i18n::t("edit.fill_never").to_string(),
+        1 => crate::i18n::t("edit.fill_once").to_string(),
+        n => crate::i18n::tn("edit.fill_times", n as u64, &[]),
     }
 }
 
@@ -11008,7 +11202,7 @@ fn fill_count_label(fills: u32) -> String {
 fn owner_line(audience: &crate::rest::organizations::Audience) -> String {
     use crate::rest::organizations::Audience;
     match audience {
-        Audience::Personal => OWNER_PERSONAL.to_string(),
+        Audience::Personal => owner_personal().to_string(),
         Audience::Shared { organisation, collections, .. } => match collections.as_slice() {
             [] => organisation.clone(),
             [one] => format!("{organisation} \u{b7} {one}"),
@@ -11019,18 +11213,20 @@ fn owner_line(audience: &crate::rest::organizations::Audience) -> String {
         // A record in this account's own sharing org is still the owner's own:
         // the org is plumbing and is never named (spec 6.9).
         Audience::SharedWithPeople { people } => match people.len() {
-            0 => OWNER_PERSONAL.to_string(),
-            1 => format!("{OWNER_PERSONAL} \u{b7} shared with {}", people[0]),
-            n => format!("{OWNER_PERSONAL} \u{b7} shared with {n} people"),
+            0 => owner_personal().to_string(),
+            1 => crate::i18n::tf("edit.owner_shared_with", &[("owner", owner_personal()), ("name", &people[0])]),
+            n => crate::i18n::tn("edit.owner_shared_with_n", n as u64, &[("owner", owner_personal())]),
         },
-        Audience::SharedWithMe { from, verified: true } => format!("Shared by {from}"),
-        Audience::SharedWithMe { from, verified: false } => format!("Shared by {from} \u{b7} unverified"),
+        Audience::SharedWithMe { from, verified: true } => crate::i18n::tf("edit.owner_shared_by", &[("from", from)]),
+        Audience::SharedWithMe { from, verified: false } => crate::i18n::tf("edit.owner_shared_by_unverified", &[("from", from)]),
     }
 }
 
 /// [`owner_line`] for an item nobody else can see. Bitwarden's own word for
 /// the personal vault, so the cell reads as the product does.
-const OWNER_PERSONAL: &str = "My vault";
+fn owner_personal() -> &'static str {
+    crate::i18n::t("edit.owner_personal")
+}
 
 /// \u{8a}'s `Owner` cell is read-only in this build, and this says why.
 ///
@@ -11039,9 +11235,9 @@ const OWNER_PERSONAL: &str = "My vault";
 /// `rest::organizations`' own note on what it would take. A combo box that
 /// listed owners and refused every one of them would be worse than a field
 /// that says what the owner IS, which is what §8a's cell is for anyway.
-const OWNER_HINT: &str =
-    "Deskwarden cannot move an item between vaults or collections. Change this in the \
-     Bitwarden web vault or app.";
+fn owner_hint_text() -> &'static str {
+    crate::i18n::t("edit.owner_hint")
+}
 
 fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<String> {
     use crate::rest::organizations::Audience;
@@ -11061,10 +11257,9 @@ fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<Strin
         // server has no such route, or refused it, or has not been asked --
         // and a card that said `0 other people` would be stating as fact the
         // one thing this app does not know. See `Roster`'s own doc.
-        None => format!("Shared through {where_}."),
-        Some(0) => format!("In {where_}, and nobody else can see it."),
-        Some(1) => format!("Also visible to 1 other person in {where_}."),
-        Some(n) => format!("Also visible to {n} other people in {where_}."),
+        None => crate::i18n::tf("edit.visible_through", &[("where", &where_)]),
+        Some(0) => crate::i18n::tf("edit.visible_only_you", &[("where", &where_)]),
+        Some(n) => crate::i18n::tn("edit.visible_also", *n as u64, &[("where", &where_)]),
     })
 }
 
@@ -11097,17 +11292,23 @@ fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<Strin
 /// arm both draw them and the tests read them, and three spellings of one
 /// word is how a card ends up saying `Folder` in one layout and `folder` in
 /// the other.
-const ITEM_FOLDER_LABEL: &str = "Folder";
-const ITEM_OWNER_LABEL: &str = "Owner";
-const ITEM_TYPE_LABEL: &str = "Type";
+fn item_folder_label() -> &'static str {
+    crate::i18n::t("edit.item_folder_label")
+}
+fn item_owner_label() -> &'static str {
+    crate::i18n::t("edit.item_owner_label")
+}
+fn item_type_label() -> &'static str {
+    crate::i18n::t("edit.item_type_label")
+}
 
 /// What the CLI will not do, said once.
 ///
 /// Drawn under the folder control in the stacked arm and under the whole row
 /// in the grid -- a 148-point cell is not where a three-line sentence goes.
-const UNFILE_REFUSAL: &str =
-    "This item can be moved to another folder, but the Bitwarden CLI this app talks to \
-     cannot remove an item from a folder. Un-file it in the web vault or app.";
+fn unfile_refusal() -> &'static str {
+    crate::i18n::t("edit.unfile_refusal")
+}
 
 /// The `Owner` control: what §8a draws as a combo, and what this build can
 /// only report. See [`OWNER_HINT`], which is the sentence the box carries so
@@ -11125,14 +11326,16 @@ fn owner_field(ui: &mut egui::Ui, owner: &str, hint: &str) {
 fn owner_hint(audience: &crate::rest::organizations::Audience) -> String {
     match audience {
         crate::rest::organizations::Audience::SharedWithMe { verified: false, .. } => {
-            format!("{}\n\n{OWNER_HINT}", crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP)
+            format!("{}\n\n{}", crate::vault_window::detail::unverified_sharer_tooltip(), owner_hint_text())
         }
-        _ => OWNER_HINT.to_string(),
+        _ => owner_hint_text().to_string(),
     }
 }
 
 /// 8a's `Copy`, and the read pane's own word for the same act.
-const COPY_LABEL: &str = "Copy";
+fn copy_label() -> &'static str {
+    crate::i18n::t("edit.copy_label")
+}
 
 /// **A row laid out as 8a lays one: a field that takes what is LEFT, and
 /// `buttons` of them after it.**
@@ -11350,7 +11553,7 @@ pub(crate) fn folder_options(folders: &[Folder], may_unfile: bool) -> Vec<String
         return Vec::new();
     }
     may_unfile
-        .then(|| NO_FOLDER_LABEL.to_string())
+        .then(|| no_folder_label().to_string())
         .into_iter()
         .chain(assignable.iter().map(|f| f.name.clone()))
         .collect()
@@ -11398,14 +11601,14 @@ fn folder_combo(
                 .iter()
                 .find(|f| Some(&f.id) == draft.folder_id.as_ref())
                 .map(|f| f.name.as_str())
-                .unwrap_or(NO_FOLDER_LABEL),
+                .unwrap_or(no_folder_label()),
         )
         .show_ui(ui, |ui| {
             // "No folder" is offered only when it can actually take effect --
             // see `EditDraft::may_unfile`. Shown disabled rather than hidden,
             // so the option's absence is a visible limitation instead of a
             // missing row.
-            let unfile = egui::Button::selectable(draft.folder_id.is_none(), NO_FOLDER_LABEL);
+            let unfile = egui::Button::selectable(draft.folder_id.is_none(), no_folder_label());
             if ui.add_enabled(may_unfile, unfile).clicked() {
                 draft.folder_id = None;
             }
@@ -11419,7 +11622,9 @@ fn folder_combo(
 }
 
 /// What the folder cell says for an item that is in none.
-const NO_FOLDER_LABEL: &str = "No folder";
+fn no_folder_label() -> &'static str {
+    crate::i18n::t("edit.no_folder_label")
+}
 
 static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -11429,7 +11634,9 @@ fn next_session() -> u64 {
 }
 
 /// Spec B 1.4 D: the Fills in card's add box.
-pub(crate) const FILLS_IN_ADD_PLACEHOLDER: &str = "Add an app or website";
+pub(crate) fn fills_in_add_placeholder() -> &'static str {
+    crate::i18n::t("edit.fills_in_add_placeholder")
+}
 
 pub(crate) fn fills_in_add_id() -> egui::Id {
     egui::Id::new("edit-fills-in-add")
@@ -11457,14 +11664,14 @@ const TWO_COLUMN_FLOOR: f32 = 900.0;
 /// IS.
 fn kind_noun(kind: ItemKind) -> &'static str {
     match kind {
-        ItemKind::Login => "Login",
-        ItemKind::Card => "Card",
-        ItemKind::Identity => "Identity",
-        ItemKind::SecureNote => "Secure note",
-        ItemKind::SshKey => "SSH key",
+        ItemKind::Login => crate::i18n::t("new_item.login"),
+        ItemKind::Card => crate::i18n::t("new_item.card"),
+        ItemKind::Identity => crate::i18n::t("edit.sec_identity"),
+        ItemKind::SecureNote => crate::i18n::t("new_item.note"),
+        ItemKind::SshKey => crate::i18n::t("new_item.ssh"),
         // The wire's own number is the only honest answer for a kind this
         // build has never heard of.
-        ItemKind::Unknown(_) => "Unknown type",
+        ItemKind::Unknown(_) => crate::i18n::t("edit.kind_unknown"),
     }
 }
 
@@ -11485,17 +11692,23 @@ pub fn strength_bars(rating: password_strength::Strength) -> usize {
 }
 
 /// 8a's `Unsaved changes` pill, in the form's title bar.
-pub const UNSAVED_PILL: &str = "Unsaved changes";
+pub fn unsaved_pill() -> &'static str {
+    crate::i18n::t("edit.unsaved_pill")
+}
 
 /// 8a's `Save changes`. Named because the footer, its paint test and the
 /// summary beside it all have to agree on the word.
-pub const SAVE_BUTTON: &str = "Save changes";
+pub fn save_button() -> &'static str {
+    crate::i18n::t("edit.save_button")
+}
 
 /// The other answer. Named for [`SAVE_BUTTON`]'s reason: the footer now
 /// MEASURES both captions before it lays either of them out, so a caption that
 /// lived only at its call site would be one the measurement could disagree
 /// with.
-pub const CANCEL_BUTTON: &str = "Cancel";
+pub fn cancel_button() -> &'static str {
+    crate::i18n::t("edit.cancel_button")
+}
 
 /// What the Save button says, which is how the footer reports a fault beside
 /// the control that fault disables.
@@ -11534,13 +11747,13 @@ pub const SAVE_CHORD_LABEL: &str = "CTRL+S";
 
 fn save_label(draft: &EditDraft) -> &'static str {
     if !draft.is_valid() {
-        "Save (needs a name)"
+        crate::i18n::t("edit.save_needs_name")
     } else if draft.sequence_fault().is_some() {
-        SAVE_TEMPLATE_BLOCKED
+        save_template_blocked()
     } else if draft.pin_name_fault().is_some() {
-        SAVE_PIN_NAME_BLOCKED
+        save_pin_name_blocked()
     } else {
-        SAVE_BUTTON
+        save_button()
     }
 }
 
@@ -11551,7 +11764,9 @@ fn save_label(draft: &EditDraft) -> &'static str {
 /// the copy the SERVER sends back, so this form's Save really is a round trip
 /// to Bitwarden and not a local write. A user deciding whether to press it
 /// while offline is being told something they cannot otherwise see.
-pub const SYNC_NOTE: &str = "Syncs to Bitwarden on save";
+pub fn sync_note() -> &'static str {
+    crate::i18n::t("edit.sync_note")
+}
 
 /// 8a's footer summary: `2 changes \u{b7} password will be added to history`.
 ///
@@ -11575,14 +11790,14 @@ pub const SYNC_NOTE: &str = "Syncs to Bitwarden on save";
 /// wording be tested against a list of [`Change`]s alone.
 fn change_summary(changes: &[Change], password: &str) -> String {
     if changes.is_empty() {
-        return NO_CHANGES_NOTE.to_string();
+        return no_changes_note().to_string();
     }
     let count = changes.len();
     let counted =
-        if count == 1 { "1 change".to_string() } else { format!("{count} changes") };
+        crate::i18n::tn("edit.changes", count as u64, &[]);
     let password_moved = changes.iter().any(|c| c.label == ChangeUnit::Password.label());
     if password_moved && !password.is_empty() {
-        format!("{counted} \u{b7} password will be added to history")
+        crate::i18n::tf("edit.changes_password", &[("counted", &counted)])
     } else {
         counted
     }
@@ -11597,11 +11812,15 @@ fn change_summary(changes: &[Change], password: &str) -> String {
 /// the scroll viewport above it. Saying "No changes yet" keeps the band one
 /// height in both states AND answers the question the Save button raises on a
 /// form nobody has edited.
-const NO_CHANGES_NOTE: &str = "No changes yet";
+fn no_changes_note() -> &'static str {
+    crate::i18n::t("edit.no_changes_note")
+}
 
 /// The ambiguous-characters chip's label. Named because two tests and the
 /// widget have to agree on it.
-const AVOID_AMBIGUOUS: &str = "Avoid lookalikes (0/O, 1/l)";
+fn avoid_ambiguous() -> &'static str {
+    crate::i18n::t("edit.avoid_ambiguous")
+}
 
 // Draw entry point: its arguments are the state it paints; a bundle would only move them.
 #[allow(clippy::too_many_arguments)]
@@ -11902,17 +12121,14 @@ pub fn draw_detail_edit(
             );
             if !creatable {
                 ui.label(
-                    RichText::new(
-                        "Deskwarden does not know this item type and cannot create one. Create \
-                         it in the Bitwarden web vault or app.",
-                    )
+                    RichText::new(crate::i18n::t("edit.cannot_create"))
                     .size(12.0)
                     .color(theme::ERROR),
                 );
                 ui.add_space(6.0);
             }
             if !draft.is_valid() {
-                ui.label(RichText::new("Name is required.").size(12.0).color(theme::ERROR));
+                ui.label(RichText::new(crate::i18n::t("edit.name_required")).size(12.0).color(theme::ERROR));
                 ui.add_space(6.0);
             }
             // Repeated here, beside the button it disables. The same sentence
@@ -11950,7 +12166,7 @@ pub fn draw_detail_edit(
             // already has.
             let summary = change_summary(&changes, &draft.password);
             let summary_width = theme::form_footer_note_width(ui, &summary);
-            let note_width = theme::form_footer_note_width(ui, SYNC_NOTE);
+            let note_width = theme::form_footer_note_width(ui, sync_note());
             // 8a's `gap: 10px` between the two buttons, and it is the SAME
             // number the row below sets as its item spacing -- so the width
             // measured here is the width laid out there.
@@ -11968,7 +12184,7 @@ pub fn draw_detail_edit(
             ) + gap
                 + theme::action_button_width(
                     ui.painter(),
-                    CANCEL_BUTTON,
+                    cancel_button(),
                     theme::SECTION_FOOTER_BUTTON_PAD_X,
                 );
             let beside = ui.available_width() >= buttons + gap + 4.0 + summary_width;
@@ -12047,7 +12263,7 @@ pub fn draw_detail_edit(
                             egui::Sense::hover(),
                         );
                         let galley = ui.painter().layout_no_wrap(
-                            SYNC_NOTE.to_string(),
+                            sync_note().to_string(),
                             egui::FontId::new(12.0, egui::FontFamily::Proportional),
                             theme::TEXT_GHOST,
                         );
@@ -12217,13 +12433,13 @@ pub fn draw_detail_edit(
                     ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.x = theme::SECTION_GRID_GAP;
                         ui.columns(3, |cols| {
-                            theme::section_grid_cell(&mut cols[0], ITEM_FOLDER_LABEL, |ui| {
+                            theme::section_grid_cell(&mut cols[0], item_folder_label(), |ui| {
                                 folder_combo(ui, draft, folders, may_unfile);
                             });
-                            theme::section_grid_cell(&mut cols[1], ITEM_OWNER_LABEL, |ui| {
+                            theme::section_grid_cell(&mut cols[1], item_owner_label(), |ui| {
                                 owner_field(ui, &owner, &owner_hint);
                             });
-                            theme::section_grid_cell(&mut cols[2], ITEM_TYPE_LABEL, |ui| {
+                            theme::section_grid_cell(&mut cols[2], item_type_label(), |ui| {
                                 theme::section_disabled_text_field(ui, kind_noun(kind));
                             });
                         });
@@ -12232,11 +12448,11 @@ pub fn draw_detail_edit(
                     // inside a 148-point cell. Same sentence, same condition.
                     if !may_unfile {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(UNFILE_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+                        ui.label(RichText::new(unfile_refusal()).size(11.0).color(theme::TEXT_FAINT));
                     }
                     return;
                 }
-                theme::section_row(ui, ITEM_FOLDER_LABEL, |ui| {
+                theme::section_row(ui, item_folder_label(), |ui| {
                     // Both the label and the rows read the *assignable* list,
                     // not the raw one, and the label matters as much as the
                     // rows: resolving a draft's folder id against the virtual
@@ -12248,13 +12464,13 @@ pub fn draw_detail_edit(
                     folder_combo(ui, draft, folders, may_unfile);
                     if !may_unfile {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(UNFILE_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+                        ui.label(RichText::new(unfile_refusal()).size(11.0).color(theme::TEXT_FAINT));
                     }
                 });
-                theme::section_row(ui, ITEM_OWNER_LABEL, |ui| {
+                theme::section_row(ui, item_owner_label(), |ui| {
                     owner_field(ui, &owner, &owner_hint);
                 });
-                theme::section_row(ui, ITEM_TYPE_LABEL, |ui| {
+                theme::section_row(ui, item_type_label(), |ui| {
                     theme::section_disabled_text_field(ui, kind_noun(kind));
                 });
             });
@@ -12284,14 +12500,14 @@ pub fn draw_detail_edit(
                         // what is LEFT -- laid out the other way round the
                         // box takes `available_width` and the Copy is pushed
                         // off the card. See `row_with_buttons`.
-                        row_with_buttons(ui, &[COPY_LABEL], |ui, room| {
+                        row_with_buttons(ui, &[copy_label()], |ui, room| {
                             theme::section_text_field_within(
                                 ui,
                                 &mut draft.username,
                                 false,
                                 room,
                             );
-                            if crate::kit::controls::row_button(ui, COPY_LABEL).clicked() {
+                            if crate::kit::controls::row_button(ui, copy_label()).clicked() {
                                 action = EditAction::CopyUsername;
                             }
                         });
@@ -12322,7 +12538,7 @@ pub fn draw_detail_edit(
                         // can never move is a control that lies, and the
                         // toggle is 52 points of the box's right inset that
                         // this row can give back to the value.
-                        row_with_buttons(ui, &[COPY_LABEL], |ui, room| {
+                        row_with_buttons(ui, &[copy_label()], |ui, room| {
                             // Spec B 1.4 A: hidden until the eye shows it,
                             // with Generate inside the field.
                             let field = crate::kit::input::password(
@@ -12345,7 +12561,7 @@ pub fn draw_detail_edit(
                             // asking for the first candidate are one thing to
                             // the user and are one thing here. See
                             // `draw_generator_modal`.
-                            if crate::kit::controls::row_button(ui, COPY_LABEL).clicked() {
+                            if crate::kit::controls::row_button(ui, copy_label()).clicked() {
                                 action = EditAction::CopyPassword;
                             }
                         });
@@ -12538,9 +12754,9 @@ pub fn draw_detail_edit(
                     let offers_clear =
                         !creating && !(card.number.is_empty() && card.brand.is_empty());
                     let mut clear_card = false;
-                    theme::section_row(ui, CARD_ROW_LABEL, |ui| {
+                    theme::section_row(ui, card_row_label(), |ui| {
                         let buttons: &[&str] =
-                            if offers_clear { &[SLOT_REMOVE_BUTTON] } else { &[] };
+                            if offers_clear { &[slot_remove_button()] } else { &[] };
                         row_with_buttons(ui, buttons, |ui, room| {
                             let brand = brand_combo(ui, card);
                             // Design 1e: the network the digits so far (else
@@ -12572,7 +12788,7 @@ pub fn draw_detail_edit(
                                 number_room,
                             );
                             if offers_clear
-                                && crate::kit::controls::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked()
+                                && crate::kit::controls::row_button_danger(ui, slot_remove_button()).clicked()
                             {
                                 clear_card = true;
                             }
@@ -12590,7 +12806,7 @@ pub fn draw_detail_edit(
 
                     // 3. Expires: month / year, Code, PIN -- one line, no
                     // Remove (owner's decision: an empty box is not saved).
-                    theme::section_row(ui, EXPIRES_ROW_LABEL, |ui| {
+                    theme::section_row(ui, expires_row_label(), |ui| {
                         expires_row(ui, card, creating, caption_ink);
                     });
 
@@ -12602,7 +12818,7 @@ pub fn draw_detail_edit(
                     if showing(Slot::CardBillingZip) {
                         theme::section_row(ui, Slot::CardBillingZip.label(), |ui| {
                             if creating {
-                                theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                                theme::section_disabled_text_field(ui, card_field_create_notice());
                             } else if field_with_remove(ui, |ui, room| {
                                 // Free text, unlike the bank: a postcode has
                                 // no closed set to pick from, and a wrong one
@@ -12629,12 +12845,12 @@ pub fn draw_detail_edit(
                     if showing(Slot::CardBank) {
                         theme::section_row(ui, Slot::CardBank.label(), |ui| {
                             if creating {
-                                theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                                theme::section_disabled_text_field(ui, card_field_create_notice());
                             } else if bank_domain_row(ui, card) {
                                 hide = Some(Slot::CardBank);
                             }
                             ui.add_space(4.0);
-                            ui.label(RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT));
+                            ui.label(RichText::new(bank_hint()).size(11.0).color(theme::TEXT_FAINT));
                         });
                     }
                 }
@@ -12725,11 +12941,7 @@ pub fn draw_detail_edit(
                     }
                 FormBody::UneditableNotice => {
                     ui.label(
-                        RichText::new(
-                            "Deskwarden can change only the name and folder of this item. Its \
-                             contents are left exactly as they are -- open it in the Bitwarden \
-                             web vault or app to edit them.",
-                        )
+                        RichText::new(crate::i18n::t("edit.uneditable"))
                         .size(12.0)
                         .color(theme::TEXT_FAINT),
                     );
@@ -12818,7 +13030,7 @@ pub fn draw_detail_edit(
                         }
                         theme::section_row(ui, Slot::Totp.label(), |ui| {
                             if creating {
-                                theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                                theme::section_disabled_text_field(ui, totp_create_notice());
                             } else if !has_seed {
                                 // **The empty state is ONE BUTTON**, and the
                                 // owner has now cut it down twice: first from
@@ -12846,7 +13058,7 @@ pub fn draw_detail_edit(
                                     ui.ctx(),
                                     crate::kit::controls::ButtonKind::Tinted,
                                     TOTP_ROW_BUTTON,
-                                    TOTP_ADD_BUTTON,
+                                    totp_add_button(),
                                     true,
                                 );
                                 let slack = ui.available_width() - width;
@@ -12860,7 +13072,7 @@ pub fn draw_detail_edit(
                                         ui,
                                         crate::kit::controls::ButtonKind::Tinted,
                                         TOTP_ROW_BUTTON,
-                                        TOTP_ADD_BUTTON,
+                                        totp_add_button(),
                                         Some(crate::kit::icon::glyph::SCAN),
                                     )
                                     .clicked()
@@ -12882,7 +13094,7 @@ pub fn draw_detail_edit(
                                 // one for Remove, the only destructive press on
                                 // this card.
                                 use crate::kit::controls::{self, ButtonKind};
-                                let reserved: f32 = [(ButtonKind::Outline, TOTP_REPLACE_BUTTON), (ButtonKind::Danger, SLOT_REMOVE_BUTTON)]
+                                let reserved: f32 = [(ButtonKind::Outline, totp_replace_button()), (ButtonKind::Danger, slot_remove_button())]
                                     .iter()
                                     .map(|(kind, label)| controls::button_width(ui.ctx(), *kind, controls::SMALL, label, false) + theme::ROW_BUTTON_GAP)
                                     .sum();
@@ -12895,12 +13107,12 @@ pub fn draw_detail_edit(
                                         &mut draft.reveal_totp,
                                         room,
                                     );
-                                    if controls::button(ui, ButtonKind::Outline, controls::SMALL, TOTP_REPLACE_BUTTON, None).clicked() {
+                                    if controls::button(ui, ButtonKind::Outline, controls::SMALL, totp_replace_button(), None).clicked() {
                                         action = EditAction::AddTotp;
                                     }
-                                    if controls::button(ui, ButtonKind::Danger, controls::SMALL, SLOT_REMOVE_BUTTON, None).clicked() {
+                                    if controls::button(ui, ButtonKind::Danger, controls::SMALL, slot_remove_button(), None).clicked() {
                                         hide = Some(Slot::Totp);
-                                        crate::kit::toast::show(ui.ctx(), TOTP_REMOVED_TOAST);
+                                        crate::kit::toast::show(ui.ctx(), totp_removed_toast());
                                     }
                                 });
                             }
@@ -12912,7 +13124,7 @@ pub fn draw_detail_edit(
                             if has_seed || creating {
                                 ui.add_space(4.0);
                                 ui.label(
-                                    RichText::new(TOTP_HINT).size(13.0).color(theme::TEXT_FAINT),
+                                    RichText::new(totp_hint()).size(13.0).color(theme::TEXT_FAINT),
                                 );
                             }
                         });
@@ -13131,7 +13343,7 @@ pub fn draw_detail_edit(
                     // `TextEdit` frame; see the note kind's box for the
                     // history. Four rows, which is about what 8a's box holds
                     // beside the `Custom fields` card it shares a line with.
-                    theme::text_area_v2(ui, &mut draft.note_body, NOTES_PLACEHOLDER, 96.0, 14);
+                    theme::text_area_v2(ui, &mut draft.note_body, notes_placeholder(), 96.0, 14);
                 });
             }
 
@@ -13374,10 +13586,14 @@ fn escape_cancels(ui: &egui::Ui, card_up: bool) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The generator card's heading, in the header band's white bold.
-const GENERATOR_TITLE: &str = "Generate password";
+fn generator_title() -> &'static str {
+    crate::i18n::t("edit.generator_title")
+}
 
 /// 3d's caption over the candidate.
-const GENERATOR_CAPTION: &str = "GENERATED";
+fn generator_caption() -> &'static str {
+    crate::i18n::t("edit.generator_caption")
+}
 
 /// 3d's `font-size: 11px` and its `letter-spacing: 0.1em`, which at 11px is
 /// 1.1 points. `theme::letterspaced` wants the tracking in points because
@@ -13424,7 +13640,9 @@ const GENERATOR_CARD_WIDTH: f32 = 520.0;
 /// `Area` by the size egui measured on the PREVIOUS pass, so a body that
 /// changed height between two frames would paint the card once in a position
 /// it no longer fits -- the jump `theme::note_modal_shape_change` exists for.
-const GENERATOR_PENDING: &str = "no password yet";
+fn generator_pending() -> &'static str {
+    crate::i18n::t("edit.generator_pending")
+}
 
 /// The affirmative answer's words.
 ///
@@ -13432,21 +13650,31 @@ const GENERATOR_PENDING: &str = "no password yet";
 /// application and writes a new item; this one replaces the text in a box on a
 /// form the user still has to save. A caption promising a save would be a
 /// promise this card cannot keep.
-const GENERATOR_USE: &str = "Use password";
+fn generator_use() -> &'static str {
+    crate::i18n::t("edit.generator_use")
+}
 
 /// The way out, and the word the header's ✕ resolves to.
-const GENERATOR_CANCEL: &str = "Cancel";
+fn generator_cancel() -> &'static str {
+    crate::i18n::t("edit.generator_cancel")
+}
 
 /// 3d's `CTRL+R NEW`, as this app's own two controls: the chord in a keycap
 /// and the verb on a button. 3d prints the pair as one static monospace run,
 /// which is a hint rather than a control -- readable in an overlay a user
 /// drove there with the keyboard, and not enough on a card opened by a
 /// pointer.
-const GENERATOR_REROLL: &str = "New";
+fn generator_reroll() -> &'static str {
+    crate::i18n::t("edit.generator_reroll")
+}
 /// The segmented selector's two cells, in 3d's reading order (its own run puts
 /// the wordier choice first too).
-const GENERATOR_KIND_PASSWORD: &str = "Password";
-const GENERATOR_KIND_PASSPHRASE: &str = "Passphrase";
+fn generator_kind_password() -> &'static str {
+    crate::i18n::t("edit.generator_kind_password")
+}
+fn generator_kind_passphrase() -> &'static str {
+    crate::i18n::t("edit.generator_kind_passphrase")
+}
 
 /// What the generator modal came back with, or nothing if it is still asking.
 ///
@@ -13509,7 +13737,7 @@ fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> Generator
     // the mark and the scrim all mean Cancel, which is also the SAFE answer by
     // construction -- the card's other outcome overwrites a password the user
     // may have typed by hand.
-    let (outcome, ()) = Dialog::new(GENERATOR_ID, GENERATOR_CARD_WIDTH).title(GENERATOR_TITLE).show(ctx, |ui| {
+    let (outcome, ()) = Dialog::new(GENERATOR_ID, GENERATOR_CARD_WIDTH).title(generator_title()).show(ctx, |ui| {
         rerolled = generator_card_body(ui, &mut draft.generator);
         ui.add_space(22.0);
         const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
@@ -13523,10 +13751,10 @@ fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> Generator
             // `EditDraft::use_generated_password` refuses the empty case
             // anyway.
             used = columns[0]
-                .add_enabled_ui(ready, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, GENERATOR_USE))
+                .add_enabled_ui(ready, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, generator_use()))
                 .inner
                 .clicked();
-            cancelled = controls::button_filling(&mut columns[1], ButtonKind::Outline, ANSWER, GENERATOR_CANCEL).clicked();
+            cancelled = controls::button_filling(&mut columns[1], ButtonKind::Outline, ANSWER, generator_cancel()).clicked();
         });
     });
 
@@ -13605,7 +13833,7 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
         // cell pressed only when it is not already in force.
         let picked = controls::segmented(
             ui,
-            &[GENERATOR_KIND_PASSWORD, GENERATOR_KIND_PASSPHRASE],
+            &[generator_kind_password(), generator_kind_passphrase()],
             usize::from(generator.passphrase),
             controls::SEG_SETTINGS,
         );
@@ -13636,8 +13864,8 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
         }
         // 3d's `CTRL+R NEW`, at the end of the row 3d puts it at: the verb on
         // the button, the chord in its hint.
-        let new = controls::button(ui, ButtonKind::Tinted, controls::SMALL, GENERATOR_REROLL, Some(crate::kit::icon::glyph::GEN));
-        crate::kit::tips::hint(ui, &new, "Roll a new one", &["Ctrl", "R"]);
+        let new = controls::button(ui, ButtonKind::Tinted, controls::SMALL, generator_reroll(), Some(crate::kit::icon::glyph::GEN));
+        crate::kit::tips::hint(ui, &new, crate::i18n::t("edit.reroll_hint"), &["Ctrl", "R"]);
         if new.clicked() {
             reroll = true;
         }
@@ -13650,7 +13878,7 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
     // `the_generator_options_stay_inside_the_modal_card`.
     ui.add_space(14.0);
     ui.horizontal(|ui| {
-        if controls::button(ui, ButtonKind::Outline, controls::SMALL, GENERATOR_OPTIONS, None).clicked() {
+        if controls::button(ui, ButtonKind::Outline, controls::SMALL, generator_options_text(), None).clicked() {
             generator.options_open = !generator.options_open;
         }
     });
@@ -13696,7 +13924,7 @@ fn generator_caption_row(ui: &mut egui::Ui, preview: &str) {
     let (row, _) = ui.allocate_exact_size(egui::Vec2::new(ui.available_width(), 26.0), egui::Sense::hover());
     let painter = ui.painter();
     let galley = painter.layout_job(theme::letterspaced(
-        GENERATOR_CAPTION,
+        generator_caption(),
         GENERATOR_CAPTION_PX,
         theme::BOLD,
         GENERATOR_CAPTION_TRACKING,
@@ -13750,7 +13978,7 @@ fn generator_preview(ui: &mut egui::Ui, preview: &str) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut job = if preview.is_empty() {
-                theme::letterspaced_mono_in(GENERATOR_PENDING, GENERATOR_PREVIEW_PX, 0.0, p.text_ghost, GENERATOR_PREVIEW_LINE)
+                theme::letterspaced_mono_in(generator_pending(), GENERATOR_PREVIEW_PX, 0.0, p.text_ghost, GENERATOR_PREVIEW_LINE)
             } else {
                 theme::letterspaced_mono_in(preview, GENERATOR_PREVIEW_PX, GENERATOR_PREVIEW_TRACKING, p.ink, GENERATOR_PREVIEW_LINE)
             };
@@ -13793,10 +14021,10 @@ pub(crate) fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer>
         ctx,
         DISCARD_ID,
         480.0,
-        DISCARD_TITLE,
-        Some(DISCARD_BODY),
-        (DISCARD_CONFIRM, ButtonKind::Danger),
-        (DISCARD_KEEP, ButtonKind::Primary),
+        discard_title(),
+        Some(discard_body()),
+        (discard_confirm(), ButtonKind::Danger),
+        (discard_keep(), ButtonKind::Primary),
     ) {
         Confirmed::Pressed(Side::Left) => Some(DiscardAnswer::Discard),
         Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(DiscardAnswer::KeepEditing),
@@ -13809,11 +14037,18 @@ pub(crate) const DISCARD_ID: &str = "detail-edit-discard";
 
 /// The confirmation's four strings, named so the tests assert on the same
 /// bytes the screen shows rather than on a re-typed copy of them.
-const DISCARD_TITLE: &str = "Discard your changes?";
-const DISCARD_BODY: &str =
-    "This form has edits that have not been saved. Closing it now loses them.";
-const DISCARD_KEEP: &str = "Keep editing";
-const DISCARD_CONFIRM: &str = "Discard changes";
+fn discard_title() -> &'static str {
+    crate::i18n::t("edit.discard_title")
+}
+fn discard_body() -> &'static str {
+    crate::i18n::t("edit.discard_body")
+}
+fn discard_keep() -> &'static str {
+    crate::i18n::t("edit.discard_keep")
+}
+fn discard_confirm() -> &'static str {
+    crate::i18n::t("edit.discard_confirm")
+}
 
 #[cfg(test)]
 mod tests {
@@ -14007,7 +14242,7 @@ mod tests {
             r#"--profile-directory="Profile 2""#,
             "the draft keeps them, so a Cancel -- or a re-point at a real .exe -- puts them back"
         );
-        assert_eq!(app.to_match().args, "", "but a Store binding must not SAVE them");
+        assert_eq!(app.to_match().args, "", "but a Store binding must not k_save() them");
 
         // Positive control: the arguments of an unhosted binding are the user's
         // and are saved verbatim, so the assertion above is not satisfied by a
@@ -14114,7 +14349,7 @@ mod tests {
         );
         assert_eq!(
             picker_subtitle(&window_row("ApplicationFrameHost.exe", false), true),
-            format!("ApplicationFrameHost.exe \u{b7} {PICKER_REFUSAL_SHORT}"),
+            format!("ApplicationFrameHost.exe \u{b7} {picker_refusal_short_v}", picker_refusal_short_v = picker_refusal_short()),
             "8b's greyed row puts its reason here"
         );
     }
@@ -14200,12 +14435,11 @@ mod tests {
 
     #[test]
     fn a_store_binding_offers_no_path_box_and_says_why() {
-        assert_eq!(app_path_row(true), AppPathRow::NotApplicable(APP_PATH_STORE_APP));
+        assert_eq!(app_path_row(true), AppPathRow::NotApplicable(app_path_store_app()));
         assert_eq!(app_path_row(false), AppPathRow::Editable);
         assert!(
-            !APP_PATH_STORE_APP.to_lowercase().contains("hosted"),
-            "the mechanism must not reach the screen: {APP_PATH_STORE_APP:?}"
-        );
+            !app_path_store_app().to_lowercase().contains("hosted"),
+            "the mechanism must not reach the screen: {app_path_store_app_v:?}", app_path_store_app_v = app_path_store_app());
     }
 
     #[test]
@@ -14227,7 +14461,7 @@ mod tests {
         for text in [
             app_path_warning(&AppMatch { path: r"..\x\chrome.exe".to_string(), ..chrome_match() })
                 .unwrap(),
-            APP_ARGS_STORE_APP,
+            app_args_store_app(),
         ] {
             assert!(!text.to_lowercase().contains("hosted"), "{text:?}");
             assert!(
@@ -17124,13 +17358,12 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = card_draft();
         let painted = open_card(&ctx, &mut draft);
-        let use_it = in_card(&ctx, &painted, GENERATOR_USE);
+        let use_it = in_card(&ctx, &painted, generator_use());
 
         let _ = frame(&ctx, &mut draft, &click(use_it.center()));
         assert_eq!(
             draft.password, "Fresh-Generated-1",
-            "{GENERATOR_USE:?} did not put the candidate in the password box"
-        );
+            "{generator_use_v:?} did not put the candidate in the password box", generator_use_v = generator_use());
         assert!(!draft.generator.modal_open, "the card stayed open after its own answer");
     }
 
@@ -17142,7 +17375,7 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = card_draft();
         let painted = open_card(&ctx, &mut draft);
-        let cancel = in_card(&ctx, &painted, GENERATOR_CANCEL);
+        let cancel = in_card(&ctx, &painted, generator_cancel());
 
         let _ = frame(&ctx, &mut draft, &click(cancel.center()));
         assert_eq!(
@@ -17205,12 +17438,11 @@ mod generator_row_tests {
             painted.strings()
         );
         assert!(
-            painted.strings().contains(&GENERATOR_CAPTION),
-            "the card is missing 3d's {GENERATOR_CAPTION:?} caption; painted: {:?}",
-            painted.strings()
-        );
+            painted.strings().contains(&generator_caption()),
+            "the card is missing 3d's {generator_caption_v:?} caption; painted: {:?}",
+            painted.strings(), generator_caption_v = generator_caption());
         assert!(
-            !painted.strings().contains(&GENERATOR_PENDING),
+            !painted.strings().contains(&generator_pending()),
             "the card is showing its empty-state line over a real candidate"
         );
     }
@@ -17224,7 +17456,7 @@ mod generator_row_tests {
         let mut draft = login_draft(false);
         let painted = open_card(&ctx, &mut draft);
         assert!(
-            painted.strings().contains(&GENERATOR_PENDING),
+            painted.strings().contains(&generator_pending()),
             "an empty card does not say it is empty; painted: {:?}",
             painted.strings()
         );
@@ -17246,14 +17478,13 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = card_draft();
         let painted = open_card(&ctx, &mut draft);
-        let button = in_card(&ctx, &painted, GENERATOR_REROLL);
+        let button = in_card(&ctx, &painted, generator_reroll());
 
         let (action, _) = frame(&ctx, &mut draft, &click(button.center()));
         assert_eq!(
             action,
             EditAction::GeneratePassword,
-            "{GENERATOR_REROLL:?} did not ask for a fresh password"
-        );
+            "{generator_reroll_v:?} did not ask for a fresh password", generator_reroll_v = generator_reroll());
         assert!(draft.generator.modal_open, "a re-roll closed the card");
     }
 
@@ -17491,7 +17722,7 @@ mod generator_row_tests {
             "the options block is on screen before anybody opened it: {:?}",
             shut.strings()
         );
-        let chip = in_card(&ctx, &shut, GENERATOR_OPTIONS);
+        let chip = in_card(&ctx, &shut, generator_options_text());
 
         let _ = frame(&ctx, &mut draft, &click(chip.center()));
         assert!(draft.generator.options_open, "clicking Options did not open the block");
@@ -17506,7 +17737,7 @@ mod generator_row_tests {
             open.strings()
         );
 
-        let chip = in_card(&ctx, &open, GENERATOR_OPTIONS);
+        let chip = in_card(&ctx, &open, generator_options_text());
         let _ = frame(&ctx, &mut draft, &click(chip.center()));
         assert!(!draft.generator.options_open, "clicking Options again did not close the block");
     }
@@ -17518,7 +17749,7 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = login_draft(false);
         let first = open_card(&ctx, &mut draft);
-        let chip = in_card(&ctx, &first, GENERATOR_OPTIONS);
+        let chip = in_card(&ctx, &first, generator_options_text());
         let miss = Pos2::new(chip.center().x, chip.top() - 60.0);
         let _ = frame(&ctx, &mut draft, &click(miss));
         assert!(!draft.generator.options_open, "a click that hit nothing opened the options");
@@ -17583,7 +17814,7 @@ mod generator_row_tests {
         draft.generator.options_open = true;
         let painted = open_card(&ctx, &mut draft);
         assert!(
-            painted.strings().contains(&LAST_CLASS_HINT),
+            painted.strings().contains(&last_class_hint()),
             "the last class standing is greyed with no explanation: {:?}",
             painted.strings()
         );
@@ -17598,7 +17829,7 @@ mod generator_row_tests {
 
     #[test]
     fn the_lookalike_chip_is_wired_to_the_lookalike_setting() {
-        let after = click_option(login_draft(false), AVOID_AMBIGUOUS);
+        let after = click_option(login_draft(false), avoid_ambiguous());
         assert!(!after.avoid_ambiguous, "clicking the lookalike chip changed nothing");
     }
 
@@ -17819,7 +18050,7 @@ mod generator_row_tests {
         // The premise: the card really is open, so every claim below is about
         // its rows rather than about a card that never appeared.
         assert!(
-            without.iter().any(|s| s == PICKER_TITLE),
+            without.iter().any(|s| s == picker_title()),
             "8b's card is not drawn, so this test asserts nothing: {without:?}"
         );
         assert!(
@@ -17953,7 +18184,7 @@ mod generator_row_tests {
         draft.app.as_mut().unwrap().settings_open = false;
 
         let (_, shut) = frame(&ctx, &mut draft, &[]);
-        for folded in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON] {
+        for folded in [app_path_label(), app_args_label(), app_browse_button()] {
             assert!(
                 !shut.strings().contains(&folded),
                 "{folded:?} is drawn over a target nobody has opened: {:?}",
@@ -17961,7 +18192,7 @@ mod generator_row_tests {
             );
         }
         // The row itself is still there, and so is the way to add another.
-        assert!(shut.strings().contains(&APP_PICK_LINK), "{:?}", shut.strings());
+        assert!(shut.strings().contains(&app_pick_link()), "{:?}", shut.strings());
 
         // **Pressed, not set**: the chevron paints two strokes and no text,
         // so it is found by the one thing beside it that does -- the match
@@ -17977,7 +18208,7 @@ mod generator_row_tests {
             "the chevron did not open the target's settings"
         );
         let (_, open) = frame(&ctx, &mut draft, &[]);
-        for shown in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON] {
+        for shown in [app_path_label(), app_args_label(), app_browse_button()] {
             assert!(
                 open.strings().contains(&shown),
                 "{shown:?} is not drawn under an opened target: {:?}",
@@ -17986,8 +18217,8 @@ mod generator_row_tests {
         }
         // **And the add row is under all of it.** The link used to sit
         // directly under the target, above that target's own settings.
-        let link = open.rect_of(APP_PICK_LINK);
-        for above in [APP_PATH_LABEL, APP_ARGS_LABEL] {
+        let link = open.rect_of(app_pick_link());
+        for above in [app_path_label(), app_args_label()] {
             let row = open.rect_of(above);
             assert!(
                 row.bottom() <= link.top(),
@@ -18013,12 +18244,12 @@ mod generator_row_tests {
         // of the row, whose words survive only as its hover text -- so the
         // mark is asserted below, by geometry, because it paints no glyph.
         for needle in [
-            APP_BLOCK_HEADING,
-            APP_PATH_LABEL,
-            APP_ARGS_LABEL,
-            APP_BROWSE_BUTTON,
-            APP_PICK_LINK,
-            APP_PICK_HINT,
+            app_block_heading(),
+            app_path_label(),
+            app_args_label(),
+            app_browse_button(),
+            app_pick_link(),
+            app_pick_hint(),
         ] {
             assert!(strings.contains(&needle), "the app block is missing {needle:?}: {strings:?}");
         }
@@ -18105,7 +18336,7 @@ mod generator_row_tests {
         // is gone for the same reason the websites row has none ("remove
         // Nothing is bound yet to match with web if nothing"). See
         // `app_add_block`.
-        for needle in [APP_BLOCK_HEADING, APP_PICK_LINK, APP_ADD_PATH_LINK] {
+        for needle in [app_block_heading(), app_pick_link(), app_add_path_link()] {
             checked += 1;
             assert!(
                 strings.contains(&needle),
@@ -18114,7 +18345,7 @@ mod generator_row_tests {
             );
         }
         assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
-        for gone in [APP_NONE_NOTICE, APP_ADD_BUTTON] {
+        for gone in [app_none_notice(), app_add_button()] {
             assert!(
                 !strings.contains(&gone),
                 "the unbound app row still draws {gone:?}, which the row it is modelled on \
@@ -18136,7 +18367,7 @@ mod generator_row_tests {
         // one of the two doors above. What must still be absent is the block's
         // own editing furniture -- the boxes that edit a binding that does not
         // exist yet.
-        for absent in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON, APP_PICK_HINT] {
+        for absent in [app_path_label(), app_args_label(), app_browse_button(), app_pick_hint()] {
             assert!(
                 !strings.contains(&absent),
                 "the editing control {absent:?} is drawn for an item bound to nothing: \
@@ -18161,7 +18392,7 @@ mod generator_row_tests {
         // an `EnumWindows`); this test is about the block the click reveals,
         // and the two doors reveal the same one. The picker half is
         // `the_pick_door_on_the_unbound_row_opens_the_card`.
-        let button = before.rect_of(APP_ADD_PATH_LINK);
+        let button = before.rect_of(app_add_path_link());
 
         // Two frames: the click lands during the first, which has already
         // painted the add control by the time the button reports it. The
@@ -18188,12 +18419,12 @@ mod generator_row_tests {
         );
         let mut checked = 0;
         for needle in [
-            APP_BLOCK_HEADING,
-            APP_PATH_LABEL,
-            APP_ARGS_LABEL,
-            APP_BROWSE_BUTTON,
-            APP_PICK_LINK,
-            APP_PICK_HINT,
+            app_block_heading(),
+            app_path_label(),
+            app_args_label(),
+            app_browse_button(),
+            app_pick_link(),
+            app_pick_hint(),
         ] {
             checked += 1;
             assert!(
@@ -18204,7 +18435,7 @@ mod generator_row_tests {
         }
         assert_eq!(checked, 6, "the loop visited nothing, so it asserted nothing");
         assert!(
-            !strings.contains(&APP_ADD_PATH_LINK),
+            !strings.contains(&app_add_path_link()),
             "the add row's second door is still drawn beside the block it opened: {strings:?}"
         );
     }
@@ -18218,7 +18449,7 @@ mod generator_row_tests {
         let mut draft = EditDraft::empty();
         draft.name = "Ledgerline".to_string();
         let (_, painted) = frame(&ctx, &mut draft, &[]);
-        let button = painted.rect_of(APP_ADD_PATH_LINK);
+        let button = painted.rect_of(app_add_path_link());
         let miss = Pos2::new(button.center().x, button.bottom() + 60.0);
         assert!(
             !button.contains(miss),
@@ -18245,7 +18476,7 @@ mod generator_row_tests {
         let mut unbound = EditDraft::empty();
         unbound.name = "Ledgerline".to_string();
         let (_, before_add) = frame(&ctx, &mut unbound, &[]);
-        let button = before_add.rect_of(APP_ADD_PATH_LINK);
+        let button = before_add.rect_of(app_add_path_link());
         // Two frames -- the block the click opened is drawn by the second.
         let _ = frame(&ctx, &mut unbound, &click(button.center()));
         let (_, after_add) = frame(&ctx, &mut unbound, &[]);
@@ -18258,7 +18489,7 @@ mod generator_row_tests {
         // cannot say so any more -- both states draw it -- so the run that
         // tells them apart is the block's own hint.
         assert!(
-            after_add.strings().contains(&APP_PICK_HINT),
+            after_add.strings().contains(&app_pick_hint()),
             "the second state is not the opened block: {:?}",
             after_add.strings()
         );
@@ -18270,7 +18501,7 @@ mod generator_row_tests {
             // The premise: the app section really is on screen in this state,
             // so every absence below is about the pills.
             assert!(
-                strings.contains(&APP_BLOCK_HEADING),
+                strings.contains(&app_block_heading()),
                 "{what} draws no app section at all, so this state asserts nothing: \
                  {strings:?}"
             );
@@ -18438,7 +18669,7 @@ mod generator_row_tests {
         let _ = frame(
             &ctx,
             &mut draft,
-            &click(close_mark_on_row(&painted, APP_BLOCK_HEADING).center()),
+            &click(close_mark_on_row(&painted, app_block_heading()).center()),
         );
         assert!(!draft.app.as_ref().unwrap().bound, "Remove did not stage a removal");
         // A frame LATER: the block above was laid out before the click was
@@ -18452,7 +18683,7 @@ mod generator_row_tests {
         // Undo -- the owner's "if removed it should just show Add again". The
         // way back from here is Cancel, which is what the staging is for.
         let strings = after.strings();
-        for needle in [APP_PICK_LINK, APP_ADD_PATH_LINK] {
+        for needle in [app_pick_link(), app_add_path_link()] {
             assert!(
                 strings.contains(&needle),
                 "a removed binding does not offer {needle:?}, so the row it left behind is \
@@ -18460,7 +18691,7 @@ mod generator_row_tests {
             );
         }
         assert!(
-            !strings.contains(&APP_REMOVED_NOTICE),
+            !strings.contains(&app_removed_notice()),
             "the removed row still explains itself in prose: {strings:?}"
         );
     }
@@ -18491,7 +18722,7 @@ mod generator_row_tests {
         // The premise: the block IS drawn, so every absence below is about the
         // control and not about a block that failed to appear at all.
         assert!(
-            strings.contains(&APP_BLOCK_HEADING),
+            strings.contains(&app_block_heading()),
             "the app block is not drawn, so this test asserts nothing: {strings:?}"
         );
         // The Remove, which is 8a's ✕ now and paints no glyph -- so the
@@ -18532,7 +18763,7 @@ mod generator_row_tests {
         let strings = painted.strings();
 
         assert!(
-            strings.contains(&APP_PATH_STORE_APP),
+            strings.contains(&app_path_store_app()),
             "a Store binding does not say why it has no path: {strings:?}"
         );
         assert!(
@@ -18543,7 +18774,7 @@ mod generator_row_tests {
         // show the string the draft is still carrying -- which is exactly why
         // that string must not be saved. See the `to_match` assertion below.
         assert!(
-            strings.contains(&APP_ARGS_STORE_APP),
+            strings.contains(&app_args_store_app()),
             "a Store binding does not say why it has no arguments: {strings:?}"
         );
         assert!(
@@ -18575,7 +18806,7 @@ mod generator_row_tests {
         // row can really do. Asserted as an absence, which is the stronger
         // claim: a button that is drawn and inert still invites the click.
         assert!(
-            !strings.contains(&APP_BROWSE_BUTTON),
+            !strings.contains(&app_browse_button()),
             "a Store binding draws a file-dialog button whose answer it could not use: \
              {strings:?}"
         );
@@ -18586,7 +18817,7 @@ mod generator_row_tests {
         // the live control that is left, and it dies to exactly that mutation.
         let (_, painted) = frame(&ctx, &mut draft, &[]);
         assert!(draft.app.as_ref().unwrap().bound, "the premise: it starts bound");
-        let remove = close_mark_on_row(&painted, APP_BLOCK_HEADING);
+        let remove = close_mark_on_row(&painted, app_block_heading());
         let _ = frame(&ctx, &mut draft, &click(remove.center()));
         assert!(
             !draft.app.as_ref().unwrap().bound,
@@ -18617,7 +18848,7 @@ mod generator_row_tests {
             "the desktop was enumerated before anyone asked"
         );
 
-        let open = painted.rect_of(APP_PICK_LINK);
+        let open = painted.rect_of(app_pick_link());
         let _ = frame(&ctx, &mut draft, &click(open.center()));
         assert!(draft.app.as_ref().unwrap().picking, "the picker did not open");
         // Two more frames before the card is READ: it floats in an anchored
@@ -18625,7 +18856,7 @@ mod generator_row_tests {
         // in on the next. See `card_on`.
         let _ = frame(&ctx, &mut draft, &[]);
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        for expected in [PICKER_TITLE, PICKER_ADD, PICKER_REFRESH, PICKER_MATCH_CAPTION] {
+        for expected in [picker_title(), picker_add(), picker_refresh(), picker_match_caption()] {
             assert!(
                 listed.strings().contains(&expected),
                 "8b's card is missing {expected:?}: {:?}",
@@ -18645,19 +18876,18 @@ mod generator_row_tests {
     /// which is unique. A tolerance of 2 points because the two buttons are
     /// laid out by one `horizontal_wrapped` and centred on each other.
     fn card_cancel(painted: &Painted) -> Rect {
-        let add = painted.rect_of(PICKER_ADD);
+        let add = painted.rect_of(picker_add());
         let found: Vec<Rect> = painted
-            .rects_of(PICKER_CANCEL)
+            .rects_of(picker_cancel())
             .into_iter()
             .filter(|r| (r.center().y - add.center().y).abs() < 2.0)
             .collect();
         assert_eq!(
             found.len(),
             1,
-            "expected exactly one Cancel beside {PICKER_ADD:?}, found {}; painted: {:?}",
+            "expected exactly one Cancel beside {picker_add_v:?}, found {}; painted: {:?}",
             found.len(),
-            painted.strings()
-        );
+            painted.strings(), picker_add_v = picker_add());
         found[0]
     }
 
@@ -18756,7 +18986,7 @@ mod generator_row_tests {
         }
 
         let (_, staged) = frame(&ctx, &mut draft, &[]);
-        let _ = frame(&ctx, &mut draft, &click(staged.rect_of(PICKER_ADD).center()));
+        let _ = frame(&ctx, &mut draft, &click(staged.rect_of(picker_add()).center()));
 
         let app = draft.app.as_ref().unwrap();
         assert_eq!(app.process, "Ledgerline.exe", "`Add target` bound nothing");
@@ -18777,7 +19007,7 @@ mod generator_row_tests {
         let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        let _ = frame(&ctx, &mut draft, &click(listed.rect_of(PICKER_ADD).center()));
+        let _ = frame(&ctx, &mut draft, &click(listed.rect_of(picker_add()).center()));
 
         let app = draft.app.as_ref().unwrap();
         assert_eq!(
@@ -18850,7 +19080,7 @@ mod generator_row_tests {
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         // Inside the card and on none of its rows: its title. (A click on the
         // scrim outside the card closes the dialog -- spec B 2.)
-        let miss = listed.rect_of(PICKER_TITLE).center();
+        let miss = listed.rect_of(picker_title()).center();
         let _ = frame(&ctx, &mut draft, &click(miss));
 
         let app = draft.app.as_ref().unwrap();
@@ -18901,7 +19131,7 @@ mod generator_row_tests {
             card_on(&ctx, vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        let subtitle = format!("ApplicationFrameHost.exe \u{b7} {PICKER_REFUSAL_SHORT}");
+        let subtitle = format!("ApplicationFrameHost.exe \u{b7} {picker_refusal_short_v}", picker_refusal_short_v = picker_refusal_short());
         assert!(
             listed.strings().contains(&subtitle.as_str()),
             "the refused row does not say why: {:?}",
@@ -18955,7 +19185,7 @@ mod generator_row_tests {
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         assert_eq!(
-            listed.rects_of(PICKER_TAKEN_CHIP).len(),
+            listed.rects_of(picker_taken_chip()).len(),
             1,
             "expected the chip on exactly the claimed row; painted: {:?}",
             listed.strings()
@@ -19001,7 +19231,7 @@ mod generator_row_tests {
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         assert!(
-            listed.strings().contains(&PICKER_MATCH_NONE),
+            listed.strings().contains(&picker_match_none()),
             "the band said something about a row nobody had chosen: {:?}",
             listed.strings()
         );
@@ -19010,13 +19240,13 @@ mod generator_row_tests {
         let _ = frame(&ctx, &mut draft, &click(ordinary.center()));
         let (_, on_ordinary) = frame(&ctx, &mut draft, &[]);
         assert!(
-            on_ordinary.strings().contains(&PICKER_RULE_PROCESS)
-                && on_ordinary.strings().contains(&PICKER_RULE_PROCESS_NOTE),
+            on_ordinary.strings().contains(&picker_rule_process())
+                && on_ordinary.strings().contains(&picker_rule_process_note()),
             "an ordinary window was not reported as matched by its process: {:?}",
             on_ordinary.strings()
         );
         assert!(
-            !on_ordinary.strings().contains(&PICKER_RULE_HOSTED),
+            !on_ordinary.strings().contains(&picker_rule_hosted()),
             "an ordinary window was offered a title match `match_engine` would never make"
         );
 
@@ -19024,8 +19254,8 @@ mod generator_row_tests {
         let _ = frame(&ctx, &mut draft, &click(store.center()));
         let (_, on_store) = frame(&ctx, &mut draft, &[]);
         assert!(
-            on_store.strings().contains(&PICKER_RULE_HOSTED)
-                && on_store.strings().contains(&PICKER_RULE_HOSTED_NOTE),
+            on_store.strings().contains(&picker_rule_hosted())
+                && on_store.strings().contains(&picker_rule_hosted_note()),
             "a hosted frame was not reported as matched by its title: {:?}",
             on_store.strings()
         );
@@ -19819,7 +20049,7 @@ mod sequence_builder_tests {
         let ctx = styled_context(PANE);
         let mut saved = draft_for(&item, "");
         let shut = frame(&ctx, PANE, &mut saved, &item, &totp, &[]);
-        let at = shut.rect_of(SEQUENCE_EDIT_BUTTON).center();
+        let at = shut.rect_of(sequence_edit_button()).center();
         let (action, _) = frame_action(&ctx, PANE, &mut saved, &item, &totp, &click(at));
         assert_eq!(
             action,
@@ -19836,7 +20066,7 @@ mod sequence_builder_tests {
         let creating_ctx = styled_context(PANE);
         let mut creating = draft_for(&item, "");
         let shut = creating_frame_action(&creating_ctx, PANE, &mut creating, &totp, &[]).1;
-        let at = shut.rect_of(SEQUENCE_EDIT_BUTTON).center();
+        let at = shut.rect_of(sequence_edit_button()).center();
         let (action, _) =
             creating_frame_action(&creating_ctx, PANE, &mut creating, &totp, &click(at));
         assert_eq!(
@@ -19865,7 +20095,7 @@ mod sequence_builder_tests {
 
         let (idle, painted) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &[]);
         assert_eq!(idle, EditAction::None, "the form reported an action with no input");
-        let button = painted.rect_of(APP_SEQUENCE_REHEARSE);
+        let button = painted.rect_of(app_sequence_rehearse());
 
         let (action, _) =
             frame_action(&ctx, PANE, &mut draft, &item, &totp, &click(button.center()));
@@ -19892,7 +20122,7 @@ mod sequence_builder_tests {
             app.template_view = true;
         }
         let (_, painted) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &[]);
-        let at = painted.rect_of(APP_SEQUENCE_REHEARSE).center();
+        let at = painted.rect_of(app_sequence_rehearse()).center();
         let (action, _) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &click(at));
         assert_eq!(action, EditAction::Rehearse);
     }
@@ -19909,7 +20139,7 @@ mod sequence_builder_tests {
         let strings = painted.strings();
         // Spec B 1.4 D: the steps as chips, and 0.15's editor one link away.
         // See `sign_in_steps`.
-        assert!(strings.contains(&SEQUENCE_EDIT_BUTTON), "there is no way in: {strings:?}");
+        assert!(strings.contains(&sequence_edit_button()), "there is no way in: {strings:?}");
         for chip in ["Type username", "Press Tab", "Type password"] {
             assert!(
                 strings.contains(&chip),
@@ -19921,7 +20151,7 @@ mod sequence_builder_tests {
             "the row still says in prose what the chips beside it say: {strings:?}"
         );
         assert!(
-            !strings.contains(&APP_SEQUENCE_OPEN),
+            !strings.contains(&app_sequence_open()),
             "the card still draws the button 8a's `Edit sequence` replaced: {strings:?}"
         );
     }
@@ -19947,7 +20177,7 @@ mod sequence_builder_tests {
         }
         assert!(strings.contains(&"Add text"), "{strings:?}");
         assert!(strings.contains(&"Add wait"), "{strings:?}");
-        assert!(strings.contains(&APP_SEQUENCE_REVEAL), "the eye is missing: {strings:?}");
+        assert!(strings.contains(&app_sequence_reveal()), "the eye is missing: {strings:?}");
     }
 
     /// **The wiring pin for the write.** A click on a palette button reaches
@@ -19988,7 +20218,7 @@ mod sequence_builder_tests {
             "the code is on screen with the eye shut: {:?}",
             shut.strings()
         );
-        let at = shut.rect_of(APP_SEQUENCE_REVEAL).center();
+        let at = shut.rect_of(app_sequence_reveal()).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
         let open = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let strings = open.strings();
@@ -20121,7 +20351,7 @@ mod sequence_builder_tests {
         totp: &detail::TotpState,
     ) -> Painted {
         let shut = open_builder(ctx, pane, draft, item, totp);
-        let at = shut.rect_of(APP_SEQUENCE_REVEAL).center();
+        let at = shut.rect_of(app_sequence_reveal()).center();
         let _ = frame(ctx, pane, draft, item, totp, &click(at));
         assert!(draft.app.as_ref().unwrap().previewing, "the eye did not open");
         frame(ctx, pane, draft, item, totp, &[])
@@ -20150,7 +20380,7 @@ mod sequence_builder_tests {
         assert_ne!(USERNAME, PASSWORD, "the fixture cannot tell a swap from a fill");
 
         let open = reveal(&ctx, PANE, &mut draft, &item, &live_code());
-        let eye = open.rect_of(APP_SEQUENCE_HIDE);
+        let eye = open.rect_of(app_sequence_hide());
         assert_eq!(
             row_below(&open, eye),
             vec![USERNAME.to_string(), "[\u{21e5}]".to_string(), PASSWORD.to_string()],
@@ -20199,7 +20429,7 @@ mod sequence_builder_tests {
     /// a bare `rect_of` finds two of everything. The chip row is the band
     /// between the block's hint and the "Add a value" heading.
     fn chip_rect(painted: &Painted, label: &str) -> Rect {
-        let floor = painted.rect_of(APP_SEQUENCE_HINT).bottom();
+        let floor = painted.rect_of(app_sequence_hint()).bottom();
         let ceiling = painted.rect_of("Add a value").top();
         let found: Vec<Rect> = painted
             .rects_of(label)
@@ -20292,7 +20522,7 @@ mod sequence_builder_tests {
             open.strings()
         );
 
-        let at = open.rect_of(APP_SEQUENCE_CLOSE).center();
+        let at = open.rect_of(app_sequence_close()).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
         let app = draft.app.as_ref().unwrap();
         assert!(!app.sequence_open, "the builder did not close");
@@ -20465,11 +20695,11 @@ mod sequence_builder_tests {
                 .unwrap_or_else(|| panic!("{sequence} was not refused at all"));
             let warning = sequence_warning(sequence, &source)
                 .unwrap_or_else(|| panic!("{sequence} produced no warning"));
-            assert_eq!(warning, format!("{SEQUENCE_REFUSED_PREFIX}{}", refusal.message()));
+            assert_eq!(warning, format!("{sequence_refused_prefix_v}{}", refusal.message(), sequence_refused_prefix_v = sequence_refused_prefix()));
             // ...and the sentence really does NAME the offending construct,
             // which is the whole point of showing it.
             assert!(
-                warning.len() > SEQUENCE_REFUSED_PREFIX.len() + 10,
+                warning.len() > sequence_refused_prefix().len() + 10,
                 "the warning for {sequence} is {warning:?}, which names nothing"
             );
         }
@@ -20505,9 +20735,8 @@ mod sequence_builder_tests {
             sequence_warning("", &source).as_deref(),
             Some(
                 format!(
-                    "{SEQUENCE_REFUSED_PREFIX}{}",
-                    Refusal::Unresolved("a username".to_string()).message()
-                )
+                    "{sequence_refused_prefix_v}{}",
+                    Refusal::Unresolved("a username".to_string()).message(), sequence_refused_prefix_v = sequence_refused_prefix())
                 .as_str()
             ),
             "the empty sequence was judged as typing nothing rather than as the default"
@@ -20546,7 +20775,7 @@ mod sequence_builder_tests {
         // The premise: the block really is shut.
         assert!(!draft.app.as_ref().unwrap().sequence_open, "the builder started open");
         assert!(
-            painted.strings().contains(&SEQUENCE_EDIT_BUTTON),
+            painted.strings().contains(&sequence_edit_button()),
             "the way into the builder is not on screen, so this is not the closed state"
         );
 
@@ -20592,7 +20821,7 @@ mod sequence_builder_tests {
             let shouted: Vec<&str> = painted
                 .strings()
                 .into_iter()
-                .filter(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX))
+                .filter(|s| s.starts_with(sequence_refused_prefix()))
                 .collect();
             assert!(
                 shouted.is_empty(),
@@ -20628,7 +20857,7 @@ mod sequence_builder_tests {
         let said = |p: &Painted| -> String {
             p.strings()
                 .into_iter()
-                .find(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX))
+                .find(|s| s.starts_with(sequence_refused_prefix()))
                 .unwrap_or_else(|| panic!("no warning was painted; painted: {:?}", p.strings()))
                 .to_string()
         };
@@ -20649,12 +20878,12 @@ mod sequence_builder_tests {
         let no_secret =
             frame(&ctx, PANE, &mut totp_draft, &item, &detail::TotpState::NoSecret, &[]);
         assert!(
-            !with_secret.strings().iter().any(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX)),
+            !with_secret.strings().iter().any(|s| s.starts_with(sequence_refused_prefix())),
             "a {{TOTP}} with a live code was warned about: {:?}",
             with_secret.strings()
         );
         assert!(
-            no_secret.strings().iter().any(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX)),
+            no_secret.strings().iter().any(|s| s.starts_with(sequence_refused_prefix())),
             "a {{TOTP}} on an item with no secret was NOT warned about, so the drawn warning \
              is not reading the TOTP state it was handed: {:?}",
             no_secret.strings()
@@ -21087,17 +21316,17 @@ mod sequence_builder_tests {
             let label = painted.rect_of(caption);
             painted.rects.iter().any(|r| r.fill == p.hover && r.rect.contains_rect(label))
         };
-        assert!(lifted(&open, VIEW_STEPS), "the view in force is not lifted onto white");
-        assert!(!lifted(&open, VIEW_TEMPLATE), "the view NOT in force is lifted too");
-        assert!(track(&open, VIEW_STEPS) && track(&open, VIEW_TEMPLATE), "the two cells are not on one track");
+        assert!(lifted(&open, view_steps()), "the view in force is not lifted onto white");
+        assert!(!lifted(&open, view_template()), "the view NOT in force is lifted too");
+        assert!(track(&open, view_steps()) && track(&open, view_template()), "the two cells are not on one track");
 
         // And it still works: pressing the unlit cell moves the control.
-        let at = open.rect_of(VIEW_TEMPLATE).center();
+        let at = open.rect_of(view_template()).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
         let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         assert!(draft.app.as_ref().unwrap().template_view, "pressing Template did not take");
-        assert!(lifted(&after, VIEW_TEMPLATE), "the control moved but the lift did not follow it");
-        assert!(!lifted(&after, VIEW_STEPS));
+        assert!(lifted(&after, view_template()), "the control moved but the lift did not follow it");
+        assert!(!lifted(&after, view_steps()));
     }
 
     /// **Pressing the cell already in force changes nothing.**
@@ -21113,13 +21342,13 @@ mod sequence_builder_tests {
         let ctx = styled_context(PANE);
         let mut draft = draft_for(&item, "{USERNAME}");
         let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
-        let to_template = open.rect_of(VIEW_TEMPLATE).center();
+        let to_template = open.rect_of(view_template()).center();
         let template = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(to_template));
 
         // An edit the user has made in the box but not yet committed anywhere
         // a re-seed would preserve.
         draft.app.as_mut().unwrap().template_draft = "{USERNAME}{ENTER}".to_string();
-        let at = template.rect_of(VIEW_TEMPLATE).center();
+        let at = template.rect_of(view_template()).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
         assert!(draft.app.as_ref().unwrap().template_view, "the lit cell switched the view off");
         assert_eq!(
@@ -21146,7 +21375,7 @@ mod sequence_builder_tests {
         let mut draft = draft_for(&item, STORED);
         let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
 
-        let to_template = open.rect_of(VIEW_TEMPLATE).center();
+        let to_template = open.rect_of(view_template()).center();
         let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(to_template));
         assert!(draft.app.as_ref().unwrap().template_view, "the Template toggle did not switch");
         assert_eq!(
@@ -21155,7 +21384,7 @@ mod sequence_builder_tests {
             "the template box was seeded with something other than the stored bytes"
         );
 
-        let to_steps = after.rect_of(VIEW_STEPS).center();
+        let to_steps = after.rect_of(view_steps()).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(to_steps));
         assert!(!draft.app.as_ref().unwrap().template_view, "the Steps toggle did not switch back");
         assert_eq!(
@@ -21180,7 +21409,7 @@ mod sequence_builder_tests {
         let ctx = styled_context(PANE);
         let mut draft = draft_for(&item, "{USERNAME}");
         let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
-        let at = open.rect_of(VIEW_TEMPLATE).center();
+        let at = open.rect_of(view_template()).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
 
         // **Really typed, not assigned.** Click into the box -- it is the one
@@ -21188,8 +21417,8 @@ mod sequence_builder_tests {
         // characters as input events, so the assignment that copies the box
         // onto the draft is on the path under test.
         let template = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
-        let top = template.rect_of(VIEW_TEMPLATE).bottom();
-        let bottom = template.rect_of(TEMPLATE_INSERT_CAPTION).top();
+        let top = template.rect_of(view_template()).bottom();
+        let bottom = template.rect_of(template_insert_caption()).top();
         let field = template
             .texts
             .iter()
@@ -21218,12 +21447,12 @@ mod sequence_builder_tests {
         // string became is the string itself, coloured token by token --
         // asserted by `the_template_line_tints_each_token_by_what_it_is`.
         assert!(
-            !after.strings().contains(&TEMPLATE_READS_AS),
+            !after.strings().contains(&template_reads_as()),
             "the read-out is back under the template field: {:?}",
             after.strings()
         );
         assert!(
-            after.strings().contains(&TEMPLATE_INSERT_CAPTION),
+            after.strings().contains(&template_insert_caption()),
             "the Insert row went with it: {:?}",
             after.strings()
         );
@@ -21284,7 +21513,7 @@ mod sequence_builder_tests {
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         // v2: the header says "Save"; the reason is its hint.
-        assert_eq!(save_label(&draft), SAVE_TEMPLATE_BLOCKED, "{:?}", painted.strings());
+        assert_eq!(save_label(&draft), save_template_blocked(), "{:?}", painted.strings());
         assert!(
             painted.strings().contains(&TEMPLATE_UNPARSED),
             "the refusal itself is not on screen: {:?}",
@@ -21301,7 +21530,7 @@ mod sequence_builder_tests {
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let fixed = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         assert!(!fixed.strings().contains(&TEMPLATE_UNPARSED));
-        assert!(!fixed.strings().contains(&SAVE_TEMPLATE_BLOCKED));
+        assert!(!fixed.strings().contains(&save_template_blocked()));
     }
 
     /// **The wiring pin for 4a's summary.** The tally is drawn, and it moves
@@ -21350,7 +21579,7 @@ mod sequence_builder_tests {
         for previewing in [false, true] {
             draft.app.as_mut().unwrap().previewing = previewing;
             let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
-            let floor = painted.rect_of(APP_SEQUENCE_HINT).bottom();
+            let floor = painted.rect_of(app_sequence_hint()).bottom();
             let ceiling = painted.rect_of("Add a value").top();
             let in_the_list = |rect: &egui::Rect| rect.top() > floor && rect.top() < ceiling;
             let painted_here: Vec<&String> = painted
@@ -21525,8 +21754,8 @@ mod sequence_builder_tests {
             let painted = run();
             // The dialog's own card is not painted when the picker is drawn
             // bare: its height is the title's top to the footer's foot.
-            let top = painted.rect_of(PICKER_TITLE).top();
-            let foot = painted.rect_of(PICKER_ADD).bottom();
+            let top = painted.rect_of(picker_title()).top();
+            let foot = painted.rect_of(picker_add()).bottom();
             heights.push((viewport, foot - top));
         }
         let (_, roomy) = *heights.last().expect("three viewports were measured");
@@ -21610,7 +21839,7 @@ mod sequence_builder_tests {
         // pinned `MODAL_CLOSE_INSET` in from the card's right edge, on the
         // title's own line.
         let card = picker_card(&painted).rect;
-        let title = painted.rect_of(PICKER_TITLE);
+        let title = painted.rect_of(picker_title());
         let mark = Pos2::new(
             card.right() - theme::MODAL_CLOSE_INSET - theme::CLOSE_MARK_HIT / 2.0,
             title.center().y,
@@ -21661,14 +21890,13 @@ mod sequence_builder_tests {
 
         let card = picker_card(&painted).rect;
         let count = painted.rect_of(&picker_count(4));
-        let refresh = painted.rect_of(PICKER_REFRESH);
-        let title = painted.rect_of(PICKER_TITLE);
+        let refresh = painted.rect_of(picker_refresh());
+        let title = painted.rect_of(picker_title());
 
         assert!(
             count.top() > refresh.top() - 4.0 && count.left() > refresh.right(),
-            "the count is at {count:?}, which is not after {PICKER_REFRESH:?} at {refresh:?} \
-             on the footer's line"
-        );
+            "the count is at {count:?}, which is not after {picker_refresh_v:?} at {refresh:?} \
+             on the footer's line", picker_refresh_v = picker_refresh());
         assert!(
             count.top() > title.bottom(),
             "the count is still on the header's line, at {count:?} against a title at {title:?}"
@@ -21713,8 +21941,8 @@ mod sequence_builder_tests {
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
 
         let card = picker_card(&painted);
-        let title = painted.rect_of(PICKER_TITLE);
-        let add = painted.rect_of(PICKER_ADD);
+        let title = painted.rect_of(picker_title());
+        let add = painted.rect_of(picker_add());
         assert!(
             card.rect.contains_rect(title) && card.rect.contains_rect(add),
             "the card's outline does not contain its own header and footer, so what was found \
@@ -21765,7 +21993,7 @@ mod sequence_builder_tests {
         }
 
         // 8b's `Match this window by` band is `background: #fbfaf9`.
-        let caption = painted.rect_of(PICKER_MATCH_CAPTION);
+        let caption = painted.rect_of(picker_match_caption());
         let tinted: Vec<PaintedRect> = painted
             .rects
             .iter()
@@ -22655,9 +22883,9 @@ mod edit_pane_layout_tests {
         // row, which are set to match them (spec 2026-10-09).
         for caption in [
             Slot::CardholderName.label(),
-            EXPIRES_ROW_LABEL,
+            expires_row_label(),
             EXPIRY_JOIN,
-            CARD_CODE_LABEL,
+            card_code_label(),
             CARD_PIN_LABEL,
         ] {
             assert_eq!(
@@ -22671,7 +22899,7 @@ mod edit_pane_layout_tests {
         // `Type` value -- so it is asked whether one of them is the caption's
         // grey rather than whether there is exactly one.
         assert!(
-            painted.inks.iter().any(|(t, ink)| t == CARD_ROW_LABEL && *ink == reference),
+            painted.inks.iter().any(|(t, ink)| t == card_row_label() && *ink == reference),
             "the Card row's caption is drawn in a different grey from the Item card above it"
         );
     }
@@ -22712,17 +22940,17 @@ mod edit_pane_layout_tests {
             );
             let count = |label: &str| painted.strings().iter().filter(|s| **s == label).count();
             assert_eq!(
-                count(SLOT_REMOVE_BUTTON),
+                count(slot_remove_button()),
                 3,
                 "a {width}pt card form does not draw one Remove each on Cardholder, Card and ZIP: \
                  {:?}",
                 painted.strings()
             );
-            assert_eq!(count(BANK_CLEAR), 1, "the {width}pt Bank row has no Clear");
+            assert_eq!(count(bank_clear()), 1, "the {width}pt Bank row has no Clear");
             // ...and all four end on one right edge, as the login form's
             // buttons do.
-            let edge = painted.frame_around(painted.rect_of(BANK_CLEAR)).right();
-            for text in painted.rects_of(SLOT_REMOVE_BUTTON) {
+            let edge = painted.frame_around(painted.rect_of(bank_clear())).right();
+            for text in painted.rects_of(slot_remove_button()) {
                 let right = painted.frame_around(text).right();
                 assert!(
                     (right - edge).abs() <= 0.5,
@@ -22795,10 +23023,10 @@ mod edit_pane_layout_tests {
         let painted = full_card_frame(&[], &mut draft);
         let order = [
             Slot::CardholderName.label(),
-            CARD_ROW_LABEL,
-            EXPIRES_ROW_LABEL,
-            BILLING_ZIP_LABEL,
-            BANK_LABEL,
+            card_row_label(),
+            expires_row_label(),
+            billing_zip_label(),
+            bank_label(),
         ];
         let tops: Vec<f32> = order.iter().map(|label| caption(&painted, label).top()).collect();
         for pair in 0..order.len() - 1 {
@@ -22840,7 +23068,7 @@ mod edit_pane_layout_tests {
             "the brand {brand:?} and the number {number:?} are not on one line"
         );
         assert!(
-            (caption(&painted, CARD_ROW_LABEL).top() - number.top()).abs() < theme::SECTION_FIELD_HEIGHT,
+            (caption(&painted, card_row_label()).top() - number.top()).abs() < theme::SECTION_FIELD_HEIGHT,
             "the number is not on the Card row"
         );
     }
@@ -22893,7 +23121,7 @@ mod edit_pane_layout_tests {
             assert!(pair[0].1.right() < pair[1].1.left(), "{:?} is not left of {:?}", pair[0], pair[1]);
         }
         // The inline captions, centred on the boxes by their ink.
-        for label in [EXPIRY_JOIN, CARD_CODE_LABEL, CARD_PIN_LABEL] {
+        for label in [EXPIRY_JOIN, card_code_label(), CARD_PIN_LABEL] {
             let middles: Vec<f32> = painted
                 .ink_middles
                 .iter()
@@ -22923,15 +23151,15 @@ mod edit_pane_layout_tests {
         let _ = frame_for(&ctx, pane, &mut login_draft, false, &[], Some(&login), &detail::TotpState::NoSecret);
         let login_painted =
             frame_for(&ctx, pane, &mut login_draft, false, &[], Some(&login), &detail::TotpState::NoSecret);
-        let copies = login_painted.rects_of(COPY_LABEL);
+        let copies = login_painted.rects_of(copy_label());
         assert!(!copies.is_empty(), "the login form drew no Copy: {:?}", login_painted.strings());
         let edge = login_painted.frame_around(copies[0]).right();
 
         let mut draft = revealed_full_card_draft();
         let painted = full_card_frame(&[], &mut draft);
-        let mut buttons = painted.rects_of(SLOT_REMOVE_BUTTON);
+        let mut buttons = painted.rects_of(slot_remove_button());
         assert_eq!(buttons.len(), 3, "Cardholder, Card and ZIP each carry one Remove");
-        buttons.push(painted.rect_of(BANK_CLEAR));
+        buttons.push(painted.rect_of(bank_clear()));
         for text in buttons {
             let button = painted.frame_around(text);
             assert!(
@@ -22949,7 +23177,7 @@ mod edit_pane_layout_tests {
         let mut draft = revealed_full_card_draft();
         let painted = full_card_frame(&[], &mut draft);
         let picker = painted.frame_around(painted.rect_of("Brex"));
-        let clear = painted.frame_around(painted.rect_of(BANK_CLEAR));
+        let clear = painted.frame_around(painted.rect_of(bank_clear()));
         assert!(
             (picker.center().y - clear.center().y).abs() <= 0.5,
             "the picker {picker:?} and Clear {clear:?} are not centred on one line"
@@ -22958,7 +23186,7 @@ mod edit_pane_layout_tests {
         assert!((clear.height() - crate::kit::controls::SMALL.height).abs() <= 0.5, "Clear {clear:?}");
         assert!(picker.right() < clear.left(), "Clear is not after the picker");
         // Clear is the Remove buttons' own control, in their own ink.
-        assert_eq!(ink_of_run(&painted, BANK_CLEAR), ink_of_run_first(&painted, SLOT_REMOVE_BUTTON));
+        assert_eq!(ink_of_run(&painted, bank_clear()), ink_of_run_first(&painted, slot_remove_button()));
         // By name, never by the stored address.
         assert!(
             !painted.strings().iter().any(|s| s.contains("brex.com")),
@@ -23012,13 +23240,13 @@ mod edit_pane_layout_tests {
         let painted = full_card_frame(&[], &mut draft);
         // The row, from its caption to the bottom of its boxes -- the label
         // cell included, which is where the old rows' chips sat.
-        let caption = caption(&painted, EXPIRES_ROW_LABEL);
+        let caption = caption(&painted, expires_row_label());
         let boxes = painted.frame_around(painted.rect_of("2029"));
         let row = Rect::from_x_y_ranges(
             caption.left()..=f32::INFINITY,
             caption.top().min(boxes.top())..=boxes.bottom(),
         );
-        let removes = painted.rects_of(SLOT_REMOVE_BUTTON);
+        let removes = painted.rects_of(slot_remove_button());
         assert_eq!(removes.len(), 3, "the card does not draw its three other Removes");
         for remove in removes {
             assert!(
@@ -23036,7 +23264,7 @@ mod edit_pane_layout_tests {
         let painted = full_card_frame(&[], &mut draft);
         let number = painted.frame_around(painted.rect_of("4111111111111111"));
         let remove = painted
-            .rects_of(SLOT_REMOVE_BUTTON)
+            .rects_of(slot_remove_button())
             .into_iter()
             .find(|r| (r.center().y - number.center().y).abs() < theme::SECTION_FIELD_HEIGHT / 2.0)
             .unwrap_or_else(|| panic!("no Remove on the Card row: {:?}", painted.strings()));
@@ -23070,11 +23298,11 @@ mod edit_pane_layout_tests {
             let mut draft = revealed_full_card_draft();
             let painted = full_card_frame_at(width, &mut draft);
             let pane = Vec2::new(width, UNCULLED_PANE_HEIGHT);
-            let edge = painted.frame_around(painted.rect_of(BANK_CLEAR)).right();
-            let card_row = caption(&painted, CARD_ROW_LABEL).top()
-                ..caption(&painted, EXPIRES_ROW_LABEL).top();
+            let edge = painted.frame_around(painted.rect_of(bank_clear())).right();
+            let card_row = caption(&painted, card_row_label()).top()
+                ..caption(&painted, expires_row_label()).top();
             let mut on_card_row = 0;
-            for text in painted.rects_of(SLOT_REMOVE_BUTTON) {
+            for text in painted.rects_of(slot_remove_button()) {
                 let button = painted.frame_around(text);
                 assert!(
                     (button.right() - edge).abs() <= 0.5,
@@ -23150,14 +23378,14 @@ mod edit_pane_layout_tests {
                 combo = ui
                     .scope(|ui| {
                         form_combo(ui, "probe-brand")
-                            .selected_text(BRAND_UNSET)
+                            .selected_text(brand_unset())
                             .width(BRAND_COMBO_WIDTH)
                             .show_ui(ui, |_ui| {})
                             .response
                             .rect
                     })
                     .inner;
-                picker = dropdown_button(ui, BANK_CHOOSE, BRAND_COMBO_WIDTH, false).rect;
+                picker = dropdown_button(ui, bank_choose(), BRAND_COMBO_WIDTH, false).rect;
             });
         });
         let mut boxes: Vec<egui::epaint::RectShape> = Vec::new();
@@ -23220,7 +23448,7 @@ mod edit_pane_layout_tests {
         let ink = |label: &str| {
             inks.iter().find(|(t, _)| t == label).map(|(_, c)| *c).expect("the label is painted")
         };
-        assert_eq!(ink(BANK_CHOOSE), ink(BRAND_UNSET), "the two unset states are in different inks");
+        assert_eq!(ink(bank_choose()), ink(brand_unset()), "the two unset states are in different inks");
     }
 
     /// **On a card, a custom field may not be called `PIN`**: it would be read
@@ -23235,15 +23463,15 @@ mod edit_pane_layout_tests {
         field.value = "1111".to_string();
         draft.fields.push(field);
         let painted = full_card_frame(&[], &mut draft);
-        let refusals = painted.rects_of(PIN_NAME_REFUSAL);
+        let refusals = painted.rects_of(pin_name_refusal());
         assert_eq!(refusals.len(), 2, "the refusal is not said under the field and beside Save");
         // v2: the header says "Save"; the reason is its hint.
-        assert_eq!(save_label(&draft), SAVE_PIN_NAME_BLOCKED);
+        assert_eq!(save_label(&draft), save_pin_name_blocked());
         assert!(!draft.is_saveable());
 
         draft.fields.last_mut().unwrap().name = "PIN hint".to_string();
         let painted = full_card_frame(&[], &mut draft);
-        assert!(painted.rects_of(PIN_NAME_REFUSAL).is_empty(), "a renamed field is still refused");
+        assert!(painted.rects_of(pin_name_refusal()).is_empty(), "a renamed field is still refused");
         assert!(draft.is_saveable());
     }
 
@@ -23845,7 +24073,9 @@ mod edit_pane_layout_tests {
 
     /// The label the disabled Save wears while the name is empty.
     // v2: the header's Save keeps its label; the reason is its hint.
-    const SAVE: &str = SAVE_BUTTON;
+    fn k_save() -> &'static str {
+        save_button()
+    }
 
     /// The title of the last card design 8a's grid draws on a login --
     /// `Notes` -- which is what "the bottom of the form" means now.
@@ -23864,7 +24094,7 @@ mod edit_pane_layout_tests {
     /// The two spellings agree -- see [`FIELDS_CARD_TITLE`].
     #[test]
     fn the_card_titles_this_module_writes_out_are_the_bands_own() {
-        assert_eq!(FIELDS_CARD_TITLE, FIELDS_BLOCK_HEADING);
+        assert_eq!(FIELDS_CARD_TITLE, fields_block_heading());
         assert_eq!(last_card(), Section::Notes.title(ItemKind::Login).to_string());
     }
 
@@ -24104,7 +24334,7 @@ mod edit_pane_layout_tests {
         let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
         let [kind, _] = generator_row_frames(&ctx, &painted, false);
-        let affirmative = painted.frame_around(in_card(&ctx, &painted, GENERATOR_USE));
+        let affirmative = painted.frame_around(in_card(&ctx, &painted, generator_use()));
         assert!(
             (affirmative.height() - kind.height()).abs() > 0.5,
             "the card's footer button measures {}pt and its recipe row {}pt -- if those are \
@@ -24193,7 +24423,7 @@ mod edit_pane_layout_tests {
             }
             // The re-roll and the disclosure are on the same row and are the
             // two most likely to be pushed off the end of it.
-            for label in [GENERATOR_OPTIONS, GENERATOR_REROLL] {
+            for label in [generator_options_text(), generator_reroll()] {
                 let rect = painted.frame_around(in_card(&ctx, &painted, label));
                 assert!(
                     card.contains_rect(rect),
@@ -24256,13 +24486,13 @@ mod edit_pane_layout_tests {
                 // below instead.
                 labels.push(" digits".to_string());
                 labels.push(" symbols".to_string());
-                labels.push(AVOID_AMBIGUOUS.to_string());
+                labels.push(avoid_ambiguous().to_string());
                 labels
             };
 
             // The disclosure chip itself first: an option block nobody can
             // open is not reachable however well it fits.
-            assert_inside("the generator's Options chip", GENERATOR_OPTIONS, pane, &painted);
+            assert_inside("the generator's Options chip", generator_options_text(), pane, &painted);
             for label in &labels {
                 assert_inside(
                     &format!("the generator option {label:?} (passphrase={passphrase})"),
@@ -24375,7 +24605,7 @@ mod edit_pane_layout_tests {
                 labels.extend(CharClass::ALL.iter().map(|c| c.label().to_string()));
                 labels.push(" digits".to_string());
                 labels.push(" symbols".to_string());
-                labels.push(AVOID_AMBIGUOUS.to_string());
+                labels.push(avoid_ambiguous().to_string());
                 labels
             };
             // **The galley's own box, not `frame_around`'s.** The card's body
@@ -24454,25 +24684,23 @@ mod edit_pane_layout_tests {
         // The kit's row button (slice 15f): 14pt Archivo SemiBold, which is
         // what `theme::apply`'s default `TextStyle::Button` is NOT at (13pt).
         let expected = egui::FontId::new(14.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-        let browse = painted.font_of(BROWSE);
+        let browse = painted.font_of(k_browse());
         assert_eq!(
             browse, expected,
-            "{BROWSE:?} is laid out in {browse:?}, which is not `theme::row_button`'s face \
+            "{k_browse_v:?} is laid out in {browse:?}, which is not `theme::row_button`'s face \
              ({expected:?}) -- a bare `egui::Button` beside the path box is the footer's own \
-             defect one row up"
-        );
+             defect one row up", k_browse_v = k_browse());
 
         // ... and the frame it paints is the row button's own height, which is
         // the half of the report the face check cannot see -- and which is
         // also the height of the box it now sits beside.
-        let frame_rect = painted.frame_around(painted.rect_of(BROWSE));
+        let frame_rect = painted.frame_around(painted.rect_of(k_browse()));
         assert!(
             (frame_rect.height() - crate::kit::controls::SMALL.height).abs() <= 0.5,
-            "{BROWSE:?} paints a {}pt-tall frame, not crate::kit::controls::SMALL.height ({}) -- a \
+            "{k_browse_v:?} paints a {}pt-tall frame, not crate::kit::controls::SMALL.height ({}) -- a \
              button with no height floor sits short of the box beside it",
             frame_rect.height(),
-            crate::kit::controls::SMALL.height
-        );
+            crate::kit::controls::SMALL.height, k_browse_v = k_browse());
     }
 
     /// **8a's `+ ` links are LINKS, in the design's own weight and blue** --
@@ -24512,8 +24740,8 @@ mod edit_pane_layout_tests {
         let unbound = frame_for(&ctx, ROOMY_PANE, &mut saved, false, &[], Some(&item), &totp);
 
         for (link, painted) in [
-            (APP_PICK_LINK, &bound),
-            (APP_ADD_PATH_LINK, &unbound),
+            (app_pick_link(), &bound),
+            (app_add_path_link(), &unbound),
         ] {
             assert_eq!(
                 painted.font_of(link),
@@ -24570,7 +24798,7 @@ mod edit_pane_layout_tests {
         // the button was. Browse is the one that has MOVED -- onto the
         // program-file row, where it now shares a line with a text box, which
         // is the narrower escape from `aae9429` of the two.
-        for label in [BROWSE, APP_PICK_LINK] {
+        for label in [k_browse(), app_pick_link()] {
             let rect = painted.rect_of(label);
             assert!(
                 bounds.contains_rect(rect),
@@ -24594,7 +24822,9 @@ mod edit_pane_layout_tests {
     /// **`CHOOSE_RUNNING_APP` used to sit beside it and is gone**: that
     /// control is [`APP_PICK_LINK`] now, which the form exports for the same
     /// reason, so there is nothing left for a second local spelling to do.
-    const BROWSE: &str = APP_BROWSE_BUTTON;
+    fn k_browse() -> &'static str {
+        app_browse_button()
+    }
 
     /// **A Save that cannot be pressed does not save**, asserted on the
     /// action the form returns and not on how the button looks.
@@ -24649,7 +24879,7 @@ mod edit_pane_layout_tests {
         let mut valid = tallest_draft();
         valid.name = "Ledgerline".to_string();
         assert!(valid.is_valid(), "the control case wants a saveable draft");
-        let (idle, saved) = press(&mut valid, SAVE_BUTTON);
+        let (idle, saved) = press(&mut valid, save_button());
         assert_eq!(
             idle,
             EditAction::None,
@@ -24665,11 +24895,11 @@ mod edit_pane_layout_tests {
 
         let mut invalid = tallest_draft();
         assert!(!invalid.is_valid(), "the case under test wants an unsaveable draft");
-        let (_, refused) = press(&mut invalid, SAVE);
+        let (_, refused) = press(&mut invalid, k_save());
         assert_eq!(
             refused,
             EditAction::None,
-            "clicking Save on a draft with no name asked the caller to SAVE it. The form's \
+            "clicking Save on a draft with no name asked the caller to k_save() it. The form's \
              only remaining defence would be the fill colour the disabled button wears"
         );
     }
@@ -24876,7 +25106,7 @@ mod edit_pane_layout_tests {
             &detail::TotpState::NoSecret,
         );
         assert!(
-            !painted.strings().contains(&DISCARD_TITLE),
+            !painted.strings().contains(&discard_title()),
             "the discard confirmation is on screen for an untouched form: {:?}",
             painted.strings()
         );
@@ -24910,7 +25140,7 @@ mod edit_pane_layout_tests {
             &detail::TotpState::NoSecret,
         );
         let on_screen = painted.strings();
-        for expected in [DISCARD_TITLE, DISCARD_BODY, DISCARD_KEEP, DISCARD_CONFIRM] {
+        for expected in [discard_title(), discard_body(), discard_keep(), discard_confirm()] {
             assert!(
                 on_screen.contains(&expected),
                 "the confirmation does not show {expected:?}: {on_screen:?}"
@@ -24946,7 +25176,7 @@ mod edit_pane_layout_tests {
             let answered = click_labelled(
                 &ctx,
                 &mut draft,
-                if confirm { DISCARD_CONFIRM } else { DISCARD_KEEP },
+                if confirm { discard_confirm() } else { discard_keep() },
             );
 
             assert!(!draft.discard_prompt, "the confirmation stayed up after being answered");
@@ -25120,7 +25350,7 @@ mod edit_pane_layout_tests {
             pane.x,
             pane.y
         );
-        let save_before = before.rect_of(SAVE);
+        let save_before = before.rect_of(k_save());
         let cancel_before = before.rect_of("Cancel");
 
         // A wheel over the middle of the form. `MouseWheel` in points is what
@@ -25147,7 +25377,7 @@ mod edit_pane_layout_tests {
 
         assert_inside("the last card's title", &last_card(), pane, &after);
         assert_eq!(
-            after.rect_of(SAVE),
+            after.rect_of(k_save()),
             save_before,
             "scrolling the form moved Save -- the buttons are not pinned"
         );
@@ -25581,7 +25811,7 @@ mod edit_pane_layout_tests {
         totp: &detail::TotpState,
     ) -> Painted {
         let shut = frame_for(ctx, pane, draft, true, &[], Some(item), totp);
-        let at = shut.rect_of(SEQUENCE_EDIT_BUTTON).center();
+        let at = shut.rect_of(sequence_edit_button()).center();
         let click = vec![
             egui::Event::PointerMoved(at),
             egui::Event::PointerButton {
@@ -25647,7 +25877,7 @@ mod edit_pane_layout_tests {
         // it, a regression that stopped drawing the builder would make every
         // assertion below trivially true.
         assert!(
-            painted.strings().contains(&APP_SEQUENCE_REVEAL),
+            painted.strings().contains(&app_sequence_reveal()),
             "the builder's eye is not on screen, so this is not the tallest form: {:?}",
             painted.strings()
         );
@@ -25754,7 +25984,7 @@ mod edit_pane_layout_tests {
         // see `offers_autofill`, which is asked here rather than matched on so
         // this list cannot drift from the form's own decision.
         if offers_autofill(kind) {
-            expected.extend([APP_BLOCK_HEADING, APP_ADD_PATH_LINK]);
+            expected.extend([app_block_heading(), app_add_path_link()]);
         }
         if creating {
             // `NewItem` has no `fields` payload, so the block says so instead
@@ -25762,9 +25992,9 @@ mod edit_pane_layout_tests {
             // is asserted, not merely the absence of the buttons: "it says
             // why" is the behaviour, and a block that drew nothing at all
             // would pass an absence check.
-            expected.push(FIELDS_CREATE_NOTICE);
+            expected.push(fields_create_notice());
         } else {
-            expected.extend([FIELD_ADD_TEXT_BUTTON, FIELD_ADD_HIDDEN_BUTTON]);
+            expected.extend([field_add_text_button(), field_add_hidden_button()]);
         }
         // Keyed off the form's OWN decision function rather than off `kind`,
         // so an SSH key -- whose boxes exist on a create and are withheld on
@@ -25793,10 +26023,10 @@ mod edit_pane_layout_tests {
                 // `creating` alone.
                 let shown = EditDraft::empty_of(kind).shown_slots(creating);
                 if shown.contains(&Slot::Totp) {
-                    expected.push(if creating { TOTP_CREATE_NOTICE } else { TOTP_HINT });
+                    expected.push(if creating { totp_create_notice() } else { totp_hint() });
                 }
                 if creating && shown.contains(&Slot::Websites) {
-                    expected.push(WEBSITE_CREATE_NOTICE);
+                    expected.push(website_create_notice());
                 }
             }
             FormBody::Card | FormBody::Identity | FormBody::Note | FormBody::SshKey => {}
@@ -25808,7 +26038,7 @@ mod edit_pane_layout_tests {
         // has one slot and it is floor, so the control would open onto an
         // empty list and is withheld.
         if !EditDraft::empty_of(kind).addable_slots(creating).is_empty() {
-            expected.push(SLOT_ADD_BUTTON);
+            expected.push(slot_add_button());
         }
         expected
     }
@@ -25821,9 +26051,9 @@ mod edit_pane_layout_tests {
     /// own row, under its own label.
     fn drawn_caption(slot: Slot) -> &'static str {
         match slot {
-            Slot::CardBrand | Slot::CardNumber => CARD_ROW_LABEL,
-            Slot::CardExpMonth | Slot::CardExpYear => EXPIRES_ROW_LABEL,
-            Slot::CardCode => CARD_CODE_LABEL,
+            Slot::CardBrand | Slot::CardNumber => card_row_label(),
+            Slot::CardExpMonth | Slot::CardExpYear => expires_row_label(),
+            Slot::CardCode => card_code_label(),
             other => other.label(),
         }
     }
@@ -25996,7 +26226,7 @@ mod edit_pane_layout_tests {
         let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
         let mut cases = 0;
         for (button, expected) in
-            [(FIELD_ADD_TEXT_BUTTON, FieldRole::Text), (FIELD_ADD_HIDDEN_BUTTON, FieldRole::Hidden)]
+            [(field_add_text_button(), FieldRole::Text), (field_add_hidden_button(), FieldRole::Hidden)]
         {
             cases += 1;
             let ctx = styled_context(pane);
@@ -26040,7 +26270,7 @@ mod edit_pane_layout_tests {
 
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
-        let removes = painted.rects_of(FIELD_REMOVE_BUTTON);
+        let removes = painted.rects_of(field_remove_button());
         assert_eq!(removes.len(), 3, "three rows must draw three removes, found {removes:?}");
         // The MIDDLE one, which is the only index a hardcoded first-or-last
         // remove cannot get right by accident.
@@ -26104,7 +26334,7 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
         assert_eq!(
-            painted.rects_of(FIELD_NAME_LABEL).len(),
+            painted.rects_of(field_name_label()).len(),
             3,
             "three rows did not draw three name boxes: {:?}",
             painted.strings()
@@ -26154,10 +26384,10 @@ mod edit_pane_layout_tests {
 
         // The control: the removal really happened and the pane really redrew.
         assert_eq!(
-            after.rects_of(FIELD_NAME_LABEL).len(),
+            after.rects_of(field_name_label()).len(),
             2,
             "the frame after the removal drew {} name boxes, not 2: {:?}",
-            after.rects_of(FIELD_NAME_LABEL).len(),
+            after.rects_of(field_name_label()).len(),
             after.strings()
         );
         assert!(
@@ -26189,7 +26419,7 @@ mod edit_pane_layout_tests {
             &[egui::Event::Text("x".to_string())],
         );
         assert_eq!(
-            typed.rects_of(FIELD_NAME_LABEL).len(),
+            typed.rects_of(field_name_label()).len(),
             2,
             "the form stopped drawing two rows while a character was typed: {:?}",
             typed.strings()
@@ -26211,7 +26441,7 @@ mod edit_pane_layout_tests {
         // measured, not supposed.
         let settled = frame(&ctx, pane, &mut draft, false, &[]);
         assert_eq!(
-            settled.rects_of(FIELD_NAME_LABEL).len(),
+            settled.rects_of(field_name_label()).len(),
             2,
             "the form stopped drawing two rows on the frame after the keystroke: {:?}",
             settled.strings()
@@ -26338,7 +26568,7 @@ mod edit_pane_layout_tests {
                 if height == TINY_PANE_HEIGHT {
                     assert!(
                         !before
-                            .rects_of(FIELD_ADD_HIDDEN_BUTTON)
+                            .rects_of(field_add_hidden_button())
                             .iter()
                             .any(|r| bounds.contains_rect(*r)),
                         "the form with {rows} custom fields already fits a {}x{} pane, so this \
@@ -26353,17 +26583,17 @@ mod edit_pane_layout_tests {
                 // takes it straight off the TOP of the viewport and would
                 // report it unreachable when it is merely passed. The user
                 // scrolls in steps too.
-                let after = scroll_to_reveal(&ctx, pane, &mut draft, FIELD_ADD_HIDDEN_BUTTON);
+                let after = scroll_to_reveal(&ctx, pane, &mut draft, field_add_hidden_button());
 
-                assert_inside("the Add a field button", FIELD_ADD_TEXT_BUTTON, pane, &after);
+                assert_inside("the Add a field button", field_add_text_button(), pane, &after);
                 assert_inside(
                     "the Add a hidden field button",
-                    FIELD_ADD_HIDDEN_BUTTON,
+                    field_add_hidden_button(),
                     pane,
                     &after,
                 );
                 // The action strip did not come with it.
-                assert_inside("Save", SAVE, pane, &after);
+                assert_inside("Save", k_save(), pane, &after);
             }
         }
         assert_eq!(cases, 4, "the case loop visited nothing, so it asserted nothing");
@@ -26402,33 +26632,33 @@ mod edit_pane_layout_tests {
         // drawn -- or one culled off the pane -- paints nothing, and the loop
         // below would then be silent about it.
         assert_eq!(
-            painted.rects_of(FIELD_NAME_LABEL).len(),
+            painted.rects_of(field_name_label()).len(),
             6,
             "six rows did not draw six name labels: {:?}",
             painted.strings()
         );
         assert_eq!(
-            painted.rects_of(FIELD_VALUE_LABEL).len(),
+            painted.rects_of(field_value_label()).len(),
             4,
             "the four text rows' value labels"
         );
         assert_eq!(
-            painted.rects_of(FIELD_HIDDEN_VALUE_LABEL).len(),
+            painted.rects_of(field_hidden_value_label()).len(),
             2,
             "a hidden row must say it is hidden -- a masked box alone looks like a text box"
         );
         assert_eq!(
-            painted.rects_of(FIELD_REMOVE_BUTTON).len(),
+            painted.rects_of(field_remove_button()).len(),
             6,
             "every row must offer its own remove"
         );
 
         let mut checked = 0;
         for label in [
-            FIELD_NAME_LABEL,
-            FIELD_VALUE_LABEL,
-            FIELD_HIDDEN_VALUE_LABEL,
-            FIELD_REMOVE_BUTTON,
+            field_name_label(),
+            field_value_label(),
+            field_hidden_value_label(),
+            field_remove_button(),
         ] {
             for rect in painted.rects_of(label) {
                 checked += 1;
@@ -26543,7 +26773,7 @@ mod edit_pane_layout_tests {
              body at all: {strings:?}"
         );
         assert!(
-            strings.contains(&TOTP_LABEL),
+            strings.contains(&totp_label()),
             "the seed row was not drawn: {strings:?}"
         );
         assert!(
@@ -26640,7 +26870,7 @@ mod edit_pane_layout_tests {
                 // checked with `rects_of` and not `rect_of`, because egui
                 // culls a shape outside the screen rect and paints NOTHING.
                 assert!(
-                    !before.rects_of(APP_ADD_PATH_LINK).iter().any(|r| bounds.contains_rect(*r)),
+                    !before.rects_of(app_add_path_link()).iter().any(|r| bounds.contains_rect(*r)),
                     "the unbound form already fits a {}x{} pane, so this height is not \
                      exercising scrolling at all",
                     pane.x,
@@ -26688,7 +26918,7 @@ mod edit_pane_layout_tests {
                         .iter()
                         .any(|r| bounds.contains_rect(*r) && within_pane(*r, pane))
                 };
-                if shown(APP_ADD_PATH_LINK) && shown(APP_BLOCK_HEADING) {
+                if shown(app_add_path_link()) && shown(app_block_heading()) {
                     reached = Some(after);
                     break;
                 }
@@ -26700,10 +26930,10 @@ mod edit_pane_layout_tests {
                     pane.x, pane.y
                 )
             });
-            assert_inside("the add row's path door", APP_ADD_PATH_LINK, pane, &after);
-            assert_inside("the row's caption", APP_BLOCK_HEADING, pane, &after);
+            assert_inside("the add row's path door", app_add_path_link(), pane, &after);
+            assert_inside("the row's caption", app_block_heading(), pane, &after);
             // The action strip did not come with it.
-            assert_inside("Save", SAVE, pane, &after);
+            assert_inside("Save", k_save(), pane, &after);
         }
         assert_eq!(heights, 2, "the height loop visited nothing, so it asserted nothing");
     }
@@ -26854,11 +27084,10 @@ mod edit_pane_layout_tests {
         for rect in &removes {
             assert!(
                 within_pane(*rect, pane),
-                "a {WEBSITE_REMOVE_BUTTON:?} mark is painted at x = {}..{} on a {}pt-wide pane",
+                "a {website_remove_button_v:?} mark is painted at x = {}..{} on a {}pt-wide pane",
                 rect.left(),
                 rect.right(),
-                pane.x
-            );
+                pane.x, website_remove_button_v = website_remove_button());
         }
         // Three dropdowns too, one per row, **each showing its OWN row's
         // value**. The match type is per-URI on the wire
@@ -26880,7 +27109,7 @@ mod edit_pane_layout_tests {
             assert_inside(&format!("website {i}'s match dropdown"), shown, pane, &painted);
         }
         assert_eq!(dropdowns, 3, "the dropdown loop asserted about nothing");
-        assert_inside("the add-a-website link", WEBSITE_ADD_BUTTON, pane, &painted);
+        assert_inside("the add-a-website link", website_add_button(), pane, &painted);
     }
 
     /// **...and every one of them is reachable at the minimum window
@@ -26918,8 +27147,8 @@ mod edit_pane_layout_tests {
         assert_eq!(reached, 4, "the website walk reached {reached} rows, not 4");
         // The Add sits below the last box, so it is the control a form that
         // merely *drew* four rows would leave out of reach.
-        let after = scroll_to_reveal(&ctx, pane, &mut draft, WEBSITE_ADD_BUTTON);
-        assert_inside("the add-a-website button", WEBSITE_ADD_BUTTON, pane, &after);
+        let after = scroll_to_reveal(&ctx, pane, &mut draft, website_add_button());
+        assert_inside("the add-a-website button", website_add_button(), pane, &after);
     }
 
     /// **The website controls are wired to the draft, not merely painted.**
@@ -26940,14 +27169,13 @@ mod edit_pane_layout_tests {
 
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
-        let at = painted.rect_of(WEBSITE_ADD_BUTTON).center();
+        let at = painted.rect_of(website_add_button()).center();
         let _ = frame(&ctx, pane, &mut draft, false, &click(at));
         assert_eq!(
             draft.uris.len(),
             4,
-            "clicking {WEBSITE_ADD_BUTTON:?} did not reach the draft -- the control is \
-             painted and connected to nothing"
-        );
+            "clicking {website_add_button_v:?} did not reach the draft -- the control is \
+             painted and connected to nothing", website_add_button_v = website_add_button());
         assert!(
             draft.uris[3].uri.is_empty(),
             "the added row arrived carrying something nobody typed"
@@ -27048,7 +27276,7 @@ mod edit_pane_layout_tests {
             let _ = frame(&ctx, pane, &mut draft, false, &[]);
             let painted = frame(&ctx, pane, &mut draft, false, &[]);
             assert_eq!(
-                painted.strings().contains(&WEBSITE_FIRST_NOTE),
+                painted.strings().contains(&website_first_note()),
                 expected,
                 "with {count} website(s) the note's presence is wrong; painted: {:?}",
                 painted.strings()
@@ -27056,7 +27284,7 @@ mod edit_pane_layout_tests {
             // The block really was drawn in every one of the four states, so
             // an absence above is about the note and not about the block.
             assert!(
-                painted.strings().contains(&WEBSITE_ADD_BUTTON),
+                painted.strings().contains(&website_add_button()),
                 "the websites block is not on screen at all with {count} website(s)"
             );
         }
@@ -27081,13 +27309,13 @@ mod edit_pane_layout_tests {
         let painted = frame(&ctx, pane, &mut draft, true, &[]);
         let strings = painted.strings();
 
-        assert_inside("the websites label", WEBSITE_LABEL, pane, &painted);
+        assert_inside("the websites label", website_label_text(), pane, &painted);
         assert!(
-            strings.contains(&WEBSITE_CREATE_NOTICE),
+            strings.contains(&website_create_notice()),
             "the create form withholds the website boxes and says nothing about why: {strings:?}"
         );
         assert!(
-            !strings.contains(&WEBSITE_ADD_BUTTON),
+            !strings.contains(&website_add_button()),
             "the create form offers an Add whose contents Save would discard"
         );
         assert!(draft.uris.is_empty(), "a create form put a website row on the draft");
@@ -27258,9 +27486,9 @@ mod edit_pane_layout_tests {
             // them. Asserting `SLOT_ADD_BUTTON` unconditionally is what
             // failed when the login gained its doors.
             let door = if matches!(kind, ItemKind::Login) {
-                WEBSITE_ADD_BUTTON
+                website_add_button()
             } else {
-                SLOT_ADD_BUTTON
+                slot_add_button()
             };
             assert_inside("the add control", door, pane, &painted);
         }
@@ -27351,7 +27579,7 @@ mod edit_pane_layout_tests {
             "the add menu's choices are on screen before it was opened"
         );
 
-        let at = shut.rect_of(SLOT_ADD_BUTTON).center();
+        let at = shut.rect_of(slot_add_button()).center();
         let _ = frame(&ctx, pane, &mut draft, false, &click(at));
         assert!(draft.add_menu_open, "clicking Add did not open the menu");
         let open = frame(&ctx, pane, &mut draft, false, &[]);
@@ -27482,7 +27710,7 @@ mod edit_pane_layout_tests {
 
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
-        let removes = painted.rects_of(SLOT_REMOVE_BUTTON);
+        let removes = painted.rects_of(slot_remove_button());
         assert_eq!(
             removes.len(),
             1,
@@ -27505,23 +27733,23 @@ mod edit_pane_layout_tests {
         // button nothing else" -- so the note's absence is now half the
         // claim rather than a string that quietly stopped being painted.
         assert!(
-            after.strings().contains(&TOTP_ADD_BUTTON),
+            after.strings().contains(&totp_add_button()),
             "the emptied row offers no way to add one back: {:?}",
             after.strings()
         );
         assert!(
-            !after.strings().contains(&TOTP_EMPTY_NOTE),
+            !after.strings().contains(&totp_empty_note()),
             "the emptied row is drawing a greyed box beside the button that is the real \
              way in: {:?}",
             after.strings()
         );
         assert!(
-            !after.strings().contains(&SLOT_REMOVE_BUTTON),
+            !after.strings().contains(&slot_remove_button()),
             "an emptied row still offers a Remove, which would remove nothing: {:?}",
             after.strings()
         );
         assert!(
-            !after.strings().contains(&TOTP_REPLACE_BUTTON),
+            !after.strings().contains(&totp_replace_button()),
             "an emptied row still offers a Replace, which has nothing to replace: {:?}",
             after.strings()
         );
@@ -27551,7 +27779,7 @@ mod edit_pane_layout_tests {
             let _ = frame(&ctx, pane, &mut draft, false, &[]);
             let painted = frame(&ctx, pane, &mut draft, false, &[]);
             assert!(
-                painted.rects_of(SLOT_REMOVE_BUTTON).is_empty(),
+                painted.rects_of(slot_remove_button()).is_empty(),
                 "a {kind:?} showing only its floor rows draws a Remove: {:?}",
                 painted.strings()
             );
@@ -27587,7 +27815,7 @@ mod edit_pane_layout_tests {
             let _ = frame(&ctx, pane, &mut draft, true, &[]);
             let painted = frame(&ctx, pane, &mut draft, true, &[]);
             assert!(
-                !painted.strings().contains(&SLOT_ADD_BUTTON),
+                !painted.strings().contains(&slot_add_button()),
                 "a {kind:?} being created draws the Add control"
             );
         }
@@ -27615,18 +27843,18 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let empty = frame(&ctx, pane, &mut draft, false, &[]);
         assert!(
-            empty.strings().contains(&WEBSITE_ADD_BUTTON),
+            empty.strings().contains(&website_add_button()),
             "a login with no website is not offering one at all: {:?}",
             empty.strings()
         );
 
-        let at = empty.rect_of(WEBSITE_ADD_BUTTON).center();
+        let at = empty.rect_of(website_add_button()).center();
         let _ = frame(&ctx, pane, &mut draft, false, &click(at));
 
         // Revealed WITH a box to type in, not just a heading.
         assert_eq!(draft.uris.len(), 1, "the revealed block has no row to type into");
         let after = frame(&ctx, pane, &mut draft, false, &[]);
-        assert_inside("the websites block's own Add", WEBSITE_ADD_BUTTON, pane, &after);
+        assert_inside("the websites block's own Add", website_add_button(), pane, &after);
 
         // ...and taking that row away takes the block with it. The Remove is
         // 8a's ✕ now and paints no glyph, so it is found by geometry -- see
@@ -27641,7 +27869,7 @@ mod edit_pane_layout_tests {
         assert!(!draft.addable_slots(false).contains(&Slot::Websites));
         let emptied = frame(&ctx, pane, &mut draft, false, &[]);
         assert!(
-            emptied.strings().contains(&WEBSITE_ADD_BUTTON),
+            emptied.strings().contains(&website_add_button()),
             "removing the last website took the way back with it: {:?}",
             emptied.strings()
         );
@@ -27673,7 +27901,7 @@ mod edit_pane_layout_tests {
             assert_inside(&format!("the {:?} chip", slot), slot.label(), pane, &painted);
         }
         assert_eq!(checked, 16, "the chip loop asserted about nothing");
-        assert_inside("the add menu's hint", SLOT_ADD_HINT, pane, &painted);
+        assert_inside("the add menu's hint", slot_add_hint(), pane, &painted);
 
         // ...and the card did not grow to hold them. Read off the Name box's
         // own caption, which is above the menu and therefore laid out against
@@ -27791,7 +28019,7 @@ mod edit_pane_layout_tests {
             frame(&ctx, pane, &mut draft, false, &[])
         };
         assert_eq!(
-            with.rects_of(SLOT_REMOVE_BUTTON).len(),
+            with.rects_of(slot_remove_button()).len(),
             16,
             "the fixture is not drawing the sixteen chips this test is about"
         );
@@ -27804,7 +28032,7 @@ mod edit_pane_layout_tests {
             let _ = frame(&ctx, pane, &mut draft, true, &[]);
             frame(&ctx, pane, &mut draft, true, &[])
         };
-        assert!(without.rects_of(SLOT_REMOVE_BUTTON).is_empty(), "the create form drew chips");
+        assert!(without.rects_of(slot_remove_button()).is_empty(), "the create form drew chips");
         assert_eq!(
             with.rect_of("Folder").left(),
             without.rect_of("Folder").left(),
@@ -28116,9 +28344,9 @@ mod edit_pane_layout_tests {
         assert_eq!(owner_line(&claimed), "Shared by boss@x.io \u{b7} unverified");
         assert_eq!(owner_line(&attested), "Shared by boss@x.io");
         assert!(owner_hint(&claimed).starts_with(crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP));
-        assert!(owner_hint(&claimed).ends_with(OWNER_HINT));
-        assert_eq!(owner_hint(&attested), OWNER_HINT);
-        assert_eq!(owner_hint(&Audience::Personal), OWNER_HINT);
+        assert!(owner_hint(&claimed).ends_with(owner_hint_text()));
+        assert_eq!(owner_hint(&attested), owner_hint_text());
+        assert_eq!(owner_hint(&Audience::Personal), owner_hint_text());
     }
 
     /// **The section rail is gone, and nothing draws it again by accident.**
@@ -28204,7 +28432,7 @@ mod edit_pane_layout_tests {
             assert!(!clean.is_dirty(), "the pristine case starts dirty");
             let _ = frame(&ctx, pane, &mut clean, false, &[]);
             let painted = frame(&ctx, pane, &mut clean, false, &[]);
-            assert_inside("the no-changes note", NO_CHANGES_NOTE, pane, &painted);
+            assert_inside("the no-changes note", no_changes_note(), pane, &painted);
 
             // ...then two real edits, which 8a reports as `2 changes`.
             let ctx = styled_context(pane);
@@ -28432,12 +28660,12 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
-        let folder = painted.rect_of(ITEM_FOLDER_LABEL);
-        let owner = painted.rect_of(ITEM_OWNER_LABEL);
+        let folder = painted.rect_of(item_folder_label());
+        let owner = painted.rect_of(item_owner_label());
         // `Type` is also a word the Identity body uses; this fixture is a
         // login, whose only `Type` is this card's.
-        let kind = painted.rect_of(ITEM_TYPE_LABEL);
-        for (name, rect) in [(ITEM_OWNER_LABEL, owner), (ITEM_TYPE_LABEL, kind)] {
+        let kind = painted.rect_of(item_type_label());
+        for (name, rect) in [(item_owner_label(), owner), (item_type_label(), kind)] {
             assert!(
                 (rect.top() - folder.top()).abs() <= 0.5,
                 "{name} sits at {} and Folder at {} -- the ITEM card is not one line",
@@ -28662,16 +28890,15 @@ mod edit_pane_layout_tests {
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
 
-        let caption = painted.rect_of(APP_BLOCK_HEADING);
-        for link in [APP_PICK_LINK, APP_ADD_PATH_LINK] {
+        let caption = painted.rect_of(app_block_heading());
+        for link in [app_pick_link(), app_add_path_link()] {
             let run = painted.rect_of(link);
             assert!(
                 (run.center().y - caption.center().y).abs() <= 1.5,
-                "{link:?} is centred at y = {} and {APP_BLOCK_HEADING:?} beside it at {} -- \
+                "{link:?} is centred at y = {} and {app_block_heading_v:?} beside it at {} -- \
                  the caption and the control it names are not on one line",
                 run.center().y,
-                caption.center().y
-            );
+                caption.center().y, app_block_heading_v = app_block_heading());
         }
     }
 
@@ -28704,7 +28931,7 @@ mod edit_pane_layout_tests {
         let mut draft = EditDraft::from_item(&item);
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
-        let link = painted.rect_of(APP_PICK_LINK).center();
+        let link = painted.rect_of(app_pick_link()).center();
         let _ = frame_for(&ctx, pane, &mut draft, false, &click(link), Some(&item), &totp);
         assert!(
             draft.app.as_ref().is_some_and(|a| a.picking),
@@ -28731,7 +28958,7 @@ mod edit_pane_layout_tests {
         let after = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
 
         let strings = after.strings();
-        for gone in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON] {
+        for gone in [app_path_label(), app_args_label(), app_browse_button()] {
             assert!(
                 !strings.contains(&gone),
                 "a picker opened from the add row and closed left {gone:?} on the form, over \
@@ -28739,7 +28966,7 @@ mod edit_pane_layout_tests {
             );
         }
         assert!(
-            strings.contains(&APP_ADD_PATH_LINK),
+            strings.contains(&app_add_path_link()),
             "the row did not go back to the add row: {strings:?}"
         );
 
@@ -28756,7 +28983,7 @@ mod edit_pane_layout_tests {
         let _ = frame_for(&ctx, pane, &mut typed, false, &escape, Some(&item), &totp);
         let kept = frame_for(&ctx, pane, &mut typed, false, &[], Some(&item), &totp);
         assert!(
-            kept.strings().contains(&APP_PATH_LABEL),
+            kept.strings().contains(&app_path_label()),
             "closing the picker threw away a path the user had already typed: {:?}",
             kept.strings()
         );
@@ -28811,17 +29038,15 @@ mod edit_pane_layout_tests {
             let strings = painted.strings();
 
             assert_eq!(
-                strings.contains(&WEBSITE_ADD_BUTTON),
+                strings.contains(&website_add_button()),
                 websites,
-                "{what} offers {WEBSITE_ADD_BUTTON:?} = {} -- expected {websites}: {strings:?}",
-                strings.contains(&WEBSITE_ADD_BUTTON)
-            );
+                "{what} offers {website_add_button_v:?} = {} -- expected {websites}: {strings:?}",
+                strings.contains(&website_add_button()), website_add_button_v = website_add_button());
             assert_eq!(
-                strings.contains(&APP_BLOCK_HEADING),
+                strings.contains(&app_block_heading()),
                 app,
-                "{what} offers {APP_BLOCK_HEADING:?} = {} -- expected {app}: {strings:?}",
-                strings.contains(&APP_BLOCK_HEADING)
-            );
+                "{what} offers {app_block_heading_v:?} = {} -- expected {app}: {strings:?}",
+                strings.contains(&app_block_heading()), app_block_heading_v = app_block_heading());
             // The card title goes with the last of its rows: a titled band
             // with nothing under it is the "drawn and empty" state this form
             // refuses everywhere.
@@ -28933,9 +29158,9 @@ mod edit_pane_layout_tests {
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
 
-        let pick = painted.rect_of(APP_PICK_LINK);
-        let word = painted.rect_of(APP_ADD_OR);
-        let path = painted.rect_of(APP_ADD_PATH_LINK);
+        let pick = painted.rect_of(app_pick_link());
+        let word = painted.rect_of(app_add_or());
+        let path = painted.rect_of(app_add_path_link());
         for (left, right) in [(pick, word), (word, path)] {
             let gap = right.left() - left.right();
             assert!(
@@ -28969,7 +29194,7 @@ mod edit_pane_layout_tests {
         let totp = detail::TotpState::NoSecret;
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
-        let link = painted.rect_of(APP_PICK_LINK).center();
+        let link = painted.rect_of(app_pick_link()).center();
 
         let _ = frame_for(&ctx, pane, &mut draft, false, &click(link), Some(&item), &totp);
         let app = draft.app.as_ref().expect("the Pick door made no draft binding");
@@ -29004,29 +29229,27 @@ mod edit_pane_layout_tests {
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
 
-        let caption = painted.rect_of(APP_PATH_LABEL);
-        let browse = painted.rect_of(APP_BROWSE_BUTTON);
+        let caption = painted.rect_of(app_path_label());
+        let browse = painted.rect_of(app_browse_button());
         assert!(
             (browse.center().y - caption.center().y).abs() <= 2.0,
-            "{APP_BROWSE_BUTTON:?} is centred at y = {} and its row's caption at {} -- the \
+            "{app_browse_button_v:?} is centred at y = {} and its row's caption at {} -- the \
              button is on a line of its own",
             browse.center().y,
-            caption.center().y
-        );
+            caption.center().y, app_browse_button_v = app_browse_button());
         // ...and flush right, with the card's other row buttons. The
         // credentials card's LAST `Copy` is the comparison -- the password
         // row's, which is the second of a pair and therefore the one whose
         // right edge `row_with_buttons` really computes.
         let last_copy = *painted
-            .rects_of(COPY_LABEL)
+            .rects_of(copy_label())
             .last()
             .expect("the credentials card draws a Copy on two rows");
         assert!(
             (browse.right() - last_copy.right()).abs() <= 1.0,
-            "{APP_BROWSE_BUTTON:?} ends at {} and the password row's {COPY_LABEL:?} at {} --              the two rows do not share a right-hand edge",
+            "{app_browse_button_v:?} ends at {} and the password row's {copy_label_v:?} at {} --              the two rows do not share a right-hand edge",
             browse.right(),
-            last_copy.right()
-        );
+            last_copy.right(), app_browse_button_v = app_browse_button(), copy_label_v = copy_label());
     }
 
     /// **Every caption in a label column fits on one line of it.**
@@ -29045,12 +29268,12 @@ mod edit_pane_layout_tests {
     fn no_row_caption_is_wider_than_the_label_column() {
         let ctx = styled_context(Vec2::new(WIDE_PANE_WIDTH, 800.0));
         let captions = [
-            APP_BLOCK_HEADING,
-            APP_PATH_LABEL,
-            APP_ARGS_LABEL,
-            APP_WINDOW_LABEL,
-            WEBSITE_LABEL,
-            TOTP_LABEL,
+            app_block_heading(),
+            app_path_label(),
+            app_args_label(),
+            app_window_label(),
+            website_label_text(),
+            totp_label(),
         ];
         let _ = ctx.run_ui(raw_input(Vec2::new(WIDE_PANE_WIDTH, 800.0), &[]), |ui| {
             for caption in captions {
@@ -29192,8 +29415,8 @@ mod edit_pane_layout_tests {
         );
 
         // ...and it is between the groups, not inside either.
-        let last_website = painted.rect_of(WEBSITE_ADD_BUTTON).bottom();
-        let app = painted.rect_of(APP_BLOCK_HEADING).top();
+        let last_website = painted.rect_of(website_add_button()).bottom();
+        let app = painted.rect_of(app_block_heading()).top();
         assert!(
             rules[0] > last_website && rules[0] < app,
             "the card's one hairline is at y = {}, which is not between the websites group \
@@ -29746,7 +29969,7 @@ mod draft_dirtiness_tests {
     #[test]
     fn the_footer_summary_only_promises_a_history_entry_when_there_will_be_one() {
         let none: Vec<Change> = Vec::new();
-        assert_eq!(change_summary(&none, "anything"), NO_CHANGES_NOTE);
+        assert_eq!(change_summary(&none, "anything"), no_changes_note());
 
         let renamed = vec![Change { label: "Name", section: Section::Item }];
         assert_eq!(change_summary(&renamed, "unchanged"), "1 change");
@@ -30439,14 +30662,14 @@ mod card_custom_field_tests {
 
         draft.fields.push(FieldDraft::new_of(FieldRole::Text));
         draft.fields.last_mut().unwrap().name = "Pin".into();
-        assert_eq!(draft.pin_name_fault(), Some(PIN_NAME_REFUSAL));
+        assert_eq!(draft.pin_name_fault(), Some(pin_name_refusal()));
         assert!(!draft.is_saveable(), "a card saved a custom field named PIN");
-        assert_eq!(save_label(&draft), SAVE_PIN_NAME_BLOCKED);
+        assert_eq!(save_label(&draft), save_pin_name_blocked());
 
         // Renaming an existing field to PIN is the same collision.
         let mut renamed = EditDraft::from_item(&card_item());
         renamed.fields[0].name = "PIN".into();
-        assert_eq!(renamed.pin_name_fault(), Some(PIN_NAME_REFUSAL));
+        assert_eq!(renamed.pin_name_fault(), Some(pin_name_refusal()));
 
         // Arrived as two PIN fields: the first is the card's PIN, the second
         // is left as it is, and neither is refused.
@@ -30922,7 +31145,7 @@ mod website_tests {
     /// by position.
     #[test]
     fn the_edit_form_and_the_read_pane_call_a_website_the_same_thing() {
-        assert_eq!(WEBSITE_LABEL, detail::copy_shortcut_label(detail::CopyShortcut::Url));
+        assert_eq!(website_label_text(), detail::copy_shortcut_label(detail::CopyShortcut::Url));
     }
 
     /// **...and the numbering says which one the read pane is showing.**
@@ -30934,7 +31157,7 @@ mod website_tests {
     /// row.
     #[test]
     fn only_the_first_website_is_unnumbered() {
-        assert_eq!(website_label(0), WEBSITE_LABEL);
+        assert_eq!(website_label(0), website_label_text());
         assert_eq!(website_label(1), "Website 2");
         assert_eq!(website_label(2), "Website 3");
     }
@@ -31395,8 +31618,8 @@ mod autofill_card_tests {
     /// two vocabularies.
     #[test]
     fn the_match_rule_readout_uses_the_pickers_own_two_words() {
-        assert_eq!(app_rule_label(false), PICKER_RULE_PROCESS);
-        assert_eq!(app_rule_label(true), PICKER_RULE_HOSTED);
+        assert_eq!(app_rule_label(false), picker_rule_process());
+        assert_eq!(app_rule_label(true), picker_rule_hosted());
         assert_ne!(
             app_rule_label(false),
             app_rule_label(true),
@@ -31757,7 +31980,7 @@ mod v2_editor_tests {
         draft.app = None;
         open_avatar_menu(&ctx, &mut draft, &item);
         assert_eq!(pick_avatar_row(&ctx, &mut draft, &item, AvatarRow::App), EditAction::None);
-        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(AVATAR_APP_FIRST_TOAST));
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(avatar_app_first_toast()));
     }
 
     /// Spec B 1.4 F-I: Custom fields, About (with the password history's
@@ -31771,7 +31994,7 @@ mod v2_editor_tests {
         let _ = draw_saved(&ctx, 0.0, wide, &mut draft, &item, false, vec![]);
         let (_, p) = draw_saved(&ctx, 0.1, wide, &mut draft, &item, false, vec![]);
         let left = exact(&p, Section::Notes.title(ItemKind::Login)).expect("Notes").right();
-        for title in [Section::CustomFields.title(ItemKind::Login), "About", MOVE_TO_TRASH] {
+        for title in [Section::CustomFields.title(ItemKind::Login), "About", move_to_trash()] {
             let at = exact(&p, title).unwrap_or_else(|| panic!("no {title}"));
             assert!(at.left() > left, "{title} is not in the right column");
         }
@@ -31788,7 +32011,7 @@ mod v2_editor_tests {
         let _ = draw_saved(&ctx, 0.0, wide, &mut draft, &item, true, vec![]);
         let (_, p) = draw_saved(&ctx, 0.1, wide, &mut draft, &item, true, vec![]);
         assert!(exact(&p, "About").is_none());
-        assert!(exact(&p, MOVE_TO_TRASH).is_none());
+        assert!(exact(&p, move_to_trash()).is_none());
     }
 
     #[test]
@@ -31865,7 +32088,7 @@ mod v2_editor_tests {
         let (_, p) = draw(&ctx, 0.0, &mut draft, true, vec![]);
         let save = control(&ctx, EditControl::Save);
         let label = p.texts.iter().find(|(_, _, r)| save.contains(r.center())).map(|(t, _, _)| t.clone());
-        assert_eq!(label.as_deref(), Some(SAVE_BUTTON));
+        assert_eq!(label.as_deref(), Some(save_button()));
     }
 
     /// Review I6: a chosen colour wins over a card's network tile too.
@@ -31958,7 +32181,7 @@ mod v2_editor_tests {
         assert!(draft.uris.is_empty(), "the ✕ takes the website off");
 
         let (_, p) = draw(&ctx, 0.2, &mut draft, false, vec![]);
-        assert!(exact(&p, FILLS_IN_ADD_PLACEHOLDER).is_some(), "the add box's placeholder");
+        assert!(exact(&p, fills_in_add_placeholder()).is_some(), "the add box's placeholder");
         ctx.memory_mut(|m| m.request_focus(fills_in_add_id()));
         let _ = draw(&ctx, 0.3, &mut draft, false, vec![]);
         let _ = draw(&ctx, 0.4, &mut draft, false, vec![egui::Event::Text("b.example".into())]);
@@ -32027,7 +32250,7 @@ mod v2_editor_tests {
         let save = control(&ctx, EditControl::Save);
         let (action, _) = draw(&ctx, 0.1, &mut draft, true, click_at(save.center()));
         assert_eq!(action, EditAction::None, "nothing is saved without a name");
-        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(NAME_FIRST_TOAST));
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(name_first_toast()));
     }
 
     #[test]
@@ -32079,7 +32302,7 @@ mod v2_editor_tests {
     fn the_folder_is_a_segmented_control_for_three_folders_or_fewer() {
         let folder = |id: &str, name: &str| Folder { id: id.into(), name: name.into(), other: Default::default() };
         let few = vec![folder("f1", "Work"), folder("f2", "Home")];
-        assert_eq!(folder_options(&few, true), vec![NO_FOLDER_LABEL.to_string(), "Work".into(), "Home".into()]);
+        assert_eq!(folder_options(&few, true), vec![no_folder_label().to_string(), "Work".into(), "Home".into()]);
         let many: Vec<Folder> = (0..4).map(|i| folder(&format!("f{i}"), &format!("F{i}"))).collect();
         assert!(folder_options(&many, true).is_empty(), "four folders are a dropdown");
         // Drawn: picking a segment files the draft.

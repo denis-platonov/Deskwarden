@@ -126,7 +126,7 @@ fn layout(ui: &egui::Ui, role: Role, text: &str, ink: Color32) -> std::sync::Arc
 /// the scan, and a stray one landing here would throw the form away on the
 /// keystroke the user meant as "stop scanning".
 pub fn draw_add_modal(ctx: &egui::Context, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
-    let sub = format!("For {}", state.item_name);
+    let sub = crate::i18n::tf("totp.for_item", &[("name", &state.item_name)]);
     // A body taller than the window scrolls inside the card instead of running
     // off it: the title block and the margins stay put.
     let room = (ctx.content_rect().height() - 2.0 * modal::GUTTER - 2.0 * f32::from(modal::PADDING) - 76.0).max(240.0);
@@ -858,7 +858,7 @@ fn found_card(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) -> b
     icon::stroke(ui.painter(), Rect::from_center_size(circle, Vec2::splat(24.0)), glyph::TICK, 2.8, p.done_mark);
 
     let code_galley = layout(ui, code_font(26.0), &grouped_code(code), p.blue_deep);
-    let secs = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, &format!("new code in {left}s"), p.text_icon);
+    let secs = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, &crate::i18n::tf("totp.new_code_in", &[("seconds", &left.to_string())]), p.text_icon);
     let right_w = code_galley.size().x.max(secs.size().x);
     let right = rect.right() - 20.0;
     let block_h = code_galley.size().y + 2.0 + secs.size().y;

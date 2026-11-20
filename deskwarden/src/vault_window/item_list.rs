@@ -318,7 +318,14 @@ pub enum MoveMenu {
 
 /// The submenu's own label. A constant because the draw code and the tests
 /// that read painted galleys both need it.
+// English only, kept because `send_ui`'s tests alias it in a `const`; everything that
+// draws reads [`move_to_folder_label`]. Phase 2 of the translation work removes this
+// constant when `send_ui` has moved to the function.
 pub const MOVE_TO_FOLDER_LABEL: &str = "Move to folder";
+
+pub fn move_to_folder_label() -> &'static str {
+    crate::i18n::t("list.move_to_folder")
+}
 
 /// Why "Edit" is greyed for a non-login.
 ///
@@ -330,13 +337,15 @@ pub const MOVE_TO_FOLDER_LABEL: &str = "Move to folder";
 /// recognise. Logins, secure notes, cards and identities are editable -- see
 /// `detail::kind_offers_edit`, which is the one predicate the enabled flag is
 /// read straight off.
-const EDIT_DISABLED_REASON: &str =
-    "Deskwarden cannot edit this item type yet. Open it in the Bitwarden web vault \
-     or app to edit it.";
+fn edit_disabled_reason() -> &'static str {
+    crate::i18n::t("list.edit_disabled")
+}
 
 /// Shown instead of a destination list when the vault has no folder that can
 /// be assigned to.
-const NO_ASSIGNABLE_FOLDERS: &str = "No folders yet";
+fn no_assignable_folders() -> &'static str {
+    crate::i18n::t("list.no_folders")
+}
 
 /// **The icon submenu's own label**, alongside [`MOVE_TO_FOLDER_LABEL`] and a
 /// constant for its reason: the two draw sites, the entry-list tests and the
@@ -354,14 +363,18 @@ const NO_ASSIGNABLE_FOLDERS: &str = "No folders yet";
 /// icon" asks for the same picture again and changes nothing the user chose.
 /// The group is everything this app can do with an item's picture, so it is
 /// named for the picture.
-pub const ICON_LABEL: &str = "Icon";
+pub fn icon_label() -> &'static str {
+    crate::i18n::t("list.icon")
+}
 
 /// The "forget this icon and fetch it again" entry's wording, the owner's own.
 ///
 /// A constant because the draw code, the entry-list tests and the tests that
 /// read painted galleys all name it, and a relabelling that reached three of
 /// those four is a menu whose test suite is about a string nobody sees.
-pub const REFRESH_ICON_LABEL: &str = "Refresh icon";
+pub fn refresh_icon_label() -> &'static str {
+    crate::i18n::t("list.refresh_icon")
+}
 
 /// The "choose this item's picture yourself" entry's wording.
 ///
@@ -373,7 +386,9 @@ pub const REFRESH_ICON_LABEL: &str = "Refresh icon";
 ///
 /// A constant for [`REFRESH_ICON_LABEL`]'s reason: the draw code, the
 /// entry-list tests and the tests that read painted galleys all name it.
-pub const SELECT_ICON_LABEL: &str = "Select icon\u{2026}";
+pub fn select_icon_label() -> &'static str {
+    crate::i18n::t("list.select_icon")
+}
 
 /// The way back to the automatic icon.
 ///
@@ -382,12 +397,16 @@ pub const SELECT_ICON_LABEL: &str = "Select icon\u{2026}";
 /// had all along, which for a login is its site's favicon and for a secure
 /// note is its monogram. A label promising removal would read as destructive
 /// on an item whose visible result is a *different* picture appearing.
-pub const CLEAR_ICON_LABEL: &str = "Use the automatic icon";
+pub fn clear_icon_label() -> &'static str {
+    crate::i18n::t("list.clear_icon")
+}
 
 /// Why the item's own folder is greyed inside the submenu. Kept rather than
 /// dropped from the list so the destinations do not reshuffle as items are
 /// selected, and so the row doubles as "this is where it lives now".
-const ALREADY_IN_THIS_FOLDER: &str = "This item is already in this folder";
+fn already_in_this_folder() -> &'static str {
+    crate::i18n::t("list.already_in_folder")
+}
 
 /// The "no folder at all" destination's label, and the reason it is greyed
 /// for an item that already has none.
@@ -395,8 +414,12 @@ const ALREADY_IN_THIS_FOLDER: &str = "This item is already in this folder";
 /// The wording is Bitwarden's own ("No folder"), so a user who files things
 /// in another client meets the phrase they already know rather than this
 /// app's invention of one.
-const NO_FOLDER_LABEL: &str = "No folder";
-const ALREADY_IN_NO_FOLDER: &str = "This item is not in a folder";
+fn no_folder_label() -> &'static str {
+    crate::i18n::t("list.no_folder")
+}
+fn already_in_no_folder() -> &'static str {
+    crate::i18n::t("list.not_in_folder")
+}
 
 /// The Delete entry's label. **One label, because the confirmation is no
 /// longer in the menu**: choosing this opens
@@ -410,11 +433,15 @@ const ALREADY_IN_NO_FOLDER: &str = "This item is not in a folder";
 /// from it rather than repeating the word: that pane had `("Delete", "Delete
 /// this item")` typed into it, so the row menu and the kebab were two
 /// spellings of one label and a rename would have moved only one of them.
-pub(super) const DELETE_LABEL: &str = "Delete";
+pub(super) fn delete_label() -> &'static str {
+    crate::i18n::t("list.delete")
+}
 
 /// The Trash row's permanent delete. Also one label, through the same modal,
 /// which says "forever" in its heading, its sentence and its button.
-const PURGE_LABEL: &str = "Delete forever";
+fn purge_label() -> &'static str {
+    crate::i18n::t("list.purge")
+}
 
 /// Trimmed text, or `None` when there is nothing worth an entry -- the same
 /// rule `detail::non_empty` applies to that pane's rows, restated here
@@ -468,10 +495,10 @@ pub fn menu_entries(
     // same untruth as a blank row, which is the rule `detail::non_empty`
     // already applies to that pane.
     if menu_non_empty(login.and_then(|l| l.username.as_deref())).is_some() {
-        entries.push(enabled_command("Copy username", RowCommand::CopyUsername));
+        entries.push(enabled_command(crate::i18n::t("list.copy_username"), RowCommand::CopyUsername));
     }
     if menu_non_empty(login.and_then(|l| l.password.as_deref()).map(|p| p.as_str())).is_some() {
-        entries.push(enabled_command("Copy password", RowCommand::CopyPassword));
+        entries.push(enabled_command(crate::i18n::t("list.copy_password"), RowCommand::CopyPassword));
         // No reveal and no confirmation before this one, by explicit user
         // decision.
     }
@@ -480,7 +507,7 @@ pub fn menu_entries(
     // poll gate are both `totp.is_some()`, so anything stricter here would
     // let a row show a 2FA chip whose menu then denies the code exists.
     if login.and_then(|l| l.totp.as_ref()).is_some() {
-        entries.push(enabled_command("Copy TOTP", RowCommand::CopyTotp));
+        entries.push(enabled_command(crate::i18n::t("list.copy_totp"), RowCommand::CopyTotp));
     }
     // Login-only, through the existing predicate rather than an inline
     // `item_type == Some(1)`: a website is a login's property, and no other
@@ -498,7 +525,7 @@ pub fn menu_entries(
             menu_non_empty(login.and_then(|l| l.uris.first()).and_then(|u| u.uri.as_deref()))
         {
             entries.push(enabled_command(
-                "Open website",
+                crate::i18n::t("list.open_website"),
                 RowCommand::OpenWebsite(url.to_string()),
             ));
         }
@@ -519,17 +546,17 @@ pub fn menu_entries(
     // rather than hidden.
     let editable = kind_offers_edit(kind);
     entries.push(MenuEntry::Command(MenuCommand {
-        label: "Edit".to_string(),
+        label: crate::i18n::t("list.edit").to_string(),
         command: RowCommand::Edit,
         enabled: editable,
-        disabled_reason: (!editable).then_some(EDIT_DISABLED_REASON),
+        disabled_reason: (!editable).then_some(edit_disabled_reason()),
     }));
     entries.push(MenuEntry::MoveToFolder(move_menu(item, folders, may_unfile)));
     // Above Delete, below everything else: Archive is the gentler of the two
     // ways to take an item out of the working vault, and the design lists
     // the two rows in that order too.
-    entries.push(enabled_command("Archive", RowCommand::Archive));
-    entries.push(enabled_command(DELETE_LABEL, RowCommand::Delete));
+    entries.push(enabled_command(crate::i18n::t("list.archive"), RowCommand::Archive));
+    entries.push(enabled_command(delete_label(), RowCommand::Delete));
     // **A received record's menu is the read half of this one** (mock 6d:
     // "only what a view-only record allows"). Everything that writes goes --
     // [`RowCommand::writes_the_record`]'s decision, not a second list here --
@@ -580,7 +607,7 @@ pub(super) fn out_of_vault_entries_for(item: &VaultItem, out: OutOfVault) -> Vec
     // entry here -- Restore, Delete forever, Unarchive -- writes the record
     // ([`RowCommand::writes_the_record`]), and NodeWarden refuses each on a
     // view-only collection. The row menu then opens on nothing; the read
-    // pane's ⋮ says why (`detail::VIEW_ONLY_FOOTER`).
+    // pane's ⋮ says why (`detail::view_only_footer_text()`).
     if !crate::vault_bridge::may_edit(item) {
         entries.retain(|entry| !matches!(entry, MenuEntry::Command(command) if command.command.writes_the_record()));
     }
@@ -588,7 +615,7 @@ pub(super) fn out_of_vault_entries_for(item: &VaultItem, out: OutOfVault) -> Vec
 }
 
 /// **What an EMPTY row menu says instead of opening on nothing** (final
-/// review, item 7): [`super::detail::VIEW_ONLY_FOOTER`], the read pane's own
+/// review, item 7): [`super::detail::view_only_footer_text()`], the read pane's own
 /// words. Only a view-only record's menu can be empty -- every writable menu
 /// holds Edit or a restore -- and one with nothing to copy (a card, a note,
 /// a login with no username or password) or anything in the Trash or the
@@ -598,7 +625,7 @@ pub(super) fn out_of_vault_entries_for(item: &VaultItem, out: OutOfVault) -> Vec
 /// Pure, for [`menu_entries`]' reason: a decision made inside the popup's
 /// closure is one no test could reach.
 pub(super) fn empty_menu_footer(entries: &[MenuEntry]) -> Option<&'static str> {
-    entries.is_empty().then_some(super::detail::VIEW_ONLY_FOOTER)
+    entries.is_empty().then_some(super::detail::view_only_footer_text())
 }
 
 /// [`out_of_vault_entries_for`] without the item: the menu for an item this
@@ -607,19 +634,19 @@ pub(super) fn empty_menu_footer(entries: &[MenuEntry]) -> Option<&'static str> {
 pub(super) fn out_of_vault_entries(out: OutOfVault) -> Vec<MenuEntry> {
     match out {
         OutOfVault::Trash => vec![
-            enabled_command("Restore", RowCommand::Restore),
+            enabled_command(crate::i18n::t("list.restore"), RowCommand::Restore),
             // The only entry in this file that is not undoable. It goes
             // through the SAME `delete_modal` the ordinary Delete does
             // rather than a second confirmation idiom -- the modal tells the
             // two apart by its `DeleteKind`, in every sentence it shows.
-            enabled_command(PURGE_LABEL, RowCommand::PurgeForever),
+            enabled_command(purge_label(), RowCommand::PurgeForever),
         ],
         // One entry, because there is exactly one thing to do with an
         // archived item. "Delete" is deliberately not offered: archiving is
         // the user putting something aside, and the route from aside to gone
         // goes back through the vault, where the ordinary Delete lives with
         // its confirmation.
-        OutOfVault::Archive => vec![enabled_command("Unarchive", RowCommand::Unarchive)],
+        OutOfVault::Archive => vec![enabled_command(crate::i18n::t("list.unarchive"), RowCommand::Unarchive)],
     }
 }
 
@@ -691,7 +718,7 @@ fn enabled_command(label: &str, command: RowCommand) -> MenuEntry {
 pub(super) fn move_menu(item: &VaultItem, folders: &[Folder], may_unfile: bool) -> MoveMenu {
     let assignable = assignable_folders(folders);
     if assignable.is_empty() && !may_unfile {
-        return MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS);
+        return MoveMenu::Empty(no_assignable_folders());
     }
     // **First, above the folders**, which is where Bitwarden's own clients
     // put it and where a destination that is not a folder belongs: reading
@@ -704,10 +731,10 @@ pub(super) fn move_menu(item: &VaultItem, folders: &[Folder], may_unfile: bool) 
     // item to item.
     let already_unfiled = item.folder_id.as_deref().unwrap_or("").is_empty();
     let unfile = may_unfile.then(|| MenuCommand {
-        label: NO_FOLDER_LABEL.to_string(),
+        label: no_folder_label().to_string(),
         command: RowCommand::Unfile,
         enabled: !already_unfiled,
-        disabled_reason: already_unfiled.then_some(ALREADY_IN_NO_FOLDER),
+        disabled_reason: already_unfiled.then_some(already_in_no_folder()),
     });
     MoveMenu::Targets(
         unfile
@@ -724,7 +751,7 @@ pub(super) fn move_menu(item: &VaultItem, folders: &[Folder], may_unfile: bool) 
                     label: folder.name.clone(),
                     command: RowCommand::MoveToFolder(folder.id.clone()),
                     enabled: !here,
-                    disabled_reason: here.then_some(ALREADY_IN_THIS_FOLDER),
+                    disabled_reason: here.then_some(already_in_this_folder()),
                 }
             }))
             .collect(),
@@ -925,36 +952,44 @@ pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &s
 /// slot the eye reads as a number, and so reads as "unknown"; in the middle
 /// of a sentence ("Search - items") it reads as a typo.
 pub fn search_hint(count: Option<usize>, filter: &SidebarFilter) -> String {
-    let (singular, plural) = match filter {
-        SidebarFilter::All => ("item", "items"),
-        SidebarFilter::Favorites => ("favorite", "favorites"),
-        // Named after the row, like every other specific noun here
-        // (Favorites -> favorites, Logins -> logins). "Search 12 apps" is
-        // the scope the sidebar shows as selected, so the two read as one
-        // thing rather than the placeholder inventing a second name for it.
-        SidebarFilter::Apps => ("app", "apps"),
-        SidebarFilter::Logins => ("login", "logins"),
-        SidebarFilter::Passkeys => ("passkey", "passkeys"),
-        SidebarFilter::Cards => ("card", "cards"),
-        SidebarFilter::Identities => ("identity", "identities"),
-        SidebarFilter::SecureNotes => ("secure note", "secure notes"),
-        SidebarFilter::SshKeys => ("SSH key", "SSH keys"),
-        SidebarFilter::Archive => ("item", "items"),
-        SidebarFilter::Trash => ("item", "items"),
-        SidebarFilter::Folder(_) => ("item", "items"),
-        // A folder's noun, for the two rows that are the same kind of thing:
-        // a cut of the vault by where an item is filed rather than by what
-        // it is. "Search 12 shared items" would be a second name for a scope
-        // the rail already names -- and would be wrong on an organisation's
-        // collection row, where what the user picked was the collection and
-        // not the sharing.
-        SidebarFilter::Organisation(_) => ("item", "items"),
-        SidebarFilter::Collection(_) => ("item", "items"),
-        SidebarFilter::Unfiled => ("item", "items"),
+    let noun = match filter {
+        SidebarFilter::Favorites => "favorites",
+        SidebarFilter::Apps => "apps",
+        SidebarFilter::Logins => "logins",
+        SidebarFilter::Passkeys => "passkeys",
+        SidebarFilter::Cards => "cards",
+        SidebarFilter::Identities => "identities",
+        SidebarFilter::SecureNotes => "notes",
+        SidebarFilter::SshKeys => "ssh_keys",
+        _ => "items",
     };
     match count {
-        Some(count) => format!("Search {count} {}", if count == 1 { singular } else { plural }),
-        None => format!("Search {plural}"),
+        Some(count) => {
+            let count = count as u64;
+            match noun {
+                "favorites" => crate::i18n::tn("list.search_n_favorites", count, &[]),
+                "apps" => crate::i18n::tn("list.search_n_apps", count, &[]),
+                "logins" => crate::i18n::tn("list.search_n_logins", count, &[]),
+                "passkeys" => crate::i18n::tn("list.search_n_passkeys", count, &[]),
+                "cards" => crate::i18n::tn("list.search_n_cards", count, &[]),
+                "identities" => crate::i18n::tn("list.search_n_identities", count, &[]),
+                "notes" => crate::i18n::tn("list.search_n_notes", count, &[]),
+                "ssh_keys" => crate::i18n::tn("list.search_n_ssh_keys", count, &[]),
+                _ => crate::i18n::tn("list.search_n_items", count, &[]),
+            }
+        }
+        None => match noun {
+            "favorites" => crate::i18n::t("list.search_favorites"),
+            "apps" => crate::i18n::t("list.search_apps"),
+            "logins" => crate::i18n::t("list.search_logins"),
+            "passkeys" => crate::i18n::t("list.search_passkeys"),
+            "cards" => crate::i18n::t("list.search_cards"),
+            "identities" => crate::i18n::t("list.search_identities"),
+            "notes" => crate::i18n::t("list.search_notes"),
+            "ssh_keys" => crate::i18n::t("list.search_ssh_keys"),
+            _ => crate::i18n::t("list.search_items"),
+        }
+        .to_string(),
     }
 }
 
@@ -994,24 +1029,28 @@ impl ListPlaceholder {
     /// and so the draw site cannot grow a fourth wording nothing decided on.
     pub fn message(self) -> &'static str {
         match self {
-            ListPlaceholder::Loading => "Loading…",
-            ListPlaceholder::Empty => "Nothing here yet",
-            ListPlaceholder::NoMatches => NOTHING_MATCHES,
+            ListPlaceholder::Loading => crate::i18n::t("list.loading"),
+            ListPlaceholder::Empty => crate::i18n::t("list.nothing_yet"),
+            ListPlaceholder::NoMatches => nothing_matches(),
         }
     }
 
     /// The line under the message, where the design draws one.
     pub fn detail(self) -> Option<&'static str> {
         match self {
-            ListPlaceholder::NoMatches => Some(NOTHING_MATCHES_DETAIL),
+            ListPlaceholder::NoMatches => Some(nothing_matches_detail()),
             ListPlaceholder::Loading | ListPlaceholder::Empty => None,
         }
     }
 }
 
 /// Spec 3.1's no-results title and its line underneath.
-pub const NOTHING_MATCHES: &str = "Nothing matches";
-pub const NOTHING_MATCHES_DETAIL: &str = "Try a site, an app or a username";
+pub fn nothing_matches() -> &'static str {
+    crate::i18n::t("list.nothing_matches")
+}
+pub fn nothing_matches_detail() -> &'static str {
+    crate::i18n::t("list.nothing_matches_detail")
+}
 
 /// Decides between the three (see [`ListPlaceholder`]), or `None` when there
 /// are rows to draw and no placeholder belongs on screen at all.
@@ -1068,10 +1107,18 @@ pub fn list_placeholder(
 /// window's ambient cadence is `FRAME_INTERVAL` (500ms), at which a spinner
 /// does not animate so much as twitch. It is asked for only in the `Loading`
 /// arm; the other two are static text with nothing to drive.
-pub const TRASH_NOTE: &str = "Items stay here for 30 days, then they're gone for good.";
-pub const EMPTY_TRASH: &str = "Empty trash";
-pub const TRASH_EMPTY: &str = "Trash is empty";
-pub const TRASH_EMPTY_DETAIL: &str = "Deleted items wait here for 30 days.";
+pub fn trash_note() -> &'static str {
+    crate::i18n::t("list.trash_note")
+}
+pub fn empty_trash() -> &'static str {
+    crate::i18n::t("list.empty_trash")
+}
+pub fn trash_empty() -> &'static str {
+    crate::i18n::t("list.trash_empty")
+}
+pub fn trash_empty_detail() -> &'static str {
+    crate::i18n::t("list.trash_empty_detail")
+}
 
 pub fn empty_trash_id() -> egui::Id {
     egui::Id::new("list-empty-trash")
@@ -1085,17 +1132,17 @@ fn trash_band(ui: &mut egui::Ui, any: bool) -> bool {
         ui.horizontal(|ui| {
             let size = kit::controls::ButtonSize { height: 36.0, pad_x: 14.0, radius: 11, font_px: 14.0 };
             let button_w = if any {
-                kit::controls::button_width(ui.ctx(), kit::controls::ButtonKind::Danger, size, EMPTY_TRASH, false) + 10.0
+                kit::controls::button_width(ui.ctx(), kit::controls::ButtonKind::Danger, size, empty_trash(), false) + 10.0
             } else {
                 0.0
             };
             let room = (ui.available_width() - button_w).max(40.0);
             ui.add_sized(
                 egui::vec2(room, 36.0),
-                egui::Label::new(tokens::job(tokens::BODY, TRASH_NOTE, p.text_faint)).wrap(),
+                egui::Label::new(tokens::job(tokens::BODY, trash_note(), p.text_faint)).wrap(),
             );
             if any {
-                let button = kit::controls::button(ui, kit::controls::ButtonKind::Danger, size, EMPTY_TRASH, None);
+                let button = kit::controls::button(ui, kit::controls::ButtonKind::Danger, size, empty_trash(), None);
                 let _ = ui.interact(button.rect, empty_trash_id(), egui::Sense::hover());
                 pressed = button.clicked();
             }
@@ -1109,8 +1156,8 @@ fn draw_trash_empty(ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(48.0);
         ui.spacing_mut().item_spacing.y = 8.0;
-        ui.label(tokens::job(PLACEHOLDER_TITLE, TRASH_EMPTY, p.ink));
-        ui.label(tokens::job(tokens::BODY, TRASH_EMPTY_DETAIL, p.text_faint));
+        ui.label(tokens::job(PLACEHOLDER_TITLE, trash_empty(), p.ink));
+        ui.label(tokens::job(tokens::BODY, trash_empty_detail(), p.text_faint));
     });
 }
 
@@ -1540,7 +1587,7 @@ pub fn draw_item_list(
         .filter(|item| matches_filter(item, filter, &search_lower))
         .collect();
 
-    let title = if searching { RESULTS_TITLE } else { scope_title };
+    let title = if searching { results_title() } else { scope_title };
     if let Some(kind) = list_header(ui, title, filtered.len()) {
         action = kind;
     }
@@ -1819,11 +1866,15 @@ pub fn draw_item_list(
 }
 
 /// The Shared tag's word (`kit::card::TagKind::Shared`).
-pub const SHARED_PILL: &str = "Shared";
+pub fn shared_pill() -> &'static str {
+    crate::i18n::t("list.shared_pill")
+}
 
 /// The tag on a row someone shares with this account: v2's neutral tag
 /// (`kit::card::TagKind::ViewOnly`), which reads "View only".
-pub const VIEW_ONLY_CHIP: &str = "View only";
+pub fn view_only_chip() -> &'static str {
+    crate::i18n::t("list.view_only")
+}
 
 /// **What sharing says about each row**: which records this account shares
 /// with someone who has them now, and who shares each received record. Built
@@ -2048,7 +2099,7 @@ fn item_row(
                     }
                 }
                 MenuEntry::MoveToFolder(destinations) => {
-                    ui.menu_button(MOVE_TO_FOLDER_LABEL, |ui| match destinations {
+                    ui.menu_button(move_to_folder_label(), |ui| match destinations {
                         MoveMenu::Targets(targets) => {
                             for target in targets {
                                 if menu_command(ui, &target) {
@@ -2068,7 +2119,7 @@ fn item_row(
                 // handing back a list with nothing in it, so there is no
                 // second variant here to unfold. See `MenuEntry::Icon`.
                 MenuEntry::Icon(actions) => {
-                    ui.menu_button(ICON_LABEL, |ui| {
+                    ui.menu_button(icon_label(), |ui| {
                         for action in actions {
                             if menu_command(ui, &action) {
                                 command = Some(action.command);
@@ -2089,7 +2140,9 @@ fn item_row(
 }
 
 /// The header's title while the search box has anything in it.
-pub const RESULTS_TITLE: &str = "Results";
+pub fn results_title() -> &'static str {
+    crate::i18n::t("list.results")
+}
 
 /// Spec 3.1's header: padding `24 24 14`, the title 26/800 and the count 15
 /// `text_ghost` beside it, and the compact `+` at the right that opens the
@@ -2116,7 +2169,7 @@ fn list_header(ui: &mut egui::Ui, title: &str, count: usize) -> Option<ItemListA
                     // From `CREATABLE_KINDS`, never a list written out here:
                     // that array keeps `ItemKind::Unknown` out of creation.
                     for kind in super::detail_edit::CREATABLE_KINDS {
-                        if ui.button(kind.label()).clicked() {
+                        if ui.button(super::detail::kind_label(kind)).clicked() {
                             chosen = Some(ItemListAction::NewItem(kind));
                             ui.close();
                         }
@@ -2170,10 +2223,12 @@ fn new_button(ui: &mut egui::Ui, p: &tokens::Palette) -> egui::Response {
         2.0,
         p.text_icon,
     );
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(NEW_ITEM_HINT)
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(new_item_hint())
 }
 /// What hovering the `+` says.
-pub const NEW_ITEM_HINT: &str = "New item";
+pub fn new_item_hint() -> &'static str {
+    crate::i18n::t("list.new_item")
+}
 
 /// Spec 3.1's offline banner. Returns whether Retry was clicked.
 fn offline_banner(ui: &mut egui::Ui) -> bool {
@@ -2195,12 +2250,12 @@ fn offline_banner(ui: &mut egui::Ui) -> bool {
                 kit::icon::stroke(ui.painter(), glyph, kit::icon::glyph::WIFI_OFF, 2.2, p.caution_mark);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(tokens::job(bold, OFFLINE_TITLE, p.caution_ink));
-                    ui.label(tokens::job(line, OFFLINE_DETAIL, p.caution_ink));
+                    ui.label(tokens::job(bold, offline_title(), p.caution_ink));
+                    ui.label(tokens::job(line, offline_detail(), p.caution_ink));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let button = ui
-                        .add(egui::Label::new(tokens::job(bold, OFFLINE_RETRY, p.caution_ink)).sense(Sense::click()))
+                        .add(egui::Label::new(tokens::job(bold, offline_retry(), p.caution_ink)).sense(Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     retry = button.clicked();
                 });
@@ -2210,9 +2265,15 @@ fn offline_banner(ui: &mut egui::Ui) -> bool {
 }
 
 /// Spec 3.1's banner copy, the apostrophe straight as the design sets it.
-pub const OFFLINE_TITLE: &str = "You're offline";
-pub const OFFLINE_DETAIL: &str = "Filling still works";
-pub const OFFLINE_RETRY: &str = "Retry";
+pub fn offline_title() -> &'static str {
+    crate::i18n::t("list.offline_title")
+}
+pub fn offline_detail() -> &'static str {
+    crate::i18n::t("list.offline_detail")
+}
+pub fn offline_retry() -> &'static str {
+    crate::i18n::t("list.offline_retry")
+}
 
 /// What a list is, for its entrance: the scope and the search. A change in
 /// either is a new list, and a new list enters again.
@@ -2320,9 +2381,9 @@ pub(crate) fn deleted_line(item: &VaultItem, today: i64) -> Option<String> {
     let deleted = item.other.get("deletedDate")?.as_str()?;
     let days = (today - super::detail::date_days(deleted)?).max(0);
     Some(match days {
-        0 => "Deleted today".to_string(),
-        1 => "Deleted yesterday".to_string(),
-        n => format!("Deleted {n} days ago"),
+        0 => crate::i18n::t("list.deleted_today").to_string(),
+        1 => crate::i18n::t("list.deleted_yesterday").to_string(),
+        n => crate::i18n::tn("list.deleted_days_ago", n as u64, &[]),
     })
 }
 
@@ -2889,8 +2950,8 @@ mod menu_entry_tests {
             .iter()
             .map(|entry| match entry {
                 MenuEntry::Command(c) => c.label.clone(),
-                MenuEntry::MoveToFolder(_) => MOVE_TO_FOLDER_LABEL.to_string(),
-                MenuEntry::Icon(_) => ICON_LABEL.to_string(),
+                MenuEntry::MoveToFolder(_) => move_to_folder_label().to_string(),
+                MenuEntry::Icon(_) => icon_label().to_string(),
             })
             .collect()
     }
@@ -2902,8 +2963,8 @@ mod menu_entry_tests {
             .filter_map(|entry| match entry {
                 MenuEntry::Command(c) => c.enabled.then(|| c.label.clone()),
                 // Either submenu itself is always openable.
-                MenuEntry::MoveToFolder(_) => Some(MOVE_TO_FOLDER_LABEL.to_string()),
-                MenuEntry::Icon(_) => Some(ICON_LABEL.to_string()),
+                MenuEntry::MoveToFolder(_) => Some(move_to_folder_label().to_string()),
+                MenuEntry::Icon(_) => Some(icon_label().to_string()),
             })
             .collect()
     }
@@ -2973,7 +3034,7 @@ mod menu_entry_tests {
                 "Copy TOTP",
                 "Open website",
                 "Edit",
-                MOVE_TO_FOLDER_LABEL,
+                move_to_folder_label(),
                 "Archive",
                 "Delete",
             ]
@@ -3074,7 +3135,7 @@ mod menu_entry_tests {
         };
         assert_eq!(
             with.first().map(|entry| entry.label.as_str()),
-            Some(NO_FOLDER_LABEL),
+            Some(no_folder_label()),
             "\"No folder\" is not the first destination; it drew {:?}",
             with.iter().map(|e| &e.label).collect::<Vec<_>>()
         );
@@ -3083,14 +3144,14 @@ mod menu_entry_tests {
             panic!("the submenu reported no destinations at all");
         };
         assert!(
-            !without.iter().any(|entry| entry.label == NO_FOLDER_LABEL),
+            !without.iter().any(|entry| entry.label == no_folder_label()),
             "a backend that cannot un-file was offered \"No folder\" anyway: {:?}",
             without.iter().map(|e| &e.label).collect::<Vec<_>>()
         );
         // And nothing else moved: the folders below it are the same list.
         let names = |menu: &[MenuCommand]| {
             menu.iter()
-                .filter(|e| e.label != NO_FOLDER_LABEL)
+                .filter(|e| e.label != no_folder_label())
                 .map(|e| e.label.clone())
                 .collect::<Vec<_>>()
         };
@@ -3207,11 +3268,11 @@ mod menu_entry_tests {
         let entries = menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", move_to_folder_label(), "Archive", "Delete"]
         );
         assert_eq!(
             enabled_labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", move_to_folder_label(), "Archive", "Delete"]
         );
     }
 
@@ -3227,11 +3288,11 @@ mod menu_entry_tests {
         let entries = menu_entries(&of_kind(Some(2)), &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", move_to_folder_label(), "Archive", "Delete"]
         );
         assert_eq!(
             enabled_labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", move_to_folder_label(), "Archive", "Delete"]
         );
     }
 
@@ -3250,7 +3311,7 @@ mod menu_entry_tests {
             })
             .expect("no Edit entry");
         assert!(!edit.enabled);
-        assert_eq!(edit.disabled_reason, Some(EDIT_DISABLED_REASON));
+        assert_eq!(edit.disabled_reason, Some(edit_disabled_reason()));
     }
 
     /// **The login-only gate on "Open website", asked of an item that is
@@ -3299,7 +3360,7 @@ mod menu_entry_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Edit",
-                MOVE_TO_FOLDER_LABEL,
+                move_to_folder_label(),
                 "Archive",
                 "Delete",
             ],
@@ -3348,7 +3409,7 @@ mod menu_entry_tests {
         for source in [FilterSource::LiveVault, FilterSource::Trash, FilterSource::Archive] {
             let entries = menu_entries(&chosen_url(&full_login()), &[], source, false);
             let top = labels(&entries);
-            for label in [ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL, REFRESH_ICON_LABEL] {
+            for label in [icon_label(), select_icon_label(), clear_icon_label(), refresh_icon_label()] {
                 assert!(
                     !top.contains(&label.to_string()),
                     "{source:?} offered {label:?}: {top:?}"
@@ -3400,7 +3461,7 @@ mod menu_entry_tests {
                 "Copy password",
                 "Open website",
                 "Edit",
-                MOVE_TO_FOLDER_LABEL,
+                move_to_folder_label(),
                 "Archive",
                 "Delete",
             ],
@@ -3425,7 +3486,7 @@ mod menu_entry_tests {
         let entries = menu_entries(&empty, &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", move_to_folder_label(), "Archive", "Delete"]
         );
         // Empty strings where the credentials should be do not make the item
         // iconless: it still carries the URI the automatic icon is read off.
@@ -3491,7 +3552,7 @@ mod menu_entry_tests {
         let folders = [folder("", "No Folder")];
         assert_eq!(
             move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault, false)),
-            MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS)
+            MoveMenu::Empty(no_assignable_folders())
         );
     }
 
@@ -3506,7 +3567,7 @@ mod menu_entry_tests {
             targets.iter().map(|t| (t.label.as_str(), t.enabled)).collect::<Vec<_>>(),
             vec![("Work", false), ("Personal", true)]
         );
-        assert_eq!(targets[0].disabled_reason, Some(ALREADY_IN_THIS_FOLDER));
+        assert_eq!(targets[0].disabled_reason, Some(already_in_this_folder()));
     }
 
     #[test]
@@ -3536,7 +3597,7 @@ mod menu_entry_tests {
     fn delete_is_the_last_entry_and_wears_one_label() {
         assert_eq!(
             labels(&menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault, false)).last().unwrap(),
-            DELETE_LABEL
+            delete_label()
         );
     }
 }
@@ -3733,7 +3794,7 @@ mod row_tile_tests {
         for clipped in &output.shapes {
             collect_text(&clipped.shape, &mut texts);
         }
-        assert!(texts.iter().any(|t| t == VIEW_ONLY_CHIP), "{texts:?}");
+        assert!(texts.iter().any(|t| t == view_only_chip()), "{texts:?}");
     }
 
     /// Which row commands write to a record -- the ones a received,
@@ -4993,29 +5054,31 @@ mod row_tile_tests {
     /// and not walked into paints the group's row and none of its three. That
     /// is what makes the per-item icon assertions below open the submenu
     /// (see `open_icon_submenu`) rather than reading the outer menu's galleys.
-    const MENU_VOCABULARY: [&str; 15] = [
+    fn menu_vocabulary() -> [&'static str; 15] {
+    [
         "Copy username",
         "Copy password",
         "Copy TOTP",
         "Open website",
-        ICON_LABEL,
-        REFRESH_ICON_LABEL,
-        SELECT_ICON_LABEL,
-        CLEAR_ICON_LABEL,
+        icon_label(),
+        refresh_icon_label(),
+        select_icon_label(),
+        clear_icon_label(),
         "Edit",
-        MOVE_TO_FOLDER_LABEL,
+        move_to_folder_label(),
         "Archive",
-        DELETE_LABEL,
+        delete_label(),
         "Restore",
         "Unarchive",
-        PURGE_LABEL,
-    ];
+        purge_label(),
+    ]
+    }
 
     fn menu_labels(p: &Painted) -> Vec<String> {
         p.texts
             .iter()
             .map(|(text, _, _)| text.clone())
-            .filter(|text| MENU_VOCABULARY.contains(&text.as_str()))
+            .filter(|text| menu_vocabulary().contains(&text.as_str()))
             .collect()
     }
 
@@ -5106,7 +5169,7 @@ mod row_tile_tests {
     /// for several frames so its submenu opens (egui opens submenus on
     /// hover, not on click).
     fn open_move_submenu(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Painted {
-        let hover = text_centre(&open_menu(items, folders.clone(), row), MOVE_TO_FOLDER_LABEL);
+        let hover = text_centre(&open_menu(items, folders.clone(), row), move_to_folder_label());
         let at = row_centre(items, row);
         let mut frames = click_frames(at, egui::PointerButton::Secondary);
         frames.extend((0..4).map(|_| vec![egui::Event::PointerMoved(hover)]));
@@ -5259,9 +5322,9 @@ mod row_tile_tests {
                 "Copy TOTP",
                 "Open website",
                 "Edit",
-                MOVE_TO_FOLDER_LABEL,
+                move_to_folder_label(),
                 "Archive",
-                DELETE_LABEL,
+                delete_label(),
             ]
         );
     }
@@ -5274,7 +5337,7 @@ mod row_tile_tests {
         let items = [card("Visa (personal)")];
         assert_eq!(
             menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", DELETE_LABEL]
+            vec!["Edit", move_to_folder_label(), "Archive", delete_label()]
         );
     }
 
@@ -5294,7 +5357,7 @@ mod row_tile_tests {
         let items = [full_login("Ledgerline"), card("Visa (personal)")];
         for row in 0..items.len() {
             let drawn = menu_labels(&open_menu(&items, vec![folder("f1", "Work")], row));
-            for label in [ICON_LABEL, REFRESH_ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL] {
+            for label in [icon_label(), refresh_icon_label(), select_icon_label(), clear_icon_label()] {
                 assert!(
                     !drawn.contains(&label.to_string()),
                     "row {row} painted {label:?}: {drawn:?}"
@@ -5321,9 +5384,9 @@ mod row_tile_tests {
                 "Copy password",
                 "Open website",
                 "Edit",
-                MOVE_TO_FOLDER_LABEL,
+                move_to_folder_label(),
                 "Archive",
-                DELETE_LABEL,
+                delete_label(),
             ]
         );
     }
@@ -5465,7 +5528,7 @@ mod row_tile_tests {
         for row in 0..items.len() {
             let p = open_menu_with(&items, vec![], row, SidebarFilter::All);
             assert!(
-                menu_labels(&p).contains(&DELETE_LABEL.to_string()),
+                menu_labels(&p).contains(&delete_label().to_string()),
                 "row {row} drew {:?}",
                 menu_labels(&p)
             );
@@ -5566,7 +5629,7 @@ mod row_tile_tests {
         let folders = vec![folder("", "No Folder"), folder("f2", "Personal")];
         let opened = open_move_submenu(&items, folders.clone(), 0);
         let destination = text_centre(&opened, "Personal");
-        let hover = text_centre(&open_menu(&items, folders.clone(), 0), MOVE_TO_FOLDER_LABEL);
+        let hover = text_centre(&open_menu(&items, folders.clone(), 0), move_to_folder_label());
         let at = row_centre(&items, 0);
         let mut frames = click_frames(at, egui::PointerButton::Secondary);
         // The pointer travels along the parent entry and then onto the
@@ -5696,9 +5759,9 @@ mod row_tile_tests {
                 "Copy TOTP",
                 "Open website",
                 "Edit",
-                MOVE_TO_FOLDER_LABEL,
+                move_to_folder_label(),
                 "Archive",
-                DELETE_LABEL,
+                delete_label(),
             ]
         );
     }
@@ -5950,16 +6013,18 @@ mod row_tile_tests {
     /// `no_right_click_menu_paints_any_icon_wording` is where its absence is
     /// asserted instead, on both sides rather than only on the out-of-vault
     /// one this array guards.
-    const LIVE_ONLY_ENTRIES: [&str; 8] = [
+    fn live_only_entries() -> [&'static str; 8] {
+    [
         "Copy username",
         "Copy password",
         "Copy TOTP",
         "Open website",
         "Edit",
-        MOVE_TO_FOLDER_LABEL,
+        move_to_folder_label(),
         "Archive",
-        DELETE_LABEL,
-    ];
+        delete_label(),
+    ]
+    }
 
     fn painted_strings(p: &Painted) -> Vec<&str> {
         p.texts.iter().map(|(t, _, _)| t.as_str()).collect()
@@ -5981,7 +6046,7 @@ mod row_tile_tests {
                  would have passed against a menu that painted nothing. Painted: {painted:?}"
             );
         }
-        for entry in LIVE_ONLY_ENTRIES {
+        for entry in live_only_entries() {
             assert!(
                 !painted.contains(&entry),
                 "an out-of-vault row offered the live vault's {entry:?}. Every entry on \
@@ -5995,7 +6060,7 @@ mod row_tile_tests {
     fn a_trashed_rows_menu_offers_restore_and_purge_and_nothing_from_the_live_vault() {
         let items = vec![full_login("Ledgerline"), full_login("Vantage")];
         let p = open_menu_under(&items, vec![folder("f1", "Work")], 0, SidebarFilter::Trash);
-        assert_out_of_vault_menu(&p, &["Restore", PURGE_LABEL]);
+        assert_out_of_vault_menu(&p, &["Restore", purge_label()]);
     }
 
     /// **A view-only row's menu that would be empty says why** (final
@@ -6012,17 +6077,17 @@ mod row_tile_tests {
         let cards = [view_only(card("Visa (shared)"))];
         assert!(menu_entries(&cards[0], &[], FilterSource::LiveVault, true).is_empty(), "the control: nothing to offer");
         let p = open_menu(&cards, vec![], 0);
-        assert!(painted_strings(&p).contains(&super::super::detail::VIEW_ONLY_FOOTER), "{:?}", painted_strings(&p));
+        assert!(painted_strings(&p).contains(&super::super::detail::view_only_footer_text()), "{:?}", painted_strings(&p));
 
         let trashed = [view_only(full_login("Ledgerline"))];
         let p = open_menu_under(&trashed, vec![], 0, SidebarFilter::Trash);
-        assert!(painted_strings(&p).contains(&super::super::detail::VIEW_ONLY_FOOTER), "{:?}", painted_strings(&p));
+        assert!(painted_strings(&p).contains(&super::super::detail::view_only_footer_text()), "{:?}", painted_strings(&p));
 
         let logins = [view_only(full_login("Ledgerline"))];
         let p = open_menu(&logins, vec![], 0);
         let painted = painted_strings(&p);
         assert!(painted.contains(&"Copy username"), "{painted:?}");
-        assert!(!painted.contains(&super::super::detail::VIEW_ONLY_FOOTER), "a menu with entries has no footer: {painted:?}");
+        assert!(!painted.contains(&super::super::detail::view_only_footer_text()), "a menu with entries has no footer: {painted:?}");
         assert_eq!(empty_menu_footer(&menu_entries(&logins[0], &[], FilterSource::LiveVault, true)), None);
     }
 
@@ -6035,7 +6100,7 @@ mod row_tile_tests {
         // two entries is worth stating: the two rows must not share a menu
         // either.
         let painted = painted_strings(&p);
-        for entry in ["Restore", PURGE_LABEL] {
+        for entry in ["Restore", purge_label()] {
             assert!(!painted.contains(&entry), "an archived row offered {entry:?}");
         }
     }
@@ -6049,13 +6114,13 @@ mod row_tile_tests {
         let items = vec![full_login("Ledgerline"), full_login("Vantage")];
         let p = open_menu_under(&items, vec![folder("f1", "Work")], 0, SidebarFilter::All);
         let painted = painted_strings(&p);
-        for entry in LIVE_ONLY_ENTRIES {
+        for entry in live_only_entries() {
             assert!(
                 painted.contains(&entry),
                 "the LIVE menu is missing {entry:?}; painted: {painted:?}"
             );
         }
-        for entry in ["Restore", "Unarchive", PURGE_LABEL] {
+        for entry in ["Restore", "Unarchive", purge_label()] {
             assert!(!painted.contains(&entry), "a live row offered {entry:?}");
         }
     }
@@ -6104,7 +6169,7 @@ mod row_tile_tests {
     fn the_row_menus_delete_is_painted_as_an_alarm_and_its_neighbours_are_not() {
         let items = vec![full_login("Ledgerline"), full_login("Vantage")];
         let p = open_menu(&items, vec![folder("f1", "Work")], 0);
-        for colour in painted_colours_of(&p, DELETE_LABEL) {
+        for colour in painted_colours_of(&p, delete_label()) {
             assert_eq!(
                 colour,
                 theme::ERROR,
@@ -6139,7 +6204,7 @@ mod row_tile_tests {
     fn a_trashed_rows_delete_forever_is_painted_as_an_alarm_and_restore_is_not() {
         let items = vec![full_login("Ledgerline")];
         let p = open_menu_under(&items, vec![], 0, SidebarFilter::Trash);
-        for colour in painted_colours_of(&p, PURGE_LABEL) {
+        for colour in painted_colours_of(&p, purge_label()) {
             assert_eq!(
                 colour,
                 theme::ERROR,
@@ -6169,7 +6234,7 @@ mod row_tile_tests {
         let p = open_menu_with(&items, vec![], 0, SidebarFilter::Trash);
         let painted = painted_strings(&p);
         assert!(
-            painted.contains(&PURGE_LABEL),
+            painted.contains(&purge_label()),
             "\"Delete forever\" never reached the trash menu; painted: {painted:?}"
         );
         assert!(
@@ -6729,7 +6794,7 @@ mod list_placeholder_tests {
         assert_eq!(ListPlaceholder::Empty.message(), "Nothing here yet");
         assert_eq!(
             ListPlaceholder::NoMatches.message(),
-            super::NOTHING_MATCHES
+            super::nothing_matches()
         );
     }
 }
@@ -7873,7 +7938,7 @@ mod v2_list_tests {
         let items = [login("Ledgerline", "a"), login("Atlas", "b"), login("Ledger two", "c")];
         let ctx = testing::ctx();
         let (p, _) = List { title: "Work", search: "ledger", ..List::of(&items) }.draw(&ctx, 0.0, vec![]);
-        assert!(p.text(RESULTS_TITLE).is_some(), "searching titles the list Results");
+        assert!(p.text(results_title()).is_some(), "searching titles the list Results");
         assert!(p.text("Work").is_none(), "the scope's own name gives way to Results");
         assert!(p.texts.iter().any(|(t, c, _)| t == "2" && *c == P.text_ghost), "Results counts the matches");
     }
@@ -7961,7 +8026,7 @@ mod v2_list_tests {
         // And none of them on a plain login.
         let plain = [login("Atlas", "b")];
         let (p, _) = List::of(&plain).draw(&testing::ctx(), 0.0, vec![]);
-        for word in ["App", "2FA", "Shared", VIEW_ONLY_CHIP] {
+        for word in ["App", "2FA", "Shared", view_only_chip()] {
             assert!(!p.texts.iter().any(|(t, _, _)| t == word), "a plain login wears {word}");
         }
     }
@@ -7982,7 +8047,7 @@ mod v2_list_tests {
         let items = [login("Ledgerline", "a")];
         let ctx = testing::ctx();
         let (p, _) = List::of(&items).draw(&ctx, 0.0, vec![]);
-        assert!(p.text(OFFLINE_TITLE).is_none(), "online, no banner");
+        assert!(p.text(offline_title()).is_none(), "online, no banner");
 
         let offline = List { offline: true, ..List::of(&items) };
         let (p, _) = offline.draw(&ctx, 0.1, vec![]);
@@ -8048,6 +8113,6 @@ mod trash_tests {
     fn an_empty_trash_says_so() {
         let ctx = crate::kit::testing::ctx();
         let p = crate::kit::testing::frame(&ctx, 0.0, egui::vec2(380.0, 400.0), vec![], draw_trash_empty);
-        assert!(p.text(TRASH_EMPTY).is_some() && p.text(TRASH_EMPTY_DETAIL).is_some());
+        assert!(p.text(trash_empty()).is_some() && p.text(trash_empty_detail()).is_some());
     }
 }

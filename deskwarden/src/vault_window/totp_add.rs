@@ -644,14 +644,14 @@ impl PickerRefusal {
                 crate::i18n::tf("totp.no_code_image", &[("advice", no_code_advice())])
             }
             PickerRefusal::Capture(why) => {
-                crate::i18n::tf("totp.title_detail", &[("title", &why.title()), ("detail", &why.detail())])
+                crate::i18n::tf("totp.title_detail", &[("title", why.title()), ("detail", why.detail())])
             }
             // The same two-clause shape as the capture's, because it is the
             // same kind of thing: a device that would not give this app what
             // it asked for, said in the device's own words rather than
             // paraphrased into a second vocabulary here.
             PickerRefusal::Camera(why) => {
-                crate::i18n::tf("totp.title_detail", &[("title", &why.title()), ("detail", &why.detail())])
+                crate::i18n::tf("totp.title_detail", &[("title", why.title()), ("detail", why.detail())])
             }
             PickerRefusal::NotAnImage => crate::i18n::t("totp.not_an_image").to_string(),
             PickerRefusal::Unreadable => crate::i18n::t("totp.unreadable").to_string(),
@@ -1177,8 +1177,8 @@ pub fn parameter_chips(auth: &OtpAuth) -> [String; 4] {
     [
         "TOTP".to_string(),
         auth.algorithm.canonical().to_string(),
-        format!("{} digits", auth.digits),
-        format!("{} s", auth.period),
+        crate::i18n::tf("totp.chip_digits", &[("digits", &auth.digits.to_string())]),
+        crate::i18n::tf("totp.chip_seconds", &[("seconds", &auth.period.to_string())]),
     ]
 }
 
@@ -1193,7 +1193,7 @@ pub fn parameters_line(auth: &OtpAuth) -> String {
 /// The line above 6c's countdown track, verbatim from the design: *"refreshes
 /// in 22 s"*.
 pub fn refresh_line(seconds_left: u16) -> String {
-    format!("refreshes in {seconds_left} s")
+    crate::i18n::tf("totp.refresh_line", &[("seconds", &seconds_left.to_string())])
 }
 
 /// The same countdown in §6d's words, which are the number and the unit and
@@ -2347,7 +2347,7 @@ pub fn copied_label(field: Option<TableField>) -> &'static str {
         Some(TableField::Issuer) => issuer_row_label(),
         Some(TableField::Account) => account_row_label(),
         Some(TableField::Secret) => secret_row_label(),
-        None => "2FA code",
+        None => crate::i18n::t("detail.copy_2fa"),
     }
 }
 

@@ -480,7 +480,7 @@ impl Step {
             if row.aside.is_empty() || parts.contains(&row.aside.as_str()) {
                 continue;
             }
-            if self.rows.len() > 1 && row.aside == detail_edit::MODIFIER_NOTE {
+            if self.rows.len() > 1 && row.aside == detail_edit::modifier_note() {
                 continue;
             }
             parts.push(&row.aside);
@@ -1759,7 +1759,7 @@ fn steps_column(
 ) {
     let summary = match sequence_tally(&draft.sequence, source) {
         Some(tally) => detail_edit::tally_short(&tally),
-        None => detail_edit::TALLY_REFUSED.to_string(),
+        None => detail_edit::tally_refused().to_string(),
     };
     if let Some(wants_template) = sequence_band(ui, &summary, draft.template_view) {
         // Seeded verbatim, every time the view is entered -- so a user who
@@ -1787,7 +1787,7 @@ fn steps_column(
             }
             if draft.sequence.is_empty() {
                 ui.label(
-                    RichText::new(detail_edit::APP_SEQUENCE_DEFAULT_NOTICE)
+                    RichText::new(detail_edit::app_sequence_default_notice())
                         .size(11.0)
                         .color(theme::TEXT_FAINT),
                 );
@@ -2495,7 +2495,7 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
             StepKind::Raw => {
                 let label = ui.add(plain(&step.rows[0].label, theme::TEXT_FAINT));
                 if !step.understood() {
-                    label.on_hover_text(detail_edit::SEQUENCE_UNKNOWN_TIP);
+                    label.on_hover_text(detail_edit::sequence_unknown_tip());
                 }
             }
         }
@@ -3337,7 +3337,7 @@ mod tests {
                 StepKind::Key => !step
                     .rows
                     .iter()
-                    .all(|row| row.aside == detail_edit::MODIFIER_NOTE),
+                    .all(|row| row.aside == detail_edit::modifier_note()),
                 StepKind::Rate | StepKind::Raw => false,
             })
             .map(|step| step.label())
@@ -3423,7 +3423,7 @@ mod tests {
         let list = steps("+hello{TAB}", &source(), false);
         assert_eq!(list.len(), 3, "{list:?}");
         assert_eq!(list[0].kind, StepKind::Key);
-        assert_eq!(list[0].aside(), detail_edit::MODIFIER_NOTE);
+        assert_eq!(list[0].aside(), detail_edit::modifier_note());
         // And with its key it is one row, saying nothing about being held.
         let held = steps("+{TAB}", &source(), false);
         assert_eq!(held.len(), 1);
@@ -4061,7 +4061,7 @@ mod tests {
         // The far cell and the explanation are gone: no dash at the end of a
         // row that has no rate, no rate on the one that has, and no words
         // beside the step saying what it does.
-        for gone in ["\u{2014}", "ms/char", "submit", detail_edit::MODIFIER_NOTE] {
+        for gone in ["\u{2014}", "ms/char", "submit", detail_edit::modifier_note()] {
             assert!(
                 !painted.strings().iter().any(|painted| painted.contains(gone)),
                 "the row still carries {gone:?}: {:?}",

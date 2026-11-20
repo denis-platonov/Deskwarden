@@ -152,16 +152,10 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
     action
 }
 
-/// The words both loading screens use -- §7a's own.
-///
-/// Named because the vault window draws this screen too, for the seconds
-/// after the startup window hands it the frame, and a second wording there
-/// would be a second thing to keep true. Its old copy read "Loading your
-/// vault…" with an ellipsis this one has not got.
-// Phase 2 of the translation work removes this constant: the vault window and
-// Preferences still read it, and their sites move to `i18n::t("loading.heading")`. Every
-// other site already does.
-pub const LOADING_HEADING: &str = "Loading your vault";
+// The words both loading screens use are `i18n::t("loading.heading")` -- §7a's own,
+// "Loading your vault". The vault window draws this screen too, for the seconds after
+// the startup window hands it the frame, and a second wording there would be a second
+// thing to keep true; that is why it is one catalog key and not a string per screen.
 
 /// **Design turn 7's waiting stack: the bar, the heading, and what is under
 /// it.** The one drawing of this screen in the whole crate.

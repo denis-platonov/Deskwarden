@@ -365,7 +365,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
         ui.add_enabled_ui(false, |ui| crate::kit::controls::switch(ui, &mut on));
         ui.label(theme::semibold(only_type_into(app), 15.0).color(theme::INK));
         ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(only_tip());
-        if theme::action_link(ui, crate::vault_window::detail_edit::SEQUENCE_EDIT_BUTTON, 13.0).clicked() {
+        if theme::action_link(ui, crate::vault_window::detail_edit::sequence_edit_button(), 13.0).clicked() {
             wants_editor = true;
         }
     });
