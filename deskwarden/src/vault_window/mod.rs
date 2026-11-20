@@ -61,7 +61,9 @@ use std::time::{Duration, Instant};
 /// indistinguishable from a timer that has stopped working. Saying so out
 /// loud also means the one place this window can tell you the vault will not
 /// lock itself is the same place it otherwise tells you when it will.
-const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
+fn auto_lock_off_label() -> &'static str {
+    crate::i18n::t("vault.auto_lock_off")
+}
 
 /// What a modal shows about the item it is asking about: **the very row the
 /// results list draws for it** -- the item's own tile, its name, and its
@@ -262,16 +264,15 @@ pub(crate) fn idle_frame(auto_lock: AutoLock, idle: Duration) -> IdleFrame {
     // the timer having broken rather than as a setting the user themselves
     // turned off.
     match auto_lock {
-        AutoLock::Never => IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned()),
+        AutoLock::Never => IdleFrame::Sidebar(auto_lock_off_label().to_owned()),
         AutoLock::After(timeout) => {
             if idle >= timeout {
                 return IdleFrame::Lock;
             }
             let remaining = timeout.saturating_sub(idle);
-            IdleFrame::Sidebar(format!(
-                "Locks in {}:{:02}",
-                remaining.as_secs() / 60,
-                remaining.as_secs() % 60
+            IdleFrame::Sidebar(crate::i18n::tf(
+                "vault.locks_in",
+                &[("time", &format!("{}:{:02}", remaining.as_secs() / 60, remaining.as_secs() % 60)[..])],
             ))
         }
     }
@@ -2373,16 +2374,14 @@ pub fn build_frame_with_search(
                             &needs_reauth_for_closure,
                             &VaultError::Unauthorized,
                         );
-                        list.error = Some(format!("{label} could not be read: the vault session expired."));
+                        list.error = Some(crate::i18n::tf("vault.list_expired", &[("label", label)]));
                     }
                     Err(AuxLoadError::Other(message)) => {
                         log::warn!("could not read the {label} list: {message}");
                         // STATED, not swallowed. The alternative is a row
                         // that sits at an en dash forever with no reason,
                         // which is indistinguishable from a slow fetch.
-                        list.error = Some(format!(
-                            "{label} could not be read from the vault. Click here to try again."
-                        ));
+                        list.error = Some(crate::i18n::tf("vault.list_failed", &[("label", label)]));
                     }
                 }
             }
@@ -2553,7 +2552,7 @@ pub fn build_frame_with_search(
                 log::warn!("manual vault sync failed: {e}");
             }
             if std::mem::take(&mut retry_from_banner) && result.is_err() {
-                crate::kit::toast::show(ui.ctx(), STILL_OFFLINE_TOAST);
+                crate::kit::toast::show(ui.ctx(), still_offline_toast());
             }
             sync_status = Some(result);
         }
@@ -3271,7 +3270,7 @@ pub fn build_frame_with_search(
                             crate::loading_ui::waiting_stack(
                                 ui,
                                 260.0,
-                                crate::loading_ui::LOADING_HEADING,
+                                crate::i18n::t("loading.heading"),
                                 None,
                             );
                         });
@@ -3310,7 +3309,7 @@ pub fn build_frame_with_search(
                         ui.vertical_centered(|ui| {
                             ui.add_space((available / 2.0 - 30.0).max(0.0));
                             ui.label(
-                                egui::RichText::new("Your vault could not be loaded")
+                                egui::RichText::new(crate::i18n::t("vault.load_failed"))
                                     .size(15.0)
                                     .color(theme::INK),
                             );
@@ -3318,7 +3317,7 @@ pub fn build_frame_with_search(
                             ui.label(egui::RichText::new(reason).size(13.0).color(theme::TEXT_FAINT));
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("Click Sync to try again.")
+                                egui::RichText::new(crate::i18n::t("vault.load_failed_hint"))
                                     .size(13.0)
                                     .color(theme::TEXT_FAINT),
                             );
@@ -3546,7 +3545,7 @@ pub fn build_frame_with_search(
                     SidebarAction::CreateFolder(name) => match cache.create_folder(&name) {
                         Ok(folder) => {
                             folders.push(folder);
-                            crate::kit::toast::show(ui.ctx(), "Folder created");
+                            crate::kit::toast::show(ui.ctx(), crate::i18n::t("vault.folder_created"));
                         }
                         Err(e) => {
                             log::warn!("failed to create folder: {e:?}");
@@ -3581,7 +3580,7 @@ pub fn build_frame_with_search(
                     }
                     // A drop the sidebar refused -- the virtual "No Folder"
                     // bucket, or the folder the item is already in. Carried
-                    // out rather than swallowed: see `sidebar::CANNOT_UNFILE`.
+                    // out rather than swallowed: see `sidebar::cannot_unfile()`.
                     SidebarAction::RefusedMove(reason) => folder_drop = Some(Err(reason)),
                     SidebarAction::None => {}
                 }
@@ -6233,7 +6232,7 @@ pub fn build_frame_with_search(
                                             }
                                         }
                                     }
-                                    (Some(_), None) => crate::kit::toast::show(ui.ctx(), "That app's icon could not be read"),
+                                    (Some(_), None) => crate::kit::toast::show(ui.ctx(), crate::i18n::t("vault.app_icon_unreadable")),
                                     (None, _) => {}
                                 }
                             }
@@ -7049,7 +7048,7 @@ pub fn build_frame_with_search(
                     }
                     Err(e) => {
                         log::warn!("failed to rename folder {}: {e:?}", state.folder_id);
-                        state.error = Some("Could not rename this folder.".to_string());
+                        state.error = Some(crate::i18n::t("vault.folder_rename_failed").to_string());
                         flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                     }
                 },
@@ -7064,7 +7063,7 @@ pub fn build_frame_with_search(
                     }
                     Err(e) => {
                         log::warn!("failed to delete folder {}: {e:?}", state.folder_id);
-                        state.error = Some("Could not delete this folder.".to_string());
+                        state.error = Some(crate::i18n::t("vault.folder_delete_failed").to_string());
                         flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                     }
                 },
@@ -7901,7 +7900,7 @@ pub fn build_frame_with_search(
                                                      replaced could not be removed: {e:?}"
                                                 );
                                                 move_error = Some(
-                                                    IMPORT_REPLACED_NOTHING.to_string(),
+                                                    import_replaced_nothing().to_string(),
                                                 );
                                                 flag_reauth_if_unauthorized(
                                                     ui.ctx(),
@@ -8047,7 +8046,7 @@ pub fn build_frame_with_search(
                     }
                     crate::kit::toast::show(
                         ui.ctx(),
-                        if failed.is_some() { "Couldn't empty the whole trash" } else { trash_modal::EMPTIED_TOAST },
+                        if failed.is_some() { crate::i18n::t("trash.empty_failed") } else { trash_modal::emptied_toast() },
                     );
                 }
             }
@@ -8320,7 +8319,7 @@ pub fn build_frame_with_search(
                             // meaningless rather than merely wrong.
                             Ok(written) => {
                                 // Spec B §8.
-                                crate::kit::toast::show(ui.ctx(), totp_add::SAVED_TOAST);
+                                crate::kit::toast::show(ui.ctx(), totp_add::saved_toast());
                                 // **An open edit form is told**, or its next
                                 // Save clears the seed this write just made.
                                 //
@@ -10099,7 +10098,7 @@ fn delete_vault_item(
 /// A pure function, so the rule is asserted directly rather than inferred from
 /// a form that has to be driven to see it.
 fn clone_name(name: &str) -> String {
-    format!("{name} - Clone")
+    crate::i18n::tf("vault.clone_name", &[("name", name)])
 }
 
 /// Moves `item_id` into `folder_id`, **reverting the window's own list if the
@@ -10160,6 +10159,20 @@ fn move_item_into_folder(
     }
 }
 
+/// Why a write the vault backend was asked to make did not happen, as the clause that
+/// completes "Couldn't ... — {because}." `request` is for the Generate button, whose
+/// call is a request and not a write.
+fn failure_because(e: &VaultError, request: bool) -> &'static str {
+    match e {
+        VaultError::Unauthorized => crate::i18n::t("vault.because_unauthorized"),
+        VaultError::Http(_) if request => crate::i18n::t("vault.because_refused_request"),
+        VaultError::Http(_) => crate::i18n::t("vault.because_refused_write"),
+        VaultError::Unreachable(_) => crate::i18n::t("vault.because_unreachable"),
+        VaultError::Parse(_) => crate::i18n::t("vault.because_parse"),
+        VaultError::Unsupported { .. } => crate::i18n::t("vault.because_unsupported"),
+    }
+}
+
 /// The inline message a failed write shows, per failure.
 ///
 /// "Failed", not "refused": one of the four arms is a backend that could not
@@ -10174,23 +10187,8 @@ fn move_item_into_folder(
 /// thing for anyone who needs it. What the band has to say is what happened
 /// and what state the item is in, and both halves are here.
 fn move_failure_message(name: &str, e: &VaultError) -> String {
-    let because = match e {
-        VaultError::Unauthorized => "the vault backend no longer accepts this session",
-        VaultError::Http(_) => "the vault backend refused the write",
-        // **Not "refused".** A dead connection, a timeout and a 5xx are a
-        // server that did not answer for this item, not a server that looked
-        // at it and said no -- and telling a user their write was refused
-        // sends them looking for what is wrong with data that is fine. The
-        // classification is [`VaultError::from_status`]'s, made where the
-        // status was still a number; this arm only words it.
-        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
-        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
-        // A refusal, not a failure: nothing was sent, so nothing can be
-        // retried. The wording says "this vault backend" because the whole
-        // point of the variant is that a *different* backend can do it.
-        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
-    };
-    format!("Couldn't move \"{name}\" \u{2014} {because}. It's still in its old folder.")
+    let because = failure_because(e, false);
+    crate::i18n::tf("vault.err_move", &[("name", name), ("because", because)])
 }
 
 /// One of the **five** commands that move an item between this window's three
@@ -10248,33 +10246,22 @@ enum ListCommand {
 fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError) -> String {
     // The same four, worded the same way as `move_failure_message`'s: one
     // vocabulary for "the backend said no" across this window, not two.
-    let because = match e {
-        VaultError::Unauthorized => "the vault backend no longer accepts this session",
-        VaultError::Http(_) => "the vault backend refused the write",
-        // See `move_failure_message`'s arm: a server that could not be
-        // reached refused nothing.
-        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
-        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
-        // A refusal, not a failure: nothing was sent, so nothing can be
-        // retried. The wording says "this vault backend" because the whole
-        // point of the variant is that a *different* backend can do it.
-        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
-    };
-    let (verb, unchanged) = match command {
-        ListCommand::Archive => ("archive", "It's still in your vault."),
-        ListCommand::Unarchive => ("unarchive", "It's still in the archive."),
-        ListCommand::Restore => ("restore", "It's still in the trash."),
+    let because = failure_because(e, false);
+    let args = [("name", name), ("because", because)];
+    match command {
+        ListCommand::Archive => crate::i18n::tf("vault.err_archive", &args),
+        ListCommand::Unarchive => crate::i18n::tf("vault.err_unarchive", &args),
+        ListCommand::Restore => crate::i18n::tf("vault.err_restore", &args),
         // "permanently delete", not "delete": this is the one irreversible
         // command in the window, and a message reading "Couldn't delete"
         // would leave a user unsure which of the two deletes was refused.
         // The two really are both reachable -- `ListCommand::Delete` below is
         // the soft one -- so the distinction is not hypothetical.
-        ListCommand::Purge => ("permanently delete", "It's still in the trash."),
+        ListCommand::Purge => crate::i18n::tf("vault.err_purge", &args),
         // The soft delete: a refused one leaves the item exactly where it
         // was, in the live vault, NOT in the trash it was headed for.
-        ListCommand::Delete => ("delete", "It's still in your vault."),
-    };
-    format!("Couldn't {verb} \"{name}\" \u{2014} {because}. {unchanged}")
+        ListCommand::Delete => crate::i18n::tf("vault.err_delete", &args),
+    }
 }
 
 /// The three writes in the detail pane that a refusal used to leave silent.
@@ -10337,21 +10324,7 @@ enum ItemWrite {
 /// form is actually in, because the question a user has after clicking and
 /// seeing nothing move is "did it half-work?" -- and the answer is always no.
 fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> String {
-    let because = match e {
-        VaultError::Unauthorized => "the vault backend no longer accepts this session",
-        VaultError::Http(_) => "the vault backend refused the write",
-        // **The arm the 503 report came in on.** Save reaches
-        // `RestBackend::update_item`, which syncs BEFORE it sends anything --
-        // so a 5xx there fails this write with no `PUT` ever made, and the
-        // old wording named a refusal of a request that was never issued.
-        // See `move_failure_message`'s arm and `VaultError::Unreachable`.
-        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
-        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
-        // A refusal, not a failure: nothing was sent, so nothing can be
-        // retried. The wording says "this vault backend" because the whole
-        // point of the variant is that a *different* backend can do it.
-        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
-    };
+    let because = failure_because(e, false);
     // Exhaustive with no catch-all, for [`move_failure_message`]'s reason: a
     // fifth write must be given its own wording rather than silently
     // inheriting a neighbour's.
@@ -10359,30 +10332,16 @@ fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> S
         // The star in the detail pane is painted from this window's own copy
         // of the item, which a refused write does not change -- so "it is not
         // a favourite" is the whole of what the user cannot otherwise see.
-        ItemWrite::Favorite => {
-            format!("Couldn't add \"{name}\" to your favourites \u{2014} {because}. It still isn't one.")
-        }
-        ItemWrite::Unfavorite => {
-            format!(
-                "Couldn't remove \"{name}\" from your favourites \u{2014} {because}. It still is one."
-            )
-        }
+        ItemWrite::Favorite => crate::i18n::tf("vault.err_favorite", &[("name", name), ("because", because)]),
+        ItemWrite::Unfavorite => crate::i18n::tf("vault.err_unfavorite", &[("name", name), ("because", because)]),
         // The editor stays open on failure (`mode` is left on `Edit`), so the
         // user's typing is not lost and the sentence says so -- otherwise the
         // safe reaction to "couldn't save" is to assume it is gone.
-        ItemWrite::Save => format!(
-            "Couldn't save your changes to \"{name}\" \u{2014} {because}. Nothing has been written, and \
-             your edits are still in the form."
-        ),
+        ItemWrite::Save => crate::i18n::tf("vault.err_save", &[("name", name), ("because", because)]),
         // `name` is the draft's name, not a vault item's: there is no vault
         // item yet, which is exactly what this says.
-        ItemWrite::Create => format!(
-            "Couldn't create \"{name}\" \u{2014} {because}. Nothing has been added to your vault, and \
-             what you typed is still in the form."
-        ),
-        ItemWrite::AppUnmatch => format!(
-            "Couldn't unmatch \"{name}\" from its app \u{2014} {because}. It is still matched to it."
-        ),
+        ItemWrite::Create => crate::i18n::tf("vault.err_create", &[("name", name), ("because", because)]),
+        ItemWrite::AppUnmatch => crate::i18n::tf("vault.err_unmatch", &[("name", name), ("because", because)]),
     }
 }
 
@@ -10427,23 +10386,11 @@ struct GenerateFailure {
 /// user has after clicking Generate and seeing the password box look exactly
 /// as it did -- "did it half-work?" -- and the answer is always no.
 fn generate_failure(e: &VaultError) -> GenerateFailure {
-    let because = match e {
-        VaultError::Unauthorized => "the vault backend no longer accepts this session",
-        VaultError::Http(_) => "the vault backend refused the request",
-        // "the request", not "the write", for this function's own reason:
-        // Generate writes nothing. The reachability half is the same one the
-        // three write messages draw -- see `move_failure_message`'s arm.
-        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
-        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
-        // A refusal, not a failure: nothing was sent, so nothing can be
-        // retried. The wording says "this vault backend" because the whole
-        // point of the variant is that a *different* backend can do it.
-        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
-    };
+    let because = failure_because(e, true);
     let tail = match e {
         // The only variant that has something further to ask of the user: the
         // draft is intact but nothing will save until the session is renewed.
-        VaultError::Unauthorized => " You'll need to sign in again before saving.",
+        VaultError::Unauthorized => crate::i18n::t("vault.err_reauth_tail"),
         // An unreachable backend joins the silent three: the session is fine,
         // so asking the user to sign in again would send them to re-enter a
         // master password that would not have helped.
@@ -10453,9 +10400,7 @@ fn generate_failure(e: &VaultError) -> GenerateFailure {
         | VaultError::Unsupported { .. } => "",
     };
     GenerateFailure {
-        message: format!(
-            "Couldn't generate a password \u{2014} {because}. Nothing in this form has changed.{tail}"
-        ),
+        message: crate::i18n::tf("vault.err_generate", &[("because", because), ("tail", tail)]),
         needs_reauth: matches!(e, VaultError::Unauthorized),
     }
 }
@@ -11481,9 +11426,9 @@ mod backend_tasks {
                     Err(problem) => return nothing_was_exported(rest_sentence(problem)),
                 };
                 if let Err(e) = std::fs::write(plan.partial_path(), document.as_bytes()) {
-                    return nothing_was_exported(format!(
-                        "The export could not be written to {} ({e}).",
-                        plan.partial_path().display()
+                    return nothing_was_exported(crate::i18n::tf(
+                        "vault.export_write_failed",
+                        &[("path", &plan.partial_path().display().to_string()), ("error", &e.to_string())],
                     ));
                 }
                 drop(document);
@@ -12116,43 +12061,23 @@ fn export_message(report: &ExportReport) -> Option<(ExportTone, String)> {
     let bad = |text: String| Some((ExportTone::Bad, text));
     match report {
         ExportReport::Cancelled => None,
-        ExportReport::Interrupted => bad(
-            "The vault export stopped unexpectedly, so Deskwarden cannot tell whether \
-             anything was written. Treat this as a failed backup, check the folder you \
-             chose, and try again."
-                .to_string(),
-        ),
-        ExportReport::Refused(ExportRefusal::NoDirectory) => bad(
-            "That destination names no folder to write into. Choose a folder and a file name."
-                .to_string(),
-        ),
-        ExportReport::Refused(ExportRefusal::IntoConfigDir) => bad(
-            "Deskwarden's own settings folder is not a safe place for a vault export \u{2014} an \
-             uninstall would delete it. Choose somewhere else."
-                .to_string(),
-        ),
-        ExportReport::Refused(ExportRefusal::EmptyFileName) => bad(
-            "That is a folder, not a file. Choose a file name for the export.".to_string(),
-        ),
+        ExportReport::Interrupted => bad(crate::i18n::t("vault.export_interrupted").to_string()),
+        ExportReport::Refused(ExportRefusal::NoDirectory) => bad(crate::i18n::t("vault.export_no_directory").to_string()),
+        ExportReport::Refused(ExportRefusal::IntoConfigDir) => bad(crate::i18n::t("vault.export_config_dir").to_string()),
+        ExportReport::Refused(ExportRefusal::EmptyFileName) => bad(crate::i18n::t("vault.export_empty_name").to_string()),
         ExportReport::Done { outcome, destination } => match outcome {
             ExportOutcome::Written => Some((
                 ExportTone::Good,
-                format!("Encrypted vault export saved to {}.", destination.display()),
+                crate::i18n::tf("vault.export_saved", &[("path", &destination.display().to_string())]),
             )),
-            ExportOutcome::SessionInvalid => bad(
-                "Your vault session has expired, so nothing was exported. Lock the vault, \
-                 unlock it again, and retry the export."
-                    .to_string(),
-            ),
-            ExportOutcome::Failed(why) => bad(format!(
-                "The export failed and nothing was saved to {}. {why}",
-                destination.display()
+            ExportOutcome::SessionInvalid => bad(crate::i18n::t("vault.export_session_expired").to_string()),
+            ExportOutcome::Failed(why) => bad(crate::i18n::tf(
+                "vault.export_failed",
+                &[("path", &destination.display().to_string()), ("why", &why.to_string())],
             )),
-            ExportOutcome::Unconfirmed => bad(format!(
-                "Bitwarden's tool reported success, but Deskwarden could not confirm that an \
-                 encrypted export was written, so nothing was saved to {}. Treat this as a \
-                 failed backup and try again.",
-                destination.display()
+            ExportOutcome::Unconfirmed => bad(crate::i18n::tf(
+                "vault.export_unconfirmed",
+                &[("path", &destination.display().to_string())],
             )),
         },
     }
@@ -12185,7 +12110,7 @@ fn draw_export_report(ctx: &egui::Context, report: &ExportReport) -> bool {
         return true;
     };
     report_dialog(
-        crate::kit::modal::Dialog::new(EXPORT_REPORT_ID, 480.0).title("Vault export").modeless(),
+        crate::kit::modal::Dialog::new(EXPORT_REPORT_ID, 480.0).title(crate::i18n::t("vault.export_title")).modeless(),
         text.as_str(),
         matches!(tone, ExportTone::Bad),
         ctx,
@@ -12213,7 +12138,7 @@ fn report_dialog(dialog: crate::kit::modal::Dialog<'_>, text: &str, bad: bool, c
         }
         ui.add_space(18.0);
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
-        dismissed = controls::button_filling(ui, ButtonKind::Primary, size, "OK").clicked();
+        dismissed = controls::button_filling(ui, ButtonKind::Primary, size, crate::i18n::t("vault.ok")).clicked();
     });
     dismissed
 }
@@ -12225,7 +12150,9 @@ fn report_dialog(dialog: crate::kit::modal::Dialog<'_>, text: &str, bad: bool, c
 /// export` runs for as long as the vault takes. A window that looked idle
 /// through that would invite a second click, and the second click is the one
 /// that would race two children onto one destination.
-const EXPORTING: &str = "Exporting the vault...";
+fn exporting() -> &'static str {
+    crate::i18n::t("vault.exporting")
+}
 
 /// The in-flight half of [`draw_export_report`]: the same card, with no
 /// dismiss button on it.
@@ -12233,8 +12160,8 @@ fn draw_export_in_flight(ctx: &egui::Context) {
     // Nothing to answer: no close mark, no scrim and no Esc; the card is
     // drawn again on the next frame for as long as the export runs.
     let _ = crate::kit::modal::Dialog::new(EXPORT_PROGRESS_ID, 480.0)
-        .title("Vault export")
-        .sub(EXPORTING)
+        .title(crate::i18n::t("vault.export_title"))
+        .sub(exporting())
         .without_close()
         .modeless()
         .show(ctx, |_ui| {});
@@ -12708,40 +12635,26 @@ fn send_delete_message(report: &SendDeleteReport) -> (DeleteTone, String) {
     match report {
         SendDeleteReport::Deleted { name } => (
             DeleteTone::Good,
-            format!("\u{201c}{name}\u{201d} was revoked. Its link no longer works."),
+            crate::i18n::tf("vault.send_revoked", &[("name", name)]),
         ),
         SendDeleteReport::Failed { name, error } if error.is_ambiguous() => (
             DeleteTone::Bad,
-            format!(
-                "Deskwarden could not confirm that \u{201c}{name}\u{201d} was revoked, so its \
-                 link may still be live. {} Check the list below before trying again.",
-                error.user_message()
-            ),
+            crate::i18n::tf("vault.send_revoke_unconfirmed", &[("name", name), ("detail", error.user_message())]),
         ),
         SendDeleteReport::Failed { name, error } => (
             DeleteTone::Bad,
-            format!(
-                "\u{201c}{name}\u{201d} was not revoked and its link is still live. {}",
-                error.user_message()
-            ),
+            crate::i18n::tf("vault.send_not_revoked", &[("name", name), ("detail", error.user_message())]),
         ),
         // **An Extend's two, which never say "revoked" and never say "still
         // live".** Neither is a claim an Extend is in a position to make: it
         // did not touch whether the link works, only for how long.
         SendDeleteReport::Extended { name } => (
             DeleteTone::Good,
-            format!(
-                "\u{201c}{name}\u{201d} now lasts {} more days. The list shows its new dates.",
-                crate::send::EXTEND_BY_DAYS
-            ),
+            crate::i18n::tn("vault.send_extended", crate::send::EXTEND_BY_DAYS as u64, &[("name", name)]),
         ),
         SendDeleteReport::ExtendFailed { name, error } => (
             DeleteTone::Bad,
-            format!(
-                "\u{201c}{name}\u{201d} could not be extended, so its dates may be as they \
-                 were. {}",
-                error.user_message()
-            ),
+            crate::i18n::tf("vault.send_extend_failed", &[("name", name), ("detail", error.user_message())]),
         ),
     }
 }
@@ -13368,26 +13281,15 @@ fn send_create_message(report: &SendCreateReport) -> (CreateTone, String) {
     match report {
         SendCreateReport::Created { name, access_url, .. } => (
             CreateTone::Good,
-            format!(
-                "\u{201c}{name}\u{201d} is published and its link is on your clipboard. \
-                 Anyone who has it can open the Send. {access_url}",
-            ),
+            crate::i18n::tf("vault.send_published", &[("name", name), ("url", &access_url.to_string())]),
         ),
         SendCreateReport::Failed { name, error } if error.is_ambiguous() => (
             CreateTone::Bad,
-            format!(
-                "Deskwarden could not confirm whether \u{201c}{name}\u{201d} was published, so \
-                 a link to it may already be live. {} Check the list below before trying \
-                 again.",
-                error.user_message()
-            ),
+            crate::i18n::tf("vault.send_publish_unconfirmed", &[("name", name), ("detail", error.user_message())]),
         ),
         SendCreateReport::Failed { name, error } => (
             CreateTone::Bad,
-            format!(
-                "\u{201c}{name}\u{201d} was not published and nothing was shared. {}",
-                error.user_message()
-            ),
+            crate::i18n::tf("vault.send_not_published", &[("name", name), ("detail", error.user_message())]),
         ),
     }
 }
@@ -13436,7 +13338,7 @@ fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bo
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new("Dismiss")
+                                    egui::RichText::new(crate::i18n::t("vault.dismiss"))
                                         .size(12.0)
                                         .color(theme::TEXT_MUTED),
                                 )
@@ -13574,7 +13476,7 @@ mod send_receive_thread {
         F: FnOnce() -> RecordImportReport + Send + 'static,
     {
         super::spawn_reporting(ctx_for_receive, tx, work, || {
-            RecordImportReport::Failed(super::RECEIVE_PANICKED.to_string())
+            RecordImportReport::Failed(super::receive_panicked().to_string())
         });
     }
 }
@@ -13586,16 +13488,17 @@ mod send_receive_thread {
 /// the vault. Saying otherwise would invite a retry, and a retry would make a
 /// third copy of the same record -- which is worse than the leftover this
 /// sentence describes.
-const IMPORT_REPLACED_NOTHING: &str =
-    "The record was imported, but the item it was meant to replace is still there. \
-     Delete it yourself if you still want it gone.";
+fn import_replaced_nothing() -> &'static str {
+    crate::i18n::t("vault.import_replaced_nothing")
+}
 
 /// What the user is told when the fetch worker panicked.
 ///
 /// Its own constant so the test that drives `spawn_send_receive_with` through
 /// a panicking fetch can assert the sentence rather than "something failed".
-const RECEIVE_PANICKED: &str =
-    "Deskwarden could not fetch that link. Nothing was imported.";
+fn receive_panicked() -> &'static str {
+    crate::i18n::t("vault.receive_panicked")
+}
 
 /// Applies one finished fetch to the import form, or does nothing.
 ///
@@ -14321,11 +14224,17 @@ enum VaultLoadStep {
 
 /// A `clear` -- a lock, or a re-auth into a possibly different account --
 /// began a new vault session before this load could read anything.
-const VAULT_SUPERSEDED_BEFORE_LOAD: &str = "the vault was locked before this load could read it";
+fn vault_superseded_before_load() -> &'static str {
+    crate::i18n::t("vault.load_superseded")
+}
 /// The same thing, but the `clear` landed after the fetch had started.
-const VAULT_CLEARED_WHILE_REFRESHING: &str = "the vault was locked while refreshing";
+fn vault_cleared_while_refreshing() -> &'static str {
+    crate::i18n::t("vault.load_cleared")
+}
 /// A populate reported success and yet left nothing readable for this era.
-const VAULT_EMPTY_AFTER_REFRESH: &str = "the vault refresh left nothing to show";
+fn vault_empty_after_refresh() -> &'static str {
+    crate::i18n::t("vault.load_empty")
+}
 /// The populate itself failed: `bw serve` refused, errored, or could not be
 /// reached. PROSE, like its three neighbours, and for a concrete reason
 /// (review 31's Minor 2) -- every one of these strings is painted verbatim
@@ -14333,7 +14242,9 @@ const VAULT_EMPTY_AFTER_REFRESH: &str = "the vault refresh left nothing to show"
 /// `format!("{e:?}")`, i.e. a `VaultError` Debug rendering shown to a user as
 /// if it were an explanation. The Debug detail is not lost: `spawn_vault_load_
 /// with_schedule` logs it immediately before sending this.
-const VAULT_REFRESH_FAILED: &str = "the vault could not be read from the local backend";
+fn vault_refresh_failed() -> &'static str {
+    crate::i18n::t("vault.load_refresh_failed")
+}
 
 /// What [`heartbeat_sync_due`] decides from. A named struct rather than
 /// five arguments, because three of them are `bool`s and a call site that
@@ -14493,7 +14404,7 @@ const HEARTBEAT_AFTER_FAILURE: Duration = Duration::from_secs(3 * 60);
 fn vault_load_step(force_refresh: bool, read: Result<VaultSnapshot, VaultUnavailable>) -> VaultLoadStep {
     match read {
         Err(VaultUnavailable::Superseded) => {
-            VaultLoadStep::GiveUp(VaultLoadFailure::Superseded(VAULT_SUPERSEDED_BEFORE_LOAD))
+            VaultLoadStep::GiveUp(VaultLoadFailure::Superseded(vault_superseded_before_load()))
         }
         Err(VaultUnavailable::Unpopulated) => VaultLoadStep::Populate,
         Ok(_) if force_refresh => VaultLoadStep::Populate,
@@ -14527,8 +14438,8 @@ fn vault_read_after_populate(
 ) -> Result<VaultSnapshot, VaultLoadFailure> {
     match read {
         Ok(snapshot) => Ok(snapshot),
-        Err(VaultUnavailable::Superseded) => Err(VaultLoadFailure::Superseded(VAULT_CLEARED_WHILE_REFRESHING)),
-        Err(VaultUnavailable::Unpopulated) => Err(VaultLoadFailure::Refresh(VAULT_EMPTY_AFTER_REFRESH.to_string())),
+        Err(VaultUnavailable::Superseded) => Err(VaultLoadFailure::Superseded(vault_cleared_while_refreshing())),
+        Err(VaultUnavailable::Unpopulated) => Err(VaultLoadFailure::Refresh(vault_empty_after_refresh().to_string())),
     }
 }
 
@@ -14643,7 +14554,7 @@ fn spawn_vault_load_with_schedule(
                 log::warn!("the vault was cleared while this refresh was in flight");
                 let _ = tx.send((
                     generation,
-                    Err(VaultLoadFailure::Superseded(VAULT_CLEARED_WHILE_REFRESHING)),
+                    Err(VaultLoadFailure::Superseded(vault_cleared_while_refreshing())),
                 ));
                 return;
             }
@@ -14655,7 +14566,7 @@ fn spawn_vault_load_with_schedule(
                 log::warn!("could not populate the vault cache: {e:?}");
                 let _ = tx.send((
                     generation,
-                    Err(VaultLoadFailure::Refresh(VAULT_REFRESH_FAILED.to_string())),
+                    Err(VaultLoadFailure::Refresh(vault_refresh_failed().to_string())),
                 ));
                 return;
             }
@@ -14809,7 +14720,9 @@ fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// What the account menu says when there is nothing to switch to and
 /// nothing is stopping one. One account is the overwhelmingly common state, and
 /// an empty menu is indistinguishable from a menu that failed to build.
-const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
+fn no_other_accounts() -> &'static str {
+    crate::i18n::t("vault.no_other_accounts")
+}
 
 /// The menu's Lock row, and the chord it also answers to.
 ///
@@ -14820,14 +14733,20 @@ const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
 /// removes an affordance and not a shortcut. The hint moves onto this row so
 /// the chord stays discoverable, which is the rule every copy chord in this app
 /// already follows.
-const LOCK_LABEL: &str = "Lock";
+fn lock_label() -> &'static str {
+    crate::i18n::t("vault.lock")
+}
 const LOCK_SHORTCUT: &str = "CTRL+L";
 
 /// The menu's two account-management rows. Spelled with `...` rather than `…`,
 /// matching `tray::ADD_ACCOUNT` and `tray::remove_account_label` — both menus
 /// say the same thing about the same two actions.
-const ADD_ACCOUNT: &str = "Add account...";
-const REMOVE_ACCOUNT: &str = "Remove this account...";
+fn add_account() -> &'static str {
+    crate::i18n::t("vault.add_account")
+}
+fn remove_account() -> &'static str {
+    crate::i18n::t("vault.remove_account")
+}
 
 /// The menu's export row.
 ///
@@ -14842,7 +14761,9 @@ const REMOVE_ACCOUNT: &str = "Remove this account...";
 /// OneDrive, snapshotted by Volume Shadow Copy and read into the search index
 /// before the user has finished reading any confirmation, and none of that is
 /// reversible. A format dropdown here would be the way to reach exactly that.
-const EXPORT_VAULT: &str = "Export vault...";
+fn export_vault() -> &'static str {
+    crate::i18n::t("vault.export_vault")
+}
 
 /// How wide the account menu is allowed to get.
 ///
@@ -15042,7 +14963,7 @@ fn account_menu_plan(
         state
             .blocked_reason()
             .map(str::to_string)
-            .unwrap_or_else(|| NO_OTHER_ACCOUNTS.to_string())
+            .unwrap_or_else(|| no_other_accounts().to_string())
     });
 
     AccountMenuPlan {
@@ -15129,7 +15050,7 @@ fn account_menu(
         ui.separator();
         // The chord rides the row, the way design 2b's pill carried it.
         if ui
-            .add(egui::Button::new(LOCK_LABEL).shortcut_text(LOCK_SHORTCUT))
+            .add(egui::Button::new(lock_label()).shortcut_text(LOCK_SHORTCUT))
             .clicked()
         {
             action = Some(AccountAction::Lock);
@@ -15139,15 +15060,15 @@ fn account_menu(
         // a read of the vault this window is already showing, so there is no
         // state in which it can only fail -- which is the test the `can_add`
         // and `can_remove` rows have to pass.
-        if ui.button(EXPORT_VAULT).clicked() {
+        if ui.button(export_vault()).clicked() {
             action = Some(AccountAction::Export);
             ui.close();
         }
-        if plan.can_add && ui.button(ADD_ACCOUNT).clicked() {
+        if plan.can_add && ui.button(add_account()).clicked() {
             action = Some(AccountAction::Add);
             ui.close();
         }
-        if plan.can_remove && ui.button(REMOVE_ACCOUNT).clicked() {
+        if plan.can_remove && ui.button(remove_account()).clicked() {
             action = Some(AccountAction::Remove);
             ui.close();
         }
@@ -15177,7 +15098,7 @@ fn account_menu(
 /// wording no longer depends on one.
 fn synced_ago_text(elapsed: Duration) -> String {
     if elapsed.as_secs() < 60 {
-        "just now".to_string()
+        crate::i18n::t("vault.just_now").to_string()
     } else {
         relative_time::ago(elapsed)
     }
@@ -15186,7 +15107,9 @@ fn synced_ago_text(elapsed: Duration) -> String {
 /// What the toolbar pill says when the most recent load produced nothing to
 /// paint but the sync that triggered it worked. Deliberately NOT "Sync
 /// failed": the sync is not what failed.
-const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
+fn vault_not_refreshed_pill() -> &'static str {
+    crate::i18n::t("vault.pill_not_refreshed")
+}
 
 /// The toolbar sync pill's dot colour and label -- the ONLY place any of
 /// these states is spelled for the user, which is why it is a function with
@@ -15218,7 +15141,9 @@ const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
 /// the user sees and the distinction collapses SILENTLY. Anyone loosening that
 /// gate owes this function a second label.
 /// The toast after the offline banner's Retry fails again (spec 3.1).
-pub(crate) const STILL_OFFLINE_TOAST: &str = "Still can\u{2019}t reach Bitwarden";
+pub(crate) fn still_offline_toast() -> &'static str {
+    crate::i18n::t("vault.still_offline")
+}
 
 /// Spec 3.1's offline banner condition: the vault on screen is the disk
 /// cache's and the last sync could not refresh it. Not while a sync is in
@@ -15235,22 +15160,22 @@ fn sync_pill(
     from_disk_age: Option<Duration>,
 ) -> (egui::Color32, String) {
     if sync_in_progress {
-        return (theme::TEXT_GHOST, "Syncing…".to_string());
+        return (theme::TEXT_GHOST, crate::i18n::t("vault.pill_syncing").to_string());
     }
     // Blue for success (there's no dedicated "success" green in this app's
     // palette -- see `theme.rs`'s module doc on "one blue hue... red reserved
     // for actual errors"), the design's error red for failure, and a neutral
     // ghost dot before the first sync has reported anything.
     match (sync_status, vault_load_error) {
-        (Some(Err(_)), _) => (theme::ERROR, with_age("Sync failed", from_disk_age)),
-        (_, Some(_)) => (theme::ERROR, with_age(VAULT_NOT_REFRESHED_PILL, from_disk_age)),
-        (Some(Ok(())), None) => (theme::BLUE, format!("Synced {}", synced_ago_text(since_last_sync))),
+        (Some(Err(_)), _) => (theme::ERROR, with_age(crate::i18n::t("vault.pill_sync_failed"), from_disk_age)),
+        (_, Some(_)) => (theme::ERROR, with_age(vault_not_refreshed_pill(), from_disk_age)),
+        (Some(Ok(())), None) => (theme::BLUE, crate::i18n::tf("vault.pill_synced", &[("ago", &synced_ago_text(since_last_sync))])),
         (None, None) => match from_disk_age {
             Some(age) => (
                 theme::TEXT_GHOST,
-                format!("Loaded from cache · {}", cache_age_text(age)),
+                crate::i18n::tf("vault.pill_cached", &[("age", &cache_age_text(age))]),
             ),
-            None => (theme::TEXT_GHOST, "Sync".to_string()),
+            None => (theme::TEXT_GHOST, crate::i18n::t("vault.pill_idle").to_string()),
         },
     }
 }
@@ -15265,7 +15190,7 @@ fn sync_pill(
 /// predates the weekend.
 fn with_age(label: &str, from_disk_age: Option<Duration>) -> String {
     match from_disk_age {
-        Some(age) => format!("{label} · {}", cache_age_text(age)),
+        Some(age) => crate::i18n::tf("vault.pill_with_age", &[("label", label), ("age", &cache_age_text(age))]),
         None => label.to_string(),
     }
 }
@@ -15284,13 +15209,13 @@ fn with_age(label: &str, from_disk_age: Option<Duration>) -> String {
 pub(crate) fn cache_age_text(age: Duration) -> String {
     let secs = age.as_secs();
     if secs < 60 {
-        "just written".to_string()
+        crate::i18n::t("vault.cache_just_written").to_string()
     } else if secs < 3600 {
-        format!("{} min old", secs / 60)
+        crate::i18n::tn("vault.cache_minutes", secs / 60, &[])
     } else if secs < 86_400 {
-        format!("{} h old", secs / 3600)
+        crate::i18n::tn("vault.cache_hours", secs / 3600, &[])
     } else {
-        format!("{} d old", secs / 86_400)
+        crate::i18n::tn("vault.cache_days", secs / 86_400, &[])
     }
 }
 
@@ -16152,16 +16077,12 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 =
 fn app_launch_failure_message(name: &str, program: &str, e: &std::io::Error) -> String {
     let because = match e.kind() {
         std::io::ErrorKind::NotFound => {
-            "Windows couldn\u{2019}t find that program \u{2014} it may have been moved, renamed \
-             or uninstalled since the app was matched"
+            crate::i18n::t("vault.launch_not_found")
         }
-        std::io::ErrorKind::PermissionDenied => "Windows refused to start it",
-        _ => "Windows couldn\u{2019}t start it",
+        std::io::ErrorKind::PermissionDenied => crate::i18n::t("vault.launch_denied"),
+        _ => crate::i18n::t("vault.launch_failed"),
     };
-    format!(
-        "Couldn\u{2019}t open the app for \u{201c}{name}\u{201d} \u{2014} {because}. Nothing was \
-         started. ({program})"
-    )
+    crate::i18n::tf("vault.err_launch", &[("name", name), ("because", because), ("program", program)])
 }
 
 /// A launch the user has asked for, waiting to happen.
@@ -16239,19 +16160,23 @@ enum LaunchConfirmAction {
 }
 
 /// The heading the confirmation shows.
-const LAUNCH_CONFIRM_TITLE: &str = "Open this app?";
+fn launch_confirm_title() -> &'static str {
+    crate::i18n::t("vault.launch_title")
+}
 
 /// The sentence above the command line.
 ///
 /// It says where the arguments came from, because that is the fact the user
 /// needs in order to judge the string underneath: they may never have typed
 /// it, and on an item shared into their vault they certainly did not.
-const LAUNCH_CONFIRM_BODY: &str =
-    "This app match stores extra command-line arguments, which are passed to the program \
-     exactly as they are written in the vault. Deskwarden will run:";
+fn launch_confirm_body() -> &'static str {
+    crate::i18n::t("vault.launch_body")
+}
 
 /// The button that starts the program. Not "OK": the label says what happens.
-const LAUNCH_CONFIRM_GO: &str = "Open";
+fn launch_confirm_go() -> &'static str {
+    crate::i18n::t("vault.launch_go")
+}
 
 /// Draws the launch confirmation as a centered card over a dimmed scrim,
 /// exactly as [`draw_folder_edit_modal`] does, and reports what was clicked.
@@ -16285,10 +16210,10 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
 
     let mut action = LaunchConfirmAction::None;
     let (outcome, ()) = Dialog::new(LAUNCH_CONFIRM_ID, 520.0)
-        .title(LAUNCH_CONFIRM_TITLE)
+        .title(launch_confirm_title())
         .sub(&pending.item_name)
         .show(ctx, |ui| {
-            ui.add(egui::Label::new(RichText::new(LAUNCH_CONFIRM_BODY).size(15.0).color(theme::INK)).wrap());
+            ui.add(egui::Label::new(RichText::new(launch_confirm_body()).size(15.0).color(theme::INK)).wrap());
             ui.add_space(10.0);
             // The exact command line, in a quiet box: what the vault says to
             // run, character for character.
@@ -16309,10 +16234,10 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
             let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.columns(2, |columns| {
-                if controls::button_filling(&mut columns[0], ButtonKind::Outline, size, "Cancel").clicked() {
+                if controls::button_filling(&mut columns[0], ButtonKind::Outline, size, crate::i18n::t("vault.cancel")).clicked() {
                     action = LaunchConfirmAction::Cancel;
                 }
-                if controls::button_filling(&mut columns[1], ButtonKind::Primary, size, LAUNCH_CONFIRM_GO).clicked() {
+                if controls::button_filling(&mut columns[1], ButtonKind::Primary, size, launch_confirm_go()).clicked() {
                     action = LaunchConfirmAction::Launch;
                 }
             });
@@ -21550,7 +21475,7 @@ mod spawn_vault_load_tests {
             "this string is painted to the user under \"Your vault could not be loaded\" -- a \
              Rust Debug rendering is not an explanation: {reason:?}"
         );
-        assert_eq!(reason, super::VAULT_REFRESH_FAILED);
+        assert_eq!(reason, super::vault_refresh_failed());
     }
 
     #[test]
@@ -22365,7 +22290,7 @@ mod apply_vault_load_result_tests {
     // load's success already landed).
     use super::{
         apply_vault_load_result, vault_body_state, VaultBodyState, VaultLoadFailure,
-        VAULT_SUPERSEDED_BEFORE_LOAD,
+        vault_superseded_before_load,
     };
     use crate::vault_bridge::VaultItem;
     use crate::vault_cache::VaultSnapshot;
@@ -22766,7 +22691,7 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             1,
-            Err(VaultLoadFailure::Superseded(VAULT_SUPERSEDED_BEFORE_LOAD)),
+            Err(VaultLoadFailure::Superseded(vault_superseded_before_load())),
             &mut items,
             &mut folders,
             &mut vault_loading,
@@ -22780,13 +22705,13 @@ mod apply_vault_load_result_tests {
         assert!(!vault_loading, "the spinner must stop -- nothing else is coming");
         assert_eq!(
             vault_load_error.as_deref(),
-            Some(VAULT_SUPERSEDED_BEFORE_LOAD),
+            Some(vault_superseded_before_load()),
             "the loader's own reason must survive the hand-off, or the window has nothing true \
              to say about why it is empty"
         );
         assert_eq!(
             vault_body_state(vault_loading, items.is_empty(), vault_load_error.as_deref(), false),
-            VaultBodyState::Unavailable(VAULT_SUPERSEDED_BEFORE_LOAD),
+            VaultBodyState::Unavailable(vault_superseded_before_load()),
             "an empty window after a give-up must SAY so rather than drawing an empty vault"
         );
     }
@@ -22809,7 +22734,7 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             2,
             2,
-            Err(VaultLoadFailure::Superseded(VAULT_SUPERSEDED_BEFORE_LOAD)),
+            Err(VaultLoadFailure::Superseded(vault_superseded_before_load())),
             &mut items,
             &mut folders,
             &mut vault_loading,
@@ -22825,7 +22750,7 @@ mod apply_vault_load_result_tests {
             Some(Ok(())),
             "the sync succeeded; a vault session that ended afterwards is not a sync failure"
         );
-        assert_eq!(vault_load_error.as_deref(), Some(VAULT_SUPERSEDED_BEFORE_LOAD));
+        assert_eq!(vault_load_error.as_deref(), Some(vault_superseded_before_load()));
         assert_eq!(
             ids(&items),
             vec!["a"],
@@ -22841,7 +22766,7 @@ mod apply_vault_load_result_tests {
         let mut items = Vec::new();
         let mut folders = Vec::new();
         let mut vault_loading = false;
-        let mut vault_load_error = Some(VAULT_SUPERSEDED_BEFORE_LOAD.to_string());
+        let mut vault_load_error = Some(vault_superseded_before_load().to_string());
         let mut selected_id = None;
         let mut sync_status = None;
         let mut totp_state = TotpState::NoSecret;
@@ -22871,7 +22796,7 @@ mod sync_pill_tests {
     // spelled for the user, and until this function existed the wording was
     // an `if` chain inside a 3000-line `eframe` closure that nothing could
     // call.
-    use super::{cache_age_text, list_offline, sync_pill, theme, STILL_OFFLINE_TOAST, VAULT_NOT_REFRESHED_PILL};
+    use super::{cache_age_text, list_offline, sync_pill, theme, still_offline_toast, vault_not_refreshed_pill};
     use std::time::Duration;
 
     /// Spec 3.1's offline banner: a vault off the disk cache whose last sync
@@ -22886,7 +22811,7 @@ mod sync_pill_tests {
         assert!(!list_offline(true, false, Some(&ok), None), "a cached vault that synced is not offline");
         assert!(!list_offline(true, false, None, None), "nothing has failed yet");
         assert!(!list_offline(true, true, Some(&failed), None), "a sync in flight may be the answer");
-        assert_eq!(STILL_OFFLINE_TOAST, "Still can\u{2019}t reach Bitwarden");
+        assert_eq!(still_offline_toast(), "Still can\u{2019}t reach Bitwarden");
     }
 
     /// Three hours, as a snapshot that came off the encrypted disk cache.
@@ -22902,7 +22827,7 @@ mod sync_pill_tests {
             None,
         );
         assert_eq!(
-            label, VAULT_NOT_REFRESHED_PILL,
+            label, vault_not_refreshed_pill(),
             "\"Sync failed\" would be a red pill on a sync that worked; \"Synced just now\" \
              would claim a refresh that never landed"
         );
@@ -23020,7 +22945,7 @@ mod sync_pill_tests {
         );
         assert_eq!(
             sync_pill(false, Some(&Ok(())), Some("locked"), Duration::ZERO, None).1,
-            VAULT_NOT_REFRESHED_PILL
+            vault_not_refreshed_pill()
         );
     }
 
@@ -24660,7 +24585,7 @@ mod auto_lock_never_wiring_tests {
     const MATCH_HEAD: &str =
         concat!("fn idle_frame(auto_lock: AutoLock, idle: ", "Duration) -> IdleFrame {");
     const NEVER_ARM: &str =
-        concat!("AutoLock::Never => IdleFrame::Sidebar(AUTO_LOCK_OFF_", "LABEL.to_owned()),");
+        concat!("AutoLock::Never => IdleFrame::Sidebar(auto_lock_off_", "label().to_owned()),");
     const AFTER_ARM: &str = concat!("AutoLock::After(timeout) ", "=> {");
     const ELAPSED_CHECK: &str = concat!("if idle >= ", "timeout {");
     const LOCKS: &str = concat!("IdleFrame::", "Lock");
@@ -24812,7 +24737,7 @@ mod the_idle_timer_follows_the_edited_setting {
 
         assert_eq!(
             frame(Some(&off), idle),
-            IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned()),
+            IdleFrame::Sidebar(auto_lock_off_label().to_owned()),
             "auto-lock was turned off in the gear and the already-open window locked anyway -- \
              this is the reported defect, where the setting only took effect on reopen"
         );
@@ -24833,7 +24758,7 @@ mod the_idle_timer_follows_the_edited_setting {
         );
 
         let line = sidebar_line(frame(Some(&off), idle));
-        assert_eq!(line, AUTO_LOCK_OFF_LABEL);
+        assert_eq!(line, auto_lock_off_label());
 
         // And it is really PAINTED. A string in a local is not what the user
         // reported; they reported a pane. `painted_sidebar_text` runs
@@ -24843,8 +24768,8 @@ mod the_idle_timer_follows_the_edited_setting {
         let painted = painted_sidebar_text(&line);
         // The v2 Lock row carries the countdown as its count: "Off".
         assert!(
-            painted.iter().any(|t| t == sidebar::lock_count(AUTO_LOCK_OFF_LABEL)),
-            "the sidebar did not paint {AUTO_LOCK_OFF_LABEL:?}; it painted {painted:?}"
+            painted.iter().any(|t| t == sidebar::lock_count(auto_lock_off_label())),
+            "the sidebar did not paint {:?}; it painted {painted:?}", auto_lock_off_label()
         );
         assert!(
             !painted.iter().any(|t| t == sidebar::lock_count("Locks in 4:00")),
@@ -24875,7 +24800,7 @@ mod the_idle_timer_follows_the_edited_setting {
         let long_idle = Duration::from_secs(3600);
         assert_eq!(
             idle_frame(effective_auto_lock(None, never), long_idle),
-            IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned())
+            IdleFrame::Sidebar(auto_lock_off_label().to_owned())
         );
 
         // Turned on in the gear, the already-open window starts locking --
@@ -25448,16 +25373,17 @@ mod account_switcher_tests {
     fn the_export_row_reports_an_export() {
         for state in [lone_state(), available_state(), blocked_state()] {
             assert_eq!(
-                pick(Some(&state), EXPORT_VAULT),
+                pick(Some(&state), export_vault()),
                 Some(AccountAction::Export),
-                "clicking {EXPORT_VAULT:?} asked for something else"
+                "clicking {:?} asked for something else",
+                export_vault()
             );
         }
         // Control: a menu with no account list has no rows at all, so the
         // assertion above is about a row that really is drawn.
         let mut switcher = Switcher::new();
         assert!(
-            !switcher.idle(None).painted(EXPORT_VAULT),
+            !switcher.idle(None).painted(export_vault()),
             "control: an app with no account list paints an export row"
         );
     }
@@ -25614,9 +25540,9 @@ mod account_switcher_tests {
         // test exists to catch. The constant is named only in the message.
         assert!(
             open.painted("No other accounts yet"),
-            "the lone-account menu says nothing at all (`NO_OTHER_ACCOUNTS` is {:?}); it \
+            "the lone-account menu says nothing at all (`no_other_accounts()` is {:?}); it \
              painted: {:?}",
-            NO_OTHER_ACCOUNTS,
+            no_other_accounts(),
             open.strings()
         );
         assert!(
@@ -25650,7 +25576,7 @@ mod account_switcher_tests {
         let clicked = switcher.click(None, idle.avatar().center());
         assert_eq!(clicked.picked, None);
         assert!(
-            !switcher.idle(None).painted(LOCK_LABEL),
+            !switcher.idle(None).painted(lock_label()),
             "a menu opened for an app that has no accounts: {:?}",
             switcher.idle(None).strings()
         );
@@ -25658,7 +25584,7 @@ mod account_switcher_tests {
         // accounts, the same avatar opens the menu.
         let mut with_accounts = Switcher::new();
         assert!(
-            with_accounts.open(Some(&available_state())).painted(LOCK_LABEL),
+            with_accounts.open(Some(&available_state())).painted(lock_label()),
             "the harness opens no menu even WITH accounts, so the assertions above are \
              about the harness rather than about the menu"
         );
@@ -25684,7 +25610,7 @@ mod account_switcher_tests {
             "clicking the avatar opened nothing; painted: {:?}",
             opened.strings()
         );
-        assert!(opened.painted(LOCK_LABEL), "painted: {:?}", opened.strings());
+        assert!(opened.painted(lock_label()), "painted: {:?}", opened.strings());
 
         // The same menu, not merely *a* menu: every row the chevron produces.
         let mut from_chevron = Switcher::new();
@@ -25861,7 +25787,7 @@ mod account_switcher_tests {
         // The positive control: the identity block IS there, so "no host line"
         // is not "no menu at all".
         assert!(open.painted(&a().email), "{:?}", open.strings());
-        assert!(open.painted(LOCK_LABEL), "{:?}", open.strings());
+        assert!(open.painted(lock_label()), "{:?}", open.strings());
 
         // And what IS stored still counts as knowing, even before `bw status`
         // answers -- `settings.json` remembering a server is an answer.
@@ -28694,7 +28620,7 @@ mod launch_confirm_tests {
         );
         // The item is named too -- the user has to know which Open this is.
         assert!(shot.painted("Ledgerline"), "painted: {:?}", shot.sources());
-        assert!(shot.painted(LAUNCH_CONFIRM_TITLE), "painted: {:?}", shot.sources());
+        assert!(shot.painted(launch_confirm_title()), "painted: {:?}", shot.sources());
     }
 
     /// **Default deny.** A frame in which nothing happened is not approval.
@@ -28751,15 +28677,16 @@ mod launch_confirm_tests {
         let pending = a_pending(hostile_plan());
         let mut dialog = Dialog::new();
         let up = dialog.up(&pending);
-        let go = up.rect_of(LAUNCH_CONFIRM_GO).center();
+        let go = up.rect_of(launch_confirm_go()).center();
         assert_eq!(
             dialog.click(&pending, go).action,
             LaunchConfirmAction::Launch,
-            "the dialog's {LAUNCH_CONFIRM_GO:?} button does not approve the launch"
+            "the dialog's {:?} button does not approve the launch",
+            launch_confirm_go()
         );
         // And the two buttons are not the same button.
         assert_ne!(
-            up.rect_of(LAUNCH_CONFIRM_GO),
+            up.rect_of(launch_confirm_go()),
             up.rect_of("Cancel"),
             "the confirm and the cancel are one control"
         );
@@ -32465,7 +32392,7 @@ mod export_wiring {
 
         // The menu is up. Positive control on the harness itself: without it a
         // failure to open the popup would look exactly like a broken row.
-        let export_at = locate(&opened, EXPORT_VAULT);
+        let export_at = locate(&opened, export_vault());
         assert!(
             FRAME_STARTED.lock().expect("not poisoned").is_empty(),
             "opening the account menu started an export, before the row was pressed"
@@ -32488,17 +32415,18 @@ mod export_wiring {
         // of "the row did something" and the half the user sees.
         let painting = ctx.run_ui(input(), |ui| frame_fn(ui));
         assert!(
-            labels(&painting).iter().any(|(t, _)| t == EXPORTING),
-            "the row started an export but the window paints no {EXPORTING:?} card, so a \
+            labels(&painting).iter().any(|(t, _)| t == exporting()),
+            "the row started an export but the window paints no {:?} card, so a \
              user has nothing on screen accounting for the `bw` that is now running. \
              Painted: {:?}",
+            exporting(),
             labels(&painting).iter().map(|(t, _)| t.clone()).collect::<Vec<_>>()
         );
 
         // AND A SECOND CLICK STARTS NO SECOND `bw`. Two exports racing on one
         // destination is two processes writing one `.dw-partial`.
         let reopened = click(&ctx, &mut frame_fn, avatar_at);
-        let export_at = locate(&reopened, EXPORT_VAULT);
+        let export_at = locate(&reopened, export_vault());
         let _ = click(&ctx, &mut frame_fn, export_at);
         let again = std::mem::take(&mut *FRAME_STARTED.lock().expect("not poisoned"));
         assert!(
@@ -32542,7 +32470,7 @@ mod export_wiring {
         );
 
         let reopened = click(&ctx, &mut frame_fn, avatar_at);
-        let export_at = locate(&reopened, EXPORT_VAULT);
+        let export_at = locate(&reopened, export_vault());
         let _ = click(&ctx, &mut frame_fn, export_at);
         let with_card_up = std::mem::take(&mut *FRAME_STARTED.lock().expect("not poisoned"));
         assert_eq!(
@@ -35265,7 +35193,7 @@ mod send_delete_wiring {
     /// tell "the control is gone" from "there are two".
     fn matrix_locate_envelope(state: ReachableState, output: &egui::FullOutput) -> egui::Pos2 {
         // v2: the record composer opens from the header's Share.
-        matrix_locate(state, output, crate::vault_window::detail::SHARE_LABEL)
+        matrix_locate(state, output, crate::vault_window::detail::share_label())
     }
 
     /// Where the detail header's **close ✕** is, to press it. See
@@ -35827,7 +35755,7 @@ mod send_delete_wiring {
         let _ = matrix_frame(&ctx, &mut frame_fn);
         let open = matrix_frame(&ctx, &mut frame_fn);
         assert!(ctx.read_response(item_list::new_button_id()).is_some(), "control: the list is drawn while reading");
-        let edit_at = matrix_locate(state, &open, crate::vault_window::detail::EDIT_LABEL);
+        let edit_at = matrix_locate(state, &open, crate::vault_window::detail::edit_label());
         let _ = matrix_click(&ctx, &mut frame_fn, edit_at);
         for _ in 0..3 {
             let _ = matrix_frame(&ctx, &mut frame_fn);
@@ -35887,7 +35815,7 @@ mod send_delete_wiring {
         // and not bound: the press below re-locates on a later frame.
         matrix_locate_pane_close(state, &ctx, &open);
         assert!(
-            matrix_find(&open, crate::vault_window::detail::SHARE_LABEL).is_some(),
+            matrix_find(&open, crate::vault_window::detail::share_label()).is_some(),
             "control: the detail pane's header strip is not on screen before anything is \
              pressed, so closing it below would prove nothing. What was painted: {:?}",
             matrix_texts(&open)
@@ -35898,13 +35826,13 @@ mod send_delete_wiring {
         let close_at = matrix_locate_pane_close(state, &ctx, &open);
         let closed = matrix_click(&ctx, &mut frame_fn, close_at);
         assert!(
-            matrix_find(&closed, crate::vault_window::detail::SHARE_LABEL).is_none(),
+            matrix_find(&closed, crate::vault_window::detail::share_label()).is_none(),
             "pressing the header's ✕ left the favourite star on screen, so the detail pane \
              is still showing. What was painted: {:?}",
             matrix_texts(&closed)
         );
         assert!(
-            matrix_find(&closed, crate::vault_window::detail::EDIT_LABEL).is_none(),
+            matrix_find(&closed, crate::vault_window::detail::edit_label()).is_none(),
             "pressing the header's ✕ left the Send envelope on screen, so the detail pane \
              is still showing"
         );
@@ -35925,7 +35853,7 @@ mod send_delete_wiring {
             reopened = matrix_frame(&ctx, &mut frame_fn);
         }
         assert!(
-            matrix_find(&reopened, crate::vault_window::detail::SHARE_LABEL).is_some(),
+            matrix_find(&reopened, crate::vault_window::detail::share_label()).is_some(),
             "clicking the row after closing the pane did not bring it back, so the ✕ is a \
              one-way door. What was painted: {:?}",
             matrix_texts(&reopened)
@@ -39090,7 +39018,7 @@ mod record_import_wiring {
         std::panic::set_hook(previous);
 
         match &report {
-            RecordImportReport::Failed(why) => assert_eq!(why, RECEIVE_PANICKED),
+            RecordImportReport::Failed(why) => assert_eq!(why, receive_panicked()),
             RecordImportReport::Read(_) => {
                 panic!("a panicked fetch reported a record it never read")
             }
@@ -39102,7 +39030,7 @@ mod record_import_wiring {
         drain_record_import(&rx2, &mut state);
         let state = state.expect("the form is still open");
         assert!(!state.in_flight, "the form wedged after a panicked fetch");
-        assert_eq!(state.failure.as_deref(), Some(RECEIVE_PANICKED));
+        assert_eq!(state.failure.as_deref(), Some(receive_panicked()));
     }
 
     /// **A failed fetch takes the previous record with it.**

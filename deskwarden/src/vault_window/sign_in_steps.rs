@@ -30,13 +30,13 @@ pub const ALL: [Step; 7] = [Step::User, Step::Pw, Step::Totp, Step::Tab, Step::S
 impl Step {
     pub fn label(self) -> &'static str {
         match self {
-            Step::User => "Type username",
-            Step::Pw => "Type password",
-            Step::Totp => "Type 2FA code",
-            Step::Tab => "Press Tab",
-            Step::Stab => "Press Shift+Tab",
-            Step::Enter => "Press Enter",
-            Step::Wait => "Wait \u{bd} second",
+            Step::User => crate::i18n::t("steps.type_username"),
+            Step::Pw => crate::i18n::t("steps.type_password"),
+            Step::Totp => crate::i18n::t("steps.type_totp"),
+            Step::Tab => crate::i18n::t("steps.press_tab"),
+            Step::Stab => crate::i18n::t("steps.press_shift_tab"),
+            Step::Enter => crate::i18n::t("steps.press_enter"),
+            Step::Wait => crate::i18n::t("steps.wait"),
         }
     }
 
@@ -85,25 +85,43 @@ impl Step {
 }
 
 /// The presets, in the segmented control's order.
-pub const PRESETS: [(&str, &[Step]); 3] = [
-    ("Standard", &[Step::User, Step::Tab, Step::Pw, Step::Enter]),
-    ("Password first", &[Step::Pw, Step::Stab, Step::User, Step::Enter]),
-    ("With 2FA", &[Step::User, Step::Tab, Step::Pw, Step::Enter, Step::Wait, Step::Totp, Step::Enter]),
-];
+pub fn presets() -> [(&'static str, &'static [Step]); 3] {
+    [
+        (crate::i18n::t("steps.preset_standard"), &[Step::User, Step::Tab, Step::Pw, Step::Enter]),
+        (crate::i18n::t("steps.preset_password_first"), &[Step::Pw, Step::Stab, Step::User, Step::Enter]),
+        (
+            crate::i18n::t("steps.preset_with_2fa"),
+            &[Step::User, Step::Tab, Step::Pw, Step::Enter, Step::Wait, Step::Totp, Step::Enter],
+        ),
+    ]
+}
 
-pub const TITLE_TIP: &str =
-    "What Deskwarden presses to sign you in. Most apps work with Standard \u{2014} only change it if a sign-in goes wrong.";
-pub const TEST_BUTTON: &str = "Test it";
-pub const TESTING_BUTTON: &str = "Testing\u{2026}";
-pub const TEST_EMPTY: &str = "Fake data appears here";
-pub const TEST_DONE_TOAST: &str = "Test finished \u{2014} every step worked";
-pub const TEST_TIP: &str = "Plays the steps with fake data, so you can check them without using your real password.";
-pub const ONLY_TIP: &str = "Your password is never typed into any other window \u{2014} not a chat, not a search box \u{2014} even if you press the shortcut there.";
+pub fn title_tip() -> &'static str {
+    crate::i18n::t("steps.title_tip")
+}
+pub fn test_button() -> &'static str {
+    crate::i18n::t("steps.test_button")
+}
+pub fn testing_button() -> &'static str {
+    crate::i18n::t("steps.testing_button")
+}
+pub fn test_empty() -> &'static str {
+    crate::i18n::t("steps.test_empty")
+}
+pub fn test_done_toast() -> &'static str {
+    crate::i18n::t("steps.test_done_toast")
+}
+pub fn test_tip() -> &'static str {
+    crate::i18n::t("steps.test_tip")
+}
+pub fn only_tip() -> &'static str {
+    crate::i18n::t("steps.only_tip")
+}
 /// Spec B 1.4 D: one step every 620 ms.
 pub const TEST_STEP_SECS: f64 = 0.62;
 
 pub fn only_type_into(app: &str) -> String {
-    format!("Only type into {}", if app.is_empty() { "the matched app" } else { app })
+    crate::i18n::tf("steps.only_type_into", &[("app", if app.is_empty() { crate::i18n::t("steps.the_matched_app") } else { app })])
 }
 
 /// The steps a stored template spells, or `None` when it holds anything the
@@ -132,7 +150,7 @@ pub fn render(steps: &[Step]) -> String {
 
 /// The preset whose steps these are exactly, if any.
 pub fn active_preset(steps: &[Step]) -> Option<usize> {
-    PRESETS.iter().position(|(_, preset)| *preset == steps)
+    presets().iter().position(|(_, preset)| *preset == steps)
 }
 
 /// What the test shows `elapsed` seconds after it started.
@@ -233,11 +251,11 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
 
     // Presets.
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(TITLE_TIP);
-        let labels: Vec<&str> = PRESETS.iter().map(|(name, _)| *name).collect();
+        ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(title_tip());
+        let labels: Vec<&str> = presets().iter().map(|(name, _)| *name).collect();
         let selected = active_preset(&steps).unwrap_or(usize::MAX);
         if let Some(picked) = crate::kit::controls::segmented(ui, &labels, selected, crate::kit::controls::SEG_SETTINGS) {
-            steps = PRESETS[picked].1.to_vec();
+            steps = presets()[picked].1.to_vec();
             ui.data_mut(|d| d.remove::<Run>(run_id()));
         }
     });
@@ -346,8 +364,8 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
         let mut on = true;
         ui.add_enabled_ui(false, |ui| crate::kit::controls::switch(ui, &mut on));
         ui.label(theme::semibold(only_type_into(app), 15.0).color(theme::INK));
-        ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(ONLY_TIP);
-        if theme::action_link(ui, crate::vault_window::detail_edit::SEQUENCE_EDIT_BUTTON, 13.0).clicked() {
+        ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(only_tip());
+        if theme::action_link(ui, crate::vault_window::detail_edit::sequence_edit_button(), 13.0).clicked() {
             wants_editor = true;
         }
     });
@@ -362,7 +380,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                let label = if testing { TESTING_BUTTON } else { TEST_BUTTON };
+                let label = if testing { testing_button() } else { test_button() };
                 let size = crate::kit::controls::ButtonSize { height: 46.0, pad_x: 18.0, radius: 13, font_px: 15.0 };
                 let button =
                     crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, size, label, Some(glyph::PLAY));
@@ -380,7 +398,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
                     if r.done { r.steps.iter().map(|s| s.test_output()).collect() } else { f.text }
                 });
                 let (text, ink) = match shown.as_deref() {
-                    None | Some("") if !testing => (TEST_EMPTY.to_string(), FAINT),
+                    None | Some("") if !testing => (test_empty().to_string(), FAINT),
                     other => (other.unwrap_or_default().to_string(), theme::INK),
                 };
                 let clip = ui.painter().with_clip_rect(pane.shrink2(Vec2::new(14.0, 0.0)));
@@ -395,7 +413,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
                     let caret = Rect::from_center_size(egui::pos2(at.right() + 3.0, pane.center().y), Vec2::new(2.0, 20.0));
                     clip.rect_filled(caret, 0.0, theme::INK);
                 }
-                ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(TEST_TIP);
+                ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(test_tip());
             });
         });
 
@@ -404,7 +422,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
         if !r.done {
             if test_frame(&r.steps, now - r.started).finished {
                 r.done = true;
-                crate::kit::toast::show(ui.ctx(), TEST_DONE_TOAST);
+                crate::kit::toast::show(ui.ctx(), test_done_toast());
                 ui.data_mut(|d| d.insert_temp(run_id(), r));
             } else {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
@@ -442,7 +460,7 @@ fn chip(ui: &mut egui::Ui, step: Step, index: usize, live: bool) -> bool {
         ui.painter().rect_filled(cross, CornerRadius::same(8), Color32::from_rgba_unmultiplied(32, 30, 29, 18));
     }
     icon::stroke(ui.painter(), Rect::from_center_size(cross.center(), Vec2::splat(12.0)), glyph::CLOSE, 2.0, if response.hovered() { theme::INK } else { FAINT });
-    response.on_hover_text("Remove step").clicked()
+    response.on_hover_text(crate::i18n::t("steps.remove_step")).clicked()
 }
 
 /// A 2pt dashed rounded box (the add button's outline).
@@ -476,13 +494,13 @@ mod tests {
 
     /// The presets' segments: the lit one is set in ink, the others are not.
     fn lit(p: &Painted) -> Vec<&'static str> {
-        PRESETS.iter().map(|(name, _)| *name).filter(|name| ink_of(p, name) == crate::kit::tokens::Palette::LIGHT.ink).collect()
+        presets().iter().map(|(name, _)| *name).filter(|name| ink_of(p, name) == crate::kit::tokens::Palette::LIGHT.ink).collect()
     }
 
     #[test]
     fn a_preset_replaces_the_steps_and_lights_its_segment() {
         let ctx = testing::ctx();
-        let mut sequence = render(PRESETS[0].1);
+        let mut sequence = render(presets()[0].1);
         let p = paint(&ctx, 0.0, &mut sequence, vec![]);
         assert_eq!(lit(&p), vec!["Standard"]);
         let at = p.texts.iter().find(|(t, _, _)| t == "Password first").unwrap().2.center();
@@ -504,7 +522,7 @@ mod tests {
     #[test]
     fn adding_and_removing_steps_edits_the_sequence() {
         let ctx = testing::ctx();
-        let mut sequence = render(PRESETS[0].1);
+        let mut sequence = render(presets()[0].1);
         let _ = paint(&ctx, 0.0, &mut sequence, vec![]);
         let enter = rect_of(&ctx, chip_remove_id(3));
         let _ = paint(&ctx, 0.1, &mut sequence, click_at(enter.center()));
@@ -526,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_plays_fake_data_one_step_every_620ms_and_never_the_password() {
-        let steps = PRESETS[0].1;
+        let steps = presets()[0].1;
         assert_eq!(test_frame(steps, 0.0), TestFrame { text: String::new(), live: None, finished: false });
         assert_eq!(test_frame(steps, 0.63).text, "sample-user");
         assert_eq!(test_frame(steps, 0.63).live, Some(0));
@@ -539,12 +557,12 @@ mod tests {
         let _ = paint(&ctx, 0.0, &mut sequence, vec![]);
         let test = rect_of(&ctx, test_button_id());
         let p = paint(&ctx, 0.1, &mut sequence, click_at(test.center()));
-        assert!(p.texts.iter().any(|(t, _, _)| t == TESTING_BUTTON) || paint(&ctx, 0.11, &mut sequence, vec![]).texts.iter().any(|(t, _, _)| t == TESTING_BUTTON));
+        assert!(p.texts.iter().any(|(t, _, _)| t == testing_button()) || paint(&ctx, 0.11, &mut sequence, vec![]).texts.iter().any(|(t, _, _)| t == testing_button()));
         let p = paint(&ctx, 0.1 + 0.62 * 3.0 + 0.01, &mut sequence, vec![]);
         let pane = p.texts.iter().find(|(t, _, _)| t.starts_with("sample-user")).expect("the test pane").0.clone();
         assert!(pane.contains("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"), "{pane}");
         let _ = paint(&ctx, 0.1 + 0.62 * 5.0 + 0.05, &mut sequence, vec![]);
-        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(TEST_DONE_TOAST));
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(test_done_toast()));
     }
 
     #[test]
@@ -552,7 +570,7 @@ mod tests {
         assert_eq!(chip_colours(Step::Pw, false), (SECRET_EDGE, theme::DANGER_WASH, theme::DANGER_INK));
         assert_eq!(chip_colours(Step::User, false).1, theme::CARD);
         let ctx = testing::ctx();
-        let mut sequence = render(PRESETS[0].1);
+        let mut sequence = render(presets()[0].1);
         let p = paint(&ctx, 0.0, &mut sequence, vec![]);
         assert!(p.rects.iter().any(|r| r.fill == theme::DANGER_WASH && r.stroke.color == SECRET_EDGE && r.rect.height() == CHIP_HEIGHT));
         assert_eq!(ink_of(&p, Step::Pw.label()), theme::DANGER_INK);
@@ -562,7 +580,7 @@ mod tests {
     #[test]
     fn the_menu_and_the_test_belong_to_their_session() {
         let ctx = testing::ctx();
-        let mut sequence = render(PRESETS[0].1);
+        let mut sequence = render(presets()[0].1);
         let paint_in = |time: f64, seq: &mut String, session: u64, events: Vec<egui::Event>| {
             testing::frame(&ctx, time, SCREEN, events, |ui| {
                 let _ = draw(ui, seq, "Ledgerline", session);
@@ -572,19 +590,19 @@ mod tests {
         let add = rect_of(&ctx, add_button_id());
         let _ = paint_in(0.1, &mut sequence, 1, click_at(add.center()));
         play_test_from(&ctx, &sequence, 1.0, 1);
-        let mut other = render(PRESETS[0].1);
+        let mut other = render(presets()[0].1);
         let p = paint_in(0.2, &mut other, 2, vec![]);
         let p2 = paint_in(0.3, &mut other, 2, vec![]);
         for p in [&p, &p2] {
             assert!(!p.texts.iter().any(|(t, _, _)| t == Step::Totp.label()), "another session's menu is open");
-            assert!(p.texts.iter().any(|(t, _, _)| t == TEST_EMPTY), "another session's test is playing");
+            assert!(p.texts.iter().any(|(t, _, _)| t == test_empty()), "another session's test is playing");
         }
     }
 
     #[test]
     fn esc_closes_the_add_menu_and_only_it() {
         let ctx = testing::ctx();
-        let mut sequence = render(PRESETS[0].1);
+        let mut sequence = render(presets()[0].1);
         let _ = paint(&ctx, 0.0, &mut sequence, vec![]);
         let add = rect_of(&ctx, add_button_id());
         let _ = paint(&ctx, 0.1, &mut sequence, click_at(add.center()));
@@ -600,10 +618,10 @@ mod tests {
 
     #[test]
     fn presets_round_trip_through_the_template() {
-        for (_, steps) in PRESETS {
+        for (_, steps) in presets() {
             assert_eq!(parse(&render(steps)).as_deref(), Some(steps));
         }
-        assert_eq!(render(PRESETS[1].1), "{PASSWORD}+{TAB}{USERNAME}{ENTER}");
+        assert_eq!(render(presets()[1].1), "{PASSWORD}+{TAB}{USERNAME}{ENTER}");
         assert_eq!(parse("{USERNAME}x"), None, "a literal is the template editor's");
         assert_eq!(parse("").unwrap(), vec![Step::User, Step::Tab, Step::Pw], "the default sequence");
     }

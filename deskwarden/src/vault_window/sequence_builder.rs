@@ -292,7 +292,9 @@ pub enum CheckFix {
 pub const PAUSE_AFTER_ENTER_MS: u32 = 200;
 
 /// The caption on that fix's button.
-pub const ADD_PAUSE_LABEL: &str = "Add 200 ms";
+pub fn add_pause_label() -> &'static str {
+    crate::i18n::t("seq.add_pause")
+}
 
 /// One line of 4a's `Checks` card.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,15 +347,15 @@ pub fn checks(sequence: &str) -> Vec<Check> {
         out.push(if changed || !types_before {
             Check {
                 tone: CheckTone::Pass,
-                line: FIELD_CHANGE_PASS.to_string(),
+                line: field_change_pass().to_string(),
                 note: String::new(),
                 fix: None,
             }
         } else {
             Check {
                 tone: CheckTone::Caution,
-                line: FIELD_CHANGE_CAUTION.to_string(),
-                note: FIELD_CHANGE_NOTE.to_string(),
+                line: field_change_caution().to_string(),
+                note: field_change_note().to_string(),
                 fix: None,
             }
         });
@@ -365,15 +367,15 @@ pub fn checks(sequence: &str) -> Vec<Check> {
     if let Some(index) = enter_needing_a_pause(&tokens) {
         out.push(Check {
             tone: CheckTone::Caution,
-            line: ENTER_CAUTION.to_string(),
-            note: ENTER_NOTE.to_string(),
+            line: enter_caution().to_string(),
+            note: enter_note().to_string(),
             fix: Some(CheckFix::PauseAfterEnter(index)),
         });
     }
 
     out.push(Check {
         tone: CheckTone::Fact,
-        line: NO_EMPTY_TEXT.to_string(),
+        line: no_empty_text().to_string(),
         note: String::new(),
         fix: None,
     });
@@ -478,7 +480,7 @@ impl Step {
             if row.aside.is_empty() || parts.contains(&row.aside.as_str()) {
                 continue;
             }
-            if self.rows.len() > 1 && row.aside == detail_edit::MODIFIER_NOTE {
+            if self.rows.len() > 1 && row.aside == detail_edit::modifier_note() {
                 continue;
             }
             parts.push(&row.aside);
@@ -626,14 +628,24 @@ pub fn sequence_without_step(sequence: &str, index: usize) -> String {
 }
 
 /// The checks' words. 4a's, where 4a has them.
-pub const FIELD_CHANGE_PASS: &str = "A field change happens before the secret is typed.";
-pub const FIELD_CHANGE_CAUTION: &str = "Nothing moves the cursor before the secret is typed.";
-pub const FIELD_CHANGE_NOTE: &str =
-    "Whatever box had focus gets the user name and the password one after the other. Add a Tab.";
-pub const ENTER_CAUTION: &str = "No wait after Enter.";
-pub const ENTER_NOTE: &str =
-    "If the dialog is slow to close, the next keystroke lands in the window behind it.";
-pub const NO_EMPTY_TEXT: &str = "Deskwarden never sends a text step whose content is empty.";
+pub fn field_change_pass() -> &'static str {
+    crate::i18n::t("seq.field_change_pass")
+}
+pub fn field_change_caution() -> &'static str {
+    crate::i18n::t("seq.field_change_caution")
+}
+pub fn field_change_note() -> &'static str {
+    crate::i18n::t("seq.field_change_note")
+}
+pub fn enter_caution() -> &'static str {
+    crate::i18n::t("seq.enter_caution")
+}
+pub fn enter_note() -> &'static str {
+    crate::i18n::t("seq.enter_note")
+}
+pub fn no_empty_text() -> &'static str {
+    crate::i18n::t("seq.no_empty_text")
+}
 
 // ---------------------------------------------------------------------------
 // The screen's own state
@@ -920,28 +932,52 @@ const STEP_TEXT_PX: f32 = 12.0;
 const STEP_WAIT_PX: f32 = 13.0;
 const STEP_RATE_PX: f32 = 11.0;
 
-pub const SCREEN_TITLE: &str = "Fill rule";
-pub const SAVE_LABEL: &str = "Save rule";
-pub const SAVE_BLOCKED_LABEL: &str = "Save (fix the template)";
-pub const DISCARD_LABEL: &str = "Discard";
+pub fn screen_title() -> &'static str {
+    crate::i18n::t("seq.screen_title")
+}
+pub fn save_label() -> &'static str {
+    crate::i18n::t("seq.save")
+}
+pub fn save_blocked_label() -> &'static str {
+    crate::i18n::t("seq.save_blocked")
+}
+pub fn discard_label() -> &'static str {
+    crate::i18n::t("seq.discard")
+}
 /// The builder's dialog id; its scrim is `"sequence-builder-scrim"`.
 pub const BUILDER_ID: &str = "sequence-builder";
-pub const VAULT_ITEM_HEADING: &str = "Vault item";
-pub const SENDS_TO_HEADING: &str = "Sends only to";
-pub const SEQUENCE_HEADING: &str = "Sequence";
-pub const TIMING_HEADING: &str = "Timing";
-pub const CHECKS_HEADING: &str = "Checks";
-pub const BUDGET_HEADING: &str = "Budget";
+pub fn vault_item_heading() -> &'static str {
+    crate::i18n::t("seq.vault_item_heading")
+}
+pub fn sends_to_heading() -> &'static str {
+    crate::i18n::t("seq.sends_to_heading")
+}
+pub fn sequence_heading() -> &'static str {
+    crate::i18n::t("seq.sequence_heading")
+}
+pub fn timing_heading() -> &'static str {
+    crate::i18n::t("seq.timing_heading")
+}
+pub fn checks_heading() -> &'static str {
+    crate::i18n::t("seq.checks_heading")
+}
+pub fn budget_heading() -> &'static str {
+    crate::i18n::t("seq.budget_heading")
+}
 
 /// The note under the rehearse button -- 4d's own sentence, which the edit
 /// form had no room for and this screen does.
-pub const REHEARSE_NOTE: &str =
-    "Types sample-user and not-a-real-password into a scratch window so you can watch the \
-     timing. No secret leaves the vault.";
+pub fn rehearse_note() -> &'static str {
+    crate::i18n::t("seq.rehearse_note")
+}
 
 /// The eye's two captions, the edit form's words.
-const REVEAL: &str = "Show what it types";
-const HIDE: &str = "Hide what it types";
+fn reveal() -> &'static str {
+    crate::i18n::t("seq.reveal")
+}
+fn hide() -> &'static str {
+    crate::i18n::t("seq.hide")
+}
 
 /// **4a's builder, in this app's standard modal.**
 ///
@@ -1032,7 +1068,7 @@ pub fn draw_sequence_builder(
     // borrow the draft.
     let blocked = draft.fault().is_some();
     let saveable = draft.saveable();
-    let label = if blocked { SAVE_BLOCKED_LABEL } else { SAVE_LABEL };
+    let label = if blocked { save_blocked_label() } else { save_label() };
     let height = body_height(&ctx);
 
     // **A v2 dialog with no padding of its own**: the title and the footer
@@ -1046,7 +1082,7 @@ pub fn draw_sequence_builder(
         .show(&ctx, |ui| {
             // The title, clear of the corner mark.
             egui::Frame::new().inner_margin(Margin { left: 30, right: 70, top: 28, bottom: 20 }).show(ui, |ui| {
-                ui.label(theme::extrabold(SCREEN_TITLE, 26.0).color(theme::INK));
+                ui.label(theme::extrabold(screen_title(), 26.0).color(theme::INK));
             });
             // **The card is as tall as its content, and no taller than the
             // window.** `auto_shrink` on the y means "be as tall as your
@@ -1087,7 +1123,7 @@ pub fn draw_sequence_builder(
                 const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
                 ui.spacing_mut().item_spacing.x = 10.0;
                 ui.columns(2, |columns| {
-                    answers.1 = controls::button_filling(&mut columns[0], ButtonKind::Outline, ANSWER, DISCARD_LABEL).clicked();
+                    answers.1 = controls::button_filling(&mut columns[0], ButtonKind::Outline, ANSWER, discard_label()).clicked();
                     answers.0 = columns[1]
                         .add_enabled_ui(saveable, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, label))
                         .inner
@@ -1237,14 +1273,14 @@ fn destination_band(
             let lane = ui.available_width();
             let chips = band_chips(draft);
             let item = BandSubject {
-                caption: VAULT_ITEM_HEADING,
+                caption: vault_item_heading(),
                 name: &draft.item_name,
                 icon: item_icon,
                 accent: true,
                 beside: BandBeside::Folder(&draft.folder),
             };
             let app = BandSubject {
-                caption: SENDS_TO_HEADING,
+                caption: sends_to_heading(),
                 name: &draft.app_name,
                 icon: app_icon,
                 accent: false,
@@ -1723,7 +1759,7 @@ fn steps_column(
 ) {
     let summary = match sequence_tally(&draft.sequence, source) {
         Some(tally) => detail_edit::tally_short(&tally),
-        None => detail_edit::TALLY_REFUSED.to_string(),
+        None => detail_edit::tally_refused().to_string(),
     };
     if let Some(wants_template) = sequence_band(ui, &summary, draft.template_view) {
         // Seeded verbatim, every time the view is entered -- so a user who
@@ -1751,7 +1787,7 @@ fn steps_column(
             }
             if draft.sequence.is_empty() {
                 ui.label(
-                    RichText::new(detail_edit::APP_SEQUENCE_DEFAULT_NOTICE)
+                    RichText::new(detail_edit::app_sequence_default_notice())
                         .size(11.0)
                         .color(theme::TEXT_FAINT),
                 );
@@ -1795,7 +1831,7 @@ fn steps_column(
                 ui.add_space(ADD_ROW_LIFT);
                 add_step_row(ui, draft, palette);
                 ui.add_space(STEP_ROW_GAP);
-                ui.label(RichText::new(REORDER_HINT).size(11.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(reorder_hint()).size(11.0).color(theme::TEXT_FAINT));
             }
         });
     ui.add_space(theme::SECTION_GAP);
@@ -1804,8 +1840,9 @@ fn steps_column(
 /// The line under the list that says how it is edited now that its rows carry
 /// no controls: the drag, and the keyboard's equivalent of it. See
 /// [`step_keys`] for why the keyboard half exists.
-pub const REORDER_HINT: &str = "Drag a step by its handle to reorder it. Select a step to remove it \
-                                with Delete, or move it with Alt+Up and Alt+Down.";
+pub fn reorder_hint() -> &'static str {
+    crate::i18n::t("seq.reorder_hint")
+}
 
 /// **4a's SEQUENCE band**: the caption, the tally, and the view toggle at the
 /// far end. Answers the view the toggle asked for, or `None`.
@@ -1852,7 +1889,7 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
                 ui.spacing_mut().item_spacing.x = SEQUENCE_BAND_GAP;
                 ui.add(
                     egui::Label::new(theme::letterspaced(
-                        &SEQUENCE_HEADING.to_uppercase(),
+                        &sequence_heading().to_uppercase(),
                         SEQUENCE_BAND_PX,
                         theme::BOLD,
                         SEQUENCE_BAND_PX * SEQUENCE_BAND_TRACKING,
@@ -2137,15 +2174,15 @@ fn step_row(
             press = RowPress::Select;
         }
         response.context_menu(|ui| {
-            if ui.button(MENU_MOVE_UP).clicked() {
+            if ui.button(menu_move_up()).clicked() {
                 press = RowPress::MoveUp;
                 ui.close();
             }
-            if ui.button(MENU_MOVE_DOWN).clicked() {
+            if ui.button(menu_move_down()).clicked() {
                 press = RowPress::MoveDown;
                 ui.close();
             }
-            if ui.button(MENU_REMOVE).clicked() {
+            if ui.button(menu_remove()).clicked() {
                 press = RowPress::Remove;
                 ui.close();
             }
@@ -2156,9 +2193,15 @@ fn step_row(
 
 /// The row's context menu, for the pointer that would rather not drag: the
 /// two moves the arrows used to be, and the removal the `x` was.
-pub const MENU_MOVE_UP: &str = "Move up";
-pub const MENU_MOVE_DOWN: &str = "Move down";
-pub const MENU_REMOVE: &str = "Remove step";
+pub fn menu_move_up() -> &'static str {
+    crate::i18n::t("seq.move_up")
+}
+pub fn menu_move_down() -> &'static str {
+    crate::i18n::t("seq.move_down")
+}
+pub fn menu_remove() -> &'static str {
+    crate::i18n::t("seq.remove_step")
+}
 
 /// The row's band: its tallest cell, known before the row is laid so every
 /// cell is centred on the same line (see [`centred_row`]). The field pill,
@@ -2452,7 +2495,7 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
             StepKind::Raw => {
                 let label = ui.add(plain(&step.rows[0].label, theme::TEXT_FAINT));
                 if !step.understood() {
-                    label.on_hover_text(detail_edit::SEQUENCE_UNKNOWN_TIP);
+                    label.on_hover_text(detail_edit::sequence_unknown_tip());
                 }
             }
         }
@@ -2639,13 +2682,13 @@ fn add_step_row(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRe
         add_wait_menu(ui, draft);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = ADD_ROW_GAP;
-            if !draft.sequence.is_empty() && crate::kit::controls::row_button(ui, USE_DEFAULT).clicked() {
+            if !draft.sequence.is_empty() && crate::kit::controls::row_button(ui, use_default()).clicked() {
                 // The empty string, not the default's own spelling: an empty
                 // stored value IS the default, and rendering it would turn an
                 // item that inherits into one that pins.
                 draft.sequence = String::new();
             }
-            let caption = if draft.revealing { HIDE } else { REVEAL };
+            let caption = if draft.revealing { hide() } else { reveal() };
             if crate::kit::controls::row_button(ui, caption).clicked() {
                 draft.revealing = !draft.revealing;
             }
@@ -2659,7 +2702,7 @@ fn add_step_row(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRe
 /// step is fields and literals in a row -- and because 4a's `+ Text` is the
 /// one button that leads to both.
 fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRef]) {
-    let button = theme::dashed_button(ui, ADD_TEXT_LABEL);
+    let button = theme::dashed_button(ui, add_text_label());
     // **Not the default close-on-click**: this menu holds a text box, and a
     // menu that shut on the first click into its own field could never be
     // typed into.
@@ -2668,7 +2711,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
             menu_body(ui, Some(width), |ui| {
-                menu_caption(ui, ADD_VALUE_CAPTION);
+                menu_caption(ui, add_value_caption());
                 // **What the pills really measured**, read off the lane they
                 // were laid in rather than off the estimate that opened the
                 // menu: the two differ by the rounding in every pill's own
@@ -2689,12 +2732,12 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                         }
                     }
                     if palette.is_empty() {
-                        ui.label(RichText::new(NO_FIELDS).size(11.0).color(theme::TEXT_FAINT));
+                        ui.label(RichText::new(no_fields()).size(11.0).color(theme::TEXT_FAINT));
                     }
                     ui.min_rect().right()
                 });
                 let pills_end = laid.inner;
-                menu_caption(ui, ADD_LITERAL_CAPTION);
+                menu_caption(ui, add_literal_caption());
                 ui.horizontal(|ui| {
                     // **`row_button`, not `secondary_button`.** The box
                     // beside it is `theme::SECTION_FIELD_HEIGHT`, 28 points,
@@ -2716,7 +2759,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                     let add = ui
                         .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
-                            let add = crate::kit::controls::row_button(ui, ADD_LITERAL_BUTTON).clicked();
+                            let add = crate::kit::controls::row_button(ui, add_literal_button()).clicked();
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
@@ -2753,10 +2796,10 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
 
 /// `+ Key`: the keys this app knows how to send.
 fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
-    let button = theme::dashed_button(ui, ADD_KEY_LABEL);
+    let button = theme::dashed_button(ui, add_key_label());
     egui::Popup::menu(&button).show(|ui| {
         menu_body(ui, Some(ADD_MENU_WIDTH), |ui| {
-            menu_caption(ui, ADD_KEY_CAPTION);
+            menu_caption(ui, add_key_caption());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
                 for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
@@ -2774,12 +2817,12 @@ fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
 /// `+ Wait`: a number of seconds, which is what the owner asked waits be set
 /// in -- the sequence stores the milliseconds.
 fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
-    let button = theme::dashed_button(ui, ADD_WAIT_LABEL);
+    let button = theme::dashed_button(ui, add_wait_label());
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
             menu_body(ui, None, |ui| {
-                menu_caption(ui, ADD_WAIT_CAPTION);
+                menu_caption(ui, add_wait_caption());
                 ui.horizontal(|ui| {
                     let box_response = theme::section_text_field_within(
                         ui,
@@ -2795,11 +2838,11 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                     if box_response.changed() {
                         draft.wait_draft = key_sequence::only_a_number(&draft.wait_draft);
                     }
-                    ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
+                    ui.label(RichText::new(wait_unit()).size(11.0).color(theme::TEXT_FAINT));
                     let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
                     let typed = entered(&box_response, ui);
                     ui.add_enabled_ui(addable, |ui| {
-                        if crate::kit::controls::row_button(ui, ADD_WAIT_BUTTON).clicked() || (typed && addable) {
+                        if crate::kit::controls::row_button(ui, add_wait_button()).clicked() || (typed && addable) {
                             if let Some(next) =
                                 detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
                             {
@@ -2811,7 +2854,7 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                 });
                 if key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_none() {
                     ui.add_space(MENU_PALETTE_GAP);
-                    ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+                    ui.label(RichText::new(wait_refusal()).size(11.0).color(theme::TEXT_FAINT));
                 }
             });
         });
@@ -2900,7 +2943,7 @@ fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
     // [`LITERAL_BOX_WIDTH`] is one that cannot show what was typed into it.
     let field_row = LITERAL_BOX_WIDTH
         + theme::ROW_BUTTON_GAP
-        + crate::kit::controls::row_button_width(ui, ADD_LITERAL_BUTTON);
+        + crate::kit::controls::row_button_width(ui, add_literal_button());
     // **Capped at the CARD, not at a number of my own.** "the rest of values
     // put in one line unless it becomes wider than Fill rule modal, then
     // transfer to next line and make the popup width dinamic to the width of
@@ -2921,9 +2964,15 @@ fn field_pill_width(ui: &egui::Ui, name: &str, secret: bool) -> f32 {
 }
 
 /// 4a's three captions, and the row's `gap: 8px` and `padding-top: 4px`.
-const ADD_TEXT_LABEL: &str = "+ Text";
-const ADD_KEY_LABEL: &str = "+ Key";
-const ADD_WAIT_LABEL: &str = "+ Wait";
+fn add_text_label() -> &'static str {
+    crate::i18n::t("seq.add_text_label")
+}
+fn add_key_label() -> &'static str {
+    crate::i18n::t("seq.add_key_label")
+}
+fn add_wait_label() -> &'static str {
+    crate::i18n::t("seq.add_wait_label")
+}
 const ADD_ROW_GAP: f32 = 8.0;
 const ADD_ROW_LIFT: f32 = 4.0;
 
@@ -2948,20 +2997,40 @@ const MENU_BLOCK_GAP: f32 = 6.0;
 const WAIT_BOX_WIDTH: f32 = 72.0;
 
 /// The captions inside the menus.
-const ADD_VALUE_CAPTION: &str = "A value from this item";
-const ADD_KEY_CAPTION: &str = "A key to press";
-const ADD_LITERAL_CAPTION: &str = "Text to type";
-const ADD_LITERAL_BUTTON: &str = "Add text";
-const ADD_WAIT_CAPTION: &str = "How long to wait";
-const ADD_WAIT_BUTTON: &str = "Add wait";
-const WAIT_UNIT: &str = "seconds";
-const NO_FIELDS: &str = "This item has no fields to reference yet.";
+fn add_value_caption() -> &'static str {
+    crate::i18n::t("seq.add_value_caption")
+}
+fn add_key_caption() -> &'static str {
+    crate::i18n::t("seq.add_key_caption")
+}
+fn add_literal_caption() -> &'static str {
+    crate::i18n::t("seq.add_literal_caption")
+}
+fn add_literal_button() -> &'static str {
+    crate::i18n::t("seq.add_literal_button")
+}
+fn add_wait_caption() -> &'static str {
+    crate::i18n::t("seq.add_wait_caption")
+}
+fn add_wait_button() -> &'static str {
+    crate::i18n::t("seq.add_wait_button")
+}
+fn wait_unit() -> &'static str {
+    crate::i18n::t("seq.wait_unit")
+}
+fn no_fields() -> &'static str {
+    crate::i18n::t("seq.no_fields")
+}
 
 /// The reset: back to the app default, which is an EMPTY stored sequence.
-const USE_DEFAULT: &str = "Use the default";
+fn use_default() -> &'static str {
+    crate::i18n::t("seq.use_default")
+}
 
 /// The refusal under the wait box, said as the rule rather than as "invalid".
-const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
+fn wait_refusal() -> &'static str {
+    crate::i18n::t("seq.wait_refusal")
+}
 
 // **4a's right rail is not drawn**, and neither is its timing strip.
 //
@@ -3076,12 +3145,12 @@ mod tests {
     fn a_password_typed_with_no_field_change_before_it_is_cautioned() {
         let found = checks("{USERNAME}{PASSWORD}");
         assert!(
-            found.iter().any(|c| c.tone == CheckTone::Caution && c.line == FIELD_CHANGE_CAUTION),
+            found.iter().any(|c| c.tone == CheckTone::Caution && c.line == field_change_caution()),
             "{found:?}"
         );
         let fixed = checks("{USERNAME}{TAB}{PASSWORD}");
         assert!(
-            fixed.iter().any(|c| c.tone == CheckTone::Pass && c.line == FIELD_CHANGE_PASS),
+            fixed.iter().any(|c| c.tone == CheckTone::Pass && c.line == field_change_pass()),
             "{fixed:?}"
         );
     }
@@ -3090,14 +3159,14 @@ mod tests {
     fn a_sequence_that_starts_at_the_password_is_not_cautioned_for_it() {
         // Nothing was typed first, so there is no field to have moved out of.
         let found = checks("{PASSWORD}");
-        assert!(found.iter().any(|c| c.tone == CheckTone::Pass && c.line == FIELD_CHANGE_PASS));
+        assert!(found.iter().any(|c| c.tone == CheckTone::Pass && c.line == field_change_pass()));
     }
 
     #[test]
     fn a_sequence_with_no_secret_has_neither_secret_check() {
         let found = checks("{USERNAME}{TAB}");
-        assert!(!found.iter().any(|c| c.line == FIELD_CHANGE_PASS));
-        assert!(!found.iter().any(|c| c.line == FIELD_CHANGE_CAUTION));
+        assert!(!found.iter().any(|c| c.line == field_change_pass()));
+        assert!(!found.iter().any(|c| c.line == field_change_caution()));
     }
 
     #[test]
@@ -3105,7 +3174,7 @@ mod tests {
         let found = checks("{USERNAME}{ENTER}{PASSWORD}");
         let caution = found
             .iter()
-            .find(|c| c.line == ENTER_CAUTION)
+            .find(|c| c.line == enter_caution())
             .expect("the Enter caution is drawn");
         let Some(CheckFix::PauseAfterEnter(index)) = caution.fix else {
             panic!("the caution offers no fix: {caution:?}")
@@ -3113,14 +3182,14 @@ mod tests {
         let fixed = with_pause_after("{USERNAME}{ENTER}{PASSWORD}", index);
         assert_eq!(fixed, "{USERNAME}{ENTER}{DELAY 200}{PASSWORD}");
         // And the fix really closes the check it came from.
-        assert!(!checks(&fixed).iter().any(|c| c.line == ENTER_CAUTION));
+        assert!(!checks(&fixed).iter().any(|c| c.line == enter_caution()));
     }
 
     #[test]
     fn an_enter_that_ends_the_sequence_is_not_cautioned() {
         assert!(!checks("{USERNAME}{TAB}{PASSWORD}{ENTER}")
             .iter()
-            .any(|c| c.line == ENTER_CAUTION));
+            .any(|c| c.line == enter_caution()));
     }
 
     #[test]
@@ -3132,7 +3201,7 @@ mod tests {
     #[test]
     fn the_one_fact_is_always_there_to_be_read() {
         let found = checks("{USERNAME}{TAB}{PASSWORD}");
-        assert!(found.iter().any(|c| c.tone == CheckTone::Fact && c.line == NO_EMPTY_TEXT));
+        assert!(found.iter().any(|c| c.tone == CheckTone::Fact && c.line == no_empty_text()));
     }
 
     /// **The card never promises the masking gate.** It used to carry "The
@@ -3268,7 +3337,7 @@ mod tests {
                 StepKind::Key => !step
                     .rows
                     .iter()
-                    .all(|row| row.aside == detail_edit::MODIFIER_NOTE),
+                    .all(|row| row.aside == detail_edit::modifier_note()),
                 StepKind::Rate | StepKind::Raw => false,
             })
             .map(|step| step.label())
@@ -3354,7 +3423,7 @@ mod tests {
         let list = steps("+hello{TAB}", &source(), false);
         assert_eq!(list.len(), 3, "{list:?}");
         assert_eq!(list[0].kind, StepKind::Key);
-        assert_eq!(list[0].aside(), detail_edit::MODIFIER_NOTE);
+        assert_eq!(list[0].aside(), detail_edit::modifier_note());
         // And with its key it is one row, saying nothing about being held.
         let held = steps("+{TAB}", &source(), false);
         assert_eq!(held.len(), 1);
@@ -3764,7 +3833,7 @@ mod tests {
             let modal = Modal::over(window);
             let painted = modal.frame(&mut draft());
             let card = painted.card();
-            let title = painted.rect_of(SCREEN_TITLE);
+            let title = painted.rect_of(screen_title());
             let asked = CARD_WIDTH.min((window.x - 2.0 * CARD_GUTTER).max(320.0));
             assert!(
                 (card.width() - asked).abs() <= 0.5,
@@ -3992,7 +4061,7 @@ mod tests {
         // The far cell and the explanation are gone: no dash at the end of a
         // row that has no rate, no rate on the one that has, and no words
         // beside the step saying what it does.
-        for gone in ["\u{2014}", "ms/char", "submit", detail_edit::MODIFIER_NOTE] {
+        for gone in ["\u{2014}", "ms/char", "submit", detail_edit::modifier_note()] {
             assert!(
                 !painted.strings().iter().any(|painted| painted.contains(gone)),
                 "the row still carries {gone:?}: {:?}",
@@ -4005,7 +4074,7 @@ mod tests {
                 "the row still carries a {control:?} control"
             );
         }
-        assert!(painted.strings().contains(&REORDER_HINT), "the list does not say how it is edited");
+        assert!(painted.strings().contains(&reorder_hint()), "the list does not say how it is edited");
     }
 
     /// **Dragging a step's handle onto another row moves it there.** The
@@ -4157,13 +4226,13 @@ mod tests {
         let modal = Modal::over(WINDOWS[1]).with_palette(palette.clone());
         let mut draft = draft();
         let painted = modal.frame(&mut draft);
-        let at = painted.rect_of(ADD_TEXT_LABEL).center();
+        let at = painted.rect_of(add_text_label()).center();
         let _ = modal.click(&mut draft, at);
         let open = modal.frame(&mut draft);
 
         // The menu's own pills, not the step list's: a run of the same name
         // is drawn in both, and the menu is the one under the add row.
-        let floor = open.rect_of(ADD_TEXT_LABEL).bottom();
+        let floor = open.rect_of(add_text_label()).bottom();
         let in_the_menu = |name: &str| -> egui::Rect {
             let found: Vec<egui::Rect> =
                 open.rects_of(name).into_iter().filter(|r| r.top() > floor).collect();
@@ -4210,7 +4279,7 @@ mod tests {
         );
 
         // With `+ Text` open, the first Escape is the menu's.
-        let at = painted.rect_of(ADD_TEXT_LABEL).center();
+        let at = painted.rect_of(add_text_label()).center();
         let _ = modal.click(&mut draft, at);
         assert!(
             egui::Popup::is_any_open(&modal.ctx),
@@ -4315,9 +4384,9 @@ mod tests {
     fn the_add_row_is_three_dashed_buttons_under_the_list() {
         let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
         let (text, key, wait) = (
-            painted.rect_of(ADD_TEXT_LABEL),
-            painted.rect_of(ADD_KEY_LABEL),
-            painted.rect_of(ADD_WAIT_LABEL),
+            painted.rect_of(add_text_label()),
+            painted.rect_of(add_key_label()),
+            painted.rect_of(add_wait_label()),
         );
         for (what, rect) in [("+ Key", key), ("+ Wait", wait)] {
             assert!(

@@ -73,7 +73,7 @@ use zeroize::Zeroizing;
 mod ui;
 pub use ui::{
     draw_add_form, draw_add_modal, draw_picker, draw_scanning, draw_stage, draw_webcam, PickerFrame, RouteCard,
-    CODE_COPY_HINT, ROUTE_CARDS,
+    code_copy_hint, route_cards,
 };
 
 // The 26px button height this form used to declare is gone with the two bare
@@ -98,7 +98,9 @@ pub use ui::{
 /// `PICKER_TITLE`'s note applies here from the other side: "Manual entry &
 /// failures" is the design document's CAPTION for the `id="6d"` panel, in the
 /// badge-and-title row outside the card, and is not painted anywhere.
-pub const HEADING: &str = "Enter the secret";
+pub fn heading() -> &'static str {
+    crate::i18n::t("totp.heading")
+}
 
 /// What the control that opens this form is CALLED, and the chord that also
 /// opens it.
@@ -118,7 +120,9 @@ pub const HEADING: &str = "Enter the secret";
 /// compares it against `ADD_TOTP_MODIFIERS`/`ADD_TOTP_KEY`, the values the key
 /// handler really matches on, so it cannot advertise a binding the code does
 /// not have.
-pub const ADD_TOTP_LABEL: &str = "Add a TOTP";
+pub fn add_totp_label() -> &'static str {
+    crate::i18n::t("totp.add_label")
+}
 /// See [`ADD_TOTP_LABEL`].
 pub const ADD_TOTP_SHORTCUT: &str = "CTRL+SHIFT+2";
 
@@ -132,7 +136,9 @@ pub const ADD_TOTP_SHORTCUT: &str = "CTRL+SHIFT+2";
 ///
 /// The name is kept because it is what every test in this file asks for the
 /// field by.
-pub const SECRET_HINT: &str = "Secret key or otpauth:// URI";
+pub fn secret_hint() -> &'static str {
+    crate::i18n::t("totp.secret_hint")
+}
 
 /// **What replaces the field when the payload was scanned**, verbatim from
 /// design 6c's own header row.
@@ -144,13 +150,17 @@ pub const SECRET_HINT: &str = "Secret key or otpauth:// URI";
 /// scanned routes get 6c's row -- which says what was read without saying what
 /// it was -- and the field is drawn only for what the user is typing
 /// themselves.
-pub const CODE_READ_LABEL: &str = "Code read";
+pub fn code_read_label() -> &'static str {
+    crate::i18n::t("totp.code_read")
+}
 /// See [`CODE_READ_LABEL`]. What kind of thing it was.
 pub const CODE_READ_KIND: &str = "otpauth://totp";
 
 /// The question printed beside the live code, verbatim from design 6c. It is
 /// the reason the code and the countdown are on screen at all.
-pub const MATCH_QUESTION: &str = "Matches what the site shows?";
+pub fn match_question() -> &'static str {
+    crate::i18n::t("totp.match_question")
+}
 
 /// **The only destructive act in this feature, verbatim.**
 ///
@@ -161,44 +171,65 @@ pub const MATCH_QUESTION: &str = "Matches what the site shows?";
 /// the service, which this app can neither do nor offer -- so this sentence is
 /// the only place the user is told what pressing the button costs. A reworded
 /// one must be a deliberate edit that reds a test, not a tidy-up.
-pub const REPLACE_WARNING: &str = "This record already has a one-time code. Saving replaces it \
-     \u{2014} the old secret cannot be recovered.";
+pub fn replace_warning() -> &'static str {
+    crate::i18n::t("totp.replace_warning")
+}
 
 /// The submit button when the item has no code yet, verbatim from design 6d.
-pub const SAVE_LABEL: &str = "Save code";
+pub fn save_label() -> &'static str {
+    crate::i18n::t("totp.save")
+}
 
 /// The submit button when there is one to overwrite, verbatim from design 6c.
 ///
 /// A **different word** from [`SAVE_LABEL`] deliberately: the button that
 /// destroys something says so on its face, not only in the paragraph above it.
-pub const REPLACE_LABEL: &str = "Replace code";
+pub fn replace_label() -> &'static str {
+    crate::i18n::t("totp.replace")
+}
 
 /// **What the footer says at its right-hand end**, verbatim from design 6c's
 /// footer row, and it is a promise about a key that really answers:
 /// [`draw_add_modal`] returns [`TotpAddAction::Cancel`] on Escape at every
 /// stage but [`Stage::Scanning`]. See `manual_footer` for why this line is
 /// drawn *instead of* 6d's second button rather than beside it.
-pub const DISMISS_HINT: &str = "Esc discards";
+pub fn dismiss_hint() -> &'static str {
+    crate::i18n::t("totp.dismiss_hint")
+}
 
 /// The control that unmasks the secret.
-pub const REVEAL_LABEL: &str = "Reveal";
+pub fn reveal_label() -> &'static str {
+    crate::i18n::t("totp.reveal")
+}
 /// See [`REVEAL_LABEL`].
-pub const HIDE_LABEL: &str = "Hide";
+pub fn hide_label() -> &'static str {
+    crate::i18n::t("totp.hide")
+}
 
 /// The label over the masked secret row.
-pub const SECRET_ROW_LABEL: &str = "Secret";
+pub fn secret_row_label() -> &'static str {
+    crate::i18n::t("totp.row_secret")
+}
 /// See [`SECRET_ROW_LABEL`].
-pub const ISSUER_ROW_LABEL: &str = "Issuer";
+pub fn issuer_row_label() -> &'static str {
+    crate::i18n::t("totp.row_issuer")
+}
 /// See [`SECRET_ROW_LABEL`].
-pub const ACCOUNT_ROW_LABEL: &str = "Account";
+pub fn account_row_label() -> &'static str {
+    crate::i18n::t("totp.row_account")
+}
 /// See [`SECRET_ROW_LABEL`]. **The parameters are spelled out and not
 /// summarised**: a card that is 8 digits over 60 seconds under SHA-256 is
 /// exactly the case a confirmation screen exists to catch, and it is
 /// invisible if the row says only "TOTP".
-pub const PARAMETERS_ROW_LABEL: &str = "Parameters";
+pub fn parameters_row_label() -> &'static str {
+    crate::i18n::t("totp.row_parameters")
+}
 
 /// The label over the live code.
-pub const CODE_ROW_LABEL: &str = "Code now";
+pub fn code_row_label() -> &'static str {
+    crate::i18n::t("totp.row_code")
+}
 
 /// Why the two controls are dead: the link already said.
 ///
@@ -210,12 +241,18 @@ pub const CODE_ROW_LABEL: &str = "Code now";
 /// It is still the app's own words rather than the design's: 6d draws
 /// these controls LIVE and so has no line for this state, and greyed
 /// controls with no reason beside them are worse than either.
-pub const PARAMETERS_FROM_URI: &str = "Set by the link that was read.";
+pub fn parameters_from_uri() -> &'static str {
+    crate::i18n::t("totp.parameters_from_uri")
+}
 
 /// The captions on the two parameter controls.
-pub const DIGITS_LABEL: &str = "Digits";
+pub fn digits_label() -> &'static str {
+    crate::i18n::t("totp.digits")
+}
 /// See [`DIGITS_LABEL`].
-pub const PERIOD_LABEL: &str = "Period";
+pub fn period_label() -> &'static str {
+    crate::i18n::t("totp.period")
+}
 
 /// The digits a card may ask for.
 ///
@@ -246,13 +283,19 @@ pub const DEFAULT_PERIOD: u16 = 30;
 /// beside the blue "6a" chip, exactly as 6b's "Scanning" caption sits outside
 /// 6b's. Painting it inside the card gave the picker two headings where the
 /// design draws one.
-pub const PICKER_TITLE: &str = "Add 2FA code";
+pub fn picker_title() -> &'static str {
+    crate::i18n::t("totp.picker_title")
+}
 
 /// Spec B §8: what a saved code says.
-pub const SAVED_TOAST: &str = "2FA code added";
+pub fn saved_toast() -> &'static str {
+    crate::i18n::t("totp.saved_toast")
+}
 
 /// The label over the item name at the top of the picker, verbatim from 6a.
-pub const ADDING_TO_LABEL: &str = "Adding to";
+pub fn adding_to_label() -> &'static str {
+    crate::i18n::t("totp.adding_to")
+}
 
 /// **The privacy line, verbatim from design 6a, and it must stay true of the
 /// code below it.**
@@ -278,9 +321,9 @@ pub const ADDING_TO_LABEL: &str = "Adding to";
 /// builds un-wiped intermediates during a decode and [`crate::qr::decode_qr`]
 /// says so in its own documentation. "Discarded once the secret is read" is a
 /// statement about what this app keeps, and that one holds.
-pub const PRIVACY_LINE: &str = "Decoding happens on this machine. The captured pixels are \
-     discarded once the secret is read, and the secret is never written to disk outside the \
-     vault.";
+pub fn privacy_line() -> &'static str {
+    crate::i18n::t("totp.privacy_line")
+}
 
 /// The four routes of design 6a, in its order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,7 +368,9 @@ pub struct RouteRow {
 /// `a_deferred_row_still_says_that_it_is_deferred` paints a synthetic
 /// disabled row so that the treatment stays exercised rather than becoming
 /// code nothing has run in a year.
-pub const DEFERRED_REASON: &str = "Not in this version";
+pub fn deferred_reason() -> &'static str {
+    crate::i18n::t("totp.deferred_reason")
+}
 
 /// **Design 6a's four routes, in its order** -- *"ordered by how often they're
 /// the right one on Windows"*.
@@ -358,41 +403,45 @@ pub const DEFERRED_REASON: &str = "Not in this version";
 /// happens when the scan misses, and a route that turned out to want a
 /// gesture the row never mentioned would be the same broken promise one click
 /// later.
-pub const ROUTES: [RouteRow; 4] = [
-    RouteRow {
-        route: Route::ScanRegion,
-        title: "Scan the code on my screen",
-        subtitle: "Deskwarden looks for it in every window \u{b7} drag a box if it misses",
-        enabled: true,
-    },
-    RouteRow {
-        route: Route::ImageFile,
-        title: "Open an image file",
-        subtitle: "A screenshot or photo \u{b7} PNG, JPG, GIF, BMP, WebP, ICO",
-        enabled: true,
-    },
-    RouteRow {
-        route: Route::ByHand,
-        title: "Enter the secret by hand",
-        subtitle: "The base32 key the site shows under the code",
-        enabled: true,
-    },
-    RouteRow {
-        route: Route::Webcam,
-        title: "Use a webcam",
-        // 6a's own line for this row is about a camera being pointed at
-        // something, and what a user needs to know before pressing it is what
-        // they will have to hold up. The second clause is the promise
-        // [`crate::webcam`] keeps and `PRIVACY.md` repeats: the camera is not
-        // on until this row is pressed, and nothing it sees is kept.
-        subtitle: "Hold the code up to the camera \u{b7} the picture stays on this PC",
-        enabled: true,
-    },
-];
+pub fn routes() -> [RouteRow; 4] {
+    [
+        RouteRow {
+            route: Route::ScanRegion,
+            title: crate::i18n::t("totp.route_scan_title"),
+            subtitle: crate::i18n::t("totp.route_scan_sub"),
+            enabled: true,
+        },
+        RouteRow {
+            route: Route::ImageFile,
+            title: crate::i18n::t("totp.route_image_title"),
+            subtitle: crate::i18n::t("totp.route_image_sub"),
+            enabled: true,
+        },
+        RouteRow {
+            route: Route::ByHand,
+            title: crate::i18n::t("totp.route_hand_title"),
+            subtitle: crate::i18n::t("totp.route_hand_sub"),
+            enabled: true,
+        },
+        RouteRow {
+            route: Route::Webcam,
+            title: crate::i18n::t("totp.route_webcam_title"),
+            // 6a's own line for this row is about a camera being pointed at
+            // something, and what a user needs to know before pressing it is what
+            // they will have to hold up. The second clause is the promise
+            // [`crate::webcam`] keeps and `PRIVACY.md` repeats: the camera is not
+            // on until this row is pressed, and nothing it sees is kept.
+            subtitle: crate::i18n::t("totp.route_webcam_sub"),
+            enabled: true,
+        },
+    ]
+}
 
 /// What the picker's way back to itself is called, from the two halves that
 /// have one.
-pub const OTHER_WAYS_LABEL: &str = "Other ways to add it";
+pub fn other_ways_label() -> &'static str {
+    crate::i18n::t("totp.other_ways")
+}
 
 /// §6d's own second answer, verbatim: *"Cancel"*.
 ///
@@ -404,7 +453,9 @@ pub const OTHER_WAYS_LABEL: &str = "Other ways to add it";
 /// picker it did not arrive from, and a hint no other modal in this app
 /// prints (`delete_modal`, `folder_modal`, `icon_modal` and the preferences
 /// capture all bind Escape and all say nothing about it).
-pub const CANCEL_LABEL: &str = "Cancel";
+pub fn cancel_label() -> &'static str {
+    crate::i18n::t("totp.cancel")
+}
 
 
 /// The heading on the card that stands while the screen is being read.
@@ -424,19 +475,25 @@ pub const CANCEL_LABEL: &str = "Cancel";
 /// what is happening, the bar says it is still happening, and neither
 /// promises a step that may not come. The overlay, when there is one, still
 /// says what to do in its own stripe.
-pub const SCANNING_HEADING: &str = "Reading your screen";
+pub fn scanning_heading() -> &'static str {
+    crate::i18n::t("totp.scanning_heading")
+}
 
 /// The line under [`SCANNING_HEADING`]. Says what to expect, which is the
 /// whole of what the owner asked for -- a wait with no end in sight is what
 /// makes a second and a half feel like a hang.
-pub const SCANNING_NOTE: &str = "This takes a moment on a large display.";
+pub fn scanning_note() -> &'static str {
+    crate::i18n::t("totp.scanning_note")
+}
 
 /// The heading over the camera preview.
 ///
 /// An instruction rather than a status, for the reason 6b's own bar is an
 /// instruction: the user is holding a phone in one hand and has one thing to
 /// do with it.
-pub const WEBCAM_HEADING: &str = "Point the camera at the code";
+pub fn webcam_heading() -> &'static str {
+    crate::i18n::t("totp.webcam_heading")
+}
 
 /// The line under [`WEBCAM_HEADING`].
 ///
@@ -444,25 +501,35 @@ pub const WEBCAM_HEADING: &str = "Point the camera at the code";
 /// reads by itself, and nothing is saved yet -- because they are the same two
 /// facts and a user who has tried both routes should not have to learn them
 /// twice.
-pub const WEBCAM_HINT: &str = "Deskwarden reads it as soon as it can. Nothing is saved yet.";
+pub fn webcam_hint() -> &'static str {
+    crate::i18n::t("totp.webcam_hint")
+}
 
 /// What the preview says before the first frame arrives.
 ///
 /// A camera can take two or three seconds to wake, and a black rectangle for
 /// that long is indistinguishable from a broken route. See
 /// `crate::webcam::FIRST_FRAME_GRACE` for what happens if it never wakes.
-pub const WEBCAM_STARTING: &str = "Starting the camera\u{2026}";
+pub fn webcam_starting() -> &'static str {
+    crate::i18n::t("totp.webcam_starting")
+}
 
 /// The heading over the device list, when there is more than one camera.
-pub const WEBCAM_CHOOSE: &str = "Which camera?";
+pub fn webcam_choose() -> &'static str {
+    crate::i18n::t("totp.webcam_choose")
+}
 
 /// The line under [`WEBCAM_CHOOSE`], which is the promise the list keeps: no
 /// device is opened, so no camera light comes on, until one is pressed.
-pub const WEBCAM_CHOOSE_HINT: &str = "None of them is switched on until you pick one.";
+pub fn webcam_choose_hint() -> &'static str {
+    crate::i18n::t("totp.webcam_choose_hint")
+}
 
 /// The way back to the device list from an open camera, when there is more
 /// than one to go back to.
-pub const WEBCAM_ANOTHER_LABEL: &str = "Use a different camera";
+pub fn webcam_another_label() -> &'static str {
+    crate::i18n::t("totp.webcam_another")
+}
 
 /// **The camera's own privacy line, and it must stay true of
 /// [`crate::webcam`].**
@@ -482,8 +549,9 @@ pub const WEBCAM_ANOTHER_LABEL: &str = "Use a different camera";
 /// * *"nothing is recorded"* -- no path in `crate::webcam` opens a file, and
 ///   `this_module_writes_nothing_anywhere` reads the module's own source to
 ///   say so.
-pub const WEBCAM_PRIVACY_LINE: &str = "The camera is on only while this is open. The picture is \
-     read on this PC and thrown away \u{2014} nothing is recorded and nothing is sent anywhere.";
+pub fn webcam_privacy_line() -> &'static str {
+    crate::i18n::t("totp.webcam_privacy")
+}
 
 /// Which half of the form is on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,7 +619,9 @@ pub enum PickerRefusal {
 
 /// The clause both [`CodeSource`]s share, so "no code found" is **one**
 /// refusal with one piece of advice rather than two that drift apart.
-const NO_CODE_ADVICE: &str = "Include the code's white margin";
+fn no_code_advice() -> &'static str {
+    crate::i18n::t("totp.no_code_advice")
+}
 
 impl PickerRefusal {
     /// **The refusal as a sentence naming the reason.**
@@ -567,29 +637,24 @@ impl PickerRefusal {
     /// rule exists to prevent.
     pub fn sentence(&self) -> String {
         match self {
-            PickerRefusal::NoCode(CodeSource::Region) => format!(
-                "No code in that region. {NO_CODE_ADVICE}, or zoom the page to 150% and drag \
-                 again."
-            ),
-            PickerRefusal::NoCode(CodeSource::Image) => format!(
-                "No code in that image. {NO_CODE_ADVICE}, or open a larger copy of the picture."
-            ),
-            PickerRefusal::Capture(why) => format!("{}. {}", why.title(), why.detail()),
+            PickerRefusal::NoCode(CodeSource::Region) => {
+                crate::i18n::tf("totp.no_code_region", &[("advice", no_code_advice())])
+            }
+            PickerRefusal::NoCode(CodeSource::Image) => {
+                crate::i18n::tf("totp.no_code_image", &[("advice", no_code_advice())])
+            }
+            PickerRefusal::Capture(why) => {
+                crate::i18n::tf("totp.title_detail", &[("title", why.title()), ("detail", why.detail())])
+            }
             // The same two-clause shape as the capture's, because it is the
             // same kind of thing: a device that would not give this app what
             // it asked for, said in the device's own words rather than
             // paraphrased into a second vocabulary here.
-            PickerRefusal::Camera(why) => format!("{}. {}", why.title(), why.detail()),
-            PickerRefusal::NotAnImage => {
-                "That file isn't a picture Deskwarden can read. It reads PNG, JPEG, GIF, BMP, \
-                 WebP and ICO \u{2014} choose a screenshot or a photo saved as one of those."
-                    .to_string()
+            PickerRefusal::Camera(why) => {
+                crate::i18n::tf("totp.title_detail", &[("title", why.title()), ("detail", why.detail())])
             }
-            PickerRefusal::Unreadable => {
-                "That file could not be opened. Check it is still where it was, and that you \
-                 have permission to read it."
-                    .to_string()
-            }
+            PickerRefusal::NotAnImage => crate::i18n::t("totp.not_an_image").to_string(),
+            PickerRefusal::Unreadable => crate::i18n::t("totp.unreadable").to_string(),
         }
     }
 }
@@ -982,10 +1047,7 @@ pub fn controls_for(reading: &Reading, typed: &str, digits: u8, period: u16) -> 
 pub fn validity_line(reading: &Reading) -> Option<String> {
     match reading {
         Reading::Empty => None,
-        Reading::Ok(auth) => Some(format!(
-            "Valid base32 \u{b7} {} characters \u{b7} spaces ignored",
-            auth.secret.len()
-        )),
+        Reading::Ok(auth) => Some(crate::i18n::tf("totp.valid_line", &[("count", &auth.secret.len().to_string())])),
         Reading::Refused(refusal) => Some(refusal_sentence(refusal)),
     }
 }
@@ -1024,22 +1086,10 @@ pub fn validity_line(reading: &Reading) -> Option<String> {
 /// than a screenshot.
 pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
     match refusal {
-        OtpRefusal::NotOtpAuth => {
-            "That isn't a one-time code. It reads as a plain URL \u{2014} Deskwarden accepts a \
-             base32 secret or an otpauth:// URI."
-                .to_string()
-        }
-        OtpRefusal::NotTotp => {
-            "That is a counter-based (hotp) code. Deskwarden can only add time-based codes, \
-             which is what sites mean by an authenticator app."
-                .to_string()
-        }
-        OtpRefusal::NoSecret => "There is no secret in that \u{2014} nothing to save.".to_string(),
-        OtpRefusal::BadSecret => {
-            "That is not a valid base32 secret. Base32 uses the letters A\u{2013}Z and the \
-             digits 2\u{2013}7; spaces and hyphens are ignored."
-                .to_string()
-        }
+        OtpRefusal::NotOtpAuth => crate::i18n::t("totp.ref_not_otpauth").to_string(),
+        OtpRefusal::NotTotp => crate::i18n::t("totp.ref_not_totp").to_string(),
+        OtpRefusal::NoSecret => crate::i18n::t("totp.ref_no_secret").to_string(),
+        OtpRefusal::BadSecret => crate::i18n::t("totp.ref_bad_secret").to_string(),
         // The characters are all fine, so saying anything about the alphabet
         // here would send the reader hunting for a bad one that is not there.
         // What is wrong is the count, so the count is what this names -- and a
@@ -1062,27 +1112,16 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
         // Pluralised, because this class contains 1: "1 characters cannot
         // decode" is the kind of sentence that makes a user doubt the rest of
         // the card.
-        OtpRefusal::PartialSecret(characters) => format!(
-            "{characters} character{} cannot decode \u{2014} one is missing, or one has been \
-             copied twice.",
-            if *characters == 1 { "" } else { "s" }
-        ),
+        OtpRefusal::PartialSecret(characters) => crate::i18n::tn("totp.ref_partial", *characters as u64, &[]),
         // Shortened for the reason above it: this was three wrapped lines as
         // well, and the clause that made it so -- "because a code saved from
         // it would be wrong and nothing on screen would say why" -- is an
         // argument for the refusal rather than anything the reader can act on.
         // What they can act on is the key, so the key is what is left, and
         // "refused, not ignored" is the one-clause version of the argument.
-        OtpRefusal::UnknownParameter(key) => format!(
-            "That URI carries {key}, which Deskwarden does not know \u{2014} refused, not ignored."
-        ),
-        OtpRefusal::BadParameter(name) => format!(
-            "That URI's {name} is not a value Deskwarden can use, so the code it saved would \
-             never match."
-        ),
-        OtpRefusal::TooLong => {
-            "That is far too long to be a one-time code.".to_string()
-        }
+        OtpRefusal::UnknownParameter(key) => crate::i18n::tf("totp.ref_unknown_param", &[("key", key)]),
+        OtpRefusal::BadParameter(name) => crate::i18n::tf("totp.ref_bad_param", &[("name", name)]),
+        OtpRefusal::TooLong => crate::i18n::t("totp.ref_too_long").to_string(),
     }
 }
 
@@ -1138,8 +1177,8 @@ pub fn parameter_chips(auth: &OtpAuth) -> [String; 4] {
     [
         "TOTP".to_string(),
         auth.algorithm.canonical().to_string(),
-        format!("{} digits", auth.digits),
-        format!("{} s", auth.period),
+        crate::i18n::tf("totp.chip_digits", &[("digits", &auth.digits.to_string())]),
+        crate::i18n::tf("totp.chip_seconds", &[("seconds", &auth.period.to_string())]),
     ]
 }
 
@@ -1154,7 +1193,7 @@ pub fn parameters_line(auth: &OtpAuth) -> String {
 /// The line above 6c's countdown track, verbatim from the design: *"refreshes
 /// in 22 s"*.
 pub fn refresh_line(seconds_left: u16) -> String {
-    format!("refreshes in {seconds_left} s")
+    crate::i18n::tf("totp.refresh_line", &[("seconds", &seconds_left.to_string())])
 }
 
 /// The same countdown in §6d's words, which are the number and the unit and
@@ -1525,9 +1564,9 @@ pub fn item_has_code(item: &crate::vault_bridge::VaultItem) -> bool {
 
 pub fn submit_label(already_has_code: bool) -> &'static str {
     if already_has_code {
-        REPLACE_LABEL
+        replace_label()
     } else {
-        SAVE_LABEL
+        save_label()
     }
 }
 
@@ -2305,10 +2344,10 @@ pub fn action_for(route: Route) -> TotpAddAction {
 /// credentials as far as a reader is concerned.
 pub fn copied_label(field: Option<TableField>) -> &'static str {
     match field {
-        Some(TableField::Issuer) => ISSUER_ROW_LABEL,
-        Some(TableField::Account) => ACCOUNT_ROW_LABEL,
-        Some(TableField::Secret) => SECRET_ROW_LABEL,
-        None => "2FA code",
+        Some(TableField::Issuer) => issuer_row_label(),
+        Some(TableField::Account) => account_row_label(),
+        Some(TableField::Secret) => secret_row_label(),
+        None => crate::i18n::t("detail.copy_2fa"),
     }
 }
 
@@ -2776,7 +2815,7 @@ mod tests {
     #[test]
     fn the_replace_warning_is_the_designs_own_sentence() {
         assert_eq!(
-            REPLACE_WARNING,
+            replace_warning(),
             "This record already has a one-time code. Saving replaces it \u{2014} the old \
              secret cannot be recovered."
         );
@@ -2857,7 +2896,7 @@ mod tests {
             draw_add_form(ui, &mut state, BOUNDARY);
         });
 
-        assert!(painted.has(ISSUER_ROW_LABEL), "the field table the confirmation IS did not draw");
+        assert!(painted.has(issuer_row_label()), "the field table the confirmation IS did not draw");
         let expected = code_at(&auth(UNUSUAL), BOUNDARY).expect("decodes");
         assert!(
             painted.has(grouped_code(&expected).as_str()),
@@ -2877,7 +2916,7 @@ mod tests {
         // owner's decision rather than a loss this test should hide: the
         // check it invited is what the field table below does, field by
         // field. See `draw_code_panel`.
-        assert!(!painted.has(MATCH_QUESTION), "§6c's stacked block is back");
+        assert!(!painted.has(match_question()), "§6c's stacked block is back");
         // The parameters SPELLED OUT: the 8/60/SHA-256 case is exactly the one
         // a confirmation exists to catch.
         assert!(painted.has("SHA256"), "the algorithm is not spelled out: {:?}", painted.0);
@@ -2964,7 +3003,7 @@ mod tests {
             "the seed was painted with nothing revealed: {:?}",
             masked_frame.0
         );
-        assert!(masked_frame.has(REVEAL_LABEL), "there is no way to reveal it");
+        assert!(masked_frame.has(reveal_label()), "there is no way to reveal it");
         assert!(masked_frame.has("\u{2022}\u{2022}\u{2022}\u{2022}"), "the masked row is missing");
 
         state.revealed = true;
@@ -2980,7 +3019,7 @@ mod tests {
             "Reveal showed nothing, so the masked assertion above proves nothing: {:?}",
             revealed.0
         );
-        assert!(revealed.has(HIDE_LABEL), "there is no way back to masked");
+        assert!(revealed.has(hide_label()), "there is no way back to masked");
     }
 
     #[test]
@@ -2992,7 +3031,7 @@ mod tests {
         });
         assert!(painted.has("plain URL"), "the refusal is not on screen: {:?}", painted.0);
         assert!(
-            !painted.has(ISSUER_ROW_LABEL),
+            !painted.has(issuer_row_label()),
             "a refused field still painted a confirmation to save from"
         );
     }
@@ -3007,7 +3046,7 @@ mod tests {
     /// right one on Windows"*, so the order is content and not layout.
     #[test]
     fn the_picker_offers_the_designs_four_routes_in_its_order() {
-        let order: Vec<Route> = ROUTES.iter().map(|r| r.route).collect();
+        let order: Vec<Route> = routes().iter().map(|r| r.route).collect();
         assert_eq!(
             order,
             vec![Route::ScanRegion, Route::ImageFile, Route::ByHand, Route::Webcam],
@@ -3019,23 +3058,23 @@ mod tests {
         // any window" would describe the fallback rather than the route. Both
         // halves of the replacement are pinned, because both are claims: it
         // says the app looks, and it still names the drag.
-        assert_eq!(ROUTES[0].title, "Scan the code on my screen");
+        assert_eq!(routes()[0].title, "Scan the code on my screen");
         assert_eq!(
-            ROUTES[0].subtitle,
+            routes()[0].subtitle,
             "Deskwarden looks for it in every window \u{b7} drag a box if it misses"
         );
         assert!(
-            !ROUTES[0].title.contains("region") && !ROUTES[0].subtitle.starts_with("Drag"),
+            !routes()[0].title.contains("region") && !routes()[0].subtitle.starts_with("Drag"),
             "the scan row still leads with the box the user no longer has to draw"
         );
         assert!(
-            ROUTES[0].subtitle.contains("drag a box"),
+            routes()[0].subtitle.contains("drag a box"),
             "the scan row no longer names the fallback the overlay still is"
         );
-        assert_eq!(ROUTES[1].title, "Open an image file");
-        assert_eq!(ROUTES[2].title, "Enter the secret by hand");
-        assert_eq!(ROUTES[3].title, "Use a webcam");
-        for row in &ROUTES {
+        assert_eq!(routes()[1].title, "Open an image file");
+        assert_eq!(routes()[2].title, "Enter the secret by hand");
+        assert_eq!(routes()[3].title, "Use a webcam");
+        for row in &routes() {
             assert!(!row.subtitle.trim().is_empty(), "{} has no line under it", row.title);
         }
         // **The row names every format the decoder reads, and the design's
@@ -3054,9 +3093,9 @@ mod tests {
             ("ICO", "*.ico"),
         ] {
             assert!(
-                ROUTES[1].subtitle.contains(named),
+                routes()[1].subtitle.contains(named),
                 "the image row does not name {named}, which the dialog offers: {}",
-                ROUTES[1].subtitle
+                routes()[1].subtitle
             );
             assert!(
                 spec.contains(extension),
@@ -3066,7 +3105,7 @@ mod tests {
         // The control on the loop above: a format neither of them names.
         // Without it the assertions pass for a subtitle that names
         // everything.
-        assert!(!ROUTES[1].subtitle.contains("TIFF"), "{}", ROUTES[1].subtitle);
+        assert!(!routes()[1].subtitle.contains("TIFF"), "{}", routes()[1].subtitle);
         assert!(!spec.contains("*.tif"));
     }
 
@@ -3080,9 +3119,9 @@ mod tests {
     /// satisfy an assertion written one way round only.
     #[test]
     fn no_route_is_deferred_today() {
-        let dead: Vec<Route> = ROUTES.iter().filter(|r| !r.enabled).map(|r| r.route).collect();
+        let dead: Vec<Route> = routes().iter().filter(|r| !r.enabled).map(|r| r.route).collect();
         assert!(dead.is_empty(), "a route is drawn dead: {dead:?}");
-        let live: Vec<Route> = ROUTES.iter().filter(|r| r.enabled).map(|r| r.route).collect();
+        let live: Vec<Route> = routes().iter().filter(|r| r.enabled).map(|r| r.route).collect();
         assert_eq!(
             live,
             vec![Route::ScanRegion, Route::ImageFile, Route::ByHand, Route::Webcam],
@@ -3090,7 +3129,8 @@ mod tests {
         );
         // The webcam row's own line, which is a promise `crate::webcam`
         // keeps and `PRIVACY.md` repeats.
-        let webcam = ROUTES.iter().find(|r| r.route == Route::Webcam).expect("6a's fourth row");
+        let all_routes = routes();
+        let webcam = all_routes.iter().find(|r| r.route == Route::Webcam).expect("6a's fourth row");
         assert!(
             webcam.subtitle.contains("stays on this PC"),
             "the camera row does not say where the picture goes: {}",
@@ -3101,7 +3141,7 @@ mod tests {
             "the camera row still points at the route that used to replace it"
         );
         // And the deferral machinery is still here for the next one.
-        assert_eq!(DEFERRED_REASON, "Not in this version");
+        assert_eq!(deferred_reason(), "Not in this version");
     }
 
     /// **The privacy line, verbatim from design 6a.**
@@ -3113,7 +3153,7 @@ mod tests {
     #[test]
     fn the_privacy_line_is_the_designs_own_sentence() {
         assert_eq!(
-            PRIVACY_LINE,
+            privacy_line(),
             "Decoding happens on this machine. The captured pixels are discarded once the \
              secret is read, and the secret is never written to disk outside the vault."
         );
@@ -3300,8 +3340,8 @@ mod tests {
         );
         assert!(region.sentence().starts_with("No code in that "));
         assert!(image.sentence().starts_with("No code in that "));
-        assert!(region.sentence().contains(NO_CODE_ADVICE));
-        assert!(image.sentence().contains(NO_CODE_ADVICE));
+        assert!(region.sentence().contains(no_code_advice()));
+        assert!(image.sentence().contains(no_code_advice()));
         // And they are not identical, because one of them would then be
         // telling the wrong user to do the wrong thing.
         assert_ne!(region.sentence(), image.sentence());
@@ -3761,9 +3801,9 @@ mod tests {
     /// reader is concerned.
     #[test]
     fn every_copy_names_itself_in_the_rows_own_word() {
-        assert_eq!(copied_label(Some(TableField::Issuer)), ISSUER_ROW_LABEL);
-        assert_eq!(copied_label(Some(TableField::Account)), ACCOUNT_ROW_LABEL);
-        assert_eq!(copied_label(Some(TableField::Secret)), SECRET_ROW_LABEL);
+        assert_eq!(copied_label(Some(TableField::Issuer)), issuer_row_label());
+        assert_eq!(copied_label(Some(TableField::Account)), account_row_label());
+        assert_eq!(copied_label(Some(TableField::Secret)), secret_row_label());
         assert_eq!(
             copied_label(None),
             crate::vault_window::detail::copy_shortcut_label(
@@ -3843,7 +3883,7 @@ mod tests {
     /// deferred today -- see [`route_for_key`]'s own note.
     #[test]
     fn a_deferred_rows_key_does_nothing() {
-        let mut deferred = ROUTES;
+        let mut deferred = routes();
         for row in deferred.iter_mut() {
             row.enabled = false;
         }
@@ -3857,7 +3897,7 @@ mod tests {
             // the assertion above is about `enabled` and not about the key
             // being unbound.
             assert!(
-                route_for_key(&ROUTES, key, egui::Modifiers::default()).is_some(),
+                route_for_key(&routes(), key, egui::Modifiers::default()).is_some(),
                 "{key:?} answers nothing even on the live table"
             );
         }
@@ -3878,7 +3918,7 @@ mod tests {
     /// exactly one key.
     #[test]
     fn every_row_the_picker_draws_answers_its_own_digit() {
-        for (row, _) in ROUTES.iter().enumerate() {
+        for (row, _) in routes().iter().enumerate() {
             assert!(
                 ROUTE_KEYS.iter().any(|(_, bound)| *bound == row),
                 "row {row} is drawn with a keycap and no key in `ROUTE_KEYS` reaches it"
@@ -3898,7 +3938,7 @@ mod tests {
                 "{key:?} does not pick the row it is drawn on"
             );
         }
-        assert_eq!(ROUTES[1].route, Route::ImageFile);
+        assert_eq!(routes()[1].route, Route::ImageFile);
     }
 
     /// **The typed route still gets its field**, so the row above is a
@@ -3913,7 +3953,7 @@ mod tests {
             draw_stage(ui, &mut state, BOUNDARY);
         });
         assert!(painted.has("JBSW Y3DP EHPK 3PXP"), "the by-hand field is gone: {:?}", painted.0);
-        assert!(!painted.has(CODE_READ_LABEL), "the by-hand route drew the scanned row");
+        assert!(!painted.has(code_read_label()), "the by-hand route drew the scanned row");
     }
 
     /// The caution band is **not** part of the gate above.
@@ -3932,14 +3972,14 @@ mod tests {
             draw_stage(ui, &mut typed, BOUNDARY);
         });
         assert!(
-            painted.has(REPLACE_WARNING),
+            painted.has(replace_warning()),
             "the caution band went out with 6c's table: {:?}",
             painted.0
         );
-        assert!(painted.has(REPLACE_LABEL), "the destructive button stopped saying so");
+        assert!(painted.has(replace_label()), "the destructive button stopped saying so");
         // Control, in the same frame: the table really is gone from this card,
         // so the band above survived a gate rather than there being no gate.
-        assert!(!painted.has(ISSUER_ROW_LABEL));
+        assert!(!painted.has(issuer_row_label()));
     }
 
     // -----------------------------------------------------------------
@@ -4490,7 +4530,7 @@ mod item_has_code_tests {
 #[cfg(test)]
 mod v2_add_2fa_tests {
     //! Spec B §8.
-    use super::ui::{self, back_id, code_id, reveal_id, save_id, table_row_id, BACK_LABEL, CODE_NOW, FOUND_TITLE, ID, MATCH_PROMPT, SCAN_AGAIN_LABEL};
+    use super::ui::{self, back_id, code_id, reveal_id, save_id, table_row_id, back_label, code_now, found_title, ID, match_prompt, scan_again_label};
     use super::*;
     use crate::kit::modal;
     use crate::kit::testing::{self, click_at};
@@ -4521,9 +4561,9 @@ mod v2_add_2fa_tests {
 
     #[test]
     fn saving_toasts_2fa_code_added() {
-        assert_eq!(SAVED_TOAST, "2FA code added");
+        assert_eq!(saved_toast(), "2FA code added");
         let source = include_str!("mod.rs");
-        let at = source.find(concat!("totp_add::", "SAVED_TOAST")).expect("the window toasts on a saved code");
+        let at = source.find(concat!("totp_add::", "saved_toast()")).expect("the window toasts on a saved code");
         let before = &source[..at];
         assert!(before.rfind(concat!("Ok(written)", " => {")).is_some_and(|ok| at - ok < 200), "the toast is not in the save's Ok arm");
     }
@@ -4633,13 +4673,13 @@ mod v2_add_2fa_tests {
         let ctx = testing::ctx();
         let mut state = typed_state("JBSW Y3DP EHPK 3PXP");
         let (p, _) = form_frames(&ctx, &mut state, vec![]);
-        assert!(p.text(CODE_NOW).is_some(), "no \"Your code right now\" row");
+        assert!(p.text(code_now()).is_some(), "no \"Your code right now\" row");
         assert!(p.text("Digits").is_some() && p.text("Period").is_some(), "the two parameters stay");
-        assert!(p.text("Save code").is_some() && p.text(BACK_LABEL).is_some());
+        assert!(p.text("Save code").is_some() && p.text(back_label()).is_some());
         let ctx = testing::ctx();
         let mut state = typed_state("");
         let (p, _) = form_frames(&ctx, &mut state, vec![]);
-        assert!(p.text(CODE_NOW).is_none());
+        assert!(p.text(code_now()).is_none());
     }
 
     #[test]
@@ -4683,14 +4723,14 @@ mod v2_add_2fa_tests {
         let ctx = testing::ctx();
         let mut state = scanned_state();
         let (p, _) = form_frames(&ctx, &mut state, vec![]);
-        assert!(p.text(FOUND_TITLE).is_some(), "no Found it");
+        assert!(p.text(found_title()).is_some(), "no Found it");
         assert!(p.text("Git Host \u{b7} anovak").is_some(), "the issuer and the account");
         assert!(p.text("new code in").is_some(), "the countdown");
-        assert!(p.text(MATCH_PROMPT).is_some());
-        for row in [ISSUER_ROW_LABEL, ACCOUNT_ROW_LABEL, SECRET_ROW_LABEL, PARAMETERS_ROW_LABEL] {
+        assert!(p.text(match_prompt()).is_some());
+        for row in [issuer_row_label(), account_row_label(), secret_row_label(), parameters_row_label()] {
             assert!(p.text(row).is_some(), "the table lost its {row} row");
         }
-        assert!(p.text(SCAN_AGAIN_LABEL).is_some() && p.text("Save code").is_some());
+        assert!(p.text(scan_again_label()).is_some() && p.text("Save code").is_some());
         assert!(p.text("JBSWY3DPEHPK3PXP").is_none(), "the secret is masked until Reveal");
     }
 
@@ -4714,7 +4754,7 @@ mod v2_add_2fa_tests {
         let ctx = testing::ctx();
         let mut state = scanned_state();
         let _ = form_frames(&ctx, &mut state, vec![]);
-        let issuer = ctx.read_response(table_row_id(ISSUER_ROW_LABEL)).expect("the Issuer row").rect;
+        let issuer = ctx.read_response(table_row_id(issuer_row_label())).expect("the Issuer row").rect;
         let (_, action) = form_frames(&ctx, &mut state, click_at(issuer.center()));
         assert_eq!(action, TotpAddAction::CopyField(TableField::Issuer));
     }
@@ -4725,12 +4765,12 @@ mod v2_add_2fa_tests {
         let mut state = typed_state("JBSW Y3DP EHPK 3PXP");
         state.already_has_code = true;
         let (p, _) = form_frames(&ctx, &mut state, vec![]);
-        assert!(p.text(&REPLACE_WARNING[..30]).is_some(), "no replace warning");
-        assert!(p.text(REPLACE_LABEL).is_some(), "the primary does not say Replace");
+        assert!(p.text(&replace_warning()[..30]).is_some(), "no replace warning");
+        assert!(p.text(replace_label()).is_some(), "the primary does not say Replace");
         let ctx = testing::ctx();
         let mut state = typed_state("JBSW Y3DP EHPK 3PXP");
         let (p, _) = form_frames(&ctx, &mut state, vec![]);
-        assert!(p.text(&REPLACE_WARNING[..30]).is_none());
+        assert!(p.text(&replace_warning()[..30]).is_none());
     }
 
     #[test]
@@ -4763,8 +4803,8 @@ mod v2_add_2fa_tests {
             }));
         }
         let p = p.unwrap();
-        assert!(p.text(ui::LOOKING_CAPTION).is_some());
-        assert!(p.text(SCANNING_NOTE).is_some(), "0.15's waiting note is gone");
+        assert!(p.text(ui::looking_caption()).is_some());
+        assert!(p.text(scanning_note()).is_some(), "0.15's waiting note is gone");
     }
 
     #[test]

@@ -129,10 +129,14 @@ use zeroize::Zeroizing;
 /// The rail row that opens this screen. Spelled once, so the sidebar and the
 /// tests that press it cannot drift apart -- exactly as
 /// [`sidebar::SENDS_ROW_LABEL`] is.
-pub const HEALTH_ROW_LABEL: &str = "Password health";
+pub fn health_row_label() -> &'static str {
+    crate::i18n::t("health.row_label")
+}
 
 /// The pane's own title, at the top of the column.
-pub const HEALTH_PANE_TITLE: &str = "Password health";
+pub fn health_pane_title() -> &'static str {
+    crate::i18n::t("health.pane_title")
+}
 
 /// Where the breach setting lives, named the way the user will find it.
 ///
@@ -147,8 +151,9 @@ pub const HEALTH_PANE_TITLE: &str = "Password health";
 /// button it does not govern -- and a sentence still naming General would
 /// have sent the reader to a page that exists and does not have it on, which
 /// is the most confusing of the available wrong answers.
-pub const BREACH_SETTING_LOCATION: &str =
-    "Preferences > Breaches > \"Check passwords against known breaches\"";
+pub fn breach_setting_location() -> &'static str {
+    crate::i18n::t("health.breach_setting_location")
+}
 
 /// One item a finding is about: enough to draw its row and to select it, and
 /// **nothing else**.
@@ -348,11 +353,11 @@ impl HealthFilter {
     /// The chip's word.
     pub fn label(self) -> &'static str {
         match self {
-            HealthFilter::All => "All",
-            HealthFilter::Reused => "Reused",
-            HealthFilter::Weak => "Weak",
-            HealthFilter::Old => "Old",
-            HealthFilter::Breached => "Breached",
+            HealthFilter::All => crate::i18n::t("health.filter_all"),
+            HealthFilter::Reused => crate::i18n::t("health.filter_reused"),
+            HealthFilter::Weak => crate::i18n::t("health.filter_weak"),
+            HealthFilter::Old => crate::i18n::t("health.filter_old"),
+            HealthFilter::Breached => crate::i18n::t("health.filter_breached"),
         }
     }
 
@@ -581,7 +586,9 @@ pub fn report_with_scan(
 
 /// D5's threshold.
 pub const OLD_DAYS: i64 = 365;
-pub const OLD_HEADING: &str = "OLD";
+pub fn old_heading() -> &'static str {
+    crate::i18n::t("health.old_heading")
+}
 
 /// A password unchanged for a year or more.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,7 +636,7 @@ pub fn old_items(items: &[VaultItem], today: i64) -> Vec<OldItem> {
 
 /// An old finding's line.
 pub fn old_detail(old: &OldItem) -> String {
-    format!("Not changed in {} days", old.days)
+    crate::i18n::tn("health.old_detail", old.days.max(0) as u64, &[])
 }
 
 /// The non-secret half of an item: what a finding row draws and clicks.
@@ -642,25 +649,24 @@ fn found(item: &VaultItem) -> FoundItem {
 /// "9 characters, lowercase letters and digits" -- something to act on. Never
 /// a score; see the module docs.
 pub fn weak_detail(weak: &WeakItem) -> String {
-    let unit = if weak.chars == 1 { "character" } else { "characters" };
     let names = weak.classes.names();
     let classes = match names.len() {
         // Unreachable for a real finding -- an empty password is excluded by
         // `password_of` long before it gets here -- but stated rather than
         // left to produce a sentence with a hole in it.
-        0 => "no characters at all".to_string(),
-        1 => format!("{} only", names[0]),
+        0 => crate::i18n::t("health.classes_none").to_string(),
+        1 => crate::i18n::tf("health.classes_only", &[("name", names[0])]),
         _ => {
             let (last, rest) = names.split_last().expect("len >= 2 in this arm");
-            format!("{} and {}", rest.join(", "), last)
+            crate::i18n::tf("health.classes_and", &[("list", &rest.join(", ")), ("last", last)])
         }
     };
-    format!("{} {unit}, {classes}", weak.chars)
+    crate::i18n::tn("health.weak_detail", weak.chars as u64, &[("classes", &classes)])
 }
 
 /// The heading over one reuse group.
 pub fn reuse_group_heading(group: &ReuseGroup) -> String {
-    format!("One password, {} items", group.items.len())
+    crate::i18n::tn("health.reuse_heading", group.items.len() as u64, &[])
 }
 
 /// The detail line under one reused row: the OTHER items on its password,
@@ -676,7 +682,7 @@ pub fn reuse_detail(group: &ReuseGroup, at: usize) -> String {
         .filter(|(i, _)| *i != at)
         .map(|(_, item)| finding_name(&item.name))
         .collect();
-    format!("Also used by {}", others.join(", "))
+    crate::i18n::tf("health.also_used_by", &[("names", &others.join(", "))])
 }
 
 /// What the top of the screen says, before any list.
@@ -713,10 +719,9 @@ impl Summary {
     /// at the draw site, so the states can be asserted without a frame.
     pub fn headline(self) -> String {
         match self {
-            Summary::NothingToCheck => "No saved passwords to check".to_string(),
-            Summary::AllClear => "No reused or weak passwords".to_string(),
-            Summary::Findings(1) => "1 item needs attention".to_string(),
-            Summary::Findings(n) => format!("{n} items need attention"),
+            Summary::NothingToCheck => crate::i18n::t("health.summary_nothing").to_string(),
+            Summary::AllClear => crate::i18n::t("health.summary_clear").to_string(),
+            Summary::Findings(n) => crate::i18n::tn("health.summary_findings", n as u64, &[]),
         }
     }
 
@@ -726,14 +731,10 @@ impl Summary {
     /// looks.
     pub fn detail(self, report: &HealthReport) -> String {
         let n = report.with_password;
-        let noun = if n == 1 { "password" } else { "passwords" };
         match self {
-            Summary::NothingToCheck => {
-                "Cards, notes, SSH keys and logins with an empty password are not checked."
-                    .to_string()
-            }
-            Summary::AllClear => format!("Checked {n} {noun}."),
-            Summary::Findings(_) => format!("Out of {n} {noun} checked."),
+            Summary::NothingToCheck => crate::i18n::t("health.detail_nothing").to_string(),
+            Summary::AllClear => crate::i18n::tn("health.detail_checked", n as u64, &[]),
+            Summary::Findings(_) => crate::i18n::tn("health.detail_out_of", n as u64, &[]),
         }
     }
 }
@@ -756,20 +757,12 @@ impl Summary {
 /// list of breach findings would be a contradiction the user would have to
 /// resolve; saying which of the two things the pill decides is not.
 pub fn breach_note(breach_checking_on: bool) -> String {
-    let source = format!(
-        "Breach findings come from the last scan you ran, not from opening this screen \u{2014} \
-         nothing here checks anything. Run one in {SCAN_LOCATION}."
-    );
+    let source = crate::i18n::tf("health.breach_source", &[("scan_location", scan_location())]);
+    let key_args = [("source", source.as_str()), ("setting", breach_setting_location())];
     if breach_checking_on {
-        format!(
-            "{source} The setting in {BREACH_SETTING_LOCATION} is on, which checks one password \
-             at a time on an item's own pane."
-        )
+        crate::i18n::tf("health.breach_note_on", &key_args)
     } else {
-        format!(
-            "{source} The setting in {BREACH_SETTING_LOCATION} is off, so nothing is checked \
-             automatically when you open an item."
-        )
+        crate::i18n::tf("health.breach_note_off", &key_args)
     }
 }
 
@@ -778,7 +771,9 @@ pub fn breach_note(breach_checking_on: bool) -> String {
 /// Per row as well as in the band's note, because a row is what gets clicked
 /// through to an item and the pane behind it will show an ordinary password
 /// with no badge on it. "Unknown" has to travel with the row.
-pub const UNKNOWN_ROW_DETAIL: &str = "Not checked \u{2014} the lookup did not complete.";
+pub fn unknown_row_detail() -> &'static str {
+    crate::i18n::t("health.unknown_row_detail")
+}
 
 /// Where the chip row keeps its selection. One `Id`, named once, so the draw
 /// and [`show_filter`] cannot disagree about which slot they are using.
@@ -803,22 +798,30 @@ pub fn show_filter(ctx: &egui::Context, filter: HealthFilter) {
 
 /// The two section bands, spelled once so the tests that look for them and
 /// the pane that paints them cannot drift.
-pub const REUSED_HEADING: &str = "REUSED";
-pub const WEAK_HEADING: &str = "WEAK";
+pub fn reused_heading() -> &'static str {
+    crate::i18n::t("health.reused_heading")
+}
+pub fn weak_heading() -> &'static str {
+    crate::i18n::t("health.weak_heading")
+}
 /// The breach section's band. **"Found in breaches", not "BREACHED"**: the
 /// other two bands name a property of the password, and this one names
 /// something that happened to it somewhere else.
-pub const BREACHED_HEADING: &str = "FOUND IN BREACHES";
+pub fn breached_heading() -> &'static str {
+    crate::i18n::t("health.breached_heading")
+}
 /// The band over the passwords a scan asked about and could not settle.
-pub const UNKNOWN_HEADING: &str = "COULD NOT BE CHECKED";
+pub fn unknown_heading() -> &'static str {
+    crate::i18n::t("health.unknown_heading")
+}
 /// The line under that band, said once rather than per row.
 ///
 /// **It says what the rows are NOT.** A list under a grey heading reads as a
 /// list of lesser problems; these are items with no answer at all, and the
 /// sentence has to rule out the reading that they came back clean.
-pub const UNKNOWN_NOTE: &str =
-    "The check for these did not complete, so nothing is known about them either way. Run the \
-     scan again.";
+pub fn unknown_note() -> &'static str {
+    crate::i18n::t("health.unknown_note")
+}
 /// What the pane says when the active filter has nothing in it.
 ///
 /// **A result, not a blank space** -- `Summary`'s argument exactly. Four of
@@ -827,20 +830,17 @@ pub const UNKNOWN_NOTE: &str =
 /// enough to cover both.
 pub fn nothing_under(filter: HealthFilter, report: &HealthReport) -> String {
     match filter {
-        HealthFilter::All => "No reused, weak or breached passwords.".to_string(),
-        HealthFilter::Reused => "No password in this vault is used twice.".to_string(),
-        HealthFilter::Weak => "No password in this vault is weak.".to_string(),
-        HealthFilter::Old => "No password in this vault is a year old.".to_string(),
+        HealthFilter::All => crate::i18n::t("health.none_all").to_string(),
+        HealthFilter::Reused => crate::i18n::t("health.none_reused").to_string(),
+        HealthFilter::Weak => crate::i18n::t("health.none_weak").to_string(),
+        HealthFilter::Old => crate::i18n::t("health.none_old").to_string(),
         // **The one filter whose empty state has two meanings**, and they are
         // opposite claims: nothing was found, or nothing was looked at. An
         // empty list cannot tell them apart, so the sentence does.
-        HealthFilter::Breached if !report.scanned => format!(
-            "No scan has been run, so nothing here has been compared against a breach list. \
-             The scan is in {SCAN_LOCATION}."
-        ),
-        HealthFilter::Breached => {
-            "None of the passwords the last scan checked was found in a breach.".to_string()
+        HealthFilter::Breached if !report.scanned => {
+            crate::i18n::tf("health.none_breached_unscanned", &[("scan_location", scan_location())])
         }
+        HealthFilter::Breached => crate::i18n::t("health.none_breached").to_string(),
     }
 }
 
@@ -848,7 +848,9 @@ pub fn nothing_under(filter: HealthFilter, report: &HealthReport) -> String {
 ///
 /// Spelled here as its own literal for [`BREACH_SETTING_LOCATION`]'s reason,
 /// and pinned against `prefs_ui.rs` by the same test.
-pub const SCAN_LOCATION: &str = "Preferences > Breaches > \"Scan all passwords now\"";
+pub fn scan_location() -> &'static str {
+    crate::i18n::t("health.scan_location")
+}
 
 /// The heading over one breach group.
 ///
@@ -860,10 +862,10 @@ pub fn breach_group_heading(group: &BreachGroup) -> String {
     let times = crate::breach::breach_count_phrase(group.count);
     match (group.items.len(), group.one_password) {
         (1, _) => times,
-        (n, true) => format!("{times} \u{2014} one password, {n} items"),
+        (n, true) => crate::i18n::tn("health.breach_one_password", n as u64, &[("times", &times)]),
         // Same count, different passwords. Rare above a handful, and stated
         // as the fact it is rather than as a guess either way.
-        (n, false) => format!("{times} \u{2014} {n} items, different passwords"),
+        (n, false) => crate::i18n::tn("health.breach_different", n as u64, &[("times", &times)]),
     }
 }
 
@@ -892,7 +894,9 @@ const CARD_RADIUS: u8 = tokens::R_CARD;
 /// Below this much room a row drops its button and the whole row is the click.
 const BUTTON_FROM: f32 = 440.0;
 /// What a Change password button says.
-pub const CHANGE_PASSWORD_LABEL: &str = "Change password";
+pub fn change_password_label() -> &'static str {
+    crate::i18n::t("health.change_password")
+}
 
 const TITLE: Role = Role { size: 30.0, face: theme::EXTRABOLD, tracking_em: -0.03 };
 const ROW_NAME: Role = Role { size: 16.0, face: theme::BOLD, tracking_em: 0.0 };
@@ -943,7 +947,7 @@ fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> H
     let p = tokens::palette(ui.ctx());
     let mut action = HealthAction::None;
 
-    ui.label(tokens::job(TITLE, HEALTH_PANE_TITLE, p.ink));
+    ui.label(tokens::job(TITLE, health_pane_title(), p.ink));
     ui.add_space(8.0);
     let summary = summary_of(report);
     let headline_ink = match summary {
@@ -965,7 +969,7 @@ fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> H
     };
 
     if filter.shows_reused() && !report.reused.is_empty() {
-        section(ui, REUSED_HEADING);
+        section(ui, reused_heading());
         let cards: Vec<(String, Vec<Line<'_>>)> = report
             .reused
             .iter()
@@ -985,7 +989,7 @@ fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> H
         }
     }
     if filter.shows_weak() && !report.weak.is_empty() {
-        section(ui, WEAK_HEADING);
+        section(ui, weak_heading());
         let lines: Vec<Line<'_>> = report
             .weak
             .iter()
@@ -995,7 +999,7 @@ fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> H
         put(found, &mut action);
     }
     if filter.shows_old() && !report.old.is_empty() {
-        section(ui, OLD_HEADING);
+        section(ui, old_heading());
         let lines: Vec<Line<'_>> = report
             .old
             .iter()
@@ -1006,7 +1010,7 @@ fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> H
     }
     if filter.shows_breached() {
         if !report.breached.is_empty() {
-            section(ui, BREACHED_HEADING);
+            section(ui, breached_heading());
             for group in &report.breached {
                 let phrase = crate::breach::breach_phrase(group.count);
                 let lines: Vec<Line<'_>> = group
@@ -1024,13 +1028,13 @@ fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> H
         // fine, and leaving it off the list is the one failure this section
         // exists to avoid.
         if !report.unknown.is_empty() {
-            section(ui, UNKNOWN_HEADING);
+            section(ui, unknown_heading());
             let lines: Vec<Line<'_>> = report
                 .unknown
                 .iter()
-                .map(|item| Line { id: &item.id, name: &item.name, reason: UNKNOWN_ROW_DETAIL.to_string(), colour: p.text_faint, change: false })
+                .map(|item| Line { id: &item.id, name: &item.name, reason: unknown_row_detail().to_string(), colour: p.text_faint, change: false })
                 .collect();
-            let found = list_card(ui, Some(UNKNOWN_NOTE), &lines);
+            let found = list_card(ui, Some(unknown_note()), &lines);
             put(found, &mut action);
         }
     }
@@ -1093,13 +1097,15 @@ fn list_card(ui: &mut egui::Ui, caption: Option<&str>, lines: &[Line<'_>]) -> Op
 /// cannot go and change a password they cannot find. In square brackets and in
 /// the page's own words, so it cannot be mistaken for an item really called
 /// this.
-pub const UNNAMED_ITEM: &str = "[No name]";
+pub fn unnamed_item() -> &'static str {
+    crate::i18n::t("health.unnamed_item")
+}
 
 /// The name a finding row paints for `name`: the item's own, or
 /// [`UNNAMED_ITEM`] when it has none. Whitespace counts as none.
 fn finding_name(name: &str) -> &str {
     if name.trim().is_empty() {
-        UNNAMED_ITEM
+        unnamed_item()
     } else {
         name
     }
@@ -1124,7 +1130,7 @@ fn finding_row(ui: &mut egui::Ui, line: &Line<'_>) -> Option<HealthAction> {
     item_list::row_tile(&mut tile_ui, None, crate::vault_bridge::ItemKind::Login, finding_name(line.name), TILE, false);
 
     let show_button = line.change && width >= BUTTON_FROM;
-    let button_width = controls::button_width(ui.ctx(), ButtonKind::Primary, controls::ROW, CHANGE_PASSWORD_LABEL, false);
+    let button_width = controls::button_width(ui.ctx(), ButtonKind::Primary, controls::ROW, change_password_label(), false);
     let text_left = tile.right() + ROW_GAP_X;
     let text_right = rect.right() - ROW_PAD_X - if show_button { button_width + ROW_GAP_X } else { 0.0 };
     let room = (text_right - text_left).max(1.0);
@@ -1146,7 +1152,7 @@ fn finding_row(ui: &mut egui::Ui, line: &Line<'_>) -> Option<HealthAction> {
             egui::vec2(button_width, controls::ROW.height),
         );
         let mut slot_ui = ui.new_child(egui::UiBuilder::new().max_rect(slot));
-        if controls::button(&mut slot_ui, ButtonKind::Primary, controls::ROW, CHANGE_PASSWORD_LABEL, None).clicked() {
+        if controls::button(&mut slot_ui, ButtonKind::Primary, controls::ROW, change_password_label(), None).clicked() {
             hit = Some(HealthAction::ChangePassword(line.id.to_string()));
         }
     }
@@ -1968,7 +1974,7 @@ mod tests {
         let mut selected = None;
         let frame = painted(&ctx, &report, &mut selected, false, None);
         let strings = texts(&frame);
-        assert!(strings.contains(&BREACHED_HEADING), "got {strings:?}");
+        assert!(strings.contains(&breached_heading()), "got {strings:?}");
         assert!(
             strings.contains(&crate::breach::breach_phrase(40_231).as_str()),
             "the row does not carry its breach phrase: {strings:?}"
@@ -2007,9 +2013,9 @@ mod tests {
         let mut selected = None;
         let frame = painted(&ctx, &report, &mut selected, false, None);
         let strings = texts(&frame);
-        assert!(strings.contains(&UNKNOWN_HEADING), "got {strings:?}");
+        assert!(strings.contains(&unknown_heading()), "got {strings:?}");
         assert!(strings.contains(&"Bank"), "got {strings:?}");
-        assert!(strings.contains(&UNKNOWN_ROW_DETAIL), "got {strings:?}");
+        assert!(strings.contains(&unknown_row_detail()), "got {strings:?}");
         assert!(
             !strings.contains(&"Shop"),
             "a password that came back SAFE was listed; only findings belong on this screen"
@@ -2057,7 +2063,7 @@ mod tests {
         assert_ne!(never, ran);
         assert!(never.contains("No scan has been run"), "{never}");
         assert!(
-            never.contains(SCAN_LOCATION),
+            never.contains(scan_location()),
             "the empty state does not say where the scan is: {never}"
         );
         assert!(ran.contains("None of the passwords"), "{ran}");
@@ -2147,7 +2153,7 @@ mod tests {
             "the Weak filter still lists the reuse findings: {:?}",
             texts(&narrowed)
         );
-        assert!(!texts(&narrowed).contains(&REUSED_HEADING));
+        assert!(!texts(&narrowed).contains(&reused_heading()));
 
         // Press "Breached", which has nothing in it under this vault.
         let at = locate(&narrowed, HealthFilter::Breached.label());
@@ -2176,7 +2182,7 @@ mod tests {
         assert!(on.contains("is on"), "{on}");
         for note in [&off, &on] {
             assert!(
-                note.contains(BREACH_SETTING_LOCATION),
+                note.contains(breach_setting_location()),
                 "the note does not say where the setting is: {note}"
             );
             // **Both states say where the findings came from**, which is the
@@ -2185,7 +2191,7 @@ mod tests {
             // scan the user ran would read as this screen having checked
             // them.
             assert!(
-                note.contains(SCAN_LOCATION),
+                note.contains(scan_location()),
                 "the note does not say where the scan is: {note}"
             );
             assert!(
@@ -2205,7 +2211,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/prefs_ui.rs");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
-        let label = BREACH_SETTING_LOCATION
+        let label = breach_setting_location()
             .rsplit_once('"')
             .and_then(|(head, _)| head.rsplit_once('"').map(|(_, label)| label.to_string()))
             .expect("the location string quotes the row's label");
@@ -2213,7 +2219,7 @@ mod tests {
         assert!(
             text.contains(&format!("{label:?}")),
             "`prefs_ui.rs` has no row labelled {label:?} any more, so \
-             `BREACH_SETTING_LOCATION` sends the user to a preference that is not there"
+             `breach_setting_location()` sends the user to a preference that is not there"
         );
 
         // **And the PAGE, not only the row.** The page name is the half that
@@ -2221,7 +2227,7 @@ mod tests {
         // than a wrong row name: the reader arrives somewhere real, does not
         // find the switch, and concludes the app is describing a feature it
         // does not have.
-        let page = BREACH_SETTING_LOCATION
+        let page = breach_setting_location()
             .split(" > ")
             .nth(1)
             .expect("the location string names a page between two chevrons");
@@ -2229,7 +2235,7 @@ mod tests {
         assert!(
             text.contains(&format!("=> {page:?},")),
             "`prefs_ui.rs` has no nav section labelled {page:?}, so \
-             `BREACH_SETTING_LOCATION` names a page that is not in that window"
+             `breach_setting_location()` names a page that is not in that window"
         );
     }
 
@@ -2353,7 +2359,7 @@ mod tests {
         let shown = settled(&ctx, &pair_report(), false);
         let texts: Vec<&str> = shown.texts.iter().map(|(t, _, _)| t.as_str()).collect();
         for expected in [
-            HEALTH_PANE_TITLE,
+            health_pane_title(),
             "3 items need attention",
             "All",
             "Reused",
@@ -2371,7 +2377,7 @@ mod tests {
             assert!(texts.contains(&expected), "the page never painted {expected:?}: {texts:?}");
         }
         assert_eq!(
-            texts.iter().filter(|t| **t == CHANGE_PASSWORD_LABEL).count(),
+            texts.iter().filter(|t| **t == change_password_label()).count(),
             3,
             "every finding row carries the Change password button: {texts:?}"
         );
@@ -2393,7 +2399,7 @@ mod tests {
         let button = shown
             .texts
             .iter()
-            .filter(|(t, _, _)| t == CHANGE_PASSWORD_LABEL)
+            .filter(|(t, _, _)| t == change_password_label())
             .map(|(_, _, r)| r.center())
             .next_back()
             .expect("a button");
@@ -2422,7 +2428,7 @@ mod tests {
         assert!(texts.iter().any(|t| t.starts_with("No reused, weak or breached")), "{texts:?}");
         assert!(!texts.contains(&"REUSED"), "an empty REUSED band was painted: {texts:?}");
         assert!(!texts.contains(&"WEAK"), "an empty WEAK band was painted: {texts:?}");
-        assert!(!texts.contains(&CHANGE_PASSWORD_LABEL), "a button with nothing to change: {texts:?}");
+        assert!(!texts.contains(&change_password_label()), "a button with nothing to change: {texts:?}");
     }
 
     /// The breach footer is on screen in both states of the setting.
@@ -2442,10 +2448,10 @@ mod tests {
         let ctx = ctx();
         let report = report_for(&[login("id", "  ", Some("abc12345"))]);
         let shown = settled(&ctx, &report, false);
-        assert!(shown.text(UNNAMED_ITEM).is_some(), "the nameless finding painted no name");
+        assert!(shown.text(unnamed_item()).is_some(), "the nameless finding painted no name");
         let named = report_for(&[login("id", "Bank", Some("abc12345"))]);
         let shown = settled(&ctx, &named, false);
-        assert!(shown.text(UNNAMED_ITEM).is_none(), "a named item got the placeholder");
+        assert!(shown.text(unnamed_item()).is_none(), "a named item got the placeholder");
     }
 
     #[test]
@@ -2456,7 +2462,7 @@ mod tests {
         let shown = settled(&ctx, &report, false);
         let (drawn, _, rect) = shown.texts.iter().find(|(t, _, _)| t.starts_with("Visual")).expect("the name");
         assert!(drawn.ends_with('\u{2026}'), "the long name was not cut: {drawn:?}");
-        let (_, _, button) = shown.texts.iter().find(|(t, _, _)| t == CHANGE_PASSWORD_LABEL).expect("the button");
+        let (_, _, button) = shown.texts.iter().find(|(t, _, _)| t == change_password_label()).expect("the button");
         assert!(rect.right() <= button.left(), "the name runs under the button");
     }
 
@@ -2465,7 +2471,7 @@ mod tests {
     fn the_column_is_capped_and_centred() {
         let ctx = ctx();
         let shown = settled(&ctx, &pair_report(), false);
-        let title = shown.text(HEALTH_PANE_TITLE).expect("the title").2;
+        let title = shown.text(health_pane_title()).expect("the title").2;
         let expected_left = (PAGE.x - COLUMN_MAX) / 2.0;
         assert!((title.left() - expected_left).abs() < 3.0, "the title starts at {}, not {expected_left}", title.left());
     }
@@ -2479,7 +2485,7 @@ mod tests {
         let tops: Vec<f32> = shown
             .texts
             .iter()
-            .filter(|(t, _, _)| t == CHANGE_PASSWORD_LABEL)
+            .filter(|(t, _, _)| t == change_password_label())
             .map(|(_, _, r)| r.center().y)
             .collect();
         assert!(tops.len() >= 2, "{tops:?}");

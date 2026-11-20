@@ -27,18 +27,42 @@ use crate::vault_cache::VaultCache;
 /// The scrim's area name (listed in `item_list::MODAL_SCRIM_AREAS`).
 pub const ID: &str = "import";
 pub const WIDTH: f32 = 620.0;
-pub const SOURCE_TITLE: &str = "Import passwords";
-pub const SOURCE_SUB: &str = "Where are they now?";
-pub const PROGRESS_TITLE: &str = "Importing\u{2026}";
-pub const PROGRESS_SUB: &str = "This takes a few seconds";
-pub const DONE_TITLE: &str = "All set";
-pub const DROP_HEADLINE: &str = "Drop the file here";
-pub const DROP_SUB: &str = "or click to choose it";
-pub const DELETE_NOTE: &str = "Delete the exported file once you're done \u{2014} it isn't encrypted.";
-pub const COUNT_LABEL: &str = "items brought in";
-pub const BACK: &str = "Back";
-pub const DONE: &str = "Done";
-pub const SEE_ITEMS: &str = "See my items";
+pub fn source_title() -> &'static str {
+    crate::i18n::t("import.source_title")
+}
+pub fn source_sub() -> &'static str {
+    crate::i18n::t("import.source_sub")
+}
+pub fn progress_title() -> &'static str {
+    crate::i18n::t("import.progress_title")
+}
+pub fn progress_sub() -> &'static str {
+    crate::i18n::t("import.progress_sub")
+}
+pub fn done_title() -> &'static str {
+    crate::i18n::t("import.done_title")
+}
+pub fn drop_headline() -> &'static str {
+    crate::i18n::t("import.drop_headline")
+}
+pub fn drop_sub() -> &'static str {
+    crate::i18n::t("import.drop_sub")
+}
+pub fn delete_note() -> &'static str {
+    crate::i18n::t("import.delete_note")
+}
+pub fn count_label() -> &'static str {
+    crate::i18n::t("import.count_label")
+}
+pub fn back() -> &'static str {
+    crate::i18n::t("import.back")
+}
+pub fn done() -> &'static str {
+    crate::i18n::t("import.done")
+}
+pub fn see_items() -> &'static str {
+    crate::i18n::t("import.see_items")
+}
 /// The glyph for "Import passwords" in the palette: a tray with an arrow in.
 pub const DOWNLOAD_TRAY: &str = "M12 4v11M7 10l5 5 5-5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4";
 const UPLOAD: &str = "M12 16V5M7 10l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3";
@@ -118,21 +142,21 @@ pub struct Finished {
 impl Wizard {
     pub fn title(&self) -> String {
         match self.step {
-            Step::ImportSource => SOURCE_TITLE.to_string(),
-            Step::File => format!("From {}", self.source.map_or("", ImportSource::label)),
-            Step::Progress => PROGRESS_TITLE.to_string(),
-            Step::Done => DONE_TITLE.to_string(),
+            Step::ImportSource => source_title().to_string(),
+            Step::File => crate::i18n::tf("import.from", &[("source", self.source.map_or("", ImportSource::label))]),
+            Step::Progress => progress_title().to_string(),
+            Step::Done => done_title().to_string(),
         }
     }
 
     pub fn sub(&self) -> Option<String> {
         match self.step {
-            Step::ImportSource => Some(SOURCE_SUB.to_string()),
+            Step::ImportSource => Some(source_sub().to_string()),
             Step::File => {
                 let label = self.source.map_or("", ImportSource::label);
-                Some(format!("Export a file from {label}, then add it here."))
+                Some(crate::i18n::tf("import.export_hint", &[("source", label)]))
             }
-            Step::Progress => Some(PROGRESS_SUB.to_string()),
+            Step::Progress => Some(progress_sub().to_string()),
             Step::Done => None,
         }
     }
@@ -299,30 +323,24 @@ fn button_size(height: f32, pad_x: f32) -> ButtonSize {
 
 /// "128 items imported".
 pub fn imported_headline(count: usize) -> String {
-    format!("{count} {} imported", if count == 1 { "item" } else { "items" })
+    crate::i18n::tn("import.imported", count as u64, &[])
 }
 
 /// The sentences under the headline: duplicates first (the spec's), then what
 /// did not land.
 pub fn done_lines(summary: &Summary) -> Vec<(String, bool)> {
-    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut lines = Vec::new();
     if summary.duplicates > 0 {
-        let verb = if summary.duplicates == 1 { "was" } else { "were" };
-        lines.push((format!("{} {verb} skipped", plural(summary.duplicates, "duplicate", "duplicates")), false));
+        lines.push((crate::i18n::tn("import.skipped", summary.duplicates as u64, &[]), false));
     }
     if summary.left_out > 0 {
-        let verb = if summary.left_out == 1 { "was" } else { "were" };
-        lines.push((format!("{} {verb} left out", plural(summary.left_out, "entry", "entries")), false));
+        lines.push((crate::i18n::tn("import.left_out", summary.left_out as u64, &[]), false));
     }
     if summary.failed > 0 {
-        lines.push((
-            format!("{} couldn't be imported", plural(summary.failed, "item", "items")),
-            true,
-        ));
+        lines.push((crate::i18n::tn("import.failed", summary.failed as u64, &[]), true));
     }
     if summary.stopped_early && summary.failed == 0 {
-        lines.push(("The import was stopped before it finished".to_string(), true));
+        lines.push((crate::i18n::t("import.stopped").to_string(), true));
     }
     lines
 }
@@ -432,14 +450,14 @@ fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
     ui.painter().text(
         egui::pos2(slot.center().x, tile.bottom() + 28.0),
         egui::Align2::CENTER_CENTER,
-        DROP_HEADLINE,
+        drop_headline(),
         egui::FontId::new(18.0, egui::FontFamily::Name(theme::EXTRABOLD.into())),
         NAVY,
     );
     ui.painter().text(
         egui::pos2(slot.center().x, tile.bottom() + 54.0),
         egui::Align2::CENTER_CENTER,
-        DROP_SUB,
+        drop_sub(),
         egui::FontId::proportional(15.0),
         Color32::from_rgb(0x4a, 0x47, 0x45),
     );
@@ -455,14 +473,14 @@ fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
     }
     ui.add_space(16.0);
     ui.horizontal(|ui| {
-        let back = controls::button(ui, ButtonKind::Outline, button_size(48.0, 20.0), BACK, None);
+        let back = controls::button(ui, ButtonKind::Outline, button_size(48.0, 20.0), back(), None);
         let _ = ui.interact(back.rect, back_id(), Sense::hover());
         if back.clicked() {
             wizard.step = Step::ImportSource;
             wizard.error = None;
         }
         ui.add_space(8.0);
-        ui.add(egui::Label::new(egui::RichText::new(DELETE_NOTE).size(14.0).color(NOTE_INK)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(delete_note()).size(14.0).color(NOTE_INK)).wrap());
     });
     answer
 }
@@ -496,7 +514,7 @@ fn progress_step(ui: &mut egui::Ui, wizard: &Wizard) {
                 .color(NAVY),
         );
         ui.add_space(16.0);
-        ui.label(egui::RichText::new(COUNT_LABEL).size(16.0).color(MUTED));
+        ui.label(egui::RichText::new(count_label()).size(16.0).color(MUTED));
         ui.add_space(16.0);
         let (bar, _) = ui.allocate_exact_size(Vec2::new(320.0, 5.0), Sense::hover());
         ui.painter().rect_filled(bar, CornerRadius::same(3), BAR);
@@ -529,12 +547,12 @@ fn done_step(ui: &mut egui::Ui, wizard: &Wizard) -> Answer {
     });
     let size = button_size(50.0, 18.0);
     ui.columns(2, |columns| {
-        let done = controls::button(&mut columns[0], ButtonKind::Outline, size, DONE, None);
+        let done = controls::button(&mut columns[0], ButtonKind::Outline, size, done(), None);
         let _ = columns[0].interact(done.rect, done_id(), Sense::hover());
         if done.clicked() {
             answer = Answer::Closed;
         }
-        let see = controls::button(&mut columns[1], ButtonKind::Primary, size, SEE_ITEMS, None);
+        let see = controls::button(&mut columns[1], ButtonKind::Primary, size, see_items(), None);
         let _ = columns[1].interact(see.rect, see_id(), Sense::hover());
         if see.clicked() {
             answer = Answer::SeeItems;
@@ -605,7 +623,7 @@ mod tests {
         let mut wizard = Wizard::default();
         let t = settle(&ctx, &mut wizard, 0.0);
         let (_, p) = frame(&ctx, t, vec![], &mut wizard);
-        assert!(has(&p, SOURCE_TITLE) && has(&p, SOURCE_SUB));
+        assert!(has(&p, source_title()) && has(&p, source_sub()));
         for source in ImportSource::ALL {
             assert!(has(&p, source.label()) && has(&p, source.initials()), "no tile for {source:?}");
         }
@@ -637,7 +655,7 @@ mod tests {
         let (_, p) = frame(&ctx, t, vec![], &mut wizard);
         assert!(has(&p, "From Chrome or Edge"));
         assert!(has(&p, "Export a file from Chrome or Edge, then add it here."));
-        assert!(has(&p, DROP_HEADLINE) && has(&p, DROP_SUB));
+        assert!(has(&p, drop_headline()) && has(&p, drop_sub()));
         let _ = click(&ctx, &mut wizard, back_id(), t + 0.1);
         assert_eq!(wizard.step, Step::ImportSource);
     }
@@ -704,7 +722,7 @@ mod tests {
         let ctx = testing::ctx();
         let t = settle(&ctx, &mut wizard, 0.0);
         let (_, p) = frame(&ctx, t, vec![], &mut wizard);
-        assert!(has(&p, DONE_TITLE));
+        assert!(has(&p, done_title()));
         assert!(has(&p, "1 item imported"));
         assert!(has(&p, "1 duplicate was skipped"));
         assert_eq!(click(&ctx, &mut wizard, see_id(), t + 0.1), Answer::SeeItems);
@@ -739,8 +757,8 @@ mod tests {
         let ctx = testing::ctx();
         let t = settle(&ctx, &mut wizard, 0.0);
         let (_, p) = frame(&ctx, t, vec![], &mut wizard);
-        assert!(has(&p, PROGRESS_TITLE) && has(&p, PROGRESS_SUB));
-        assert!(has(&p, "3") && has(&p, COUNT_LABEL));
+        assert!(has(&p, progress_title()) && has(&p, progress_sub()));
+        assert!(has(&p, "3") && has(&p, count_label()));
         assert!(p.repaint_delay < Duration::from_secs(1), "the counter keeps moving");
         let mark = ctx.read_response(crate::kit::modal::close_id(ID)).expect("the close mark").rect.center();
         let (answer, _) = frame(&ctx, t + 0.1, click_at(mark), &mut wizard);

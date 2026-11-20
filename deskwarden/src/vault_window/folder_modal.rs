@@ -68,16 +68,16 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
     use crate::kit::controls::{self, ButtonKind, ButtonSize};
     use crate::kit::modal::{Dialog, ModalOutcome};
     let mut action = FolderEditAction::None;
-    let (outcome, ()) = Dialog::new(ID, 480.0).title("Edit folder").show(ctx, |ui| {
+    let (outcome, ()) = Dialog::new(ID, 480.0).title(crate::i18n::t("folder.title")).show(ctx, |ui| {
         let width = ui.available_width();
         ui.spacing_mut().item_spacing.y = 7.0;
         ui.label(
-            RichText::new("Folder name")
+            RichText::new(crate::i18n::t("folder.name_label"))
                 .font(egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())))
                 .color(theme::TEXT_SECONDARY),
         );
         crate::kit::input::text(ui, name_id(), &mut state.name, "", false, width);
-        ui.label(RichText::new("Use \"/\" to nest, e.g. Work/Clients").size(13.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(crate::i18n::t("folder.nest_hint")).size(13.0).color(theme::TEXT_FAINT));
         if let Some(error) = &state.error {
             ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
         }
@@ -85,7 +85,7 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let delete_label = if state.delete_armed { "Confirm delete" } else { "Delete" };
+            let delete_label = if state.delete_armed { crate::i18n::t("folder.confirm_delete") } else { crate::i18n::t("folder.delete") };
             if controls::button(ui, ButtonKind::Danger, size, delete_label, None).clicked() {
                 if state.delete_armed {
                     action = FolderEditAction::Delete;
@@ -95,10 +95,10 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if controls::button(ui, ButtonKind::Primary, size, "Save", None).clicked() {
+                if controls::button(ui, ButtonKind::Primary, size, crate::i18n::t("folder.save"), None).clicked() {
                     action = FolderEditAction::Save;
                 }
-                if controls::button(ui, ButtonKind::Outline, size, "Cancel", None).clicked() {
+                if controls::button(ui, ButtonKind::Outline, size, crate::i18n::t("folder.cancel"), None).clicked() {
                     action = FolderEditAction::Cancel;
                 }
             });

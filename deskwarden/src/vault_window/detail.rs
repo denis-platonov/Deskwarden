@@ -118,7 +118,9 @@ pub(crate) const ROW_PAD_Y: i8 = 13;
 /// the EDIT pane names the same card through `Section::title` -- the two are
 /// one click apart and a heading that drifted between them is exactly what
 /// moving this row out of `LOGIN CREDENTIALS` was for.
-pub(crate) const TOTP_CARD_HEADING: &str = "ONE-TIME CODE";
+pub(crate) fn totp_card_heading() -> &'static str {
+    crate::i18n::t("detail.totp_heading")
+}
 const CARD_HEADING_SIZE: f32 = 12.0;
 /// 6b's `.chead .side`: 11px, and `gap: 10px` from the caption -- see
 /// [`card_with_side`].
@@ -217,7 +219,9 @@ const MASKED_BULLETS: usize = 10;
 /// so the two are meant to read as one thing -- but that module has not been
 /// renamed yet, and nothing here may claim the two strings are identical
 /// until it follows.
-const TOTP_SECRET_LABEL: &str = "TOTP secret";
+fn totp_secret_label() -> &'static str {
+    crate::i18n::t("detail.totp_secret")
+}
 /// The 11px runs the design uses for a row's secondary line (2b's `18s`).
 const ROW_HINT_SIZE: f32 = 11.0;
 
@@ -688,7 +692,7 @@ pub enum DetailAction {
     /// silent drop into a *disclosure*: what the create form cannot carry is
     /// visibly not in the form the user is looking at when they press Save,
     /// and the login form already says so in as many words
-    /// (`detail_edit::TOTP_CREATE_NOTICE`). That is the same argument the
+    /// (`detail_edit::totp_create_notice()`). That is the same argument the
     /// import decision made, and it is why this variant carries nothing --
     /// the caller re-resolves the selected item and builds the draft.
     ///
@@ -861,12 +865,9 @@ pub enum DetailAction {
 #[must_use]
 pub fn view_only_footer(from: &str, unverified: bool) -> String {
     if unverified {
-        format!(
-            "Shared with you, view-only. The server does not say who owns it; the name \u{201c}{from}\u{201d} comes from \
-             the organisation's own title."
-        )
+        crate::i18n::tf("detail.shared_unverified_footer", &[("from", from)])
     } else {
-        format!("Shared by {from}, view-only. Only they can edit or delete it.")
+        crate::i18n::tf("detail.shared_footer", &[("from", from)])
     }
 }
 
@@ -876,16 +877,22 @@ pub fn view_only_footer(from: &str, unverified: bool) -> String {
 #[must_use]
 pub fn shared_by_line(from: &str, unverified: bool) -> String {
     if unverified {
-        format!("Shared by {from} \u{b7} unverified \u{b7} view-only")
+        crate::i18n::tf("detail.shared_line_unverified", &[("from", from)])
     } else {
-        format!("Shared by {from} \u{b7} view-only")
+        crate::i18n::tf("detail.shared_line", &[("from", from)])
     }
 }
 
 /// The hover on an unverified "Shared by" -- the official-path spec §4.3's
 /// own words: the planted-organisation risk is shown, not silently trusted.
+// English only: `share_ui` and `send_ui` still read it. Phase 2 of the translation work
+// removes this constant when they have moved to [`unverified_sharer_tooltip`].
 pub const UNVERIFIED_SHARER_TOOLTIP: &str =
     "This server does not say who owns the organisation. The name comes from the organisation's own title.";
+
+pub fn unverified_sharer_tooltip() -> &'static str {
+    crate::i18n::t("detail.unverified_tooltip")
+}
 
 /// The received record's kebab entry that leaves its sharer's org --
 /// `(unverified)` after the name where it is only the org's own title, as
@@ -893,9 +900,9 @@ pub const UNVERIFIED_SHARER_TOOLTIP: &str =
 #[must_use]
 pub fn stop_receiving_label(from: &str, unverified: bool) -> String {
     if unverified {
-        format!("Stop receiving from {from} (unverified)")
+        crate::i18n::tf("detail.stop_receiving_unverified", &[("from", from)])
     } else {
-        format!("Stop receiving from {from}")
+        crate::i18n::tf("detail.stop_receiving", &[("from", from)])
     }
 }
 
@@ -903,7 +910,9 @@ pub fn stop_receiving_label(from: &str, unverified: bool) -> String {
 /// sharing view does not name (a read-only organisation collection, or a
 /// received record before the view has arrived). Says the same fact without
 /// inventing a name.
-pub const VIEW_ONLY_FOOTER: &str = "View-only. Only its owner can edit or delete it.";
+pub fn view_only_footer_text() -> &'static str {
+    crate::i18n::t("detail.view_only_footer")
+}
 
 /// **What a view-only record allows** (spec 6.9): everything that reads,
 /// nothing that writes. The server refuses a write anyway (spec 10.3); this
@@ -1112,12 +1121,8 @@ pub fn detail_body_for(kind: ItemKind) -> DetailBody {
         ItemKind::Identity => DetailBody::Identity,
         ItemKind::SshKey => DetailBody::SshKey,
         ItemKind::Unknown(item_type) => DetailBody::Unsupported(UnsupportedPane {
-            heading: "UNSUPPORTED ITEM",
-            message: format!(
-                "Deskwarden doesn't know how to show item type {item_type} yet. Its \
-                 contents are unchanged and safe -- open it in the Bitwarden web vault \
-                 or app to view or edit it."
-            ),
+            heading: crate::i18n::t("detail.unsupported_heading"),
+            message: crate::i18n::tf("detail.unsupported_message", &[("item_type", &item_type.to_string())]),
         }),
     }
 }
@@ -1402,41 +1407,41 @@ fn identity_groups(identity: &IdentityData) -> IdentityGroups {
     };
     let groups = vec![
         group(
-            "Name",
+            crate::i18n::t("detail.group_name"),
             vec![
-                f("Title", &identity.title),
-                f("First name", &identity.first_name),
-                f("Middle name", &identity.middle_name),
-                f("Last name", &identity.last_name),
+                f(crate::i18n::t("field.title"), &identity.title),
+                f(crate::i18n::t("field.first_name"), &identity.first_name),
+                f(crate::i18n::t("field.middle_name"), &identity.middle_name),
+                f(crate::i18n::t("field.last_name"), &identity.last_name),
             ],
         ),
         group(
-            "Contact",
+            crate::i18n::t("detail.group_contact"),
             vec![
-                f("Email", &identity.email),
-                f("Phone", &identity.phone),
-                f("Username", &identity.username),
-                f("Company", &identity.company),
+                f(crate::i18n::t("field.email"), &identity.email),
+                f(crate::i18n::t("field.phone"), &identity.phone),
+                f(crate::i18n::t("field.username"), &identity.username),
+                f(crate::i18n::t("field.company"), &identity.company),
             ],
         ),
         group(
-            "Address",
+            crate::i18n::t("detail.group_address"),
             vec![
-                f("Address", &identity.address1),
-                f("Address 2", &identity.address2),
-                f("Address 3", &identity.address3),
-                f("City", &identity.city),
-                f("State", &identity.state),
-                f("Postal code", &identity.postal_code),
-                f("Country", &identity.country),
+                f(crate::i18n::t("field.address"), &identity.address1),
+                f(crate::i18n::t("field.address2"), &identity.address2),
+                f(crate::i18n::t("field.address3"), &identity.address3),
+                f(crate::i18n::t("field.city"), &identity.city),
+                f(crate::i18n::t("field.state"), &identity.state),
+                f(crate::i18n::t("field.postal_code"), &identity.postal_code),
+                f(crate::i18n::t("field.country"), &identity.country),
             ],
         ),
         group(
-            "Government IDs",
+            crate::i18n::t("detail.group_ids"),
             vec![
-                f("SSN", &identity.ssn),
-                f("Passport number", &identity.passport_number),
-                f("Licence number", &identity.license_number),
+                f(crate::i18n::t("field.ssn"), &identity.ssn),
+                f(crate::i18n::t("field.passport_number"), &identity.passport_number),
+                f(crate::i18n::t("field.licence_number"), &identity.license_number),
             ],
         ),
     ];
@@ -1474,20 +1479,16 @@ pub fn metadata_line(
     password_age_days: Option<i64>,
 ) -> String {
     let updated = updated_text(updated_days_ago);
-    let filled = if fill_count == 1 {
-        "Filled 1 time".to_string()
-    } else {
-        format!("Filled {fill_count} times")
-    };
+    let filled = crate::i18n::tn("detail.filled", fill_count as u64, &[]);
     let strength = password_strength::rate(password).label();
     // The separator belongs to the segment, so an absent age leaves no
     // orphaned "\u{b7}" behind it. `String::new()` is the whole "say nothing"
     // path -- see `password_age_text`.
     let age = match password_age_text(password_age_days) {
-        Some(text) => format!(" \u{b7} {text}"),
+        Some(text) => crate::i18n::tf("detail.meta_age", &[("text", &text)]),
         None => String::new(),
     };
-    format!("{updated}{age} \u{b7} {filled} \u{b7} Strength: {strength}")
+    crate::i18n::tf("detail.meta_line", &[("updated", &updated), ("age", &age), ("filled", &filled), ("strength", strength)])
 }
 
 /// **Which date on the item is the age of the password the user is looking
@@ -1571,8 +1572,8 @@ fn password_age_date<'a>(
 /// resolution the data carries and an hour here would be invented.
 fn password_age_text(age_days: Option<i64>) -> Option<String> {
     match age_days {
-        Some(n) if n <= 0 => Some("Password set today".to_string()),
-        Some(n) => Some(format!("Password set {}", relative_time::ago_days(n as u64))),
+        Some(n) if n <= 0 => Some(crate::i18n::t("detail.password_set_today").to_string()),
+        Some(n) => Some(crate::i18n::tf("detail.password_set", &[("age", &relative_time::ago_days(n as u64))])),
         None => None,
     }
 }
@@ -1598,9 +1599,9 @@ fn password_age_text(age_days: Option<i64>) -> Option<String> {
 /// not parse.
 fn updated_text(updated_days_ago: Option<i64>) -> String {
     match updated_days_ago {
-        Some(n) if n <= 0 => "Updated today".to_string(),
-        Some(n) => format!("Updated {}", relative_time::ago_days(n as u64)),
-        None => "Updated recently".to_string(),
+        Some(n) if n <= 0 => crate::i18n::t("detail.updated_today").to_string(),
+        Some(n) => crate::i18n::tf("detail.updated", &[("age", &relative_time::ago_days(n as u64))]),
+        None => crate::i18n::t("detail.updated_recently").to_string(),
     }
 }
 
@@ -1671,8 +1672,8 @@ pub fn should_check(enabled: bool, kind: ItemKind, password: &str) -> bool {
 /// nothing was checked at all.
 pub fn strip_segment(status: BreachStatus) -> Option<String> {
     Some(match status {
-        BreachStatus::Pending => "\u{b7} Breach check: checking\u{2026}".to_string(),
-        BreachStatus::Safe => "\u{b7} Not in any known breach".to_string(),
+        BreachStatus::Pending => crate::i18n::t("detail.breach_pending").to_string(),
+        BreachStatus::Safe => crate::i18n::t("detail.breach_safe").to_string(),
         // `breach_phrase` owns this wording, including the rule that the
         // advice never varies by count -- "seen 3 times" and "seen 40,000
         // times" mean the same thing and get the same sentence. Reused, never
@@ -1684,7 +1685,7 @@ pub fn strip_segment(status: BreachStatus) -> Option<String> {
         // [`segment_placement`]), and a separator at the start of a line is
         // a bullet with nothing in front of it.
         BreachStatus::Breached(count) => breach_phrase(count),
-        BreachStatus::Unavailable => "\u{b7} Breach check unavailable".to_string(),
+        BreachStatus::Unavailable => crate::i18n::t("detail.breach_unavailable").to_string(),
     })
 }
 
@@ -1790,18 +1791,8 @@ fn breach_segment(
 /// case here to get wrong for an ordinary item.
 pub fn out_of_vault_text(out: OutOfVault) -> (&'static str, &'static str) {
     match out {
-        OutOfVault::Trash => (
-            "This item is in the Trash.",
-            "Deskwarden does not edit, fill or copy from a trashed item -- the vault would \
-             reject the write and the fill would have nothing to type. Restore it, or delete \
-             it forever, with the buttons above.",
-        ),
-        OutOfVault::Archive => (
-            "This item is archived.",
-            "Archived items are kept out of the vault list, out of app matching and out of \
-             autofill -- which is what archiving them is for. Unarchive it with the button \
-             above, and everything it can normally do comes back.",
-        ),
+        OutOfVault::Trash => (crate::i18n::t("detail.trash_title"), crate::i18n::t("detail.trash_body")),
+        OutOfVault::Archive => (crate::i18n::t("detail.archive_title"), crate::i18n::t("detail.archive_body")),
     }
 }
 
@@ -1886,7 +1877,7 @@ pub fn draw_out_of_vault_read(
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if entries.is_empty() {
                     let p = crate::kit::tokens::palette(ui.ctx());
-                    ui.label(crate::kit::tokens::job(crate::kit::tokens::BODY, VIEW_ONLY_FOOTER, p.text_faint));
+                    ui.label(crate::kit::tokens::job(crate::kit::tokens::BODY, view_only_footer_text(), p.text_faint));
                 }
                 for entry in entries {
                     let super::item_list::MenuEntry::Command(entry) = entry else {
@@ -2134,23 +2125,23 @@ pub(crate) fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
 /// [`copy_row`] reads straight off the row it just drew.
 ///
 /// `pub(crate)` rather than private so the EDIT form can be held to the same
-/// word: `detail_edit::WEBSITE_LABEL` labels the box that fills the row this
+/// word: `detail_edit::website_label_text()` labels the box that fills the row this
 /// names, and two hand-written spellings of "Website" are two things that can
 /// drift into a read pane and an edit form disagreeing about what a field is
 /// called. See `the_edit_form_and_the_read_pane_call_a_website_the_same_thing`.
 pub(crate) fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
     match which {
-        CopyShortcut::Username => "Username",
-        CopyShortcut::Password => "Password",
-        CopyShortcut::Totp => "2FA code",
-        CopyShortcut::Url => "Website",
+        CopyShortcut::Username => crate::i18n::t("field.username"),
+        CopyShortcut::Password => crate::i18n::t("field.password"),
+        CopyShortcut::Totp => crate::i18n::t("detail.copy_2fa"),
+        CopyShortcut::Url => crate::i18n::t("detail.copy_website"),
         // The card's four, read off the very constants `card_rows` paints, so
         // the row's label, the chord's name and the toast are one string in
         // the strongest sense available: the same `const`.
-        CopyShortcut::CardNumber => NUMBER_LABEL,
-        CopyShortcut::CardExpiry => EXPIRY_LABEL,
-        CopyShortcut::CardCode => CODE_LABEL,
-        CopyShortcut::Cardholder => CARDHOLDER_LABEL,
+        CopyShortcut::CardNumber => number_label(),
+        CopyShortcut::CardExpiry => expiry_label(),
+        CopyShortcut::CardCode => code_label(),
+        CopyShortcut::Cardholder => cardholder_label(),
     }
 }
 
@@ -2225,7 +2216,7 @@ fn copy_toast_text(label: &str, verbatim: bool) -> String {
     if verbatim {
         label.to_string()
     } else {
-        format!("{label} copied")
+        crate::i18n::tf("detail.copied", &[("label", label)])
     }
 }
 
@@ -2313,8 +2304,8 @@ fn note_body_overflow(ctx: &egui::Context, overflowed: bool) {
 /// cannot name a key it is not bound to.
 fn copy_row_tooltip(hint: Option<CopyShortcut>) -> String {
     match hint {
-        Some(which) => format!("Click to copy · {}", copy_shortcut_chord(which)),
-        None => "Click to copy".to_string(),
+        Some(which) => crate::i18n::tf("detail.click_to_copy_chord", &[("chord", copy_shortcut_chord(which))]),
+        None => crate::i18n::t("detail.click_to_copy").to_string(),
     }
 }
 
@@ -2775,18 +2766,28 @@ pub(crate) enum HeaderControl {
 
 /// [`HeaderControl`]'s id.
 /// The action row's words.
-pub const FILL_LABEL: &str = "Fill";
-pub const SHARE_LABEL: &str = "Share";
-pub const EDIT_LABEL: &str = "Edit";
+pub fn fill_label() -> &'static str {
+    crate::i18n::t("detail.fill")
+}
+pub fn share_label() -> &'static str {
+    crate::i18n::t("detail.share")
+}
+pub fn edit_label() -> &'static str {
+    crate::i18n::t("detail.edit")
+}
 
 pub(crate) fn header_control_id(which: HeaderControl) -> egui::Id {
     egui::Id::new(("detail-header", which))
 }
 
 /// The more menu's entry that shares the record with a person.
-pub const SHARE_WITH_PERSON_LABEL: &str = "Share with a person";
+pub fn share_with_person_label() -> &'static str {
+    crate::i18n::t("detail.share_with_person")
+}
 /// The more menu's entry that opens the add-a-code card.
-pub const ADD_2FA_MENU_LABEL: &str = "Add 2FA code";
+pub fn add_2fa_menu_label() -> &'static str {
+    crate::i18n::t("detail.add_2fa")
+}
 
 /// Whether this frame's Esc closes the pane: pressed, and no field (nor a
 /// modal, nor an open menu) is there to take it first.
@@ -2807,7 +2808,7 @@ pub(crate) fn fill_toast(item: &VaultItem) -> String {
         })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| item.name.clone());
-    format!("Click the sign-in field in {target}")
+    crate::i18n::tf("detail.fill_toast", &[("target", &target)])
 }
 
 /// The header's avatar (spec 3.3): 72pt at radius 20.
@@ -2819,11 +2820,26 @@ const V2_ROW_GAP: f32 = 18.0;
 /// The action row's buttons, and the star's and more's squares.
 const V2_ACTION_HEIGHT: f32 = 48.0;
 
+/// The item type's name as the user reads it. `ItemKind::label` is English and sits in a
+/// module the translation system does not reach (`vault_bridge`), so every screen that
+/// draws a type name asks here.
+pub(crate) fn kind_label(kind: ItemKind) -> String {
+    match kind {
+        ItemKind::Login => crate::i18n::t("new_item.login"),
+        ItemKind::SecureNote => crate::i18n::t("new_item.note"),
+        ItemKind::Card => crate::i18n::t("new_item.card"),
+        ItemKind::Identity => crate::i18n::t("edit.sec_identity"),
+        ItemKind::SshKey => crate::i18n::t("new_item.ssh"),
+        ItemKind::Unknown(_) => crate::i18n::t("detail.unsupported_item"),
+    }
+    .to_string()
+}
+
 /// The kind as the header names it (spec 3.3: a card is a "Payment card").
 pub(crate) fn header_kind_label(kind: ItemKind) -> String {
     match kind {
-        ItemKind::Card => "Payment card".to_string(),
-        other => other.label(),
+        ItemKind::Card => crate::i18n::t("detail.payment_card").to_string(),
+        other => kind_label(other),
     }
 }
 
@@ -2870,7 +2886,7 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
         2.2,
         p.text_icon,
     );
-    kit::tips::hint(ui, &close, "Close", &["Esc"]);
+    kit::tips::hint(ui, &close, crate::i18n::t("detail.close"), &["Esc"]);
     out.close = close.clicked();
 
     // Beside the avatar when there is room for a name; under the avatar row,
@@ -3187,7 +3203,7 @@ pub fn draw_detail_read(
         .unwrap_or_default();
     // **The chord still copies the FIRST**, which is the one this item's
     // page is drawn from and its icon fetched from -- the edit form says so
-    // in as many words (`detail_edit::WEBSITE_FIRST_NOTE`). A chord that
+    // in as many words (`detail_edit::website_first_note()`). A chord that
     // asked "which one" would not be a chord.
     let website = websites.first().copied().unwrap_or("");
 
@@ -3383,9 +3399,9 @@ pub fn draw_detail_read(
                 // squares too and Share waits in the more menu.
                 let ctx = ui.ctx().clone();
                 let worded: Vec<f32> = [
-                    fills.then(|| controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, FILL_LABEL, true)),
-                    writable.then(|| controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, SHARE_LABEL, true)),
-                    edits.then(|| controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, EDIT_LABEL, true)),
+                    fills.then(|| controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, fill_label(), true)),
+                    writable.then(|| controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, share_label(), true)),
+                    edits.then(|| controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, edit_label(), true)),
                     writable.then_some(V2_ACTION_HEIGHT),
                     Some(V2_ACTION_HEIGHT),
                 ]
@@ -3401,16 +3417,16 @@ pub fn draw_detail_read(
                             kit::icon::stroke(painter, glyph, kit::icon::glyph::FILL, 2.2, egui::Color32::WHITE);
                         })
                     } else {
-                        controls::button(ui, controls::ButtonKind::Primary, controls::LARGE, FILL_LABEL, Some(kit::icon::glyph::FILL))
+                        controls::button(ui, controls::ButtonKind::Primary, controls::LARGE, fill_label(), Some(kit::icon::glyph::FILL))
                     };
-                    kit::tips::hint(ui, &fill, "Fill into the app", &[]);
+                    kit::tips::hint(ui, &fill, crate::i18n::t("detail.fill_hint"), &[]);
                     if fill.clicked() {
                         action = DetailAction::Fill;
                     }
                 }
                 if writable {
                     if !compact {
-                        let share = controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, SHARE_LABEL, Some(kit::icon::glyph::SHARED));
+                        let share = controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, share_label(), Some(kit::icon::glyph::SHARED));
                         kit::tips::hint(ui, &share, record_ui::SEND_RECORD_LABEL, &["Mod", "Shift", "S"]);
                         if share.clicked() {
                             action = DetailAction::SendRecord;
@@ -3422,9 +3438,9 @@ pub fn draw_detail_read(
                                 kit::icon::stroke(painter, glyph, kit::icon::glyph::EDIT, 2.0, p.ink);
                             })
                         } else {
-                            controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, EDIT_LABEL, Some(kit::icon::glyph::EDIT))
+                            controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, edit_label(), Some(kit::icon::glyph::EDIT))
                         };
-                        kit::tips::hint(ui, &edit, "Edit", &[]);
+                        kit::tips::hint(ui, &edit, crate::i18n::t("detail.edit_hint"), &[]);
                         if edit.clicked() {
                             action = DetailAction::Edit;
                         }
@@ -3438,7 +3454,7 @@ pub fn draw_detail_read(
                             kit::icon::stroke(painter, glyph, kit::icon::glyph::FAV, 2.0, p.text_label);
                         }
                     });
-                    kit::tips::hint(ui, &star, if on { "Remove from Favorites" } else { "Add to Favorites" }, &[]);
+                    kit::tips::hint(ui, &star, if on { crate::i18n::t("detail.unfavorite") } else { crate::i18n::t("detail.favorite") }, &[]);
                     if star.clicked() {
                         action = DetailAction::ToggleFavorite(!on);
                     }
@@ -3446,7 +3462,7 @@ pub fn draw_detail_read(
                 let more = square_button(ui, HeaderControl::More, |painter, glyph| {
                     kit::icon::stroke(painter, glyph, kit::icon::glyph::MORE, 3.0, p.text_icon);
                 });
-                kit::tips::hint(ui, &more, "More", &[]);
+                kit::tips::hint(ui, &more, crate::i18n::t("detail.more"), &[]);
                 egui::Popup::menu(&more)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show(|ui| {
@@ -3470,7 +3486,7 @@ pub fn draw_detail_read(
                     if !writable {
                         let footer = people
                             .view_only_from
-                            .map_or_else(|| VIEW_ONLY_FOOTER.to_string(), |from| view_only_footer(from, people.view_only_unverified));
+                            .map_or_else(|| view_only_footer_text().to_string(), |from| view_only_footer(from, people.view_only_unverified));
                         ui.set_width(VIEW_ONLY_MENU_WIDTH);
                         // **Stop receiving (spec 6.9), the one entry**, and
                         // only on a record the view names a sharer for and
@@ -3502,14 +3518,14 @@ pub fn draw_detail_read(
                     // `item_list::icon_menu` is unchanged and still decides
                     // which of the three a given item is offered; see
                     // `detail_edit`'s `edit_header`, its one reader.
-                    if compact_actions && ui.button(SHARE_LABEL).clicked() {
+                    if compact_actions && ui.button(share_label()).clicked() {
                         action = DetailAction::SendRecord;
                         ui.close();
                     }
                     match people.share_control {
                         Some(ShareControl::Share) => {
                             if ui
-                                .button(SHARE_WITH_PERSON_LABEL)
+                                .button(share_with_person_label())
                                 .on_hover_text(super::share_ui::SHARE_TOOLTIP)
                                 .clicked()
                             {
@@ -3518,12 +3534,12 @@ pub fn draw_detail_read(
                             }
                         }
                         Some(ShareControl::Disabled(why)) => {
-                            ui.add_enabled(false, egui::Button::new(SHARE_WITH_PERSON_LABEL))
+                            ui.add_enabled(false, egui::Button::new(share_with_person_label()))
                                 .on_disabled_hover_text(why);
                         }
                         None => {}
                     }
-                    if item_takes_a_one_time_code(item) && ui.button(ADD_2FA_MENU_LABEL).clicked() {
+                    if item_takes_a_one_time_code(item) && ui.button(add_2fa_menu_label()).clicked() {
                         action = DetailAction::AddTotp;
                         ui.close();
                     }
@@ -3555,11 +3571,10 @@ pub fn draw_detail_read(
                     // payload" -- an SSH key satisfies only the second, and
                     // cloning one would POST an empty key.
                     if kind_offers_clone(kind) {
-                        let clone = ui.button("Clone");
+                        let clone = ui.button(crate::i18n::t("detail.clone"));
                         if clone
                             .on_hover_text(
-                                "Open a new item pre-filled from this one. Nothing is saved \
-                                 until you press Save.",
+                                crate::i18n::t("detail.clone_hover"),
                             )
                             .clicked()
                         {
@@ -3586,7 +3601,7 @@ pub fn draw_detail_read(
                     // item's folder is not a property of its type, and
                     // `move_menu` files a card or an SSH key exactly as it
                     // files a login.
-                    ui.menu_button(super::item_list::MOVE_TO_FOLDER_LABEL, |ui| {
+                    ui.menu_button(super::item_list::move_to_folder_label(), |ui| {
                         match super::item_list::move_menu(item, folders, may_unfile) {
                             super::item_list::MoveMenu::Targets(targets) => {
                                 for target in &targets {
@@ -3677,11 +3692,11 @@ pub fn draw_detail_read(
                     // because the tooltip and the reported action are this
                     // pane's, not the list's -- see that function's doc.
                     let entry = super::item_list::plain_command(
-                        super::item_list::DELETE_LABEL,
+                        super::item_list::delete_label(),
                         super::item_list::RowCommand::Delete,
                     );
                     let delete = super::item_list::menu_command_button(ui, &entry);
-                    if delete.on_hover_text("Delete this item").clicked() {
+                    if delete.on_hover_text(crate::i18n::t("detail.delete_hover")).clicked() {
                         action = DetailAction::Delete;
                         // Closes, like Edit and Clone above it. The one
                         // entry in this menu that deliberately did NOT close
@@ -3748,7 +3763,7 @@ pub fn draw_detail_read(
             // the match below consumes it.
             let has_code = code.is_some();
             if has_code || seed {
-                card(ui, TOTP_CARD_HEADING, |ui| {
+                card(ui, totp_card_heading(), |ui| {
                     // Exhaustive on purpose -- no catch-all arm -- so a new
                     // `TotpRow` variant fails to compile here instead of
                     // silently inheriting whatever the last arm happened to
@@ -3779,7 +3794,7 @@ pub fn draw_detail_read(
                         }
                         masked_row(
                         ui,
-                        TOTP_SECRET_LABEL,
+                        totp_secret_label(),
                         totp_secret,
                         // Per-view, not sticky: this flag is cleared by the
                         // selection-change reset in `vault_window::mod`'s
@@ -3818,21 +3833,21 @@ pub fn draw_detail_read(
                     card_field_card(ui, &fields, super::item_list::card_network(item), reveal, &mut action, vault);
                 }
                 None => {
-                    card(ui, "CARD DETAILS", |ui| {
-                        empty_pane_note(ui, "No card details on this item.");
+                    card(ui, crate::i18n::t("detail.card_heading"), |ui| {
+                        empty_pane_note(ui, crate::i18n::t("detail.no_card"));
                     });
                 }
             }
             ui.add_space(CARD_GAP);
         }
         DetailBody::Identity => {
-            card(ui, "IDENTITY", |ui| {
+            card(ui, crate::i18n::t("detail.identity_heading"), |ui| {
                 identity_rows(ui, item.identity.as_ref().map(identity_groups), &mut action);
             });
             ui.add_space(CARD_GAP);
         }
         DetailBody::SshKey => {
-            card(ui, "SSH KEY", |ui| {
+            card(ui, crate::i18n::t("detail.ssh_heading"), |ui| {
                 ssh_key_rows(ui, item.ssh_key.as_ref().map(ssh_key_fields), reveal, &mut action);
             });
             ui.add_space(10.0);
@@ -3860,7 +3875,7 @@ pub fn draw_detail_read(
         .iter()
         .any(|entry| masked_row_visible(entry.password.as_str()))
     {
-        card(ui, "PREVIOUS PASSWORDS", |ui| {
+        card(ui, crate::i18n::t("detail.previous_passwords"), |ui| {
             history_rows(ui, &history, &mut reveal.password_history, &mut action);
         });
         ui.add_space(CARD_GAP);
@@ -3888,7 +3903,7 @@ pub fn draw_detail_read(
     // asking `app_match.is_some()` filed it as "no field at all" and hid the
     // card outright on a non-fillable kind. See `app_card_body`.
     if app_card_visible(app_field_present) {
-        card(ui, APP_CARD_HEADING, |ui| {
+        card(ui, app_card_heading(), |ui| {
             app_match_card(
                 ui,
                 app_match.as_ref(),
@@ -3913,7 +3928,7 @@ pub fn draw_detail_read(
     // the absent-rather-than-empty rule the rest of this pane follows.
     let custom_fields = custom_field_rows(item);
     if !custom_fields.is_empty() {
-        card(ui, CUSTOM_FIELDS_CARD_HEADING, |ui| {
+        card(ui, custom_fields_card_heading(), |ui| {
             custom_fields_card_rows(ui, &custom_fields, reveal, &mut action);
         });
         ui.add_space(CARD_GAP);
@@ -3938,7 +3953,7 @@ pub fn draw_detail_read(
     let has_people = !people.people.is_empty();
     if shared.is_some() || has_people || people.notice.is_some() {
         let side = has_people.then_some(super::share_ui::SHARING_SIDE);
-        card_with_side(ui, SHARING_CARD_HEADING, side, |ui| {
+        card_with_side(ui, sharing_card_heading(), side, |ui| {
             if has_people {
                 super::share_ui::draw_people_block(ui, &item.name, &people, &mut action);
             }
@@ -3948,7 +3963,7 @@ pub fn draw_detail_read(
             let note = if has_people {
                 Some(super::share_ui::PEOPLE_NOTE)
             } else {
-                shared.map(|_| SHARING_NOTE)
+                shared.map(|_| sharing_note())
             };
             super::share_ui::draw_card_note(ui, people.notice, note);
         });
@@ -3972,7 +3987,7 @@ pub fn draw_detail_read(
     // other: a secure note draws no body card of its own, so its NOTES card
     // is last by the same rule as every other kind rather than by accident.
     if let Some(notes) = notes_text(item) {
-        card(ui, "NOTES", |ui| {
+        card(ui, crate::i18n::t("detail.notes_heading"), |ui| {
             notes_body(ui, &item.id, notes, &mut action);
         });
         ui.add_space(CARD_GAP);
@@ -4129,7 +4144,9 @@ pub fn draw_detail_read(
 /// heading honest about what the rows underneath are: a web address and a
 /// Windows executable are matched by two different engines against two
 /// different things.
-const APP_CARD_HEADING: &str = "MATCHED APP";
+fn app_card_heading() -> &'static str {
+    crate::i18n::t("detail.matched_app")
+}
 
 /// What the card says when the item is bound to nothing.
 ///
@@ -4140,9 +4157,9 @@ const APP_CARD_HEADING: &str = "MATCHED APP";
 /// -- so there is no way for this pane to raise it without restructuring
 /// `main.rs`. Saying nothing at all was the alternative, and it leaves a user
 /// looking at an empty card with no idea that the feature exists.
-const APP_MATCH_EMPTY_NOTICE: &str =
-    "No app is matched to this item yet. Use \"Add app...\" in the Deskwarden tray menu to \
-     pick a window, and it will show up here.";
+fn app_match_empty_notice() -> &'static str {
+    crate::i18n::t("detail.app_empty")
+}
 
 /// What the card says under the rows when the match was captured off a
 /// Microsoft Store / UWP frame.
@@ -4153,8 +4170,9 @@ const APP_MATCH_EMPTY_NOTICE: &str =
 /// than on an executable name, because that is what makes it behave
 /// differently -- it is the only match that keeps working while the app is
 /// suspended, and the only one a renamed window can break.
-const APP_HOSTED_NOTE: &str =
-    "Matched by its window title, because this is a Microsoft Store app.";
+fn app_hosted_note() -> &'static str {
+    crate::i18n::t("detail.app_hosted")
+}
 
 /// What the card says under the rows about a live binding: what focusing this
 /// app does.
@@ -4178,8 +4196,9 @@ const APP_HOSTED_NOTE: &str =
 /// 298pt pane, which is the third time this card has been made unreachable.
 /// `the_matched_app_card_is_reachable_on_the_shortest_window` is what caught
 /// it and is what any re-wording has to answer to.
-const APP_MATCH_BEHAVIOUR_NOTE: &str =
-    "Press CTRL+ALT+B while this app is focused to fill it. See Prompt on match in Preferences.";
+fn app_match_behaviour_note() -> &'static str {
+    crate::i18n::t("detail.app_behaviour")
+}
 
 /// What the card says under the rows when the match exists but the engine
 /// will never act on it -- see [`app_match_is_dead`].
@@ -4195,11 +4214,9 @@ const APP_MATCH_BEHAVIOUR_NOTE: &str =
 /// ways out the picker names: re-add through the tray, or clear it. Unlike
 /// every other note on this card, the process name it is about is already in
 /// the App row directly above, so this sentence does not repeat it.
-const APP_MATCH_DEAD_NOTICE: &str =
-    "Deskwarden is ignoring this match, so it never fires: that process owns the window for \
-     every Microsoft Store app, and no window title was recorded to tell those apps apart. \
-     Nothing in your vault has been changed. Use \u{201c}Add app\u{2026}\u{201d} in the \
-     Deskwarden tray menu to pick the app again, or Remove to clear it.";
+fn app_match_dead_notice() -> &'static str {
+    crate::i18n::t("detail.app_dead")
+}
 
 /// What the card says when the item carries a `deskwarden:app-match` field
 /// whose value this build cannot read -- see
@@ -4212,12 +4229,9 @@ const APP_MATCH_DEAD_NOTICE: &str =
 /// honestly do with it: the value cannot be repaired from a shape nothing can
 /// parse, and `without_app_match` clears it on the field's NAME and so works
 /// perfectly on exactly this case.
-const APP_MATCH_UNREADABLE_NOTICE: &str =
-    "This item has a Deskwarden app match that cannot be read \u{2014} the \
-     \u{201c}deskwarden:app-match\u{201d} custom field is there, but its contents are not \
-     something this version understands, which usually means it was edited by hand in \
-     another Bitwarden client. Autofill ignores it. Remove clears the field, and \
-     \u{201c}Add app\u{2026}\u{201d} in the Deskwarden tray menu can bind this item again.";
+fn app_match_unreadable_notice() -> &'static str {
+    crate::i18n::t("detail.app_unreadable")
+}
 
 /// Whether [`MatchEngine`](crate::match_engine::MatchEngine) has dropped this
 /// match -- i.e. whether the binding the card is about **can never fire**.
@@ -4342,9 +4356,13 @@ fn app_card_body(app_match: Option<&AppMatch>, field_present: bool) -> AppCardBo
 /// remove, which is the exact defect this card was added to end. An
 /// unreadable field IS a binding; only its text is lost.
 /// The "Fills in" card's words (spec 3.3).
-pub const FILLS_IN_LABEL: &str = "Fills in";
+pub fn fills_in_label() -> &'static str {
+    crate::i18n::t("detail.fills_in")
+}
 /// Spec 3.3's `fills` tip.
-const FILLS_TIP: &str = "Deskwarden suggests this login when one of these apps or sites asks you to sign in.";
+fn fills_tip() -> &'static str {
+    crate::i18n::t("detail.fills_tip")
+}
 
 /// A website as its chip shows it: no scheme, no path.
 fn fills_in_site_label(uri: &str) -> &str {
@@ -4380,14 +4398,14 @@ fn fills_in_card(ui: &mut egui::Ui, websites: &[&str]) -> Option<DetailAction> {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(tokens::job(tokens::LABEL, FILLS_IN_LABEL, p.text_label));
-            kit::tips::help_dot(ui, ui.id().with("fills-tip"), FILLS_TIP, 260.0, kit::tips::Placement::Above);
+            ui.label(tokens::job(tokens::LABEL, fills_in_label(), p.text_label));
+            kit::tips::help_dot(ui, ui.id().with("fills-tip"), fills_tip(), 260.0, kit::tips::Placement::Above);
         });
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             for uri in websites {
-                let chip = fills_in_chip(ui, kit::icon::glyph::WEB, fills_in_site_label(uri)).on_hover_text("Open in browser");
+                let chip = fills_in_chip(ui, kit::icon::glyph::WEB, fills_in_site_label(uri)).on_hover_text(crate::i18n::t("detail.open_in_browser"));
                 if chip.clicked() {
                     chosen = Some(DetailAction::OpenWebsite((*uri).to_string()));
                 }
@@ -4478,7 +4496,7 @@ struct AppRow {
 ///    function.
 fn app_match_rows(m: &AppMatch, name: &str) -> Vec<AppRow> {
     let mut rows = vec![AppRow {
-        label: "App",
+        label: crate::i18n::t("detail.row_app"),
         // **`name`, not `m.process`** -- the whole of the user's report.
         // Resolved by `AppIdentityCache` off the path
         // [`app_name_lookup_path`] chose, and passed in rather than looked up
@@ -4491,7 +4509,7 @@ fn app_match_rows(m: &AppMatch, name: &str) -> Vec<AppRow> {
     }];
     if m.hosted && !m.title.is_empty() {
         rows.push(AppRow {
-            label: "Window title",
+            label: crate::i18n::t("detail.row_window_title"),
             value: m.title.clone(),
             copy: m.title.clone(),
             real: true,
@@ -4500,7 +4518,7 @@ fn app_match_rows(m: &AppMatch, name: &str) -> Vec<AppRow> {
     }
     if row_offers_copy(&m.path) {
         rows.push(AppRow {
-            label: "Program file",
+            label: crate::i18n::t("detail.row_program_file"),
             value: m.path.clone(),
             copy: m.path.clone(),
             real: true,
@@ -4808,38 +4826,35 @@ fn app_open_refusal(m: &AppMatch) -> Option<&'static str> {
         return None;
     }
     if m.hosted {
-        return Some(APP_OPEN_HOSTED_NOTE);
+        return Some(app_open_hosted_note());
     }
     if m.path.is_empty() {
-        return Some(APP_OPEN_NO_PATH_NOTE);
+        return Some(app_open_no_path_note());
     }
     if m.launchable_path().is_none() {
-        return Some(APP_OPEN_REFUSED_NOTE);
+        return Some(app_open_refused_note());
     }
     None
 }
 
 /// Why a Microsoft Store app gets no Open. The word `hosted` stays off the
 /// screen, exactly as it does in [`APP_HOSTED_NOTE`].
-const APP_OPEN_HOSTED_NOTE: &str =
-    "Deskwarden can\u{2019}t start this one for you: Microsoft Store apps are opened through \
-     Windows rather than by running a program file. Use the Start menu.";
+fn app_open_hosted_note() -> &'static str {
+    crate::i18n::t("detail.open_hosted")
+}
 
 /// Why a match saved before `path` existed gets no Open.
-const APP_OPEN_NO_PATH_NOTE: &str =
-    "Deskwarden can\u{2019}t start this app: no program file was recorded when it was matched. \
-     Use \u{201c}Add app\u{2026}\u{201d} in the Deskwarden tray menu to pick it again, and the \
-     program file will be recorded this time.";
+fn app_open_no_path_note() -> &'static str {
+    crate::i18n::t("detail.open_no_path")
+}
 
 /// Why a recorded path this build will not execute gets no Open. It does not
 /// repeat the path -- the Program file row directly above is showing it, which
 /// is the whole reason that row shows `path` raw rather than through
 /// `launchable_path`.
-const APP_OPEN_REFUSED_NOTE: &str =
-    "Deskwarden won\u{2019}t start the program file above: it isn\u{2019}t a plain drive path \
-     ending in this app\u{2019}s own executable name, so it can\u{2019}t be trusted to be the \
-     program that was matched. Re-add the app from the Deskwarden tray menu to record it \
-     again.";
+fn app_open_refused_note() -> &'static str {
+    crate::i18n::t("detail.open_refused")
+}
 
 /// One thing the card's Open control can do.
 ///
@@ -4888,8 +4903,8 @@ fn app_open_choices(m: &AppMatch, website: &str) -> Vec<OpenChoice> {
 /// executable's name.
 fn open_choice_label(choice: &OpenChoice) -> String {
     match choice {
-        OpenChoice::App { name, .. } => format!("Open {name}"),
-        OpenChoice::Website(_) => OPEN_WEBSITE_LABEL.to_string(),
+        OpenChoice::App { name, .. } => crate::i18n::tf("detail.open_named", &[("name", name)]),
+        OpenChoice::Website(_) => open_website_label().to_string(),
     }
 }
 
@@ -4897,8 +4912,8 @@ fn open_choice_label(choice: &OpenChoice) -> String {
 /// website, the URL and where it goes. See [`command_line`].
 fn open_choice_hover(choice: &OpenChoice) -> String {
     match choice {
-        OpenChoice::App { plan, .. } => format!("Runs {}", command_line(plan)),
-        OpenChoice::Website(url) => format!("Opens {url} in your default browser"),
+        OpenChoice::App { plan, .. } => crate::i18n::tf("detail.runs", &[("command", &command_line(plan))]),
+        OpenChoice::Website(url) => crate::i18n::tf("detail.opens_url", &[("url", url)]),
     }
 }
 
@@ -4939,10 +4954,16 @@ fn app_name_open_action(m: &AppMatch, website: &str) -> Option<DetailAction> {
 
 /// The website entry's label. A constant so the source pin and the draw site
 /// cannot drift.
-const OPEN_WEBSITE_LABEL: &str = "Open website";
+fn open_website_label() -> &'static str {
+    crate::i18n::t("detail.open_website")
+}
 /// The menu button's own label, when there are two choices behind it.
-const OPEN_MENU_LABEL: &str = "Open";
-const OPEN_MENU_HOVER: &str = "Open this item\u{2019}s app or its website";
+fn open_menu_label() -> &'static str {
+    crate::i18n::t("detail.open")
+}
+fn open_menu_hover() -> &'static str {
+    crate::i18n::t("detail.open_hover")
+}
 
 /// The card's footer lines, under the rows: what focusing this app does, and
 /// -- for a Store app -- why this match is keyed on a title.
@@ -4954,11 +4975,11 @@ const OPEN_MENU_HOVER: &str = "Open this item\u{2019}s app or its website";
 /// failed to be.
 fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
     if app_match_is_dead(m) {
-        return vec![APP_MATCH_DEAD_NOTICE];
+        return vec![app_match_dead_notice()];
     }
-    let mut notes = vec![APP_MATCH_BEHAVIOUR_NOTE];
+    let mut notes = vec![app_match_behaviour_note()];
     if m.hosted {
-        notes.push(APP_HOSTED_NOTE);
+        notes.push(app_hosted_note());
     }
     // Last, under the caption that says what the match does, because it is
     // about a control the user is looking for and cannot see. See
@@ -5041,7 +5062,7 @@ fn app_match_card(
         AppCardBody::Unbound => {
             card_text(
                 ui,
-                RichText::new(APP_MATCH_EMPTY_NOTICE)
+                RichText::new(app_match_empty_notice())
                     .size(ROW_LABEL_SIZE)
                     .color(theme::TEXT_FAINT),
             );
@@ -5052,7 +5073,7 @@ fn app_match_card(
         // value. The notice says what is wrong, and Remove -- the same
         // control, in the same column, as the bound card's -- clears it.
         AppCardBody::Unreadable => {
-            app_notice_with_remove(ui, APP_MATCH_UNREADABLE_NOTICE, removable, action);
+            app_notice_with_remove(ui, app_match_unreadable_notice(), removable, action);
             return;
         }
     };
@@ -5093,7 +5114,9 @@ fn app_match_card(
 
 /// The word on the card's one destructive control, in one place, so the
 /// button and every test that names it read one string.
-const APP_REMOVE_LABEL: &str = "Remove";
+fn app_remove_label() -> &'static str {
+    crate::i18n::t("detail.app_remove")
+}
 
 /// One of the card's real rows: [`credential_row`], except that the value
 /// **wraps**.
@@ -5231,7 +5254,7 @@ fn app_name_row(
             match open {
                 Some(_) => {
                     opened = theme::link_galley(ui, galley)
-                        .on_hover_text(format!("{APP_OPEN_HOVER} \u{b7} {}", OPEN_APP_CHORD.2))
+                        .on_hover_text(crate::i18n::tf("detail.open_app_chord", &[("hover", app_open_hover()), ("chord", OPEN_APP_CHORD.2)]))
                         .clicked();
                 }
                 None => {
@@ -5266,7 +5289,9 @@ fn app_name_row(
 /// and nothing else may. **It carries the chord**, which is what keeps the
 /// shortcut discoverable on the narrow panes where [`app_row_chord_fits`]
 /// declines to paint it.
-const APP_OPEN_HOVER: &str = "Open this app";
+fn app_open_hover() -> &'static str {
+    crate::i18n::t("detail.app_open_hover")
+}
 
 /// The least room the app's NAME may be laid out in. Below this a name is
 /// broken across a line per word or worse, and the row grows into a ribbon.
@@ -5505,14 +5530,22 @@ fn app_card_footer(
 }
 
 /// **Design 5d's card**: what is out there right now, and the way to stop it.
-pub const SHARING_CARD_HEADING: &str = "SHARING";
+pub fn sharing_card_heading() -> &'static str {
+    crate::i18n::t("detail.sharing_heading")
+}
 
 /// The row's label column. 5d's own word for the one thing this card lists.
-const ACTIVE_SEND_LABEL: &str = "Active Send";
+fn active_send_label() -> &'static str {
+    crate::i18n::t("detail.active_send")
+}
 
 /// 5d's two controls.
-pub const REVOKE_LABEL: &str = "Revoke";
-pub const SEND_AGAIN_LABEL: &str = "Send again";
+pub fn revoke_label() -> &'static str {
+    crate::i18n::t("detail.revoke")
+}
+pub fn send_again_label() -> &'static str {
+    crate::i18n::t("detail.send_again")
+}
 
 /// What the card says about a live Send's reach.
 ///
@@ -5520,11 +5553,14 @@ pub const SEND_AGAIN_LABEL: &str = "Send again";
 /// recipient -- it is a link, and anybody holding it can open it -- which is
 /// the same fact that keeps 5a's `Recipient` field and its two toggles
 /// unbuilt. The design's line names a person; this one names what is true.
-pub const SEND_REACH: &str = "Anyone with the link";
+pub fn send_reach() -> &'static str {
+    crate::i18n::t("detail.send_reach")
+}
 
 /// 5d's note under the card, which is the pill's whole meaning.
-pub const SHARING_NOTE: &str =
-    "The pill disappears on its own when the Send expires or is revoked \u{2014} it always      means someone can open this right now, never \"was shared once\".";
+pub fn sharing_note() -> &'static str {
+    crate::i18n::t("detail.sharing_note")
+}
 
 /// **The live Send the SHARING card is about, and where its revoke has got
 /// to.**
@@ -5636,11 +5672,11 @@ fn sharing_card(
     use super::share_ui::{EntryPill, EntryTile};
     let send = shared.send;
     let state = crate::send::send_state(send, now);
-    super::share_ui::sharing_block(ui, super::share_ui::BlockMark::Plane, ACTIVE_SEND_LABEL, |ui| {
+    super::share_ui::sharing_block(ui, super::share_ui::BlockMark::Plane, active_send_label(), |ui| {
         // The room the controls keep in every state is the resting pair's, so
         // the question, the running delete and the resting row lay the text
         // out alike and nothing moves between them.
-        let room = super::share_ui::controls_room(ui, &[REVOKE_LABEL, SEND_AGAIN_LABEL]);
+        let room = super::share_ui::controls_room(ui, &[revoke_label(), send_again_label()]);
         super::share_ui::sharing_entry(
             ui,
             EntryTile::Send,
@@ -5648,7 +5684,7 @@ fn sharing_card(
             |ui| {
                 super::share_ui::entry_title(
                     ui,
-                    SEND_REACH,
+                    send_reach(),
                     EntryPill::Send(send_ui::state_tone(state), send_ui::state_label(state)),
                 );
                 let _ = super::share_ui::entry_line(ui, &send_ui::row_subtitle(send, now), None);
@@ -5680,14 +5716,14 @@ fn sharing_card(
                 // that takes something away reads last. In the danger ink now
                 // that it deletes, as the Sent screen's Revoke is red; step
                 // one still destroys nothing.
-                if theme::row_button_danger(ui, REVOKE_LABEL)
-                    .on_hover_text("Delete this Send, so its link stops working for good")
+                if theme::row_button_danger(ui, revoke_label())
+                    .on_hover_text(crate::i18n::t("detail.revoke_hover"))
                     .clicked()
                 {
                     *action = DetailAction::RevokeSend;
                 }
-                if theme::row_button(ui, SEND_AGAIN_LABEL)
-                    .on_hover_text("Publish a new link for this record")
+                if theme::row_button(ui, send_again_label())
+                    .on_hover_text(crate::i18n::t("detail.send_again_hover"))
                     .clicked()
                 {
                     *action = DetailAction::SendRecord;
@@ -5725,8 +5761,8 @@ fn sharing_card(
 ///
 /// **One click, no arming.** See the module note above this pair.
 fn app_card_remove_control(ui: &mut egui::Ui, action: &mut DetailAction) {
-    if theme::row_button(ui, APP_REMOVE_LABEL)
-        .on_hover_text("Stop autofilling this item into that app")
+    if theme::row_button(ui, app_remove_label())
+        .on_hover_text(crate::i18n::t("detail.app_remove_hover"))
         .clicked()
     {
         *action = DetailAction::RemoveAppMatch;
@@ -5759,7 +5795,7 @@ fn app_card_open_control(ui: &mut egui::Ui, choices: &[OpenChoice], action: &mut
         // Both. The user's own words: "show dropdown exe or web if both
         // present".
         many => {
-            let open = theme::row_button(ui, OPEN_MENU_LABEL).on_hover_text(OPEN_MENU_HOVER);
+            let open = theme::row_button(ui, open_menu_label()).on_hover_text(open_menu_hover());
             egui::Popup::menu(&open).show(|ui| {
                 for choice in many {
                     if ui
@@ -6360,13 +6396,15 @@ fn notes_body(ui: &mut egui::Ui, item_id: &str, notes: &str, action: &mut Detail
     // and the selection half needs no code at all.
     if tile.clicked() || text.clicked() {
         *action = DetailAction::CopyValue(notes.to_string());
-        note_copied(ui.ctx(), NOTES_COPY_LABEL);
+        note_copied(ui.ctx(), notes_copy_label());
     }
 }
 
 /// What the NOTES card's copy confirmation says. Named once so the toast and
 /// the test cannot disagree about it.
-const NOTES_COPY_LABEL: &str = "Notes";
+fn notes_copy_label() -> &'static str {
+    crate::i18n::t("detail.notes")
+}
 
 /// The note's `TextEdit` id: **this constant AND the item's own id**.
 ///
@@ -7193,7 +7231,7 @@ fn masked_row(
             // after the tile's own background widget, so egui gives it the
             // click instead -- see `copy_row`.
             if theme::eye_toggle(ui, *revealed)
-                .on_hover_text(if *revealed { "Hide" } else { "Reveal" })
+                .on_hover_text(if *revealed { crate::i18n::t("detail.hide") } else { crate::i18n::t("detail.reveal") })
                 .clicked()
             {
                 *revealed = !*revealed;
@@ -7247,9 +7285,15 @@ fn empty_pane_note(ui: &mut egui::Ui, text: &str) {
 /// to reach for and a sixth field has to go through [`CardFields`] (where
 /// `is_empty`'s destructuring makes it a compile error) to reach the pane.
 /// The hero's face labels (spec 3.3), set in tracked capitals.
-pub const HERO_HOLDER: &str = "CARD HOLDER";
-pub const HERO_EXPIRES: &str = "EXPIRES";
-pub const HERO_CODE: &str = "CODE";
+pub fn hero_holder() -> &'static str {
+    crate::i18n::t("detail.hero_holder")
+}
+pub fn hero_expires() -> &'static str {
+    crate::i18n::t("detail.hero_expires")
+}
+pub fn hero_code() -> &'static str {
+    crate::i18n::t("detail.hero_code")
+}
 
 /// The hero's 135deg gradient at `t` along its diagonal (0 top-left, 1
 /// bottom-right): `b` until 45%, then on towards the ink it would reach at
@@ -7392,10 +7436,10 @@ fn card_hero(
     let mut x = inner.left();
     let code = fields.code.as_deref().unwrap_or("");
     let columns = [
-        (HERO_HOLDER, fields.cardholder.clone().unwrap_or_else(|| "\u{2014}".to_string())),
-        (HERO_EXPIRES, fields.expiry.clone().unwrap_or_else(|| "\u{2014}".to_string())),
+        (hero_holder(), fields.cardholder.clone().unwrap_or_else(|| "\u{2014}".to_string())),
+        (hero_expires(), fields.expiry.clone().unwrap_or_else(|| "\u{2014}".to_string())),
         (
-            HERO_CODE,
+            hero_code(),
             if code.is_empty() {
                 "\u{2014}".to_string()
             } else if reveal.card_code {
@@ -7413,11 +7457,11 @@ fn card_hero(
     // overlong name ends in an ellipsis rather than pushing them off.
     let limit = if net.is_some() { inner.right() - 76.0 * k - 8.0 * k } else { inner.right() };
     let natural = |label: &str, value: &str| galley(label_role, label, faint).size().x.max(galley(value_role, value, white).size().x);
-    let others = natural(HERO_EXPIRES, &columns[1].1) + natural(HERO_CODE, &columns[2].1) + (16.0 * 2.0 + 32.0) * k;
+    let others = natural(hero_expires(), &columns[1].1) + natural(hero_code(), &columns[2].1) + (16.0 * 2.0 + 32.0) * k;
     let holder_room = (limit - inner.left() - others).max(24.0 * k);
     for (label, value) in columns {
         let l = galley(label_role, label, faint);
-        let v = if label == HERO_HOLDER {
+        let v = if label == hero_holder() {
             let mut job = tokens::job(value_role, &value, white);
             job.wrap = egui::text::TextWrapping::truncate_at_width(holder_room);
             ctx.fonts_mut(|f| f.layout_job(job))
@@ -7428,7 +7472,7 @@ fn card_hero(
         let value_w = v.size().x;
         ui.painter().galley(egui::pos2(x, label_y), l, faint);
         ui.painter().galley(egui::pos2(x, label_y + label_h + 2.0), v, white);
-        if label == HERO_CODE && !code.is_empty() {
+        if label == hero_code() && !code.is_empty() {
             let at = egui::Rect::from_center_size(egui::pos2(x + value_w + (8.0 + 12.0) * k, label_y + label_h + 2.0 + value_h / 2.0), egui::Vec2::splat(24.0 * k));
             let response = ui.interact(at, ui.id().with("hero-code-eye"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
             ui.painter().circle_filled(at.center(), 12.0 * k, egui::Color32::from_white_alpha(if response.hovered() { 71 } else { 36 }));
@@ -7438,7 +7482,7 @@ fn card_hero(
                 reveal.card_code = !reveal.card_code;
             }
         }
-        x += w + (16.0 + if label == HERO_CODE { 32.0 } else { 0.0 }) * k;
+        x += w + (16.0 + if label == hero_code() { 32.0 } else { 0.0 }) * k;
     }
     // The network's mark, in a 76 x 34 box at the right: the user's own
     // picture if they supplied one, else the bundled mark (78 x 30, at most
@@ -7491,9 +7535,9 @@ fn card_field_card(
         };
         if let Some(holder) = fields.cardholder.as_deref() {
             rule(ui);
-            if field::single(ui, CARDHOLDER_LABEL, holder, 0.0, None).copy {
+            if field::single(ui, cardholder_label(), holder, 0.0, None).copy {
                 *action = DetailAction::CopyValue(holder.to_string());
-                note_copied(ui.ctx(), CARDHOLDER_LABEL);
+                note_copied(ui.ctx(), cardholder_label());
             }
         }
         if let Some(number) = fields.number.as_deref() {
@@ -7503,13 +7547,13 @@ fn card_field_card(
             } else {
                 crate::card_brand::mask_for(number, network)
             };
-            let row = field::single(ui, NUMBER_LABEL, &shown, 0.06, Some(reveal.card_number));
+            let row = field::single(ui, number_label(), &shown, 0.06, Some(reveal.card_number));
             if row.reveal {
                 reveal.card_number = !reveal.card_number;
             }
             if row.copy {
                 *action = DetailAction::CopyCardNumber;
-                note_copied(ui.ctx(), NUMBER_LABEL);
+                note_copied(ui.ctx(), number_label());
             }
         }
         if fields.expiry.is_some() || fields.code.is_some() {
@@ -7526,19 +7570,19 @@ fn card_field_card(
             };
             let (a, b) = field::pair(
                 ui,
-                field::Cell { label: EXPIRY_LABEL, value: expiry, tracking_em: 0.0, secret: None },
-                field::Cell { label: CODE_LABEL, value: &code_shown, tracking_em: 0.12, secret: (!code.is_empty()).then_some(reveal.card_code) },
+                field::Cell { label: expiry_label(), value: expiry, tracking_em: 0.0, secret: None },
+                field::Cell { label: code_label(), value: &code_shown, tracking_em: 0.12, secret: (!code.is_empty()).then_some(reveal.card_code) },
             );
             if a.copy && fields.expiry.is_some() {
                 *action = DetailAction::CopyValue(expiry.to_string());
-                note_copied(ui.ctx(), EXPIRY_LABEL);
+                note_copied(ui.ctx(), expiry_label());
             }
             if b.reveal {
                 reveal.card_code = !reveal.card_code;
             }
             if b.copy && !code.is_empty() {
                 *action = DetailAction::CopyCardCode;
-                note_copied(ui.ctx(), CODE_LABEL);
+                note_copied(ui.ctx(), code_label());
             }
         }
         if let Some(pin) = fields.pin.as_ref() {
@@ -7559,16 +7603,16 @@ fn card_field_card(
         if let Some(domain) = fields.bank.as_deref() {
             rule(ui);
             let name = bank_name(domain, vault);
-            if field::single(ui, CARD_BANK_LABEL, &name, 0.0, None).copy {
+            if field::single(ui, card_bank_label(), &name, 0.0, None).copy {
                 *action = DetailAction::CopyValue(name.clone());
-                note_copied(ui.ctx(), CARD_BANK_LABEL);
+                note_copied(ui.ctx(), card_bank_label());
             }
         }
         if let Some(zip) = fields.billing_zip.as_deref() {
             rule(ui);
-            if field::single(ui, CARD_BILLING_ZIP_LABEL, zip, 0.0, None).copy {
+            if field::single(ui, card_billing_zip_label(), zip, 0.0, None).copy {
                 *action = DetailAction::CopyValue(zip.to_string());
-                note_copied(ui.ctx(), CARD_BILLING_ZIP_LABEL);
+                note_copied(ui.ctx(), card_billing_zip_label());
             }
         }
     });
@@ -7581,9 +7625,15 @@ fn card_field_card(
 /// `Expires` and `Code` rather than `Expiry` and `Security code`: they share a
 /// line now, and the two long forms do not fit beside one another on a pane
 /// this app can actually be. The words are the design's own.
-const NUMBER_LABEL: &str = "Card number";
-const EXPIRY_LABEL: &str = "Expires";
-const CODE_LABEL: &str = "Security code";
+fn number_label() -> &'static str {
+    crate::i18n::t("detail.card_number")
+}
+fn expiry_label() -> &'static str {
+    crate::i18n::t("detail.card_expires")
+}
+fn code_label() -> &'static str {
+    crate::i18n::t("detail.card_code")
+}
 /// `Cardholder`, not "Cardholder name": the owner's own words, and it reads
 /// the way `Number`, `Expires` and `Code` above it do -- the noun the card
 /// prints, with nothing appended. The label column is a fixed
@@ -7592,13 +7642,19 @@ const CODE_LABEL: &str = "Security code";
 /// change. `copy_shortcut_label` carries it to the copy toast and the chord
 /// description follows it, so the row, the toast and the shortcut list say
 /// one thing.
-const CARDHOLDER_LABEL: &str = "Name on card";
-/// The edit form's own word for the bank row (`detail_edit::BANK_LABEL`), so
+fn cardholder_label() -> &'static str {
+    crate::i18n::t("detail.card_holder")
+}
+/// The edit form's own word for the bank row (`detail_edit::bank_label()`), so
 /// the row is called one thing on the two panes.
-const CARD_BANK_LABEL: &str = super::detail_edit::BANK_LABEL;
+fn card_bank_label() -> &'static str {
+    super::detail_edit::bank_label()
+}
 /// The edit form's own words for the billing postcode row
-/// (`detail_edit::BILLING_ZIP_LABEL`), for the same reason.
-const CARD_BILLING_ZIP_LABEL: &str = super::detail_edit::BILLING_ZIP_LABEL;
+/// (`detail_edit::billing_zip_label()`), for the same reason.
+fn card_billing_zip_label() -> &'static str {
+    super::detail_edit::billing_zip_label()
+}
 /// The card's PIN row, in the edit form's word for it
 /// (`detail_edit::CARD_PIN_LABEL`) -- which is also the custom field's own
 /// name, so every Bitwarden client calls it the same thing.
@@ -7755,9 +7811,9 @@ fn bank_name_without_a_login(domain: &str) -> String {
 /// entries are the oldest thing this pane shows.
 pub fn history_label(last_used_date: Option<&str>) -> String {
     match last_used_date.and_then(days_since) {
-        Some(n) if n <= 0 => "Today".to_string(),
+        Some(n) if n <= 0 => crate::i18n::t("detail.today").to_string(),
         Some(n) => relative_time::ago_days(n as u64),
-        None => "Earlier".to_string(),
+        None => crate::i18n::t("detail.earlier").to_string(),
     }
 }
 
@@ -7868,11 +7924,7 @@ pub(crate) fn history_rows(
         }
         empty_pane_note(
             ui,
-            &format!(
-                "{hidden} older {} not shown here -- open this item in the Bitwarden web \
-                 vault or app to see all of them.",
-                if hidden == 1 { "password is" } else { "passwords are" }
-            ),
+            &crate::i18n::tn("detail.older_hidden", hidden as u64, &[]),
         );
     }
 }
@@ -7901,11 +7953,11 @@ fn ssh_key_rows(
     action: &mut DetailAction,
 ) {
     let Some(fields) = fields else {
-        empty_pane_note(ui, "No SSH key details on this item.");
+        empty_pane_note(ui, crate::i18n::t("detail.no_ssh"));
         return;
     };
     if fields.is_empty() {
-        empty_pane_note(ui, "No SSH key details on this item.");
+        empty_pane_note(ui, crate::i18n::t("detail.no_ssh"));
         return;
     }
     let SshKeyFields {
@@ -7927,11 +7979,11 @@ fn ssh_key_rows(
     };
     if let Some(v) = &public_key {
         separate(ui, &mut first);
-        credential_row(ui, "Public key", v, None, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, crate::i18n::t("detail.public_key"), v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &fingerprint {
         separate(ui, &mut first);
-        credential_row(ui, "Fingerprint", v, None, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, crate::i18n::t("detail.fingerprint"), v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &private_key {
         separate(ui, &mut first);
@@ -7948,7 +8000,7 @@ fn ssh_key_rows(
         let fixed = "\u{2022}".repeat(MASKED_BULLETS);
         masked_row(
             ui,
-            "Private key",
+            crate::i18n::t("detail.private_key"),
             v,
             &mut reveal.ssh_private_key,
             action,
@@ -7976,7 +8028,7 @@ fn ssh_key_rows(
 fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut DetailAction) {
     let groups = groups.unwrap_or_default();
     if groups.is_empty() {
-        empty_pane_note(ui, "No identity details on this item.");
+        empty_pane_note(ui, crate::i18n::t("detail.no_identity"));
         return;
     }
     for (group_index, (group_name, rows)) in groups.iter().enumerate() {
@@ -8025,11 +8077,15 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
 /// The card's heading: the edit form's `Custom fields` card, in this pane's
 /// uppercase. `the_custom_fields_card_is_titled_as_the_edit_forms_is` holds
 /// the two together.
-const CUSTOM_FIELDS_CARD_HEADING: &str = "CUSTOM FIELDS";
+fn custom_fields_card_heading() -> &'static str {
+    crate::i18n::t("detail.custom_fields_heading")
+}
 
 /// The label a field with no name is drawn under -- the edit form's own words
 /// for the same row.
-const UNNAMED_FIELD_LABEL: &str = "(unnamed field)";
+fn unnamed_field_label() -> &'static str {
+    crate::i18n::t("detail.unnamed_field")
+}
 
 /// What one custom field draws as, by its Bitwarden `type`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8104,7 +8160,7 @@ fn every_custom_field_row(item: &VaultItem) -> Vec<CustomFieldRow<'_>> {
             let label = match field.name.as_deref() {
                 Some(name) if name.starts_with(super::detail_edit::OURS_PREFIX) => return None,
                 Some(name) if !name.trim().is_empty() => name,
-                _ => UNNAMED_FIELD_LABEL,
+                _ => unnamed_field_label(),
             };
             let value = field
                 .value
@@ -8155,33 +8211,33 @@ pub fn custom_field_copy_text(item: &VaultItem, index: usize) -> Option<&str> {
 /// own numbering (`LoginLinkedId`, `CardLinkedId`, `IdentityLinkedId`).
 fn linked_field_name(id: i64) -> Option<&'static str> {
     Some(match id {
-        100 => "Username",
-        101 => "Password",
-        300 => "Cardholder name",
-        301 => "Expiration month",
-        302 => "Expiration year",
-        303 => "Security code",
-        304 => "Brand",
-        305 => "Number",
-        400 => "Title",
-        401 => "Middle name",
-        402 => "Address 1",
-        403 => "Address 2",
-        404 => "Address 3",
-        405 => "City",
-        406 => "State",
-        407 => "Postal code",
-        408 => "Country",
-        409 => "Company",
-        410 => "Email",
-        411 => "Phone",
-        412 => "SSN",
-        413 => "Username",
-        414 => "Passport number",
-        415 => "License number",
-        416 => "First name",
-        417 => "Last name",
-        418 => "Full name",
+        100 => crate::i18n::t("field.username"),
+        101 => crate::i18n::t("field.password"),
+        300 => crate::i18n::t("field.cardholder_name"),
+        301 => crate::i18n::t("field.expiration_month"),
+        302 => crate::i18n::t("field.expiration_year"),
+        303 => crate::i18n::t("field.security_code"),
+        304 => crate::i18n::t("field.brand"),
+        305 => crate::i18n::t("field.number"),
+        400 => crate::i18n::t("field.title"),
+        401 => crate::i18n::t("field.middle_name"),
+        402 => crate::i18n::t("field.address1"),
+        403 => crate::i18n::t("field.address2"),
+        404 => crate::i18n::t("field.address3"),
+        405 => crate::i18n::t("field.city"),
+        406 => crate::i18n::t("field.state"),
+        407 => crate::i18n::t("field.postal_code"),
+        408 => crate::i18n::t("field.country"),
+        409 => crate::i18n::t("field.company"),
+        410 => crate::i18n::t("field.email"),
+        411 => crate::i18n::t("field.phone"),
+        412 => crate::i18n::t("field.ssn"),
+        413 => crate::i18n::t("field.username"),
+        414 => crate::i18n::t("field.passport_number"),
+        415 => crate::i18n::t("field.license_number"),
+        416 => crate::i18n::t("field.first_name"),
+        417 => crate::i18n::t("field.last_name"),
+        418 => crate::i18n::t("field.full_name"),
         _ => return None,
     })
 }
@@ -8226,9 +8282,9 @@ fn custom_fields_card_rows(
                     MaskedFace::default(),
                 );
             }
-            CustomFieldFace::Boolean(on) => plain_value_row(ui, row.label, if on { "Yes" } else { "No" }),
+            CustomFieldFace::Boolean(on) => plain_value_row(ui, row.label, if on { crate::i18n::t("detail.yes") } else { crate::i18n::t("detail.no") }),
             CustomFieldFace::Linked(to) => {
-                let text = to.map_or_else(|| "Linked field".to_string(), |to| format!("Linked to {to}"));
+                let text = to.map_or_else(|| crate::i18n::t("detail.linked_field").to_string(), |to| crate::i18n::tf("detail.linked_to", &[("to", to)]));
                 plain_value_row(ui, row.label, &text);
             }
         }
@@ -8314,7 +8370,7 @@ fn totp_code_row(
     // move it back up to the tip and the next row would draw over the code.
     let mut tip_ui = ui.new_child(egui::UiBuilder::new().max_rect(tip));
     let tip_id = tip_ui.id().with("totp-tip");
-    kit::tips::help_dot(&mut tip_ui, tip_id, TOTP_TIP, 250.0, kit::tips::Placement::Above);
+    kit::tips::help_dot(&mut tip_ui, tip_id, totp_tip(), 250.0, kit::tips::Placement::Above);
 
     let copy_rect = egui::Rect::from_min_size(egui::pos2(inner.right() - 42.0, inner.center().y - 21.0), egui::Vec2::splat(42.0));
     let centre = egui::pos2(copy_rect.left() - 14.0 - 20.0, inner.center().y);
@@ -8338,7 +8394,7 @@ fn totp_code_row(
         p.text_icon
     };
     kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(copy_rect.center(), egui::Vec2::splat(19.0)), kit::icon::glyph::COPY, 2.0, glyph_ink);
-    kit::tips::hint(ui, &copy, "Copy 2FA code", &["Mod", "T"]);
+    kit::tips::hint(ui, &copy, crate::i18n::t("detail.copy_2fa_hint"), &["Mod", "T"]);
     if copy.clicked() && row_offers_copy(code) {
         *action = DetailAction::CopyTotp;
         note_copied(ui.ctx(), copy_shortcut_label(CopyShortcut::Totp));
@@ -8358,7 +8414,9 @@ fn totp_code_row(
 }
 
 /// Spec 3.3's `totp` tip, beside "2FA code".
-const TOTP_TIP: &str = "The second step some sites ask for. Deskwarden types it for you after the password.";
+fn totp_tip() -> &'static str {
+    crate::i18n::t("detail.totp_tip")
+}
 
 /// A code split in two for reading: `123 456`, `1234 5678`; an odd length
 /// puts the longer half second.
@@ -8388,8 +8446,12 @@ pub(crate) fn ring_points(centre: egui::Pos2, radius: f32, fraction: f32) -> Vec
 }
 
 /// The Add 2FA row's words (spec 3.3).
-pub const ADD_2FA_ROW_TITLE: &str = "Add 2FA code";
-pub const ADD_2FA_ROW_DETAIL: &str = "Scan the QR code from your screen";
+pub fn add_2fa_row_title() -> &'static str {
+    crate::i18n::t("detail.add_2fa_row_title")
+}
+pub fn add_2fa_row_detail() -> &'static str {
+    crate::i18n::t("detail.add_2fa_row_detail")
+}
 
 /// Spec 3.3's Add 2FA row, for a login with no code: the scan tile, the two
 /// lines and a chevron; the whole row opens the add-a-code card.
@@ -8397,8 +8459,8 @@ fn add_2fa_row(ui: &mut egui::Ui, action: &mut DetailAction) {
     use crate::kit::{self, tokens};
     let p = tokens::palette(ui.ctx());
     let ctx = ui.ctx().clone();
-    let title = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::ROW_TITLE, ADD_2FA_ROW_TITLE, p.blue_deep)));
-    let detail = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::SUBTITLE, ADD_2FA_ROW_DETAIL, p.text_faint)));
+    let title = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::ROW_TITLE, add_2fa_row_title(), p.blue_deep)));
+    let detail = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::SUBTITLE, add_2fa_row_detail(), p.text_faint)));
     let column_h = title.size().y + 2.0 + detail.size().y;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 32.0 + column_h.max(42.0)),
@@ -8504,7 +8566,7 @@ fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
 /// problem -- this is the everyday, usually sub-second case right after
 /// selecting an item, not a backend issue.
 fn totp_fetching_row(ui: &mut egui::Ui) {
-    totp_status_row(ui, "Fetching\u{2026}", None);
+    totp_status_row(ui, crate::i18n::t("detail.totp_fetching"), None);
 }
 
 /// The One-time code row for `TotpState::Unavailable`: this item has a TOTP
@@ -8518,8 +8580,8 @@ fn totp_fetching_row(ui: &mut egui::Ui) {
 fn totp_unavailable_row(ui: &mut egui::Ui) {
     totp_status_row(
         ui,
-        "Unavailable right now",
-        Some("Couldn't reach the vault to get the current code."),
+        crate::i18n::t("detail.totp_unavailable"),
+        Some(crate::i18n::t("detail.totp_unavailable_detail")),
     );
 }
 
@@ -8543,11 +8605,8 @@ fn totp_unavailable_row(ui: &mut egui::Ui) {
 fn totp_no_code_row(ui: &mut egui::Ui) {
     totp_status_row(
         ui,
-        "No code available for this item",
-        Some(
-            "The vault has no current code for it. If its authenticator key was changed \
-             on another device, Sync to pick that up.",
-        ),
+        crate::i18n::t("detail.totp_none"),
+        Some(crate::i18n::t("detail.totp_none_detail")),
     );
 }
 
@@ -8974,7 +9033,7 @@ mod tests {
             // draws no envelope. So it is asserted here rather than left to
             // the shape of the code.
             assert!(
-                !painted.iter().any(|t| t == SHARE_LABEL),
+                !painted.iter().any(|t| t == share_label()),
                 "the out-of-vault pane offers Share, so a trashed or archived item can be \
                  published to a public link"
             );
@@ -10053,7 +10112,7 @@ mod tests {
         /// second is a real answer.
         fn open_move_submenu(&mut self, item: &VaultItem, totp: &TotpState) -> Frame {
             let open = self.open_kebab(item, totp);
-            let entry = open.rect_of(crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+            let entry = open.rect_of(crate::vault_window::item_list::move_to_folder_label());
             let _ = self.click(item, totp, entry.center());
             self.idle(item, totp)
         }
@@ -10117,7 +10176,7 @@ mod tests {
             let mut pane = Pane::new();
             let open = pane.open_kebab(&item, &TotpState::NoSecret);
             let (delete, _) = open.menu_row_of("Delete");
-            let (sibling, _) = open.menu_row_of(crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+            let (sibling, _) = open.menu_row_of(crate::vault_window::item_list::move_to_folder_label());
             assert!(
                 (delete.width() - sibling.width()).abs() < 0.5,
                 "{kind:?}: Delete's row is {} wide and Move to folder's is {} -- the entries \
@@ -10189,7 +10248,7 @@ mod tests {
                 "{kind:?}: the Delete row is painted {resting:?} whether the pointer is on it \
                  or not, so it has no hover at all"
             );
-            let (_, sibling) = menu_row_colours(kind, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+            let (_, sibling) = menu_row_colours(kind, crate::vault_window::item_list::move_to_folder_label());
             assert_eq!(
                 hovered, sibling,
                 "{kind:?}: hovering Delete paints {hovered:?} but hovering Move to folder \
@@ -10242,7 +10301,7 @@ mod tests {
             // still makes the point the loop exists for: a menu that had
             // turned uniformly red fails here.
             {
-                let sibling = crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL;
+                let sibling = crate::vault_window::item_list::move_to_folder_label();
                 assert_ne!(
                     open.text_colour_of(sibling),
                     theme::ERROR,
@@ -10749,11 +10808,13 @@ mod tests {
     /// Every icon wording, so the absences below are absolute rather than
     /// "the ones I looked for" -- the rule `item_list`'s own
     /// `MENU_VOCABULARY` states for the other surface.
-    const ICON_ROWS: [&str; 3] = [
-        crate::vault_window::item_list::REFRESH_ICON_LABEL,
-        crate::vault_window::item_list::SELECT_ICON_LABEL,
-        crate::vault_window::item_list::CLEAR_ICON_LABEL,
-    ];
+    fn icon_rows() -> [&'static str; 3] {
+    [
+        crate::vault_window::item_list::refresh_icon_label(),
+        crate::vault_window::item_list::select_icon_label(),
+        crate::vault_window::item_list::clear_icon_label(),
+    ]
+    }
 
     /// **A live item's kebab offers no icon entry either.**
     ///
@@ -10769,12 +10830,12 @@ mod tests {
             let open = pane.open_kebab(&item, &TotpState::NoSecret);
             let painted = open.strings();
             assert!(
-                painted.contains(&crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL),
+                painted.contains(&crate::vault_window::item_list::move_to_folder_label()),
                 "{kind:?}: the kebab painted no menu at all, so the absences below prove \
                  nothing: {painted:?}"
             );
             for label in
-                std::iter::once(crate::vault_window::item_list::ICON_LABEL).chain(ICON_ROWS)
+                std::iter::once(crate::vault_window::item_list::icon_label()).chain(icon_rows())
             {
                 assert!(
                     !painted.contains(&label),
@@ -11095,7 +11156,7 @@ mod tests {
                 "{kind:?}: the removed header Fill button is painted again"
             );
             assert_eq!(
-                contains(&texts, FILLS_IN_LABEL),
+                contains(&texts, fills_in_label()),
                 kind_offers_fill(kind),
                 "{kind:?}: the autofill card disagrees with kind_offers_fill"
             );
@@ -11475,7 +11536,7 @@ mod tests {
         );
         // The behaviour note is there too -- and it is the ONE note, not one
         // of three captions chosen by the item's stored `trigger`.
-        assert!(notes.contains(&APP_MATCH_BEHAVIOUR_NOTE), "{notes:?}");
+        assert!(notes.contains(&app_match_behaviour_note()), "{notes:?}");
         for mode in TRIGGER_ORDER {
             assert!(
                 !notes.contains(&trigger_caption(mode)),
@@ -11485,7 +11546,7 @@ mod tests {
         }
         // Control: an ordinary app gets the note and NOT the Store note.
         let ordinary = app_card_notes(&a_desktop_match());
-        assert_eq!(ordinary, vec![APP_MATCH_BEHAVIOUR_NOTE]);
+        assert_eq!(ordinary, vec![app_match_behaviour_note()]);
     }
 
     /// **The fixture that deliberately differs.** `a_store_match` and
@@ -11503,7 +11564,7 @@ mod tests {
             let m = AppMatch { trigger: mode, ..a_desktop_match() };
             assert_eq!(
                 app_card_notes(&m),
-                vec![APP_MATCH_BEHAVIOUR_NOTE],
+                vec![app_match_behaviour_note()],
                 "a stored {mode:?} changed what the card says about this binding"
             );
         }
@@ -11546,8 +11607,8 @@ mod tests {
             "Program file",
             r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe",
             "Remove",
-            APP_MATCH_BEHAVIOUR_NOTE,
-            APP_HOSTED_NOTE,
+            app_match_behaviour_note(),
+            app_hosted_note(),
         ] {
             assert!(
                 frame.painted(needle),
@@ -11579,18 +11640,20 @@ mod tests {
     /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
     /// in this file against it, so a ninth card fails the build's own suite
     /// rather than quietly narrowing the ordering claim.
-    const EVERY_CARD_HEADING: [&str; 10] = [
-        TOTP_CARD_HEADING,
+    fn every_card_heading() -> [&'static str; 10] {
+    [
+        totp_card_heading(),
         "CARD DETAILS",
         "IDENTITY",
         "SSH KEY",
         "UNSUPPORTED ITEM",
         "PREVIOUS PASSWORDS",
-        APP_CARD_HEADING,
-        CUSTOM_FIELDS_CARD_HEADING,
-        SHARING_CARD_HEADING,
+        app_card_heading(),
+        custom_fields_card_heading(),
+        sharing_card_heading(),
         "NOTES",
-    ];
+    ]
+    }
 
     /// The list above is the whole list. Counted off the source rather than
     /// trusted: `EVERY_CARD_HEADING` is what
@@ -11621,10 +11684,10 @@ mod tests {
             .count();
         assert_eq!(
             calls,
-            EVERY_CARD_HEADING.len(),
-            "this pane draws {calls} cards and EVERY_CARD_HEADING names {}; a card that is \
+            every_card_heading().len(),
+            "this pane draws {calls} cards and every_card_heading() names {}; a card that is \
              not in that list is a card NOTES is never asserted to be below",
-            EVERY_CARD_HEADING.len()
+            every_card_heading().len()
         );
     }
 
@@ -11636,7 +11699,7 @@ mod tests {
         /// *nothing at all*. Every caller asserts the COUNT before it reads a
         /// single coordinate.
         fn card_headings(&self) -> Vec<(&str, egui::Rect)> {
-            let mut found: Vec<(&str, egui::Rect)> = EVERY_CARD_HEADING
+            let mut found: Vec<(&str, egui::Rect)> = every_card_heading()
                 .iter()
                 .filter_map(|heading| {
                     let rects: Vec<egui::Rect> = self
@@ -11835,7 +11898,7 @@ mod tests {
         );
         let after = pane.idle(&item, &TotpState::NoSecret);
         assert!(
-            after.painted(&copy_toast_text(NOTES_COPY_LABEL, false)),
+            after.painted(&copy_toast_text(notes_copy_label(), false)),
             "the note copied without saying so; painted: {:?}",
             after.strings()
         );
@@ -11949,7 +12012,7 @@ mod tests {
         );
         let after = pane.idle(&item, &TotpState::NoSecret);
         assert!(
-            !after.painted(&copy_toast_text(NOTES_COPY_LABEL, false)),
+            !after.painted(&copy_toast_text(notes_copy_label(), false)),
             "a selection drag raised a copy confirmation; painted: {:?}",
             after.strings()
         );
@@ -12299,8 +12362,9 @@ mod tests {
         let with = pane.idle(&bound, &TotpState::NoSecret);
 
         assert!(
-            !without.painted(APP_CARD_HEADING),
-            "an unbound item still draws the {APP_CARD_HEADING:?} card: {:?}",
+            !without.painted(app_card_heading()),
+            "an unbound item still draws the {:?} card: {:?}",
+            app_card_heading(),
             without.strings()
         );
         // And none of its contents by another name.
@@ -12331,7 +12395,7 @@ mod tests {
         // its bottom edge and the card that follows it. `CARD_GAP` is not that
         // gap on its own -- the cards also carry the scroll area's item
         // spacing -- which is why this is read and not stated.
-        let card = with.filled_box_around(with.rect_of(APP_CARD_HEADING), theme::CARD);
+        let card = with.filled_box_around(with.rect_of(app_card_heading()), theme::CARD);
         let next = with.filled_box_around(with.rect_of("NOTES"), theme::CARD);
         let expected = card.height() + (next.top() - card.bottom());
         assert!(
@@ -12355,7 +12419,7 @@ mod tests {
         let mut pane = Pane::new();
         let frame = pane.idle(&bound, &TotpState::NoSecret);
         let mut checked = 0;
-        for needle in [APP_CARD_HEADING, "App", "Program file", "Remove"] {
+        for needle in [app_card_heading(), "App", "Program file", "Remove"] {
             checked += 1;
             assert!(
                 frame.painted(needle),
@@ -12441,10 +12505,10 @@ mod tests {
         collect_text_rects(&all, &mut texts);
         let strings: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(
-            strings.contains(&detail_edit::APP_BLOCK_HEADING),
+            strings.contains(&detail_edit::app_block_heading()),
             "the edit form no longer draws {:?}, so there is no app control there at \
              all: {strings:?}",
-            detail_edit::APP_BLOCK_HEADING
+            detail_edit::app_block_heading()
         );
 
         // And the read pane's gate is not in that file.
@@ -12501,7 +12565,7 @@ mod tests {
         // The premise: this pane IS drawing the card, so the absences below
         // are about the pills and not about a card that vanished.
         assert!(laid_out.painted("MATCHED APP"), "{:?}", laid_out.strings());
-        assert!(laid_out.painted(APP_MATCH_BEHAVIOUR_NOTE), "{:?}", laid_out.strings());
+        assert!(laid_out.painted(app_match_behaviour_note()), "{:?}", laid_out.strings());
 
         for mode in TRIGGER_ORDER {
             assert!(
@@ -12527,7 +12591,7 @@ mod tests {
         let note = pane.click(
             &item,
             &TotpState::NoSecret,
-            laid_out.rect_of(APP_MATCH_BEHAVIOUR_NOTE).center(),
+            laid_out.rect_of(app_match_behaviour_note()).center(),
         );
         assert_eq!(
             note.action,
@@ -12674,14 +12738,14 @@ mod tests {
             );
         }
         assert!(
-            !notes.contains(&APP_MATCH_BEHAVIOUR_NOTE),
+            !notes.contains(&app_match_behaviour_note()),
             "a dead binding still claims the fill hotkey does something for it: {notes:?}"
         );
         // The controls, on a LIVE match: the behaviour note is there and the
         // dead notice is not, so neither assertion above is satisfied by a
         // constant.
         let live = app_card_notes(&a_store_match());
-        assert!(live.contains(&APP_MATCH_BEHAVIOUR_NOTE), "{live:?}");
+        assert!(live.contains(&app_match_behaviour_note()), "{live:?}");
         assert!(!live.iter().any(|n| n.contains("ignoring")), "{live:?}");
     }
 
@@ -12734,7 +12798,7 @@ mod tests {
         // was the previous behaviour.
         let live = bound_to(&a_login(), &a_store_match());
         let live_frame = pane.idle(&live, &TotpState::NoSecret);
-        assert!(live_frame.painted(APP_MATCH_BEHAVIOUR_NOTE));
+        assert!(live_frame.painted(app_match_behaviour_note()));
         assert!(
             !live_frame.strings().iter().any(|t| t.contains("ignoring")),
             "a live binding is being called ignored: {:?}",
@@ -12877,7 +12941,7 @@ mod tests {
             let mut pane = Pane::new();
             let bare = pane.idle(&an_item(item_type_for(kind)), &TotpState::NoSecret);
             assert!(
-                !bare.painted(APP_CARD_HEADING),
+                !bare.painted(app_card_heading()),
                 "a {kind:?} bound to nothing draws an app card: {:?}",
                 bare.strings()
             );
@@ -13262,7 +13326,7 @@ mod tests {
             contains(&texts, "No card details"),
             "an empty card drew a heading over nothing: {texts:?}"
         );
-        for absent in [CARDHOLDER_LABEL, "Number", "Security code"] {
+        for absent in [cardholder_label(), "Number", "Security code"] {
             assert!(
                 !contains(&texts, absent),
                 "an empty card drew a {absent:?} row it has no data for: {texts:?}"
@@ -13742,8 +13806,9 @@ mod tests {
             assert!(frame.painted(shown), "the identity card lost {shown:?}: {:?}", frame.strings());
         }
         assert!(
-            frame.painted(CUSTOM_FIELDS_CARD_HEADING),
-            "an identity with a custom field drew no {CUSTOM_FIELDS_CARD_HEADING:?} card: {:?}",
+            frame.painted(custom_fields_card_heading()),
+            "an identity with a custom field drew no {:?} card: {:?}",
+            custom_fields_card_heading(),
             frame.strings()
         );
         assert!(frame.painted("D-U-N-S number"), "the field's name is missing: {:?}", frame.strings());
@@ -13765,7 +13830,7 @@ mod tests {
             assert!(frame.painted("ACC-4471"), "{kind:?} drew no field value: {:?}", frame.strings());
             let headings = frame.card_headings();
             let names: Vec<&str> = headings.iter().map(|(h, _)| *h).collect();
-            assert!(names.contains(&CUSTOM_FIELDS_CARD_HEADING), "{kind:?} drew {names:?}");
+            assert!(names.contains(&custom_fields_card_heading()), "{kind:?} drew {names:?}");
             assert_eq!(names.last(), Some(&"NOTES"), "{kind:?}: NOTES is not last in {names:?}");
         }
     }
@@ -13813,7 +13878,7 @@ mod tests {
             custom_field(crate::vault_bridge::BILLING_ZIP_FIELD, Some("SW1A 1AA"), None),
         ];
         let texts = painted(&item, &TotpState::NoSecret);
-        assert!(!contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
+        assert!(!contains(&texts, custom_fields_card_heading()), "{texts:?}");
         assert!(!contains(&texts, "SW1A 1AA"), "{texts:?}");
         assert!(custom_field_rows(&item).is_empty());
 
@@ -13821,7 +13886,7 @@ mod tests {
         // that field and still without ours.
         item.fields.push(custom_field("PIN hint", Some("birthday"), Some(0)));
         let texts = painted(&item, &TotpState::NoSecret);
-        assert!(contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
+        assert!(contains(&texts, custom_fields_card_heading()), "{texts:?}");
         assert!(contains(&texts, "birthday"), "{texts:?}");
         assert!(!contains(&texts, "SW1A 1AA"), "{texts:?}");
     }
@@ -13862,7 +13927,7 @@ mod tests {
                 // A type this build does not know is masked, not shown.
                 (7, "Mystery", CustomFieldFace::Hidden("m")),
                 (8, "Sign-in", CustomFieldFace::Linked(Some("Username"))),
-                (9, UNNAMED_FIELD_LABEL, CustomFieldFace::Text("orphan")),
+                (9, unnamed_field_label(), CustomFieldFace::Text("orphan")),
             ]
         );
         // What a click copies is what the row shows, trimmed.
@@ -13895,8 +13960,8 @@ mod tests {
     #[test]
     fn the_custom_fields_card_is_titled_as_the_edit_forms_is() {
         assert_eq!(
-            CUSTOM_FIELDS_CARD_HEADING,
-            super::super::detail_edit::FIELDS_BLOCK_HEADING.to_uppercase()
+            custom_fields_card_heading(),
+            super::super::detail_edit::fields_block_heading().to_uppercase()
         );
     }
 
@@ -13931,7 +13996,7 @@ mod tests {
     #[test]
     fn clicking_a_cards_bank_or_billing_zip_copies_it() {
         let item = napps_brex();
-        for (label, value) in [(CARD_BANK_LABEL, "Brex"), (CARD_BILLING_ZIP_LABEL, "94107")] {
+        for (label, value) in [(card_bank_label(), "Brex"), (card_billing_zip_label(), "94107")] {
             let mut pane = Pane::new();
             let laid_out = pane.idle(&item, &TotpState::NoSecret);
             assert!(laid_out.painted(value), "{value} is not shown");
@@ -13948,8 +14013,8 @@ mod tests {
         let item = napps_brex();
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &TotpState::NoSecret);
-        let one_line = frame.rect_of(CARDHOLDER_LABEL).height();
-        for label in [CARD_BANK_LABEL, CARD_BILLING_ZIP_LABEL] {
+        let one_line = frame.rect_of(cardholder_label()).height();
+        for label in [card_bank_label(), card_billing_zip_label()] {
             assert!(
                 frame.rect_of(label).height() <= one_line + 0.5,
                 "{label:?} wraps in the label column"
@@ -13978,8 +14043,8 @@ mod tests {
             field.value = Some(zeroize::Zeroizing::new("   ".to_string()));
         }
         let texts = painted(&item, &TotpState::NoSecret);
-        assert!(!contains(&texts, CARD_BANK_LABEL), "{texts:?}");
-        assert!(!contains(&texts, CARD_BILLING_ZIP_LABEL), "{texts:?}");
+        assert!(!contains(&texts, card_bank_label()), "{texts:?}");
+        assert!(!contains(&texts, card_billing_zip_label()), "{texts:?}");
         assert!(contains(&texts, "No card details on this item."), "{texts:?}");
     }
 
@@ -14028,7 +14093,7 @@ mod tests {
             "the bank's domain is painted: {:?}",
             frame.strings()
         );
-        let clicked = pane.click(&item, &TotpState::NoSecret, copy_button(&frame, CARD_BANK_LABEL));
+        let clicked = pane.click(&item, &TotpState::NoSecret, copy_button(&frame, card_bank_label()));
         assert_eq!(clicked.action, DetailAction::CopyValue("Chase Bank".to_string()));
     }
 
@@ -14166,7 +14231,7 @@ mod tests {
         let rows = custom_field_rows(&item);
         assert_eq!(rows.len(), 1, "a non-card's PIN field left CUSTOM FIELDS");
         let texts = painted(&item, &TotpState::NoSecret);
-        assert!(contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
+        assert!(contains(&texts, custom_fields_card_heading()), "{texts:?}");
     }
 
     /// The positive control on the repair: the rule between two identity
@@ -14457,7 +14522,7 @@ mod tests {
             .into_iter()
             .filter_map(|(name, which)| pane.ctx.read_response(header_control_id(which)).map(|r| (name, r.rect)))
             .chain(
-                [FILL_LABEL, SHARE_LABEL, EDIT_LABEL]
+                [fill_label(), share_label(), edit_label()]
                     .into_iter()
                     .filter(|label| frame.painted(label))
                     .map(|label| (label, frame.rect_of(label))),
@@ -14572,7 +14637,7 @@ mod tests {
             "the view-only kebab does not say why it is empty: {painted:?}"
         );
         assert_eq!(view_only_footer("denis@x.io", false), "Shared by denis@x.io, view-only. Only they can edit or delete it.");
-        for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
+        for writer in ["Edit", "Clone", crate::vault_window::item_list::delete_label(), crate::vault_window::item_list::move_to_folder_label()] {
             assert!(!painted.contains(&writer), "a received record's kebab offers {writer:?}: {painted:?}");
         }
     }
@@ -14597,7 +14662,7 @@ mod tests {
         let mut unnamed = Pane::new();
         let open = unnamed.open_kebab(&item, &TotpState::NoSecret);
         let painted = open.strings();
-        assert!(painted.contains(&VIEW_ONLY_FOOTER), "control: the unnamed kebab opened: {painted:?}");
+        assert!(painted.contains(&view_only_footer_text()), "control: the unnamed kebab opened: {painted:?}");
         assert!(!painted.iter().any(|s| s.starts_with("Stop receiving")), "{painted:?}");
     }
 
@@ -14658,8 +14723,8 @@ mod tests {
         assert!(!frame.texts.iter().any(|(t, _)| t.contains("Shared by")), "{:?}", frame.texts);
         let open = pane.open_kebab(&item, &TotpState::NoSecret);
         let painted = open.strings();
-        assert!(painted.contains(&VIEW_ONLY_FOOTER), "{painted:?}");
-        for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
+        assert!(painted.contains(&view_only_footer_text()), "{painted:?}");
+        for writer in ["Edit", "Clone", crate::vault_window::item_list::delete_label(), crate::vault_window::item_list::move_to_folder_label()] {
             assert!(!painted.contains(&writer), "an edit:false item's kebab offers {writer:?}: {painted:?}");
         }
     }
@@ -14671,11 +14736,11 @@ mod tests {
     fn a_view_only_records_matched_app_card_offers_no_remove() {
         let item = bound_to(&a_login_on_the_web(), &a_browser_match());
         let mut pane = Pane::new().knows_app(CHROME_PATH, CHROME_NAME);
-        assert!(pane.idle(&item, &TotpState::NoSecret).painted(APP_REMOVE_LABEL), "control: Remove on a writable record");
+        assert!(pane.idle(&item, &TotpState::NoSecret).painted(app_remove_label()), "control: Remove on a writable record");
         let mut received = Pane::new().knows_app(CHROME_PATH, CHROME_NAME).view_only("denis@x.io");
         let frame = received.idle(&item, &TotpState::NoSecret);
-        assert!(frame.painted(OPEN_MENU_LABEL), "the card is still drawn, with Open");
-        assert!(!frame.painted(APP_REMOVE_LABEL), "a view-only record's card offers Remove");
+        assert!(frame.painted(open_menu_label()), "the card is still drawn, with Open");
+        assert!(!frame.painted(app_remove_label()), "a view-only record's card offers Remove");
     }
 
     /// **The Trash's ⋮ for an `edit: false` record offers neither Restore
@@ -14691,7 +14756,7 @@ mod tests {
             for writer in ["Restore", "Delete forever", "Unarchive"] {
                 assert!(!opened.iter().any(|t| t == writer), "{out:?}: offers {writer:?}: {opened:?}");
             }
-            assert!(opened.iter().any(|t| t == VIEW_ONLY_FOOTER), "{out:?}: says nothing: {opened:?}");
+            assert!(opened.iter().any(|t| t == view_only_footer_text()), "{out:?}: says nothing: {opened:?}");
         }
     }
 
@@ -15308,10 +15373,10 @@ mod tests {
         // Idle: both controls, and no question.
         let mut idle_pane = Pane::new().sharing(a_live_send(), false, false);
         let idle = idle_pane.idle(&item, &totp);
-        assert!(idle.painted(SHARING_CARD_HEADING), "no SHARING card: {:?}", idle.strings());
-        assert!(idle.painted(SEND_AGAIN_LABEL), "{:?}", idle.strings());
+        assert!(idle.painted(sharing_card_heading()), "no SHARING card: {:?}", idle.strings());
+        assert!(idle.painted(send_again_label()), "{:?}", idle.strings());
         assert!(!idle.painted(send_ui::CONFIRM_LABEL), "{:?}", idle.strings());
-        let revoke_at = idle.rect_of(REVOKE_LABEL).center();
+        let revoke_at = idle.rect_of(revoke_label()).center();
         let pressed = idle_pane.click(&item, &totp, revoke_at);
         assert_eq!(
             pressed.action,
@@ -15324,9 +15389,9 @@ mod tests {
         let mut asking_pane = Pane::new().sharing(a_live_send(), true, false);
         let asking = asking_pane.idle(&item, &totp);
         assert!(asking.painted(send_ui::CONFIRM_PROMPT), "{:?}", asking.strings());
-        assert!(!asking.painted(REVOKE_LABEL), "Revoke is still offered while it asks");
+        assert!(!asking.painted(revoke_label()), "Revoke is still offered while it asks");
         assert!(
-            !asking.painted(SEND_AGAIN_LABEL),
+            !asking.painted(send_again_label()),
             "Send again stayed beside a question about destroying the link: {:?}",
             asking.strings()
         );
@@ -15364,7 +15429,7 @@ mod tests {
         let mut busy_pane = Pane::new().sharing(a_live_send(), false, true);
         let busy = busy_pane.idle(&item, &totp);
         assert!(busy.painted(send_ui::DELETING_LABEL), "{:?}", busy.strings());
-        for label in [REVOKE_LABEL, SEND_AGAIN_LABEL, send_ui::CANCEL_LABEL, send_ui::CONFIRM_LABEL] {
+        for label in [revoke_label(), send_again_label(), send_ui::CANCEL_LABEL, send_ui::CONFIRM_LABEL] {
             assert!(!busy.painted(label), "{label:?} is offered while the Send is being deleted");
         }
         assert_eq!(
@@ -15397,33 +15462,33 @@ mod tests {
         let totp = TotpState::NoSecret;
 
         let people_only = Pane::new().with_people(anna_shared()).idle(&item, &totp);
-        assert!(people_only.painted(SHARING_CARD_HEADING), "{:?}", people_only.strings());
+        assert!(people_only.painted(sharing_card_heading()), "{:?}", people_only.strings());
         assert!(people_only.painted("anna@x.io") && people_only.painted(crate::vault_window::share_ui::STOP_LABEL));
         assert!(people_only.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
-        assert!(!people_only.painted(ACTIVE_SEND_LABEL), "an Active Send with no Send out");
+        assert!(!people_only.painted(active_send_label()), "an Active Send with no Send out");
 
         let both = Pane::new().with_people(anna_shared()).sharing(a_live_send(), false, false).idle(&item, &totp);
         let people_label = both.rect_of("People");
-        let send_label = both.rect_of(ACTIVE_SEND_LABEL);
+        let send_label = both.rect_of(active_send_label());
         assert!(people_label.bottom() < send_label.top(), "People are not above the Active Send");
         assert!(both.rect_of("anna@x.io").bottom() < send_label.top());
-        assert!(send_label.bottom() < both.rect_of(SEND_REACH).top(), "the label is stacked over its entry");
+        assert!(send_label.bottom() < both.rect_of(send_reach()).top(), "the label is stacked over its entry");
         assert!(both.painted(crate::vault_window::share_ui::SHARING_SIDE), "{:?}", both.strings());
         assert!(both.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
-        assert!(!both.painted(SHARING_NOTE), "two notes on one card");
+        assert!(!both.painted(sharing_note()), "two notes on one card");
         assert_eq!(
-            both.card_headings().iter().filter(|(h, _)| *h == SHARING_CARD_HEADING).count(),
+            both.card_headings().iter().filter(|(h, _)| *h == sharing_card_heading()).count(),
             1,
             "one SHARING card for both blocks"
         );
 
         let send_only = Pane::new().sharing(a_live_send(), false, false).idle(&item, &totp);
-        assert!(send_only.painted(SHARING_NOTE));
+        assert!(send_only.painted(sharing_note()));
         assert!(!send_only.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
         assert!(!send_only.painted(crate::vault_window::share_ui::SHARING_SIDE), "the side note is about people");
 
         let neither = Pane::new().idle(&item, &totp);
-        assert!(!neither.painted(SHARING_CARD_HEADING));
+        assert!(!neither.painted(sharing_card_heading()));
     }
 
     /// **A sharing sentence is drawn on the card, at its foot** -- the
@@ -15439,7 +15504,7 @@ mod tests {
         let notice = "Couldn't stop sharing Acme VPN.";
 
         let alone = Pane::new().with_sharing_notice(notice).idle(&item, &totp);
-        assert!(alone.painted(SHARING_CARD_HEADING), "{:?}", alone.strings());
+        assert!(alone.painted(sharing_card_heading()), "{:?}", alone.strings());
         assert!(alone.painted(notice));
 
         let quiet = Pane::new().with_people(anna_shared()).idle(&item, &totp);
@@ -15557,7 +15622,7 @@ mod tests {
     /// into -- 8a gives them a card of their own and the EDIT pane always
     /// has. The owner: "TOTP should be separate tile and not with password".
     fn totp_card(frame: &Frame) -> egui::Rect {
-        frame.filled_box_around(frame.rect_of(TOTP_CARD_HEADING), theme::CARD)
+        frame.filled_box_around(frame.rect_of(totp_card_heading()), theme::CARD)
     }
 
     /// The reveal eye nearest `row_y` -- the one belonging to the row whose
@@ -15611,12 +15676,12 @@ mod tests {
         let mut pane = Pane::new().revealing_secrets();
         let frame = pane.idle(&item, &a_live_code());
 
-        assert!(frame.painted(TOTP_SECRET_LABEL), "got {:?}", frame.strings());
+        assert!(frame.painted(totp_secret_label()), "got {:?}", frame.strings());
 
         // UNDER the One-time code row, which is the placement the request
         // asked for -- read off the paint, not off the source order.
         let code = frame.rect_of(copy_shortcut_label(CopyShortcut::Totp));
-        let secret = frame.rect_of(TOTP_SECRET_LABEL);
+        let secret = frame.rect_of(totp_secret_label());
         assert!(
             secret.height() > 0.0 && secret.width() > 0.0,
             "the label has no box, so every geometry check below is about nothing: {secret:?}"
@@ -15634,7 +15699,8 @@ mod tests {
         // ...and inside the ONE-TIME CODE card, not floating in the pane.
         assert!(
             totp_card(&frame).contains_rect(secret),
-            "the secret row is outside the {TOTP_CARD_HEADING} card"
+            "the secret row is outside the {} card",
+            totp_card_heading()
         );
 
         // MASKED, with an eye that is not struck through -- the only visible
@@ -15682,7 +15748,7 @@ mod tests {
         let masked = pane.idle(&item, &a_live_code());
 
         assert!(
-            masked.painted(TOTP_SECRET_LABEL),
+            masked.painted(totp_secret_label()),
             "the row is missing entirely, so 'it is masked' is vacuous: {:?}",
             masked.strings()
         );
@@ -15722,7 +15788,7 @@ mod tests {
         // THE CONTROL, in this same test: revealed, the glyphs DO carry the
         // seed. Without it every assertion above would pass against a pane
         // that cannot paint the seed under any circumstances.
-        let row_y = masked.rect_of(TOTP_SECRET_LABEL).center().y;
+        let row_y = masked.rect_of(totp_secret_label()).center().y;
         let revealed = reveal_by_clicking(&mut pane, &masked, &item, &a_live_code(), row_y);
         assert!(
             revealed.rendered.iter().any(|(_, glyphs, _)| glyphs.contains(SEED)),
@@ -15757,7 +15823,7 @@ mod tests {
 
         let mut pane = Pane::new().revealing_secrets();
         let shown = pane.idle(&first, &a_live_code());
-        let row_y = shown.rect_of(TOTP_SECRET_LABEL).center().y;
+        let row_y = shown.rect_of(totp_secret_label()).center().y;
 
         // THE PREMISE: the click really revealed the first item's seed.
         let revealed = reveal_by_clicking(&mut pane, &shown, &first, &a_live_code(), row_y);
@@ -15777,7 +15843,7 @@ mod tests {
         let next = pane.idle(&second, &a_live_code());
 
         assert!(
-            next.painted(TOTP_SECRET_LABEL),
+            next.painted(totp_secret_label()),
             "the second item drew no secret row at all, so 'its seed is masked' is vacuous: {:?}",
             next.strings()
         );
@@ -15802,7 +15868,7 @@ mod tests {
 
         // ...AND THE CONTROL: the second item's seed CAN be revealed on its
         // own row, so "masked" above is not "this pane can never show it".
-        let row_y = next.rect_of(TOTP_SECRET_LABEL).center().y;
+        let row_y = next.rect_of(totp_secret_label()).center().y;
         let again = reveal_by_clicking(&mut pane, &next, &second, &a_live_code(), row_y);
         assert!(
             again.painted(OTHER_SEED),
@@ -15848,7 +15914,7 @@ mod tests {
         let mut pane = Pane::new().revealing_secrets();
         let warm = pane.idle(&item, &a_live_code());
         assert!(
-            warm.painted(TOTP_SECRET_LABEL),
+            warm.painted(totp_secret_label()),
             "the premise: the row under test is not being drawn at all: {:?}",
             warm.strings()
         );
@@ -15858,7 +15924,7 @@ mod tests {
         assert!(
             !plaintext_reached_the_allocator(|| {
                 let frame = pane.idle(&item, &a_live_code());
-                drew = frame.painted(TOTP_SECRET_LABEL) && !frame.painted(PROBE);
+                drew = frame.painted(totp_secret_label()) && !frame.painted(PROBE);
             }),
             "painting the MASKED secret row released a copy of the seed to the allocator"
         );
@@ -16085,12 +16151,12 @@ mod tests {
         let mut pane = Pane::new().revealing_secrets();
         let frame = pane.idle(&item, &a_live_code());
         assert!(
-            frame.painted(TOTP_SECRET_LABEL),
+            frame.painted(totp_secret_label()),
             "the premise: no secret row was drawn at all: {:?}",
             frame.strings()
         );
 
-        let row_y = frame.rect_of(TOTP_SECRET_LABEL).center().y;
+        let row_y = frame.rect_of(totp_secret_label()).center().y;
         let after = reveal_by_clicking(&mut pane, &frame, &item, &a_live_code(), row_y);
         assert!(
             pane.reveal.totp_secret,
@@ -16140,7 +16206,7 @@ mod tests {
         // point of one seam rather than two derivations.
         let mut pane = Pane::new().revealing_secrets();
         let frame = pane.idle(&from_uri, &a_live_code());
-        let row_y = frame.rect_of(TOTP_SECRET_LABEL).center().y;
+        let row_y = frame.rect_of(totp_secret_label()).center().y;
         let shown = reveal_by_clicking(&mut pane, &frame, &from_uri, &a_live_code(), row_y);
         assert!(
             shown.painted(copied.as_str()),
@@ -16183,13 +16249,13 @@ mod tests {
         let mut pane = Pane::new().revealing_secrets();
         let frame = pane.idle(&item, &a_live_code());
         assert!(
-            frame.painted(TOTP_SECRET_LABEL),
+            frame.painted(totp_secret_label()),
             "the bare-seed row is no longer drawn at all: {:?}",
             frame.strings()
         );
         assert!(!frame.painted(SEED), "the row does not start masked");
 
-        let row_y = frame.rect_of(TOTP_SECRET_LABEL).center().y;
+        let row_y = frame.rect_of(totp_secret_label()).center().y;
         let after = reveal_by_clicking(&mut pane, &frame, &item, &a_live_code(), row_y);
         assert_eq!(
             after.rendered_glyphs(SEED),
@@ -16242,7 +16308,7 @@ mod tests {
         let mut pane = Pane::new().revealing_secrets();
         let warm = pane.idle(&item, &a_live_code());
         assert!(
-            warm.painted(TOTP_SECRET_LABEL),
+            warm.painted(totp_secret_label()),
             "the premise: the row under test is not being drawn at all: {:?}",
             warm.strings()
         );
@@ -16252,7 +16318,7 @@ mod tests {
         assert!(
             !plaintext_reached_the_allocator(|| {
                 let frame = pane.idle(&item, &a_live_code());
-                drew = frame.painted(TOTP_SECRET_LABEL) && !frame.painted(PROBE);
+                drew = frame.painted(totp_secret_label()) && !frame.painted(PROBE);
             }),
             "reducing and painting the MASKED secret row released a copy of the seed to the \
              allocator"
@@ -17385,9 +17451,9 @@ mod tests {
         let mut bad_path = a_browser_match();
         bad_path.path = r"C:\Apps\..\chrome.exe".to_string();
 
-        assert_eq!(app_open_refusal(&a_store_match()), Some(APP_OPEN_HOSTED_NOTE));
-        assert_eq!(app_open_refusal(&no_path), Some(APP_OPEN_NO_PATH_NOTE));
-        assert_eq!(app_open_refusal(&bad_path), Some(APP_OPEN_REFUSED_NOTE));
+        assert_eq!(app_open_refusal(&a_store_match()), Some(app_open_hosted_note()));
+        assert_eq!(app_open_refusal(&no_path), Some(app_open_no_path_note()));
+        assert_eq!(app_open_refusal(&bad_path), Some(app_open_refused_note()));
 
         // The overlap, which no fixture covered: hosted AND nothing recorded.
         let mut hosted_no_path = a_store_match();
@@ -17398,7 +17464,7 @@ mod tests {
         );
         assert_eq!(
             app_open_refusal(&hosted_no_path),
-            Some(APP_OPEN_HOSTED_NOTE),
+            Some(app_open_hosted_note()),
             "a Store app with no recorded path is told to re-pick it from the tray menu, \
              which cannot help: re-picking a Store app records another hosted match that \
              still gets no Open"
@@ -17406,7 +17472,7 @@ mod tests {
 
         // Control: the three sentences really are distinct, so the assertions
         // above are not all satisfied by one string.
-        let all = [APP_OPEN_HOSTED_NOTE, APP_OPEN_NO_PATH_NOTE, APP_OPEN_REFUSED_NOTE];
+        let all = [app_open_hosted_note(), app_open_no_path_note(), app_open_refused_note()];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a, b, "two refusals are the same sentence");
@@ -17425,7 +17491,7 @@ mod tests {
             "the card offers no Open and does not say why: {notes:?}"
         );
         // The behaviour note is still there: the binding still fires.
-        assert!(notes.contains(&APP_MATCH_BEHAVIOUR_NOTE), "{notes:?}");
+        assert!(notes.contains(&app_match_behaviour_note()), "{notes:?}");
 
         // A Store app gets its own reason, not the "no program file" one.
         let store = app_card_notes(&a_store_match());
@@ -17438,7 +17504,7 @@ mod tests {
             "ApplicationFrameHost.exe",
             TriggerMode::Prompt,
         ));
-        assert_eq!(dead, vec![APP_MATCH_DEAD_NOTICE], "{dead:?}");
+        assert_eq!(dead, vec![app_match_dead_notice()], "{dead:?}");
 
         // The control: a launchable match's notes say none of this.
         let fine = app_card_notes(&a_browser_match());
@@ -17520,8 +17586,8 @@ mod tests {
         );
         // Not a menu button: the bare word would be a question beside a
         // Program file row.
-        assert!(!frame.painted(OPEN_MENU_LABEL), "{:?}", frame.strings());
-        assert!(!frame.painted(OPEN_WEBSITE_LABEL), "{:?}", frame.strings());
+        assert!(!frame.painted(open_menu_label()), "{:?}", frame.strings());
+        assert!(!frame.painted(open_website_label()), "{:?}", frame.strings());
         // And what it draws is the LABEL, not an elided stub of it.
         assert_eq!(frame.rendered_glyphs("Open chrome.exe"), "Open chrome.exe");
     }
@@ -17557,19 +17623,19 @@ mod tests {
         let mut pane = Pane::new();
 
         let closed = pane.idle(&item, &TotpState::NoSecret);
-        assert!(closed.painted(OPEN_MENU_LABEL), "{:?}", closed.strings());
+        assert!(closed.painted(open_menu_label()), "{:?}", closed.strings());
         assert!(
             !closed.painted("Open chrome.exe"),
             "the menu's entries are painted with the menu shut: {:?}",
             closed.strings()
         );
 
-        let open_button = closed.rect_of(OPEN_MENU_LABEL).center();
+        let open_button = closed.rect_of(open_menu_label()).center();
         let _ = pane.click(&item, &TotpState::NoSecret, open_button);
         // A popup only PAINTS on the frame after the click that opened it.
         let menu = pane.idle(&item, &TotpState::NoSecret);
         assert!(menu.painted("Open chrome.exe"), "{:?}", menu.strings());
-        assert!(menu.painted(OPEN_WEBSITE_LABEL), "{:?}", menu.strings());
+        assert!(menu.painted(open_website_label()), "{:?}", menu.strings());
     }
 
     /// And each entry does its own thing.
@@ -17580,11 +17646,11 @@ mod tests {
 
         for (entry, expected) in [
             ("Open chrome.exe", DetailAction::OpenApp(app_launch_plan(&m, WEB).unwrap())),
-            (OPEN_WEBSITE_LABEL, DetailAction::OpenWebsite(WEB.to_string())),
+            (open_website_label(), DetailAction::OpenWebsite(WEB.to_string())),
         ] {
             let mut pane = Pane::new();
             let closed = pane.idle(&item, &TotpState::NoSecret);
-            let _ = pane.click(&item, &TotpState::NoSecret, closed.rect_of(OPEN_MENU_LABEL).center());
+            let _ = pane.click(&item, &TotpState::NoSecret, closed.rect_of(open_menu_label()).center());
             let menu = pane.idle(&item, &TotpState::NoSecret);
             let row = menu.rect_of(entry).center();
             let clicked = pane.click(&item, &TotpState::NoSecret, row);
@@ -17602,11 +17668,11 @@ mod tests {
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &TotpState::NoSecret);
 
-        assert!(!frame.painted(OPEN_MENU_LABEL), "{:?}", frame.strings());
+        assert!(!frame.painted(open_menu_label()), "{:?}", frame.strings());
         assert!(!frame.painted("Open chrome.exe"), "{:?}", frame.strings());
-        assert!(!frame.painted(OPEN_WEBSITE_LABEL), "{:?}", frame.strings());
+        assert!(!frame.painted(open_website_label()), "{:?}", frame.strings());
         assert!(
-            frame.painted(APP_OPEN_NO_PATH_NOTE),
+            frame.painted(app_open_no_path_note()),
             "the card silently dropped Open with no explanation: {:?}",
             frame.strings()
         );
@@ -17628,12 +17694,12 @@ mod tests {
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &TotpState::NoSecret);
         assert!(
-            frame.painted(APP_MATCH_UNREADABLE_NOTICE),
+            frame.painted(app_match_unreadable_notice()),
             "the premise: this item's field really is unreadable; painted {:?}",
             frame.strings()
         );
         assert!(frame.painted("Remove"), "{:?}", frame.strings());
-        for label in [OPEN_MENU_LABEL, OPEN_WEBSITE_LABEL, "Open chrome.exe"] {
+        for label in [open_menu_label(), open_website_label(), "Open chrome.exe"] {
             assert!(!frame.painted(label), "an unreadable field offered {label:?}");
         }
     }
@@ -17805,7 +17871,7 @@ mod tests {
             frame.strings()
         );
         assert!(
-            frame.painted(APP_MATCH_DEAD_NOTICE),
+            frame.painted(app_match_dead_notice()),
             "the premise: this card really is saying the binding is dead"
         );
     }
@@ -17855,8 +17921,8 @@ mod tests {
             );
         }
         // And it is still explained, and still not launchable.
-        assert!(frame.painted(APP_HOSTED_NOTE), "{:?}", frame.strings());
-        assert!(frame.painted(APP_OPEN_HOSTED_NOTE), "{:?}", frame.strings());
+        assert!(frame.painted(app_hosted_note()), "{:?}", frame.strings());
+        assert!(frame.painted(app_open_hosted_note()), "{:?}", frame.strings());
     }
 
     // -- the icon -------------------------------------------------------
@@ -17973,7 +18039,7 @@ mod tests {
         );
         // The refusal is still on screen, which is the other half: the card
         // says why there is no Open rather than merely omitting one.
-        assert!(laid_out.painted(APP_OPEN_NO_PATH_NOTE), "{:?}", laid_out.strings());
+        assert!(laid_out.painted(app_open_no_path_note()), "{:?}", laid_out.strings());
         // And the chord is not advertised either.
         assert!(
             !laid_out.painted(OPEN_APP_CHORD.2),
@@ -18150,7 +18216,7 @@ mod tests {
             hovered
                 .strings()
                 .iter()
-                .any(|s| s.contains(OPEN_APP_CHORD.2) && s.contains(APP_OPEN_HOVER)),
+                .any(|s| s.contains(OPEN_APP_CHORD.2) && s.contains(app_open_hover())),
             "hovering the app's name on a narrow pane names neither the act nor the chord: \
              {:?}",
             hovered.strings()
@@ -18185,8 +18251,8 @@ mod tests {
         for width in [MIN_PANE, PANE] {
             let mut pane = Pane::wide(width).tall().knows_app(CHROME_PATH, CHROME_NAME);
             let frame = pane.idle(&item, &TotpState::NoSecret);
-            let note = frame.rect_of(APP_MATCH_BEHAVIOUR_NOTE);
-            for control in [APP_REMOVE_LABEL, OPEN_MENU_LABEL] {
+            let note = frame.rect_of(app_match_behaviour_note());
+            for control in [app_remove_label(), open_menu_label()] {
                 let rect = frame.rect_of(control);
                 assert!(
                     !rect.intersects(note),
@@ -18207,7 +18273,7 @@ mod tests {
             // the card's own left edge, where the labels are -- NOT out in
             // the value column where the notes and every other row's value
             // sit. Open is the leftmost of the two.
-            let open = frame.rect_of(OPEN_MENU_LABEL);
+            let open = frame.rect_of(open_menu_label());
             let label = frame.body_rect_of("App");
             assert!(
                 open.left() < note.left(),
@@ -18224,7 +18290,7 @@ mod tests {
                 label.left()
             );
             assert!(
-                frame.rect_of(APP_REMOVE_LABEL).left() > open.left(),
+                frame.rect_of(app_remove_label()).left() > open.left(),
                 "Remove is not after Open on the controls line"
             );
         }
@@ -18241,15 +18307,15 @@ mod tests {
             let mut pane = Pane::wide(width).tall();
             let frame = pane.idle(&item, &TotpState::NoSecret);
             assert!(
-                frame.painted(APP_MATCH_BEHAVIOUR_NOTE),
+                frame.painted(app_match_behaviour_note()),
                 "no note on a {width}pt pane: {:?}",
                 frame.strings()
             );
             // The glyphs really laid, not the source: a note elided away
             // would still have a rect for the test above to miss.
             assert_eq!(
-                frame.rendered_glyphs(APP_MATCH_BEHAVIOUR_NOTE),
-                APP_MATCH_BEHAVIOUR_NOTE,
+                frame.rendered_glyphs(app_match_behaviour_note()),
+                app_match_behaviour_note(),
                 "the note was elided on a {width}pt pane"
             );
         }
@@ -18380,15 +18446,15 @@ mod tests {
             let mut pane = Pane::new();
             let item = a_login();
             let f = pane.idle(&item, &TotpState::NoSecret);
-            assert!(f.painted(ADD_2FA_ROW_TITLE) && f.painted(ADD_2FA_ROW_DETAIL), "{:?}", f.strings());
-            let at = f.rect_of(ADD_2FA_ROW_DETAIL).center();
+            assert!(f.painted(add_2fa_row_title()) && f.painted(add_2fa_row_detail()), "{:?}", f.strings());
+            let at = f.rect_of(add_2fa_row_detail()).center();
             assert_eq!(pane.click(&item, &TotpState::NoSecret, at).action, DetailAction::AddTotp);
             // A login that has a code offers its code instead.
             let f = Pane::new().idle(&a_login_with_a_code(), &code(20));
-            assert!(!f.painted(ADD_2FA_ROW_DETAIL));
+            assert!(!f.painted(add_2fa_row_detail()));
             // And a received record cannot be given one.
             let f = Pane::new().view_only("anna@x.io").idle(&item, &TotpState::NoSecret);
-            assert!(!f.painted(ADD_2FA_ROW_DETAIL));
+            assert!(!f.painted(add_2fa_row_detail()));
         }
 
         /// Where a field row's eye and copy buttons sit: 20pt in from the
@@ -18436,7 +18502,7 @@ mod tests {
             // The hero: the masked number, the face's three labels and the
             // network's word.
             assert!(f.painted("\u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} 4242"), "{:?}", f.strings());
-            for word in [HERO_HOLDER, HERO_EXPIRES, HERO_CODE] {
+            for word in [hero_holder(), hero_expires(), hero_code()] {
                 assert!(f.painted(word), "the hero has no {word}: {:?}", f.strings());
             }
             assert!(f.painted("John Doe"));
@@ -18444,10 +18510,10 @@ mod tests {
             assert!(!f.painted("VISA"), "{:?}", f.strings());
             assert!(!f.painted("123"), "the code is masked on the face");
             // The field card under it: Expires and Security code on one row.
-            let expires = f.rect_of(EXPIRY_LABEL);
-            let code = f.rect_of(CODE_LABEL);
+            let expires = f.rect_of(expiry_label());
+            let code = f.rect_of(code_label());
             assert!((expires.top() - code.top()).abs() < 1.0 && expires.right() < code.left(), "{expires:?} {code:?}");
-            assert!(f.painted(CARDHOLDER_LABEL) && f.painted(NUMBER_LABEL));
+            assert!(f.painted(cardholder_label()) && f.painted(number_label()));
             // The hero's eye shows the number.
             // The hero's number is the first, above the field card's.
             let number = f
@@ -18468,14 +18534,14 @@ mod tests {
             let item = bound_to(&a_login(), &a_desktop_match());
             let mut pane = Pane::new().tall();
             let f = pane.idle(&item, &TotpState::NoSecret);
-            assert!(f.painted(FILLS_IN_LABEL), "{:?}", f.strings());
+            assert!(f.painted(fills_in_label()), "{:?}", f.strings());
             let site = f.rect_of("app.ledgerline.com");
             assert_eq!(pane.click(&item, &TotpState::NoSecret, site.center()).action, DetailAction::OpenWebsite("app.ledgerline.com".into()));
             // The matched app is named once, on its own card, not as a chip.
             assert_eq!(f.texts.iter().filter(|(t, _)| t.contains("Ledgerline.exe")).count(), f.texts.iter().filter(|(t, r)| t.contains("Ledgerline.exe") && r.top() > site.bottom()).count());
             // No website: no card.
             let f = Pane::new().idle(&an_item(Some(2)), &TotpState::NoSecret);
-            assert!(!f.painted(FILLS_IN_LABEL));
+            assert!(!f.painted(fills_in_label()));
         }
 
         #[test]
@@ -18484,13 +18550,13 @@ mod tests {
             item.fields = vec![custom_field("Employee ID", Some("LL-40912"), Some(0))];
             let mut pane = Pane::new().tall();
             let f = pane.idle(&item, &TotpState::NoSecret);
-            for heading in ["PREVIOUS PASSWORDS", CUSTOM_FIELDS_CARD_HEADING, "NOTES"] {
+            for heading in ["PREVIOUS PASSWORDS", custom_fields_card_heading(), "NOTES"] {
                 assert!(f.painted(heading), "{heading} is gone: {:?}", f.strings());
             }
             assert!(f.painted("LL-40912"));
             // v2 cards: white at radius 18, under the headings.
             let notes = f.rect_of("NOTES");
-            let card = f.filled_box_around(f.rect_of(CUSTOM_FIELDS_CARD_HEADING), P.card);
+            let card = f.filled_box_around(f.rect_of(custom_fields_card_heading()), P.card);
             assert!(card.height() > 30.0);
             assert!(f.rects.iter().any(|(r, c)| *c == P.card && (*r == card)), "a card holds its heading");
             // The footer is plain text on the pane, no box of its own.
@@ -18552,7 +18618,7 @@ mod tests {
             item.login.as_mut().unwrap().totp = Some("JBSWY3DPEHPK3PXP".to_string().into());
             let f = Pane::new().revealing_secrets().tall().idle(&item, &code(20));
             let digits = f.rect_of("123 456");
-            let seed = f.rect_of(TOTP_SECRET_LABEL);
+            let seed = f.rect_of(totp_secret_label());
             assert!(seed.top() >= digits.bottom(), "the seed row {seed:?} overlaps the code {digits:?}");
         }
 
@@ -18750,10 +18816,10 @@ mod tests {
             assert_eq!(more.size(), vec2(48.0, 48.0));
             let _ = pane.click(&item, &TotpState::NoSecret, more.center());
             let open = pane.idle(&item, &TotpState::NoSecret);
-            for entry in [SHARE_WITH_PERSON_LABEL, ADD_2FA_MENU_LABEL, "Clone", crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL, "Delete"] {
+            for entry in [share_with_person_label(), add_2fa_menu_label(), "Clone", crate::vault_window::item_list::move_to_folder_label(), "Delete"] {
                 assert!(open.painted(entry), "the more menu has no {entry:?}: {:?}", open.strings());
             }
-            let share = open.rect_of(SHARE_WITH_PERSON_LABEL);
+            let share = open.rect_of(share_with_person_label());
             let chosen = pane.click(&item, &TotpState::NoSecret, share.center());
             assert_eq!(chosen.action, DetailAction::ShareRecord);
         }
@@ -18798,7 +18864,7 @@ mod tests {
             assert!(!f.painted("Share"), "Share waits in the more menu");
             let _ = pane.click(&item, &TotpState::NoSecret, control(&pane, HeaderControl::More).center());
             let open = pane.idle(&item, &TotpState::NoSecret);
-            let share = open.rect_of(SHARE_LABEL);
+            let share = open.rect_of(share_label());
             assert_eq!(pane.click(&item, &TotpState::NoSecret, share.center()).action, DetailAction::SendRecord);
             // And at the design's own width, words.
             let mut wide = Pane::wide(648.0);
@@ -19507,7 +19573,7 @@ mod read_pane_scroll_tests {
         // already fits in, where the scroll below is a no-op and the whole
         // thing is blind.
         assert!(
-            before.rect_of(APP_CARD_HEADING).is_none(),
+            before.rect_of(app_card_heading()).is_none(),
             "the tallest item already fits in a {NARROW}x{SHORT} pane, so this test is \
              not exercising scrolling at all"
         );
@@ -19524,7 +19590,7 @@ mod read_pane_scroll_tests {
         // one of these at once, wholly inside the pane, which is strictly
         // more than the old assertion asked at a fixed offset.
         let sources = [
-            APP_CARD_HEADING,
+            app_card_heading(),
             // The control commit `a33b75e` added, which was the single least
             // reachable thing on the pane.
             "Open Ledgerline.exe",
@@ -19555,7 +19621,7 @@ mod read_pane_scroll_tests {
             // text in the same column, which is more card height, which is
             // exactly the direction that made this card unreachable twice.
             // Removing the pill row took a row off; this put text back on.
-            APP_MATCH_BEHAVIOUR_NOTE,
+            app_match_behaviour_note(),
         ];
         let after = pane.scroll_until_all_visible(&item, &sources);
         for source in sources {
@@ -19580,7 +19646,7 @@ mod read_pane_scroll_tests {
         // **Nothing on the card is drawn on top of anything else on it.**
         // `assert_visible` says every control is on the pane; it cannot say
         // they are not stacked, which is exactly what the user reported.
-        let note = after.rect_of(APP_MATCH_BEHAVIOUR_NOTE).expect("the note");
+        let note = after.rect_of(app_match_behaviour_note()).expect("the note");
         for control in ["Open Ledgerline.exe", "Remove"] {
             let rect = after.rect_of(control).expect("the control");
             assert!(
@@ -19641,10 +19707,10 @@ mod read_pane_scroll_tests {
         // already carried the app card's heading off the top. Asked for as
         // one offset that shows both headings, which exists and is what an
         // ordering comparison needs.
-        let both = pane.scroll_until_all_visible(&item, &["NOTES", APP_CARD_HEADING]);
+        let both = pane.scroll_until_all_visible(&item, &["NOTES", app_card_heading()]);
         let notes_top = both.rect_of("NOTES").expect("just asserted visible").top();
         let app_top = both
-            .rect_of(APP_CARD_HEADING)
+            .rect_of(app_card_heading())
             .expect("just asserted visible")
             .top();
         assert!(

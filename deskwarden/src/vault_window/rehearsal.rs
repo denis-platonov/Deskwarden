@@ -245,10 +245,14 @@ pub fn scratch_target() -> Option<isize> {
 // ---------------------------------------------------------------------------
 
 /// What the readout says while the sequence is still being typed.
-pub const WAITING_NOTE: &str = "Rehearsing\u{2026} watch the panel below.";
+pub fn waiting_note() -> &'static str {
+    crate::i18n::t("rehearsal.waiting")
+}
 
 /// The design's heading for the panel showing what really landed.
-pub const ARRIVED_HEADING: &str = "WHAT ARRIVED";
+pub fn arrived_heading() -> &'static str {
+    crate::i18n::t("rehearsal.arrived_heading")
+}
 
 /// The glyph for a Tab that arrived.
 ///
@@ -305,8 +309,7 @@ pub fn arrived_panel(arrived: &str) -> String {
 /// [`crate::injector::sequence::MAX_BURST`], so a six-act sequence plans as
 /// nine steps and a user told "9" is being told an implementation detail.
 pub fn finished_line(elapsed: Duration, acts: usize) -> String {
-    let unit = if acts == 1 { "act" } else { "acts" };
-    format!("Rehearsal finished \u{b7} {} \u{b7} {acts} {unit}", elapsed_label(elapsed))
+    crate::i18n::tn("rehearsal.finished", acts as u64, &[("elapsed", &elapsed_label(elapsed))])
 }
 
 /// The whole readout, as the one string the scratch window's panel shows.
@@ -315,8 +318,9 @@ pub fn finished_line(elapsed: Duration, acts: usize) -> String {
 /// which draws a bare `\n` as a box rather than as a line break.
 pub fn report_text(arrived: &str, elapsed: Duration, acts: usize) -> String {
     format!(
-        "{}\r\n\r\n{ARRIVED_HEADING}\r\n{}",
+        "{}\r\n\r\n{}\r\n{}",
         finished_line(elapsed, acts),
+        arrived_heading(),
         arrived_panel(arrived).replace('\n', "\r\n")
     )
 }
@@ -575,7 +579,7 @@ mod tests {
 
         let report = report_text(&format!("{SAMPLE_USER}\t"), Duration::from_millis(2100), 5);
         assert!(report.starts_with("Rehearsal finished \u{b7} 2.1 s"), "{report:?}");
-        assert!(report.contains(ARRIVED_HEADING), "{report:?}");
+        assert!(report.contains(arrived_heading()), "{report:?}");
         assert!(report.contains(&format!("{SAMPLE_USER}{ARRIVED_TAB}")), "{report:?}");
         // Every line break in the readout is a Windows one: a bare `\n` is
         // drawn as a box by the edit control this is written for. Controlled by

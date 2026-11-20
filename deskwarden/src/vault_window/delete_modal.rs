@@ -61,8 +61,8 @@ impl DeleteKind {
     /// The modal's heading.
     fn heading(self) -> &'static str {
         match self {
-            DeleteKind::ToTrash => "Delete item",
-            DeleteKind::Forever => "Delete forever",
+            DeleteKind::ToTrash => crate::i18n::t("delete.heading_trash"),
+            DeleteKind::Forever => crate::i18n::t("delete.heading_forever"),
         }
     }
 
@@ -74,14 +74,8 @@ impl DeleteKind {
     /// two facts in one breath and the reader keeps the wrong one.
     fn body(self) -> &'static str {
         match self {
-            DeleteKind::ToTrash => {
-                "It moves to the Trash. You can restore it from there, on this or any \
-                 other Bitwarden client."
-            }
-            DeleteKind::Forever => {
-                "This cannot be undone. The item and everything on it is removed from the \
-                 vault on every device."
-            }
+            DeleteKind::ToTrash => crate::i18n::t("delete.body_trash"),
+            DeleteKind::Forever => crate::i18n::t("delete.body_forever"),
         }
     }
 
@@ -93,8 +87,8 @@ impl DeleteKind {
     /// reader could still think the Trash is catching it.
     fn confirm_label(self) -> &'static str {
         match self {
-            DeleteKind::ToTrash => "Delete",
-            DeleteKind::Forever => "Delete forever",
+            DeleteKind::ToTrash => crate::i18n::t("delete.confirm_trash"),
+            DeleteKind::Forever => crate::i18n::t("delete.confirm_forever"),
         }
     }
 }
@@ -193,7 +187,7 @@ pub fn draw_delete_modal(
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
         ui.spacing_mut().item_spacing.x = 10.0;
         ui.columns(2, |columns| {
-            let cancel = controls::button_filling(&mut columns[0], ButtonKind::Outline, size, "Cancel");
+            let cancel = controls::button_filling(&mut columns[0], ButtonKind::Outline, size, crate::i18n::t("delete.cancel"));
             let _ = columns[0].interact(cancel.rect, confirm_button_id(ID, Side::Left), egui::Sense::hover());
             if cancel.clicked() {
                 action = DeleteConfirmAction::Cancel;

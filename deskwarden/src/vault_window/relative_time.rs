@@ -65,16 +65,16 @@ const YEAR: u64 = 365 * DAY;
 pub fn ago(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     if secs >= YEAR {
-        pair(secs / YEAR, "y", (secs % YEAR) / DAY, "d")
+        pair(secs / YEAR, crate::i18n::t("time.unit_y"), (secs % YEAR) / DAY, crate::i18n::t("time.unit_d"))
     } else if secs >= DAY {
-        pair(secs / DAY, "d", (secs % DAY) / HOUR, "h")
+        pair(secs / DAY, crate::i18n::t("time.unit_d"), (secs % DAY) / HOUR, crate::i18n::t("time.unit_h"))
     } else if secs >= HOUR {
-        pair(secs / HOUR, "h", (secs % HOUR) / MINUTE, "m")
+        pair(secs / HOUR, crate::i18n::t("time.unit_h"), (secs % HOUR) / MINUTE, crate::i18n::t("time.unit_m"))
     } else if secs >= MINUTE {
         // Deliberately no seconds tail -- see the module doc.
-        pair(secs / MINUTE, "m", 0, "s")
+        pair(secs / MINUTE, crate::i18n::t("time.unit_m"), 0, crate::i18n::t("time.unit_s"))
     } else {
-        pair(secs, "s", 0, "")
+        pair(secs, crate::i18n::t("time.unit_s"), 0, "")
     }
 }
 
@@ -85,9 +85,12 @@ pub fn ago(elapsed: Duration) -> String {
 /// unit boundary would carry one.
 fn pair(large: u64, large_unit: &str, small: u64, small_unit: &str) -> String {
     if small == 0 {
-        format!("{large}{large_unit} ago")
+        crate::i18n::tf("time.ago_single", &[("large", &large.to_string()), ("large_unit", large_unit)])
     } else {
-        format!("{large}{large_unit} {small}{small_unit} ago")
+        crate::i18n::tf(
+            "time.ago_pair",
+            &[("large", &large.to_string()), ("large_unit", large_unit), ("small", &small.to_string()), ("small_unit", small_unit)],
+        )
     }
 }
 

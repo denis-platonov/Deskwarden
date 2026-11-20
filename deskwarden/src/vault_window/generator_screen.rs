@@ -9,13 +9,27 @@ use crate::kit::controls::{self, ButtonKind, ButtonSize};
 use crate::settings::GeneratorPrefs;
 use crate::theme;
 
-pub const TITLE: &str = "Generator";
-pub const SUB: &str = "A strong password, passphrase or PIN, made on this PC.";
-pub const MODES: [&str; 3] = ["Password", "Passphrase", "PIN"];
-pub const COPY: &str = "Copy";
-pub const COPIED: &str = "Copied";
-pub const REGENERATE: &str = "New";
-pub const AVOID_LOOKALIKES: &str = "Avoid look-alikes";
+pub fn title() -> &'static str {
+    crate::i18n::t("generator.title")
+}
+pub fn sub() -> &'static str {
+    crate::i18n::t("generator.sub")
+}
+pub fn modes() -> [&'static str; 3] {
+    [crate::i18n::t("generator.mode_password"), crate::i18n::t("generator.mode_passphrase"), crate::i18n::t("generator.mode_pin")]
+}
+pub fn copy() -> &'static str {
+    crate::i18n::t("generator.copy")
+}
+pub fn copied() -> &'static str {
+    crate::i18n::t("generator.copied")
+}
+pub fn regenerate() -> &'static str {
+    crate::i18n::t("generator.regenerate")
+}
+pub fn avoid_lookalikes() -> &'static str {
+    crate::i18n::t("generator.avoid_lookalikes")
+}
 const WIDTH: f32 = 760.0;
 const MUTED: Color32 = Color32::from_rgb(0x8a, 0x87, 0x85);
 
@@ -72,7 +86,7 @@ impl GeneratorScreen {
             }
             Err(e) => {
                 self.value = Zeroizing::new(String::new());
-                self.error = Some(format!("Couldn't make one: {e}"));
+                self.error = Some(crate::i18n::tf("generator.err_make", &[("error", &e.to_string())]));
             }
         }
         self.stale = false;
@@ -128,11 +142,11 @@ pub fn draw(ui: &mut egui::Ui, state: &mut GeneratorScreen) -> GeneratorAction {
             ui.vertical(|ui| {
                 ui.set_width(width);
                 ui.label(
-                    egui::RichText::new(TITLE)
+                    egui::RichText::new(title())
                         .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
                         .color(theme::INK),
                 );
-                ui.label(egui::RichText::new(SUB).size(16.0).color(Color32::from_rgb(0x7d, 0x79, 0x79)));
+                ui.label(egui::RichText::new(sub()).size(16.0).color(Color32::from_rgb(0x7d, 0x79, 0x79)));
                 ui.add_space(20.0);
                 value_card(ui, state);
                 ui.add_space(16.0);
@@ -165,8 +179,8 @@ const SLIDER_RAIL: Color32 = Color32::from_rgb(0xe6, 0xe3, 0xdf);
 fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
     card(ui, |ui| {
         let size = ButtonSize { height: 48.0, pad_x: 20.0, radius: 14, font_px: 16.0 };
-        let buttons = controls::button_width(ui.ctx(), ButtonKind::Primary, size, COPY, false)
-            + controls::button_width(ui.ctx(), ButtonKind::Outline, size, REGENERATE, false)
+        let buttons = controls::button_width(ui.ctx(), ButtonKind::Primary, size, copy(), false)
+            + controls::button_width(ui.ctx(), ButtonKind::Outline, size, regenerate(), false)
             + 24.0;
         ui.horizontal(|ui| {
             let room = (ui.available_width() - buttons).max(80.0);
@@ -177,13 +191,13 @@ fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
                     .color(theme::INK),
             };
             ui.add_sized(Vec2::new(room, 48.0), egui::Label::new(text).truncate());
-            let copy = controls::button(ui, ButtonKind::Primary, size, COPY, None);
+            let copy = controls::button(ui, ButtonKind::Primary, size, copy(), None);
             let _ = ui.interact(copy.rect, copy_id(), egui::Sense::hover());
             if copy.clicked() && !state.value.is_empty() {
                 crate::clipboard::copy_secret(&state.value);
-                crate::kit::toast::show(ui.ctx(), COPIED);
+                crate::kit::toast::show(ui.ctx(), copied());
             }
-            let again = controls::button(ui, ButtonKind::Outline, size, REGENERATE, None);
+            let again = controls::button(ui, ButtonKind::Outline, size, regenerate(), None);
             let _ = ui.interact(again.rect, regenerate_id(), egui::Sense::hover());
             if again.clicked() {
                 state.regenerate();
@@ -198,7 +212,7 @@ fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
         };
         ui.horizontal(|ui| {
             ui.label(theme::bold(label, 15.0).color(ink));
-            ui.label(egui::RichText::new(format!("about {} bits", bits.round() as u32)).size(14.0).color(MUTED));
+            ui.label(egui::RichText::new(crate::i18n::tf("generator.bits", &[("bits", &(bits.round() as u32).to_string())])).size(14.0).color(MUTED));
         });
     });
 }
@@ -206,14 +220,14 @@ fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
 fn options_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
     card(ui, |ui| {
         let selected = mode_index(state.prefs.mode);
-        if let Some(picked) = controls::segmented(ui, &MODES, selected, controls::SEG_GENERATOR) {
+        if let Some(picked) = controls::segmented(ui, &modes(), selected, controls::SEG_GENERATOR) {
             state.prefs.mode = [GeneratorMode::Password, GeneratorMode::Passphrase, GeneratorMode::Pin][picked];
         }
         ui.add_space(18.0);
         let (label, value, range) = match state.prefs.mode {
-            GeneratorMode::Password => ("Length", &mut state.prefs.length, 8..=64),
-            GeneratorMode::Passphrase => ("Words", &mut state.prefs.words, 3..=10),
-            GeneratorMode::Pin => ("Digits", &mut state.prefs.pin_length, 4..=12),
+            GeneratorMode::Password => (crate::i18n::t("generator.length"), &mut state.prefs.length, 8..=64),
+            GeneratorMode::Passphrase => (crate::i18n::t("generator.words"), &mut state.prefs.words, 3..=10),
+            GeneratorMode::Pin => (crate::i18n::t("generator.digits"), &mut state.prefs.pin_length, 4..=12),
         };
         ui.horizontal(|ui| {
             ui.label(theme::bold(label, 15.0).color(theme::INK));
@@ -247,7 +261,7 @@ fn options_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 controls::switch(ui, &mut state.prefs.avoid_lookalikes);
-                ui.label(theme::bold(AVOID_LOOKALIKES, 15.0).color(theme::INK));
+                ui.label(theme::bold(avoid_lookalikes(), 15.0).color(theme::INK));
             });
         }
     });
@@ -271,7 +285,7 @@ mod tests {
         let ctx = testing::ctx();
         let mut state = GeneratorScreen::new(GeneratorPrefs::default());
         let (_, p) = frame(&ctx, 0.0, &mut state, vec![]);
-        for mode in MODES {
+        for mode in modes() {
             assert!(p.text(mode).is_some(), "no {mode}");
         }
         assert_eq!(state.value().len(), 20, "the default password is 20 long");

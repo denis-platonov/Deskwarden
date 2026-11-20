@@ -59,20 +59,30 @@ const WIDTH: f32 = 580.0;
 const TIP_WIDTH: f32 = 280.0;
 
 /// Spec B section 8: the tip under the title, verbatim.
-pub const TIP: &str = "When you turn on two-step sign-in, the site shows a QR code. Scan it here and you won't need a phone app.";
+pub fn tip() -> &'static str {
+    crate::i18n::t("totp.tip")
+}
 
 /// The caption on the scan panel, verbatim.
-pub const LOOKING_CAPTION: &str = "Looking for a code\u{2026}";
+pub fn looking_caption() -> &'static str {
+    crate::i18n::t("totp.looking_caption")
+}
 
 /// What the scanned card says when the code carries neither an issuer nor an
 /// account (0.15's heading for the same card).
-pub const FOUND_TITLE: &str = "Found it";
+pub fn found_title() -> &'static str {
+    crate::i18n::t("totp.found_title")
+}
 
 /// The question under the found card, verbatim from the design.
-pub const MATCH_PROMPT: &str = "Does this match the code on the site?";
+pub fn match_prompt() -> &'static str {
+    crate::i18n::t("totp.match_prompt")
+}
 
 /// The preview row's label on the by-hand form, verbatim.
-pub const CODE_NOW: &str = "Your code right now";
+pub fn code_now() -> &'static str {
+    crate::i18n::t("totp.code_now")
+}
 
 /// The two answers' button: 52 high, radius 15, 16 px (spec B section 8).
 const ANSWER: ButtonSize = ButtonSize { height: 52.0, pad_x: 18.0, radius: 15, font_px: 16.0 };
@@ -116,14 +126,14 @@ fn layout(ui: &egui::Ui, role: Role, text: &str, ink: Color32) -> std::sync::Arc
 /// the scan, and a stray one landing here would throw the form away on the
 /// keystroke the user meant as "stop scanning".
 pub fn draw_add_modal(ctx: &egui::Context, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
-    let sub = format!("For {}", state.item_name);
+    let sub = crate::i18n::tf("totp.for_item", &[("name", &state.item_name)]);
     // A body taller than the window scrolls inside the card instead of running
     // off it: the title block and the margins stay put.
     let room = (ctx.content_rect().height() - 2.0 * modal::GUTTER - 2.0 * f32::from(modal::PADDING) - 76.0).max(240.0);
     let (outcome, action) = Dialog::new(ID, WIDTH)
-        .title(PICKER_TITLE)
+        .title(picker_title())
         .sub(&sub)
-        .title_tip(TIP, TIP_WIDTH)
+        .title_tip(tip(), TIP_WIDTH)
         .esc_closes(state.stage != Stage::Scanning)
         .show(ctx, |ui| {
             // The body is drawn as it is, and measured. Only a window too short
@@ -197,7 +207,7 @@ fn refusal_note(ui: &mut egui::Ui, text: &str) {
 
 /// The amber band over the buttons when saving would replace a code.
 fn caution_note(ui: &mut egui::Ui) {
-    modal::note(ui, modal::Tone::Caution, REPLACE_WARNING);
+    modal::note(ui, modal::Tone::Caution, replace_warning());
 }
 
 /// A quiet line under the body: the info mark and a sentence.
@@ -226,12 +236,12 @@ pub struct PickerFrame {
 /// quiet rows, the last refusal if there is one, and the privacy sentence.
 pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     let mut action = TotpAddAction::None;
-    let mut rows = Vec::with_capacity(ROUTES.len());
+    let mut rows = Vec::with_capacity(routes().len());
     let mut chosen = None;
 
     ui.spacing_mut().item_spacing.x = 12.0;
     ui.columns(2, |columns| {
-        for (column, card) in columns.iter_mut().zip(ROUTE_CARDS.iter()) {
+        for (column, card) in columns.iter_mut().zip(route_cards().iter()) {
             let (response, rect) = route_card(column, card);
             rows.push((card.route, rect));
             if response.clicked() {
@@ -241,7 +251,7 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     });
     // 0.15's other two routes, in the design's quiet row.
     ui.spacing_mut().item_spacing.y = 10.0;
-    for row in ROUTES.iter().filter(|row| !ROUTE_CARDS.iter().any(|card| card.route == row.route)) {
+    for row in routes().iter().filter(|row| !route_cards().iter().any(|card| card.route == row.route)) {
         let (response, rect) = quiet_row(ui, row);
         rows.push((row.route, rect));
         if response.clicked() {
@@ -256,7 +266,7 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     if chosen.is_none() {
         chosen = ui.input(|i| {
             i.events.iter().find_map(|event| match event {
-                egui::Event::Key { key, pressed: true, modifiers, .. } => route_for_key(&ROUTES, *key, *modifiers),
+                egui::Event::Key { key, pressed: true, modifiers, .. } => route_for_key(&routes(), *key, *modifiers),
                 _ => None,
             })
         });
@@ -273,7 +283,7 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     if let Some(refusal) = state.refusal {
         refusal_note(ui, &refusal.sentence());
     }
-    quiet_line(ui, PRIVACY_LINE);
+    quiet_line(ui, privacy_line());
     PickerFrame { action, rows }
 }
 
@@ -287,10 +297,12 @@ pub struct RouteCard {
     primary: bool,
 }
 
-pub const ROUTE_CARDS: [RouteCard; 2] = [
-    RouteCard { route: Route::ScanRegion, title: "Scan from screen", sub: "Draw a box around the code", primary: true },
-    RouteCard { route: Route::ByHand, title: "Type the key", sub: "The code of letters under the QR", primary: false },
-];
+pub fn route_cards() -> [RouteCard; 2] {
+    [
+    RouteCard { route: Route::ScanRegion, title: crate::i18n::t("totp.card_scan_title"), sub: crate::i18n::t("totp.card_scan_sub"), primary: true },
+    RouteCard { route: Route::ByHand, title: crate::i18n::t("totp.card_hand_title"), sub: crate::i18n::t("totp.card_hand_sub"), primary: false },
+    ]
+}
 
 fn route_card(ui: &mut egui::Ui, card: &RouteCard) -> (egui::Response, egui::Rect) {
     let p = palette(ui.ctx());
@@ -421,11 +433,11 @@ pub fn draw_scanning(ui: &mut egui::Ui) -> TotpAddAction {
         let glow = egui::Shadow { offset: [0, 0], blur: 14, spread: 4, color: Color32::from_rgba_unmultiplied(59, 116, 232, 140) };
         ui.painter().add(glow.as_shape(line, CornerRadius::same(3)));
         ui.painter().rect_filled(line, CornerRadius::same(3), SCAN_LINE);
-        let caption = layout(ui, Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, LOOKING_CAPTION, CAPTION_INK);
+        let caption = layout(ui, Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, looking_caption(), CAPTION_INK);
         let caption_at = egui::pos2(panel.center().x - caption.size().x / 2.0, tile.bottom() + 18.0);
         let caption_h = caption.size().y;
         ui.painter().galley(caption_at, caption, CAPTION_INK);
-        let note = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, SCANNING_NOTE, PANEL_NOTE_INK);
+        let note = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, scanning_note(), PANEL_NOTE_INK);
         ui.painter().galley(egui::pos2(panel.center().x - note.size().x / 2.0, caption_at.y + caption_h + 2.0), note, PANEL_NOTE_INK);
     });
     // The line is moving: keep drawing.
@@ -489,8 +501,8 @@ pub fn draw_webcam(ui: &mut egui::Ui, state: &mut TotpAdd, frame: Option<crate::
     if picking {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(bold(WEBCAM_CHOOSE, 18.0, p.ink));
-            ui.label(plain(WEBCAM_CHOOSE_HINT, 14.0, p.text_faint));
+            ui.label(bold(webcam_choose(), 18.0, p.ink));
+            ui.label(plain(webcam_choose_hint(), 14.0, p.text_faint));
         });
         ui.spacing_mut().item_spacing.y = 10.0;
         for (index, camera) in devices.iter().enumerate() {
@@ -510,18 +522,18 @@ pub fn draw_webcam(ui: &mut egui::Ui, state: &mut TotpAdd, frame: Option<crate::
                     Color32::WHITE,
                 );
             } else {
-                let caption = layout(ui, Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, WEBCAM_STARTING, CAPTION_INK);
+                let caption = layout(ui, Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, webcam_starting(), CAPTION_INK);
                 ui.painter().galley(panel.center() - caption.size() / 2.0, caption, CAPTION_INK);
             }
         });
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(bold(WEBCAM_HEADING, 18.0, p.ink));
-            ui.label(plain(if showing { WEBCAM_HINT } else { WEBCAM_STARTING }, 14.0, p.text_faint));
+            ui.label(bold(webcam_heading(), 18.0, p.ink));
+            ui.label(plain(if showing { webcam_hint() } else { webcam_starting() }, 14.0, p.text_faint));
         });
     }
 
-    quiet_line(ui, WEBCAM_PRIVACY_LINE);
+    quiet_line(ui, webcam_privacy_line());
 
     ui.horizontal(|ui| {
         let both = several && !picking;
@@ -529,13 +541,13 @@ pub fn draw_webcam(ui: &mut egui::Ui, state: &mut TotpAdd, frame: Option<crate::
         ui.spacing_mut().item_spacing.x = 10.0;
         if both {
             ui.allocate_ui(egui::vec2(each, ANSWER.height), |ui| {
-                if controls::button_filling(ui, ButtonKind::Outline, ANSWER, WEBCAM_ANOTHER_LABEL).clicked() {
+                if controls::button_filling(ui, ButtonKind::Outline, ANSWER, webcam_another_label()).clicked() {
                     back_to_list = true;
                 }
             });
         }
         ui.allocate_ui(egui::vec2(each, ANSWER.height), |ui| {
-            if controls::button_filling(ui, ButtonKind::Outline, ANSWER, OTHER_WAYS_LABEL).clicked() {
+            if controls::button_filling(ui, ButtonKind::Outline, ANSWER, other_ways_label()).clicked() {
                 go_back = true;
             }
         });
@@ -622,7 +634,7 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
             state.period = period;
         }
         if !live {
-            ui.label(plain(PARAMETERS_FROM_URI, 13.0, p.text_label));
+            ui.label(plain(parameters_from_uri(), 13.0, p.text_label));
         }
     }
 
@@ -647,7 +659,7 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
         ui.spacing_mut().item_spacing.x = 10.0;
         let each = (ui.available_width() - 10.0) / 2.0;
         ui.allocate_ui(egui::vec2(each, ANSWER.height), |ui| {
-            let back_label = if state.scanned { SCAN_AGAIN_LABEL } else { BACK_LABEL };
+            let back_label = if state.scanned { scan_again_label() } else { back_label() };
             let button = controls::button_filling(ui, ButtonKind::Outline, ANSWER, back_label);
             let _ = ui.interact(button.rect, back_id(), Sense::hover());
             back = button.clicked();
@@ -676,12 +688,16 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
 }
 
 /// The Back answer on the by-hand form (spec B section 8).
-pub const BACK_LABEL: &str = "Back";
+pub fn back_label() -> &'static str {
+    crate::i18n::t("totp.back")
+}
 
 /// The first answer on the read-from-a-code form (spec B section 8 `found`).
 /// It returns to the picker, where Scan from screen is one press away and so
 /// are the image and the camera.
-pub const SCAN_AGAIN_LABEL: &str = "Scan again";
+pub fn scan_again_label() -> &'static str {
+    crate::i18n::t("totp.scan_again")
+}
 
 /// Spec B section 8: the key field is 58 high, radius 16, a 2 px edge that is
 /// blue once the field reads as a code, mono 18 with `.1em` tracking, and its
@@ -732,7 +748,7 @@ fn parameter_controls(ui: &mut egui::Ui, digits: u8, period: u16, live: bool) ->
         ui.columns(2, |columns| {
             columns[0].vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 7.0;
-                ui.label(bold(DIGITS_LABEL, 14.0, p.text_nav));
+                ui.label(bold(digits_label(), 14.0, p.text_nav));
                 let faces: Vec<String> = DIGITS_CHOICES.iter().map(|d| d.to_string()).collect();
                 let faces: Vec<&str> = faces.iter().map(String::as_str).collect();
                 let selected = DIGITS_CHOICES.iter().position(|d| *d == digits).unwrap_or(0);
@@ -742,7 +758,7 @@ fn parameter_controls(ui: &mut egui::Ui, digits: u8, period: u16, live: bool) ->
             });
             columns[1].vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 7.0;
-                ui.label(bold(PERIOD_LABEL, 14.0, p.text_nav));
+                ui.label(bold(period_label(), 14.0, p.text_nav));
                 let faces: Vec<String> = PERIOD_CHOICES.iter().map(|s| format!("{s} s")).collect();
                 let faces: Vec<&str> = faces.iter().map(String::as_str).collect();
                 let selected = PERIOD_CHOICES.iter().position(|s| *s == period).unwrap_or(0);
@@ -768,7 +784,7 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
             action = TotpAddAction::CopyCode;
         }
         ui.vertical_centered(|ui| {
-            ui.label(plain(MATCH_PROMPT, 15.0, palette(ui.ctx()).text_icon));
+            ui.label(plain(match_prompt(), 15.0, palette(ui.ctx()).text_icon));
         });
         if let Some(field) = draw_field_table(ui, auth, state) {
             if action == TotpAddAction::None {
@@ -782,7 +798,9 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
 }
 
 /// The tip shown when a live code is hovered.
-pub const CODE_COPY_HINT: &str = "Click to copy this code";
+pub fn code_copy_hint() -> &'static str {
+    crate::i18n::t("totp.code_copy_hint")
+}
 
 fn code_font(size: f32) -> Role {
     Role { size, face: theme::BOLD, tracking_em: 0.12 }
@@ -800,7 +818,7 @@ fn code_now_row(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) ->
     ui.painter().rect_filled(rect, CornerRadius::same(16), if response.hovered() { p.blue_wash } else { p.chip_on });
     let mark = Rect::from_center_size(egui::pos2(rect.left() + 20.0 + 10.0, rect.center().y), Vec2::splat(20.0));
     icon::stroke(ui.painter(), mark, glyph::TICK, 2.8, p.done_mark);
-    let label = layout(ui, Role { size: 15.0, face: theme::REGULAR, tracking_em: 0.0 }, CODE_NOW, p.text_nav);
+    let label = layout(ui, Role { size: 15.0, face: theme::REGULAR, tracking_em: 0.0 }, code_now(), p.text_nav);
     let label_w = label.size().x;
     ui.painter().galley(egui::pos2(mark.right() + 14.0, rect.center().y - label.size().y / 2.0), label, p.text_nav);
     let refresh = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, &format!("\u{b7} {}", refresh_line(left)), p.text_label);
@@ -817,7 +835,7 @@ fn code_now_row(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) ->
     if filled.width() > 0.0 {
         ui.painter().rect_filled(filled, CornerRadius::same(2), p.blue);
     }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(CODE_COPY_HINT).clicked()
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(code_copy_hint()).clicked()
 }
 
 /// Spec B section 8 `found`: padding 18 20, radius 18, bg `#f5f7fd`, a 1 px
@@ -840,7 +858,7 @@ fn found_card(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) -> b
     icon::stroke(ui.painter(), Rect::from_center_size(circle, Vec2::splat(24.0)), glyph::TICK, 2.8, p.done_mark);
 
     let code_galley = layout(ui, code_font(26.0), &grouped_code(code), p.blue_deep);
-    let secs = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, &format!("new code in {left}s"), p.text_icon);
+    let secs = layout(ui, Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 }, &crate::i18n::tf("totp.new_code_in", &[("seconds", &left.to_string())]), p.text_icon);
     let right_w = code_galley.size().x.max(secs.size().x);
     let right = rect.right() - 20.0;
     let block_h = code_galley.size().y + 2.0 + secs.size().y;
@@ -851,7 +869,7 @@ fn found_card(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) -> b
     ui.painter().galley(egui::pos2(right - secs.size().x, top + code_h + 2.0), secs, p.text_icon);
 
     let text_left = circle.x + 24.0 + 14.0;
-    let title = layout(ui, Role { size: 18.0, face: theme::EXTRABOLD, tracking_em: 0.0 }, FOUND_TITLE, p.ink);
+    let title = layout(ui, Role { size: 18.0, face: theme::EXTRABOLD, tracking_em: 0.0 }, found_title(), p.ink);
     let who = match (auth.issuer.as_deref(), auth.account.as_deref()) {
         (Some(issuer), Some(account)) => format!("{issuer} \u{b7} {account}"),
         (Some(only), None) | (None, Some(only)) => only.to_string(),
@@ -864,7 +882,7 @@ fn found_card(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) -> b
     let title_h = title.size().y;
     ui.painter().galley(egui::pos2(text_left, text_top), title, p.ink);
     ui.painter().galley(egui::pos2(text_left, text_top + title_h + 3.0), who, p.text_nav);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(CODE_COPY_HINT).clicked()
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(code_copy_hint()).clicked()
 }
 
 // ---------------------------------------------------------------------------
@@ -885,14 +903,14 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) -> O
             let width = ui.available_width();
             ui.set_min_width(width);
             let issuer = auth.issuer.as_deref().unwrap_or("\u{2014}").to_string();
-            if table_row(ui, ISSUER_ROW_LABEL, field_to_copy(state, TableField::Issuer).is_some(), |ui| {
+            if table_row(ui, issuer_row_label(), field_to_copy(state, TableField::Issuer).is_some(), |ui| {
                 ui.label(bold(&issuer, 15.0, p.ink));
             }, |_| {}) {
                 pressed = Some(TableField::Issuer);
             }
             table_seam(ui);
             let account = auth.account.as_deref().unwrap_or("\u{2014}").to_string();
-            if table_row(ui, ACCOUNT_ROW_LABEL, field_to_copy(state, TableField::Account).is_some(), |ui| {
+            if table_row(ui, account_row_label(), field_to_copy(state, TableField::Account).is_some(), |ui| {
                 ui.label(plain(&account, 15.0, p.ink));
             }, |_| {}) {
                 pressed = Some(TableField::Account);
@@ -900,12 +918,12 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) -> O
             table_seam(ui);
             let mut toggle = false;
             let shown = if state.revealed { secret_as_typed(&auth.secret) } else { masked(&auth.secret) };
-            if table_row(ui, SECRET_ROW_LABEL, true, |ui| {
+            if table_row(ui, secret_row_label(), true, |ui| {
                 ui.add(egui::Label::new(
                     egui::RichText::new(&shown).font(egui::FontId::new(14.0, egui::FontFamily::Monospace)).color(p.ink),
                 ).truncate());
             }, |ui| {
-                toggle = row_action(ui, if state.revealed { HIDE_LABEL } else { REVEAL_LABEL }).clicked();
+                toggle = row_action(ui, if state.revealed { hide_label() } else { reveal_label() }).clicked();
             }) {
                 pressed = Some(TableField::Secret);
             }
@@ -915,7 +933,7 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) -> O
             }
             table_seam(ui);
             let chips = parameter_chips(auth);
-            let _ = table_row(ui, PARAMETERS_ROW_LABEL, false, |ui| {
+            let _ = table_row(ui, parameters_row_label(), false, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                     for chip in &chips {

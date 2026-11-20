@@ -167,7 +167,7 @@ pub fn notice_for(detail: &str) -> Notice {
         Some(rest) => (stopped_title(), rest.trim_start()),
         None => (nothing_typed_title(), detail),
     };
-    let heading = format!("{}. ", crate::vault_window::preflight::REFUSED_HEADING);
+    let heading = format!("{}. ", crate::vault_window::preflight::refused_heading());
     let rest = rest.strip_prefix(heading.as_str()).unwrap_or(rest);
     Notice { title, body: sentence(rest) }
 }

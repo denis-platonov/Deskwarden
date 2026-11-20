@@ -114,16 +114,13 @@ pub enum IconPickAction {
 /// disagree -- a user told "PNG or ICO" over a dialog showing only PNG files
 /// concludes the app is broken, and they are half right.
 fn file_hint() -> String {
-    format!(
-        "Any picture Deskwarden can read ({}). It is shrunk to 64x64 and stored on the item, so \
-         it syncs to your other devices.",
-        crate::file_picker::ICON_FILTER_SPEC
-    )
+    crate::i18n::tf("icon.file_hint", &[("formats", crate::file_picker::ICON_FILTER_SPEC)])
 }
 
 /// The URL box's hint.
-const URL_HINT: &str = "A direct link to an image, e.g. https://example.com/logo.png. The \
-                        address is stored; the picture is fetched when the item is shown.";
+fn url_hint() -> &'static str {
+    crate::i18n::t("icon.url_hint")
+}
 
 /// How wide the card is. Unchanged from the plain card this replaced: two
 /// hints of three lines each set the height, and 360 is the width at which
@@ -132,7 +129,9 @@ const CARD_WIDTH: f32 = 480.0;
 
 /// The heading, which is now the header band's words rather than the body's
 /// first line.
-const CARD_TITLE: &str = "Select icon";
+fn card_title() -> &'static str {
+    crate::i18n::t("icon.title")
+}
 
 /// The dialog's id; its scrim is `"icon-pick-scrim"`.
 pub const ID: &str = "icon-pick";
@@ -173,25 +172,25 @@ pub fn draw_icon_modal(ctx: &egui::Context, state: &mut IconPickState) -> IconPi
     let mut action = IconPickAction::None;
     let typed = !state.url.trim().is_empty();
     let mut use_url = false;
-    let (outcome, ()) = Dialog::new(ID, CARD_WIDTH).title(CARD_TITLE).show(ctx, |ui| {
+    let (outcome, ()) = Dialog::new(ID, CARD_WIDTH).title(card_title()).show(ctx, |ui| {
         let width = ui.available_width();
         state.subject.draw(ui);
         ui.add_space(12.0);
-        field_label(ui, "Image file");
+        field_label(ui, crate::i18n::t("icon.file_label"));
         ui.add_space(7.0);
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
-        if controls::button(ui, ButtonKind::Outline, size, "Choose a file\u{2026}", None).clicked() {
+        if controls::button(ui, ButtonKind::Outline, size, crate::i18n::t("icon.choose_file"), None).clicked() {
             action = IconPickAction::ChooseFile;
         }
         ui.add_space(6.0);
         hint(ui, &file_hint());
 
         ui.add_space(16.0);
-        field_label(ui, "Or an image address");
+        field_label(ui, crate::i18n::t("icon.url_label"));
         ui.add_space(7.0);
         crate::kit::input::text(ui, url_id(), &mut state.url, "https://example.com/logo.png", false, width);
         ui.add_space(6.0);
-        hint(ui, URL_HINT);
+        hint(ui, url_hint());
 
         if let Some(error) = &state.error {
             ui.add_space(10.0);
@@ -202,7 +201,7 @@ pub fn draw_icon_modal(ctx: &egui::Context, state: &mut IconPickState) -> IconPi
             if !typed {
                 ui.set_opacity(0.4);
             }
-            let press = controls::button_filling(ui, ButtonKind::Primary, size, "Use this address");
+            let press = controls::button_filling(ui, ButtonKind::Primary, size, crate::i18n::t("icon.use_address"));
             let _ = ui.interact(press.rect, use_id(), egui::Sense::hover());
             use_url = press.clicked() && typed;
         });
@@ -241,9 +240,7 @@ fn hint(ui: &mut egui::Ui, text: &str) {
 /// the backend's error text: that is a `VaultError` for the log, and pasting
 /// a transport failure into a modal tells the user nothing they can act on.
 pub fn write_failed_sentence() -> String {
-    "That icon could not be saved to the vault. Check your connection and try again \u{2014} the \
-     item still has the icon it had before."
-        .to_string()
+    crate::i18n::t("icon.write_failed").to_string()
 }
 
 /// A refusal, as a sentence, for the caller that has an [`IconRefusal`] and

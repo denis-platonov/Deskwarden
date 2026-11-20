@@ -63,7 +63,7 @@
 //! (`app::fill_dispatch_tests::a_password_fill_types_nothing_when_the_preflight_refuses`
 //! asserts the notifier was told, on both refusing shapes).
 //!
-//! [`REFUSED_HEADING`] -- "Nothing sent", design 4b's own word for this state
+//! [`refused_heading`] -- "Nothing sent", design 4b's own word for this state
 //! -- survived the card by moving into those sentences, so it is still the
 //! first thing the user reads when a fill is declined. The rest of 4b's string
 //! table went with the screen that painted it.
@@ -314,7 +314,9 @@ pub fn dispatch_with<T>(
 /// now, so it leads every sentence [`refusal_notice`] composes instead -- the
 /// user still reads "Nothing sent" first, in the one place a refusal now
 /// reaches them.
-pub const REFUSED_HEADING: &str = "Nothing sent";
+pub fn refused_heading() -> &'static str {
+    crate::i18n::t("preflight.refused_heading")
+}
 
 /// What the user is told when a gated fill did not happen. Reaches them
 /// through the same [`crate::injector::sequence::Notifier`] every other
@@ -342,11 +344,10 @@ pub const REFUSED_HEADING: &str = "Nothing sent";
 /// `picker_prompt`, which is where every other copy in this app already lives.
 pub fn refusal_notice(gated_reason: Option<Refusal>) -> String {
     let why = match gated_reason {
-        Some(Refusal::WrongProcess) => "The window in front is not the one this item's rule was \
-             written for. Deskwarden will not type a password there.",
-        None => "Deskwarden could not tell which window is in front, so it did not type anything.",
+        Some(Refusal::WrongProcess) => crate::i18n::t("preflight.wrong_process"),
+        None => crate::i18n::t("preflight.unknown_window"),
     };
-    format!("{REFUSED_HEADING}. {why}")
+    crate::i18n::tf("preflight.refusal", &[("heading", refused_heading()), ("reason", why)])
 }
 
 /// A gate whose foreground is a **fixture**, for the tests that drive a whole
@@ -402,7 +403,7 @@ mod tests {
     ///
     /// This is the one surviving channel for a declined fill, so both
     /// sentences are asserted here rather than left to the surface that used
-    /// to paint them. Each one leads with [`REFUSED_HEADING`] -- design 4b's
+    /// to paint them. Each one leads with [`refused_heading`] -- design 4b's
     /// own word for this state -- and each names the fact that is wrong, so a
     /// user who pressed the hotkey knows which of "press it again" and "you
     /// are in the wrong window" is their next move.
@@ -412,7 +413,7 @@ mod tests {
         let unknown = refusal_notice(None);
         for notice in [&wrong, &unknown] {
             assert!(
-                notice.starts_with(REFUSED_HEADING),
+                notice.starts_with(refused_heading()),
                 "{notice:?} does not lead with the design's word for this state"
             );
             // The masking refusal is gone on the owner's ruling, so no notice

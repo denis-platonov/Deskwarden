@@ -14,9 +14,13 @@ use crate::kit::tokens::{self, palette, Role};
 use crate::theme;
 
 /// The line under the shield (design 1a, verbatim).
-pub const OPENING: &str = "Opening your vault";
+pub fn opening() -> &'static str {
+    crate::i18n::t("splash.opening")
+}
 /// The same line when the vault is opening from the saved copy on disk.
-pub const OPENING_OFFLINE: &str = "Opening your saved copy";
+pub fn opening_offline() -> &'static str {
+    crate::i18n::t("splash.opening_offline")
+}
 /// How long the splash takes to fade once the vault is ready.
 pub const FADE: f32 = 0.45;
 /// The progress track (design 1a: 220 by 4).
@@ -57,7 +61,7 @@ pub fn paint(ctx: &egui::Context, rect: Rect, offline: bool, fade: f32) {
     // track -- centred as a block.
     let role = Role { size: 24.0, face: theme::EXTRABOLD, tracking_em: -0.01 };
     let white = Color32::WHITE.gamma_multiply(shown);
-    let line = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, if offline { OPENING_OFFLINE } else { OPENING }, white)));
+    let line = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, if offline { opening_offline() } else { opening() }, white)));
     let block = SHIELD.y + 28.0 + line.size().y + 18.0 + TRACK.y;
     let top = rect.center().y - block / 2.0;
     let shield = Rect::from_center_size(
@@ -143,16 +147,16 @@ mod tests {
     fn the_splash_is_navy_with_the_reversed_shield_and_its_line() {
         let p = painted(0.3, false, 0.0);
         assert!(p.rects.iter().any(|r| r.fill == P.blue_deep && r.rect == WINDOW), "no navy ground");
-        let (_, ink, _) = p.text(OPENING).expect("the line");
+        let (_, ink, _) = p.text(opening()).expect("the line");
         assert_eq!(*ink, egui::Color32::WHITE);
-        assert!(p.text(OPENING_OFFLINE).is_none());
+        assert!(p.text(opening_offline()).is_none());
     }
 
     #[test]
     fn offline_opens_the_saved_copy() {
         let p = painted(0.3, true, 0.0);
-        assert!(p.text(OPENING_OFFLINE).is_some());
-        assert!(p.text(OPENING).is_none() || OPENING_OFFLINE.contains(OPENING));
+        assert!(p.text(opening_offline()).is_some());
+        assert!(p.text(opening()).is_none() || opening_offline().contains(opening()));
     }
 
     #[test]
@@ -186,15 +190,15 @@ mod tests {
             testing::frame(&ctx, time, SIZE, vec![], |ui| host(ui.ctx(), WINDOW, loading, false))
         };
         let loading = frame(0.0, true);
-        assert!(loading.text(OPENING).is_some());
+        assert!(loading.text(opening()).is_some());
         // The fade starts on the first frame the vault is ready...
         frame(1.0, false);
         // ...and part-way through it the splash is part-way gone.
         let fading = frame(1.2, false);
-        let (_, ink, _) = fading.text(OPENING).expect("still fading out");
+        let (_, ink, _) = fading.text(opening()).expect("still fading out");
         assert!(ink.a() > 0 && ink.a() < 255, "{ink:?}");
         let gone = frame(1.0 + FADE as f64 + 0.05, false);
-        assert!(gone.text(OPENING).is_none(), "the splash outlived its fade");
+        assert!(gone.text(opening()).is_none(), "the splash outlived its fade");
         let quiet = frame(2.0, false);
         assert_ne!(quiet.repaint_delay, std::time::Duration::ZERO, "a finished splash keeps the window drawing");
     }
@@ -203,6 +207,6 @@ mod tests {
     fn a_vault_that_never_loaded_shows_no_splash() {
         let ctx = testing::ctx();
         let p = testing::frame(&ctx, 0.0, SIZE, vec![], |ui| host(ui.ctx(), WINDOW, false, false));
-        assert!(p.text(OPENING).is_none());
+        assert!(p.text(opening()).is_none());
     }
 }
