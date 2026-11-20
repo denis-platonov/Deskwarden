@@ -143,9 +143,6 @@ pub fn ok_label() -> &'static str {
     crate::i18n::t("notice_card.ok")
 }
 
-/// The chip inside it. `crate::prompt_card::ENTER_SHORTCUT`'s spelling.
-pub const ENTER_SHORTCUT: &str = crate::prompt_card::ENTER_SHORTCUT;
-
 /// What the body says when the refusal arrived with no words at all. No
 /// caller sends one today; a card with an empty well is worse than this.
 pub fn fallback_body() -> &'static str {
@@ -1302,7 +1299,10 @@ mod win32 {
                     .map(|r| r.text)
                     .unwrap_or_default();
                 let skin = crate::panel_draw::skin(crate::panel_draw::PanelButton::Primary, hovered);
-                let hint = Some((super::ENTER_SHORTCUT, fonts.hint));
+                // The card's ONLY button: Enter plainly presses it, so it
+                // carries no `ENTER` chip (the owner's call; the chip is kept
+                // for cards with a choice of buttons).
+                let hint: Option<(&str, windows::Win32::Graphics::Gdi::HFONT)> = None;
                 let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                 if focused {
                     // The ring in LOGICAL size, from `layout`: `rounded`
@@ -1679,7 +1679,6 @@ mod tests {
     fn the_cards_words_and_dimensions_are_the_ones_it_promises() {
         assert_eq!(nothing_typed_title(), "Nothing was typed");
         assert_eq!(ok_label(), "OK");
-        assert_eq!(ENTER_SHORTCUT, "ENTER");
         assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
         assert_eq!(WIDTH, crate::panel_draw::CARD_W);
         assert_ne!(nothing_typed_title(), stopped_title());

@@ -203,9 +203,6 @@ pub fn unlock_label() -> &'static str {
     crate::i18n::t("locked_card.unlock")
 }
 
-/// The `Enter` chip inside the *Unlock* button: Enter presses it.
-pub const ENTER_SHORTCUT: &str = crate::prompt_card::ENTER_SHORTCUT;
-
 /// The number of `crate::app::overlay_height` choice-row pitches the
 /// caller's placement is computed from.
 ///
@@ -428,7 +425,7 @@ static APP_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new())
 /// than stylistic: a D2D device was measured at 53.85 MB against this kind of
 /// window's 1.79 MB.
 mod win32 {
-    use super::{Painted, Role, APP_NAME, ENTER_SHORTCUT, GONE, LOCKED_CARD_TITLE, PENDING};
+    use super::{Painted, Role, APP_NAME, GONE, LOCKED_CARD_TITLE, PENDING};
     use crate::prompt_card::Box2;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -1127,7 +1124,10 @@ mod win32 {
                 let skin = panel_draw::skin(PanelButton::Deep, hovered);
                 let l = super::layout();
                 let dpi = DPI_PERCENT.load(Ordering::SeqCst);
-                let hint = Some((ENTER_SHORTCUT, fonts.hint));
+                // The card's ONLY button: Enter plainly presses it, so it
+                // carries no `ENTER` chip (the owner's call; the chip is kept
+                // for cards with a choice of buttons).
+                let hint: Option<(&str, windows::Win32::Graphics::Gdi::HFONT)> = None;
                 if focused {
                     // **The ring is given LOGICAL size, from `layout`.** `rounded`
                     // scales what it is handed, and `rc` came back from
@@ -1633,7 +1633,6 @@ mod tests {
     fn the_cards_words_are_the_ones_it_promises() {
         assert_eq!(locked_pill(), "Locked");
         assert_eq!(unlock_label(), "Unlock");
-        assert_eq!(ENTER_SHORTCUT, "ENTER");
         assert_eq!(
             locked_text(APP),
             (

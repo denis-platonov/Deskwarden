@@ -1401,6 +1401,26 @@ pub fn draw_mark(hdc: HDC, rect: RECT) {
     let ox = rect.left as f32 + (box_w - aw * s) / 2.0;
     let oy = rect.top as f32 + (box_h - ah * s) / 2.0;
 
+    // **Antialiased first**: each quadrant is filled at 4 x 4 samples a
+    // pixel into the destination's own pixels, so the shield's diagonal and
+    // its curved tip come out smooth instead of stair-stepped. The four
+    // quadrants partition the samples, so they still meet with no seam. The
+    // hard `Polygon` below is only the fallback when no DIB can be made.
+    let polys: Vec<FilledPolygon> = crate::theme::quadrant_outlines()
+        .iter()
+        .zip(crate::theme::QUADRANT_FILLS)
+        .map(|(outline, fill)| {
+            let pts = outline
+                .iter()
+                .map(|p| (ox + p.x * s - rect.left as f32, oy + p.y * s - rect.top as f32))
+                .collect();
+            (pts, [fill.r(), fill.g(), fill.b()])
+        })
+        .collect();
+    if with_pixels(hdc, rect, |pixels, w, h| blend_polygons(pixels, w, h, &polys)) {
+        return;
+    }
+
     unsafe {
         for (outline, fill_colour) in
             crate::theme::quadrant_outlines().iter().zip(crate::theme::QUADRANT_FILLS)
@@ -1424,6 +1444,63 @@ pub fn draw_mark(hdc: HDC, rect: RECT) {
             SelectObject(hdc, old_pen);
             let _ = DeleteObject(brush);
             let _ = DeleteObject(pen);
+        }
+    }
+}
+
+/// A closed outline in pixel coordinates, and the colour it is filled with.
+pub type FilledPolygon = (Vec<(f32, f32)>, [u8; 3]);
+
+/// Whether `(x, y)` is inside `poly` (even-odd).
+fn inside(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut hit = false;
+    let mut j = poly.len().wrapping_sub(1);
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            hit = !hit;
+        }
+        j = i;
+    }
+    hit
+}
+
+/// Fills `polys` -- each a closed outline in pixel coordinates of this
+/// `w` x `h` buffer, with its colour -- into `pixels` (`0x00RRGGBB`) at 4 x 4
+/// samples a pixel. A sample belongs to the first polygon that holds it, so
+/// shapes that share an edge partition it and leave no seam. Pure.
+pub fn blend_polygons(pixels: &mut [u32], w: i32, h: i32, polys: &[FilledPolygon]) {
+    const N: i32 = 4;
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0.0f32; 3];
+            let mut hits = 0;
+            for sy in 0..N {
+                for sx in 0..N {
+                    let px = x as f32 + (sx as f32 + 0.5) / N as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / N as f32;
+                    if let Some((_, c)) = polys.iter().find(|(poly, _)| inside(poly, px, py)) {
+                        sum[0] += c[0] as f32;
+                        sum[1] += c[1] as f32;
+                        sum[2] += c[2] as f32;
+                        hits += 1;
+                    }
+                }
+            }
+            if hits == 0 {
+                continue;
+            }
+            let i = (y * w + x) as usize;
+            let under = pixels[i];
+            let a = hits as f32 / (N * N) as f32;
+            let under = [((under >> 16) & 0xff) as f32, ((under >> 8) & 0xff) as f32, (under & 0xff) as f32];
+            let mut out = [0u32; 3];
+            for k in 0..3 {
+                let over = sum[k] / hits as f32;
+                out[k] = (under[k] + (over - under[k]) * a).round().clamp(0.0, 255.0) as u32;
+            }
+            pixels[i] = (out[0] << 16) | (out[1] << 8) | out[2];
         }
     }
 }
@@ -1742,6 +1819,30 @@ mod tests {
         // A radius too big for the rectangle is clamped to a pill.
         let pill = rounded_rect_sdf(10.0, 10.0, 40.0, 20.0, 999.0);
         assert!((pill - (-10.0)).abs() < 1e-3, "{pill}");
+    }
+
+    #[test]
+    fn the_shield_is_filled_with_soft_edges_and_no_seam_between_quadrants() {
+        // Two triangles sharing the diagonal of a 4 x 4 square, red and blue,
+        // over white: every pixel is fully covered (no seam), and a pixel on
+        // the diagonal is a mix of both rather than one or the other.
+        let polys = vec![
+            (vec![(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)], [255, 0, 0]),
+            (vec![(4.0, 0.0), (4.0, 4.0), (0.0, 4.0)], [0, 0, 255]),
+        ];
+        let mut px = vec![0x00ff_ffffu32; 16];
+        blend_polygons(&mut px, 4, 4, &polys);
+        for p in &px {
+            assert_eq!(p & 0x00ff00, 0, "white showed through between the two halves: {p:#08x}");
+        }
+        // Pixel (1, 2) straddles the diagonal x + y = 4.
+        let diag = px[9];
+        assert!(diag >> 16 > 0x20 && diag & 0xff > 0x20, "the diagonal pixel is not a blend: {diag:#08x}");
+        // And a lone triangle's edge is partly the background.
+        let mut px = vec![0x00ff_ffffu32; 16];
+        blend_polygons(&mut px, 4, 4, &polys[..1]);
+        let edge = px[9];
+        assert!(edge & 0xff > 0x20 && edge & 0xff < 0xe0, "the edge pixel is not antialiased: {edge:#08x}");
     }
 
     #[test]
