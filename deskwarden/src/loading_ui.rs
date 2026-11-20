@@ -1569,7 +1569,7 @@ mod first_window_body_tests {
     /// local-copy offers, rather than a splash that never ends.
     #[test]
     fn the_first_window_loads_behind_the_splash_and_slow_and_unreachable_keep_their_bodies() {
-        let opening = crate::vault_window::splash::OPENING;
+        let opening = crate::vault_window::splash::opening();
         assert!(rendered(&frame(FirstWindowBody::Loading)).contains(opening));
         let slow = rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None }));
         assert!(!slow.contains(opening), "{slow}");

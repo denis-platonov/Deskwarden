@@ -173,8 +173,8 @@ impl OutOfVault {
     /// the first time a variant is renamed.
     pub fn label(self) -> &'static str {
         match self {
-            OutOfVault::Trash => "Trash",
-            OutOfVault::Archive => "Archive",
+            OutOfVault::Trash => crate::i18n::t("sidebar.trash"),
+            OutOfVault::Archive => crate::i18n::t("sidebar.archive"),
         }
     }
 }
@@ -518,25 +518,25 @@ pub enum SidebarAction {
 /// reads as its kind.
 pub fn scope_title(filter: &SidebarFilter, folders: &[Folder], lists: VaultLists<'_>) -> String {
     let fixed = match filter {
-        SidebarFilter::All => "All items",
-        SidebarFilter::Favorites => "Favorites",
-        SidebarFilter::Apps => "Apps",
-        SidebarFilter::Logins => "Logins",
-        SidebarFilter::Passkeys => "Passkeys",
-        SidebarFilter::Cards => "Cards",
-        SidebarFilter::Identities => "Identities",
-        SidebarFilter::SecureNotes => "Secure notes",
-        SidebarFilter::SshKeys => "SSH keys",
-        SidebarFilter::Archive => "Archive",
-        SidebarFilter::Trash => "Trash",
+        SidebarFilter::All => crate::i18n::t("sidebar.all_items"),
+        SidebarFilter::Favorites => crate::i18n::t("sidebar.favorites"),
+        SidebarFilter::Apps => crate::i18n::t("sidebar.apps"),
+        SidebarFilter::Logins => crate::i18n::t("sidebar.logins"),
+        SidebarFilter::Passkeys => crate::i18n::t("sidebar.passkeys"),
+        SidebarFilter::Cards => crate::i18n::t("sidebar.cards"),
+        SidebarFilter::Identities => crate::i18n::t("sidebar.identities"),
+        SidebarFilter::SecureNotes => crate::i18n::t("sidebar.secure_notes"),
+        SidebarFilter::SshKeys => crate::i18n::t("sidebar.ssh_keys"),
+        SidebarFilter::Archive => crate::i18n::t("sidebar.archive"),
+        SidebarFilter::Trash => crate::i18n::t("sidebar.trash"),
         SidebarFilter::Folder(id) => {
-            return folders.iter().find(|f| &f.id == id).map_or_else(|| "Folder".to_string(), |f| f.name.clone())
+            return folders.iter().find(|f| &f.id == id).map_or_else(|| crate::i18n::t("sidebar.folder").to_string(), |f| f.name.clone())
         }
         SidebarFilter::Unfiled => {
             return folders
                 .iter()
                 .find(|f| is_virtual_folder(f))
-                .map_or_else(|| "No folder".to_string(), |f| f.name.clone())
+                .map_or_else(|| crate::i18n::t("sidebar.no_folder").to_string(), |f| f.name.clone())
         }
         SidebarFilter::Organisation(id) => {
             return lists
@@ -544,7 +544,7 @@ pub fn scope_title(filter: &SidebarFilter, folders: &[Folder], lists: VaultLists
                 .visible_organisations()
                 .into_iter()
                 .find(|o| &o.id == id)
-                .map_or_else(|| "Organisation".to_string(), |o| o.label().to_string())
+                .map_or_else(|| crate::i18n::t("sidebar.organisation").to_string(), |o| o.label().to_string())
         }
         SidebarFilter::Collection(id) => {
             return lists
@@ -553,7 +553,7 @@ pub fn scope_title(filter: &SidebarFilter, folders: &[Folder], lists: VaultLists
                 .into_iter()
                 .flat_map(|o| lists.sharing.collections_of(&o.id))
                 .find(|c| &c.id == id)
-                .map_or_else(|| "Collection".to_string(), |c| c.label().to_string())
+                .map_or_else(|| crate::i18n::t("sidebar.collection").to_string(), |c| c.label().to_string())
         }
     };
     fixed.to_string()
@@ -609,7 +609,14 @@ pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
 /// **`Shared`**, the design's word for it (spec A 4, and the page's own title).
 /// The owner's earlier "Sent" is retired: the rail, the page and the palette
 /// say one word. "Shared with me" is the other direction.
+// English only, kept for the tests in `send_ui` that locate the row by it; the rail
+// itself reads [`sends_row_label`]. Phase 2 of the translation work removes this
+// constant when `send_ui` has moved to the function.
 pub const SENDS_ROW_LABEL: &str = "Shared";
+
+pub fn sends_row_label() -> &'static str {
+    crate::i18n::t("sidebar.sends")
+}
 
 /// Design 5b's `Shared with me` row: the Sends **other people** sent to this
 /// user and this app imported.
@@ -617,10 +624,14 @@ pub const SENDS_ROW_LABEL: &str = "Shared";
 /// Its count is a local record rather than a query -- see
 /// [`crate::receive_history`], which is the file, and why it holds no access
 /// URL.
-pub const RECEIVED_ROW_LABEL: &str = "Shared with me";
+pub fn received_row_label() -> &'static str {
+    crate::i18n::t("sidebar.received")
+}
 
 /// The design's own name for the section these rows sit in (5b: `SHARING`).
-pub const SHARING_SECTION_LABEL: &str = "SHARING";
+pub fn sharing_section_label() -> &'static str {
+    crate::i18n::t("sidebar.section_sharing")
+}
 
 /// **Design 5b's SHARING sub-filters: a third selection axis, orthogonal to
 /// both [`SidebarFilter`] and [`Screen`].**
@@ -700,11 +711,11 @@ impl SendScope {
     pub fn label(self) -> &'static str {
         use crate::vault_window::send_ui;
         match self {
-            SendScope::All => SENDS_ROW_LABEL,
+            SendScope::All => sends_row_label(),
             SendScope::Waiting => send_ui::WAITING_LABEL,
             SendScope::Opened => send_ui::OPENED_LABEL,
             SendScope::Used => send_ui::USED_LABEL,
-            SendScope::Ended => ENDED_ROW_LABEL,
+            SendScope::Ended => ended_row_label(),
         }
     }
 
@@ -733,10 +744,10 @@ impl SendScope {
     pub fn eyebrow(self) -> &'static str {
         match self {
             SendScope::All => crate::vault_window::send_ui::SENDS_HEADING,
-            SendScope::Waiting => "WAITING",
-            SendScope::Opened => "OPENED",
-            SendScope::Used => "USED",
-            SendScope::Ended => "ENDED",
+            SendScope::Waiting => crate::i18n::t("sidebar.eyebrow_waiting"),
+            SendScope::Opened => crate::i18n::t("sidebar.eyebrow_opened"),
+            SendScope::Used => crate::i18n::t("sidebar.eyebrow_used"),
+            SendScope::Ended => crate::i18n::t("sidebar.eyebrow_ended"),
         }
     }
 
@@ -755,12 +766,10 @@ impl SendScope {
     pub fn gloss(self) -> Option<&'static str> {
         match self {
             SendScope::All => None,
-            SendScope::Waiting => Some("The link is live, and nobody has opened it yet."),
-            SendScope::Opened => Some("The link is live, and somebody has opened it."),
-            SendScope::Used => Some("Opened, with every permitted view spent."),
-            SendScope::Ended => {
-                Some("Out of time or turned off \u{2014} expired and revoked links together.")
-            }
+            SendScope::Waiting => Some(crate::i18n::t("sidebar.gloss_waiting")),
+            SendScope::Opened => Some(crate::i18n::t("sidebar.gloss_opened")),
+            SendScope::Used => Some(crate::i18n::t("sidebar.gloss_used")),
+            SendScope::Ended => Some(crate::i18n::t("sidebar.gloss_ended")),
         }
     }
 }
@@ -768,7 +777,9 @@ impl SendScope {
 /// The word [`SendScope::Ended`] prints. Spelled once, and **not** one of
 /// `send_ui`'s four pill labels; see [`SendScope`] for why that is deliberate
 /// rather than an oversight.
-pub const ENDED_ROW_LABEL: &str = "Ended";
+pub fn ended_row_label() -> &'static str {
+    crate::i18n::t("sidebar.ended")
+}
 
 /// How many Sends fall on the parent row and on each of its four sub-rows.
 ///
@@ -1060,15 +1071,29 @@ const ROW_GAP: f32 = 2.0;
 const GLYPH_GAP: f32 = 12.0;
 
 /// The rail's New item button.
-pub const NEW_ITEM_LABEL: &str = "New item";
+pub fn new_item_label() -> &'static str {
+    crate::i18n::t("sidebar.new_item")
+}
 /// The closed New folder row.
-pub const NEW_FOLDER_LABEL: &str = "New folder";
+pub fn new_folder_label() -> &'static str {
+    crate::i18n::t("sidebar.new_folder")
+}
 /// The open New folder row's placeholder (design 1a, verbatim).
-pub const NEW_FOLDER_PLACEHOLDER: &str = "Folder name, then Enter";
+pub fn new_folder_placeholder() -> &'static str {
+    crate::i18n::t("sidebar.new_folder_placeholder")
+}
 /// The pinned Lock row.
-pub const LOCK_ROW_LABEL: &str = "Lock";
+pub fn lock_row_label() -> &'static str {
+    crate::i18n::t("sidebar.lock")
+}
 /// The TOOLS section's Settings row.
+// English only, kept for the tests in `send_ui`; the rail reads [`settings_row_label`].
+// Phase 2 of the translation work removes this constant when `send_ui` has moved.
 pub const SETTINGS_ROW_LABEL: &str = "Settings";
+
+pub fn settings_row_label() -> &'static str {
+    crate::i18n::t("sidebar.settings")
+}
 
 /// The colours the rail paints in this frame: the window publishes the
 /// user's style into the context (`kit::tokens::set_sidebar_style`), so the
@@ -1180,24 +1205,24 @@ pub fn draw_sidebar(
                 // spelled out, and `ROW_GAP` is applied around each row loop.
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                section_label(ui, "Vault", true);
+                section_label(ui, crate::i18n::t("sidebar.section_vault"), true);
                 ui.spacing_mut().item_spacing.y = ROW_GAP;
                 for (label, filter) in [
-                    ("All items", SidebarFilter::All),
-                    ("Favorites", SidebarFilter::Favorites),
+                    (crate::i18n::t("sidebar.all_items"), SidebarFilter::All),
+                    (crate::i18n::t("sidebar.favorites"), SidebarFilter::Favorites),
                     // Directly after Favorites, by the owner's instruction
                     // ("it is our main feature").
-                    ("Apps", SidebarFilter::Apps),
-                    ("Logins", SidebarFilter::Logins),
-                    ("Passkeys", SidebarFilter::Passkeys),
-                    ("Cards", SidebarFilter::Cards),
-                    ("Identities", SidebarFilter::Identities),
-                    ("Secure notes", SidebarFilter::SecureNotes),
-                    ("SSH keys", SidebarFilter::SshKeys),
+                    (crate::i18n::t("sidebar.apps"), SidebarFilter::Apps),
+                    (crate::i18n::t("sidebar.logins"), SidebarFilter::Logins),
+                    (crate::i18n::t("sidebar.passkeys"), SidebarFilter::Passkeys),
+                    (crate::i18n::t("sidebar.cards"), SidebarFilter::Cards),
+                    (crate::i18n::t("sidebar.identities"), SidebarFilter::Identities),
+                    (crate::i18n::t("sidebar.secure_notes"), SidebarFilter::SecureNotes),
+                    (crate::i18n::t("sidebar.ssh_keys"), SidebarFilter::SshKeys),
                     // The section's outer edge: items put away rather than
                     // items in use.
-                    ("Archive", SidebarFilter::Archive),
-                    ("Trash", SidebarFilter::Trash),
+                    (crate::i18n::t("sidebar.archive"), SidebarFilter::Archive),
+                    (crate::i18n::t("sidebar.trash"), SidebarFilter::Trash),
                 ] {
                     // **The 0.15 kinds design 1a does not draw stay out of
                     // sight while they hold nothing**: Passkeys, Identities
@@ -1216,12 +1241,12 @@ pub fn draw_sidebar(
                 }
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                section_label(ui, "Tools", false);
+                section_label(ui, crate::i18n::t("sidebar.section_tools"), false);
                 if tools_rows(ui, lists, &mut screens) {
                     action = SidebarAction::OpenSettings;
                 }
 
-                section_label(ui, "Folders", false);
+                section_label(ui, crate::i18n::t("sidebar.section_folders"), false);
                 ui.spacing_mut().item_spacing.y = ROW_GAP;
                 // What is being dragged over this window right now, if
                 // anything, and what each folder row would do with it. Both
@@ -1379,13 +1404,13 @@ fn new_item_button(
     );
     crate::kit::icon::stroke(ui.painter(), plus, crate::kit::icon::glyph::PLUS, 2.4, palette.new_fg);
     let role = crate::kit::tokens::Role { size: 15.0, face: theme::BOLD, tracking_em: 0.0 };
-    let label = ui.painter().layout_job(crate::kit::tokens::job(role, NEW_ITEM_LABEL, palette.new_fg));
+    let label = ui.painter().layout_job(crate::kit::tokens::job(role, new_item_label(), palette.new_fg));
     ui.painter().galley(
         egui::pos2(plus.right() + 10.0, rect.center().y - label.size().y / 2.0),
         label,
         palette.new_fg,
     );
-    crate::kit::tips::hint(ui, &response, NEW_ITEM_LABEL, &["Mod", "N"]);
+    crate::kit::tips::hint(ui, &response, new_item_label(), &["Mod", "N"]);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1417,14 +1442,15 @@ pub enum DropOutcome {
 /// Worth re-testing after a CLI upgrade -- current `bitwarden/clients` main
 /// assigns `folderId` unconditionally, so this looks like a version
 /// difference rather than a permanent property of the API.
-pub const CANNOT_UNFILE: &str =
-    "\"No Folder\" isn't a place an item can be moved to \u{2014} the Bitwarden CLI this build talks \
-     to cannot take an item out of a folder, so the drop was refused rather than looking like \
-     it worked.";
+pub fn cannot_unfile() -> &'static str {
+    crate::i18n::t("sidebar.cannot_unfile")
+}
 
 /// Why the folder an item already lives in refuses it. The same fact the
 /// row menu's "Move to folder" submenu greys that destination for.
-pub const ALREADY_IN_THIS_FOLDER: &str = "That item is already in this folder.";
+pub fn already_in_this_folder() -> &'static str {
+    crate::i18n::t("sidebar.already_in_folder")
+}
 
 /// The same refusal for the "No Folder" row, on a backend that CAN un-file:
 /// the item is not in a folder, so there is nothing for the drop to do.
@@ -1433,7 +1459,9 @@ pub const ALREADY_IN_THIS_FOLDER: &str = "That item is already in this folder.";
 /// because "already in this folder" is untrue of a row that is not a folder
 /// -- and a refusal a user cannot square with what they are looking at is
 /// worse than the silent no-op it replaced.
-pub const ALREADY_IN_NO_FOLDER: &str = "That item is not in a folder.";
+pub fn already_in_no_folder() -> &'static str {
+    crate::i18n::t("sidebar.not_in_folder")
+}
 
 /// What each of `folders` does when `dragged` is released on it -- **one
 /// entry per folder, in the order the sidebar draws them**, which is what
@@ -1473,19 +1501,19 @@ pub fn drop_outcomes(
                 // move and refusing it would be this app withholding
                 // something that works.
                 if !may_unfile {
-                    return DropOutcome::Refuse(CANNOT_UNFILE);
+                    return DropOutcome::Refuse(cannot_unfile());
                 }
                 // Already unfiled: a write that would achieve nothing, and
                 // the same refusal the row below gives for the folder an
                 // item already lives in.
                 return if dragged.folder_id.as_deref().unwrap_or("").is_empty() {
-                    DropOutcome::Refuse(ALREADY_IN_NO_FOLDER)
+                    DropOutcome::Refuse(already_in_no_folder())
                 } else {
                     DropOutcome::Accept
                 };
             }
             if dragged.folder_id.as_deref() == Some(folder.id.as_str()) {
-                return DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER);
+                return DropOutcome::Refuse(already_in_this_folder());
             }
             DropOutcome::Accept
         })
@@ -1514,10 +1542,11 @@ fn section_label(ui: &mut egui::Ui, text: &str, first: bool) -> egui::Rect {
 /// What the Lock row's right-hand count shows: the running time out of
 /// "Locks in m:ss", or "Off" when auto-lock is off.
 pub(crate) fn lock_count(countdown: &str) -> &str {
-    if let Some(time) = countdown.strip_prefix("Locks in ") {
+    let locks_in = crate::i18n::tf("vault.locks_in", &[("time", "\u{0}")]);
+    if let Some(time) = super::top_bar::unfill(&locks_in, countdown) {
         time
-    } else if countdown == "Auto-lock is off" {
-        "Off"
+    } else if countdown == crate::i18n::t("vault.auto_lock_off") {
+        crate::i18n::t("sidebar.lock_off")
     } else {
         countdown
     }
@@ -1539,11 +1568,11 @@ fn lock_row(
         response.hovered(),
         false,
         crate::kit::icon::glyph::LOCK,
-        LOCK_ROW_LABEL,
+        lock_row_label(),
         Some(lock_count(countdown)),
         0.0,
     );
-    crate::kit::tips::hint(ui, &response, LOCK_ROW_LABEL, &["Mod", "L"]);
+    crate::kit::tips::hint(ui, &response, lock_row_label(), &["Mod", "L"]);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1556,7 +1585,9 @@ fn lock_row(
 /// rail heading that disagreed with every sentence written about it would be
 /// a difference a reader has to resolve. One constant, so the owner can
 /// disagree in one edit.
-pub const ORGANISATIONS_SECTION_LABEL: &str = "ORGANISATIONS";
+pub fn organisations_section_label() -> &'static str {
+    crate::i18n::t("sidebar.section_organisations")
+}
 
 /// **Design 5b's SHARING section, one section up: the organisations this
 /// account is in, and their collections indented underneath.**
@@ -1639,7 +1670,7 @@ fn draw_organisations(
         return;
     }
 
-    section_label(ui, ORGANISATIONS_SECTION_LABEL, false);
+    section_label(ui, organisations_section_label(), false);
     ui.spacing_mut().item_spacing.y = ROW_GAP;
     for organisation in organisations {
         // `item_row`, the same helper every VAULT row uses, so an
@@ -1694,7 +1725,9 @@ fn draw_organisations(
 /// [`Screens`] rather than [`SidebarFilter`] variants, and [`Screens::select`]
 /// is the only way in.
 /// Slice 6: the TOOLS row for the Generator screen.
-pub const GENERATOR_ROW_LABEL: &str = "Generator";
+pub fn generator_row_label() -> &'static str {
+    crate::i18n::t("sidebar.generator")
+}
 
 fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_>) -> bool {
     use crate::kit::icon::glyph;
@@ -1712,7 +1745,7 @@ fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_
             (None, shares) => Some(shares),
         };
         let count = badge_text(count);
-        if sidebar_row(ui, glyph::SHARED, SENDS_ROW_LABEL, Some(&count), on, width, 0.0, ROW_HEIGHT)
+        if sidebar_row(ui, glyph::SHARED, sends_row_label(), Some(&count), on, width, 0.0, ROW_HEIGHT)
             .clicked()
         {
             screens.select_sharing(SendScope::All);
@@ -1722,7 +1755,7 @@ fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_
         // Distinct items with a finding: always known, so never an en dash.
         let width = ui.available_width();
         let on = screens.is(Screen::Health);
-        let label = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+        let label = crate::vault_window::password_health::health_row_label();
         let count = badge_text(Some(lists.health_findings));
         if sidebar_row(ui, glyph::HEALTH, label, Some(&count), on, width, 0.0, ROW_HEIGHT).clicked() {
             screens.select(Screen::Health);
@@ -1732,13 +1765,13 @@ fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_
         // Slice 6: the Generator screen.
         let width = ui.available_width();
         let on = screens.is(Screen::Generator);
-        if sidebar_row(ui, glyph::GEN, GENERATOR_ROW_LABEL, None, on, width, 0.0, ROW_HEIGHT).clicked() {
+        if sidebar_row(ui, glyph::GEN, generator_row_label(), None, on, width, 0.0, ROW_HEIGHT).clicked() {
             screens.select(Screen::Generator);
         }
     }
     let width = ui.available_width();
     let settings_on = screens.is(Screen::Settings);
-    let settings = sidebar_row(ui, glyph::SETTINGS, SETTINGS_ROW_LABEL, None, settings_on, width, 0.0, ROW_HEIGHT)
+    let settings = sidebar_row(ui, glyph::SETTINGS, settings_row_label(), None, settings_on, width, 0.0, ROW_HEIGHT)
         .clicked();
     ui.spacing_mut().item_spacing.y = 0.0;
     settings
@@ -1755,7 +1788,7 @@ fn received_row(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<
     let row = sidebar_row(
         ui,
         crate::kit::icon::glyph::RECEIVED,
-        RECEIVED_ROW_LABEL,
+        received_row_label(),
         Some(&count),
         on,
         width,
@@ -1796,7 +1829,7 @@ fn new_folder_row(ui: &mut egui::Ui, palette: &crate::kit::tokens::SidebarPalett
         crate::kit::icon::stroke(ui.painter(), glyph, crate::kit::icon::glyph::PLUS, 2.0, palette.muted);
         let label = ui
             .painter()
-            .layout_job(crate::kit::tokens::job(crate::kit::tokens::NAV, NEW_FOLDER_LABEL, palette.muted));
+            .layout_job(crate::kit::tokens::job(crate::kit::tokens::NAV, new_folder_label(), palette.muted));
         ui.painter().galley(
             egui::pos2(glyph.right() + GLYPH_GAP, rect.center().y - label.size().y / 2.0),
             label,
@@ -1819,7 +1852,7 @@ fn new_folder_row(ui: &mut egui::Ui, palette: &crate::kit::tokens::SidebarPalett
     let field = egui::TextEdit::singleline(&mut name)
         .id(edit_id)
         .frame(egui::Frame::NONE)
-        .hint_text(egui::RichText::new(NEW_FOLDER_PLACEHOLDER).color(palette.muted).size(14.0))
+        .hint_text(egui::RichText::new(new_folder_placeholder()).color(palette.muted).size(14.0))
         .text_color(palette.text)
         .font(egui::FontId::new(14.0, egui::FontFamily::Proportional))
         .desired_width(width - 2.0 * ROW_INSET_X);
@@ -1993,7 +2026,7 @@ mod drop_outcome_tests {
         );
         assert_eq!(
             drop_outcomes(&folders, &filed, false)[0],
-            DropOutcome::Refuse(CANNOT_UNFILE),
+            DropOutcome::Refuse(cannot_unfile()),
             "a backend that cannot un-file accepted a drop that would do nothing"
         );
         // **The rest of the rail is unaffected either way** -- the flag
@@ -2022,12 +2055,12 @@ mod drop_outcome_tests {
         for already in [None, Some("")] {
             assert_eq!(
                 drop_outcomes(&folders, &dragged(already), true)[0],
-                DropOutcome::Refuse(ALREADY_IN_NO_FOLDER),
+                DropOutcome::Refuse(already_in_no_folder()),
                 "with folder_id {already:?} the drop was not refused for being a no-op"
             );
         }
         assert_ne!(
-            ALREADY_IN_NO_FOLDER, ALREADY_IN_THIS_FOLDER,
+            already_in_no_folder(), already_in_this_folder(),
             "the two refusals read alike, so one of them is describing the wrong row"
         );
     }
@@ -2037,7 +2070,7 @@ mod drop_outcome_tests {
         assert_eq!(
             drop_outcomes(&a_real_looking_vault(), &dragged(None), false),
             vec![
-                DropOutcome::Refuse(CANNOT_UNFILE),
+                DropOutcome::Refuse(cannot_unfile()),
                 DropOutcome::Accept,
                 DropOutcome::Accept,
             ]
@@ -2056,7 +2089,7 @@ mod drop_outcome_tests {
         for from in [None, Some("f1"), Some("f2")] {
             assert_eq!(
                 drop_outcomes(&a_real_looking_vault(), &dragged(from), false)[0],
-                DropOutcome::Refuse(CANNOT_UNFILE),
+                DropOutcome::Refuse(cannot_unfile()),
                 "the virtual bucket accepted an item dragged from {from:?}"
             );
         }
@@ -2069,8 +2102,8 @@ mod drop_outcome_tests {
         assert_eq!(
             drop_outcomes(&a_real_looking_vault(), &dragged(Some("f1")), false),
             vec![
-                DropOutcome::Refuse(CANNOT_UNFILE),
-                DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER),
+                DropOutcome::Refuse(cannot_unfile()),
+                DropOutcome::Refuse(already_in_this_folder()),
                 DropOutcome::Accept,
             ]
         );
@@ -2084,14 +2117,14 @@ mod drop_outcome_tests {
         let folders = a_real_looking_vault();
         let outcomes = drop_outcomes(&folders, &dragged(Some("f2")), false);
         assert_eq!(outcomes.len(), folders.len());
-        assert_eq!(outcomes[2], DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER));
+        assert_eq!(outcomes[2], DropOutcome::Refuse(already_in_this_folder()));
     }
 
     #[test]
     fn a_vault_with_no_real_folders_accepts_nothing() {
         assert_eq!(
             drop_outcomes(&[folder("", "No Folder")], &dragged(None), false),
-            vec![DropOutcome::Refuse(CANNOT_UNFILE)]
+            vec![DropOutcome::Refuse(cannot_unfile())]
         );
         assert_eq!(drop_outcomes(&[], &dragged(None), false), Vec::<DropOutcome>::new());
     }
@@ -2739,7 +2772,7 @@ mod drag_and_drop_tests {
         let from = centre_of(&items, &folders, "Vantage");
         let to = centre_of(&items, &folders, "No Folder");
         let run = run_frames(&items, &folders, drag_frames(from, to));
-        assert_eq!(run.action, SidebarAction::RefusedMove(CANNOT_UNFILE));
+        assert_eq!(run.action, SidebarAction::RefusedMove(cannot_unfile()));
     }
 
     #[test]
@@ -2748,7 +2781,7 @@ mod drag_and_drop_tests {
         let from = centre_of(&items, &folders, "Vantage"); // already in "f1"
         let to = centre_of(&items, &folders, "Work");
         let run = run_frames(&items, &folders, drag_frames(from, to));
-        assert_eq!(run.action, SidebarAction::RefusedMove(ALREADY_IN_THIS_FOLDER));
+        assert_eq!(run.action, SidebarAction::RefusedMove(already_in_this_folder()));
     }
 
     #[test]
@@ -3820,8 +3853,8 @@ mod tests {
     #[test]
     fn the_ended_row_says_a_different_word_from_the_pills_and_explains_which_ones() {
         use crate::vault_window::send_ui;
-        assert_ne!(ENDED_ROW_LABEL, send_ui::EXPIRED_LABEL);
-        assert_ne!(ENDED_ROW_LABEL, send_ui::REVOKED_LABEL);
+        assert_ne!(ended_row_label(), send_ui::EXPIRED_LABEL);
+        assert_ne!(ended_row_label(), send_ui::REVOKED_LABEL);
         // The two rows that do NOT merge anything borrow the pill's own word,
         // so the only row spelled differently is the only row that differs.
         assert_eq!(SendScope::Waiting.label(), send_ui::WAITING_LABEL);
@@ -3863,7 +3896,7 @@ mod tests {
                 other: serde_json::Map::new(),
             })
             .collect();
-        let health = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+        let health = crate::vault_window::password_health::health_row_label();
 
         // Unscrolled: off the bottom. If this ever stops being true the test
         // below has stopped exercising anything -- the rail would simply fit.
@@ -3875,7 +3908,7 @@ mod tests {
         // Both ends are asserted: Sends is still past the floor, and the row
         // that is now below it is further past it again.
         let (resting, bounds) = scrolled_rail(VaultLists::live_only(&live), &folders, 0.0);
-        let sends_at_rest = row_top(&resting, RECEIVED_ROW_LABEL);
+        let sends_at_rest = row_top(&resting, received_row_label());
         assert!(
             sends_at_rest > bounds.bottom(),
             "{} folders no longer overflow the rail (Sends rests at y={sends_at_rest}, floor \\
@@ -3883,7 +3916,7 @@ mod tests {
             folders.len(),
             bounds.bottom()
         );
-        let last_at_rest = row_top(&resting, NEW_FOLDER_LABEL);
+        let last_at_rest = row_top(&resting, new_folder_label());
         assert!(
             last_at_rest > sends_at_rest,
             "control: the rail's last row rests at y={last_at_rest}, above its Sends row at              y={sends_at_rest} -- the SHARING section this test was re-measured for is not              being drawn below it"
@@ -3896,7 +3929,7 @@ mod tests {
         // the ones a long folder list pushes out first.
         let (scrolled, bounds) = scrolled_rail(VaultLists::live_only(&live), &folders, -4000.0);
         let _ = health;
-        for label in [RECEIVED_ROW_LABEL, NEW_FOLDER_LABEL] {
+        for label in [received_row_label(), new_folder_label()] {
             let rect = scrolled
                 .iter()
                 .find(|(text, _)| text == label)
@@ -4013,7 +4046,7 @@ mod tests {
     fn the_screen_rows_still_hold_their_invariant_from_below_the_folders() {
         let live = three_unfiled_and_two_filed();
         let folders = one_real_folder_and_the_virtual_bucket();
-        let health_label = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+        let health_label = crate::vault_window::password_health::health_row_label();
 
         // Password health selects itself and nothing else.
         let (filter, sends, health) =
@@ -4761,7 +4794,7 @@ mod tests {
         let (painted, _, _, _) =
             painted_sidebar_parts("Locks in 11:42", VaultLists::live_only(&live), &folders);
         assert!(
-            !painted.iter().any(|(text, _)| text == ORGANISATIONS_SECTION_LABEL),
+            !painted.iter().any(|(text, _)| text == organisations_section_label()),
             "an account with no organisations was given an ORGANISATIONS heading: {painted:?}"
         );
         assert!(
@@ -4778,7 +4811,7 @@ mod tests {
             &folders,
         );
         assert!(
-            painted.iter().any(|(text, _)| text == ORGANISATIONS_SECTION_LABEL),
+            painted.iter().any(|(text, _)| text == organisations_section_label()),
             "control: the section does not appear even WITH an organisation, so the absence \
              asserted above is not evidence of anything: {painted:?}"
         );
@@ -4810,9 +4843,9 @@ mod tests {
         let order = [
             ("FOLDERS", top_of("FOLDERS")),
             ("No Folder", top_of("No Folder")),
-            (RECEIVED_ROW_LABEL, top_of(RECEIVED_ROW_LABEL)),
-            (NEW_FOLDER_LABEL, top_of(NEW_FOLDER_LABEL)),
-            (ORGANISATIONS_SECTION_LABEL, top_of(ORGANISATIONS_SECTION_LABEL)),
+            (received_row_label(), top_of(received_row_label())),
+            (new_folder_label(), top_of(new_folder_label())),
+            (organisations_section_label(), top_of(organisations_section_label())),
             ("Acme Security", top_of("Acme Security")),
             ("Production", top_of("Production")),
         ];
@@ -5060,7 +5093,7 @@ mod tests {
         let (painted, _bounds) = scrolled_rail(lists, &[], -6000.0);
         let near = |label: &str| painted.iter().find(|(t, _)| t == label).map(|(_, r)| *r).expect(label);
         let sent = near(SENDS_ROW_LABEL);
-        let received = near(RECEIVED_ROW_LABEL);
+        let received = near(received_row_label());
         assert!(painted.iter().any(|(t, r)| t == "3" && (r.center().y - sent.center().y).abs() < 2.0), "Shared does not count 3: {painted:?}");
         assert!(painted.iter().any(|(t, r)| t == "2" && (r.center().y - received.center().y).abs() < 2.0), "Shared with me does not count 2: {painted:?}");
     }
@@ -5105,7 +5138,7 @@ mod tests {
         let (_, none) = dots_of(VaultLists { received_records: 12, ..VaultLists::live_only(&[]) });
         assert!(none.is_empty(), "no invitation, no dot: {none:?}");
         let (texts, dots) = dots_of(VaultLists { received_records: 12, invitation_waiting: true, ..VaultLists::live_only(&[]) });
-        let label = texts.iter().find(|(t, _)| t == RECEIVED_ROW_LABEL).map(|(_, r)| *r).expect("the row");
+        let label = texts.iter().find(|(t, _)| t == received_row_label()).map(|(_, r)| *r).expect("the row");
         let count = texts.iter().find(|(t, r)| t == "12" && (r.center().y - label.center().y).abs() < 2.0).map(|(_, r)| *r).expect("its count");
         assert_eq!(dots.len(), 1, "{dots:?}");
         let dot = dots[0];
@@ -5288,12 +5321,12 @@ mod v2_rail_tests {
         let at = |t: &str| order.iter().position(|x| x == t).unwrap_or_else(|| panic!("{t} missing: {order:?}"));
         assert!(at("Trash") < at("TOOLS"));
         assert!(at("TOOLS") < at(SENDS_ROW_LABEL));
-        assert!(at(SENDS_ROW_LABEL) < at(crate::vault_window::password_health::HEALTH_ROW_LABEL));
-        assert!(at(crate::vault_window::password_health::HEALTH_ROW_LABEL) < at(SETTINGS_ROW_LABEL));
+        assert!(at(SENDS_ROW_LABEL) < at(crate::vault_window::password_health::health_row_label()));
+        assert!(at(crate::vault_window::password_health::health_row_label()) < at(SETTINGS_ROW_LABEL));
         assert!(at(SETTINGS_ROW_LABEL) < at("FOLDERS"));
         assert!(at("FOLDERS") < at("Engineering"));
-        assert!(at("Engineering") < at(RECEIVED_ROW_LABEL));
-        assert!(at(RECEIVED_ROW_LABEL) < at(NEW_FOLDER_LABEL));
+        assert!(at("Engineering") < at(received_row_label()));
+        assert!(at(received_row_label()) < at(new_folder_label()));
     }
 
     #[test]
@@ -5328,13 +5361,13 @@ mod v2_rail_tests {
     #[test]
     fn new_item_returns_new_item() {
         let ctx = testing::ctx();
-        assert_eq!(click_text(&mut Fixture::new(vec![]), &ctx, NEW_ITEM_LABEL), SidebarAction::NewItem);
+        assert_eq!(click_text(&mut Fixture::new(vec![]), &ctx, new_item_label()), SidebarAction::NewItem);
     }
 
     #[test]
     fn clicking_lock_returns_lock() {
         let ctx = testing::ctx();
-        assert_eq!(click_text(&mut Fixture::new(vec![]), &ctx, LOCK_ROW_LABEL), SidebarAction::Lock);
+        assert_eq!(click_text(&mut Fixture::new(vec![]), &ctx, lock_row_label()), SidebarAction::Lock);
     }
 
     #[test]
@@ -5361,35 +5394,35 @@ mod v2_rail_tests {
     fn the_new_folder_row_opens_an_input_and_enter_creates_the_folder() {
         let ctx = testing::ctx();
         let mut fixture = Fixture::new(vec![]);
-        assert_eq!(click_text(&mut fixture, &ctx, NEW_FOLDER_LABEL), SidebarAction::None);
+        assert_eq!(click_text(&mut fixture, &ctx, new_folder_label()), SidebarAction::None);
         let open = fixture.frame(&ctx, 0.2, vec![], "Locks in 11:42");
-        assert!(open.painted.text(NEW_FOLDER_LABEL).is_none(), "the row became an input");
+        assert!(open.painted.text(new_folder_label()).is_none(), "the row became an input");
         assert!(ctx.memory(|m| m.focused().is_some()), "the input takes the keyboard");
         fixture.frame(&ctx, 0.3, typed("Taxes"), "Locks in 11:42");
         assert!(ctx.text_edit_focused(), "letters go to the folder name, not to vault shortcuts");
         let done = fixture.frame(&ctx, 0.4, key(egui::Key::Enter), "Locks in 11:42");
         assert_eq!(done.action, SidebarAction::CreateFolder("Taxes".into()));
         let after = fixture.frame(&ctx, 0.5, vec![], "Locks in 11:42");
-        assert!(after.painted.text(NEW_FOLDER_LABEL).is_some(), "and closes again");
+        assert!(after.painted.text(new_folder_label()).is_some(), "and closes again");
     }
 
     #[test]
     fn escape_or_a_blank_name_creates_nothing() {
         let ctx = testing::ctx();
         let mut fixture = Fixture::new(vec![]);
-        click_text(&mut fixture, &ctx, NEW_FOLDER_LABEL);
+        click_text(&mut fixture, &ctx, new_folder_label());
         fixture.frame(&ctx, 0.2, typed("   "), "Locks in 11:42");
         let blank = fixture.frame(&ctx, 0.3, key(egui::Key::Enter), "Locks in 11:42");
         assert_eq!(blank.action, SidebarAction::None);
 
         let ctx = testing::ctx();
         let mut fixture = Fixture::new(vec![]);
-        click_text(&mut fixture, &ctx, NEW_FOLDER_LABEL);
+        click_text(&mut fixture, &ctx, new_folder_label());
         fixture.frame(&ctx, 0.2, typed("Taxes"), "Locks in 11:42");
         let escaped = fixture.frame(&ctx, 0.3, key(egui::Key::Escape), "Locks in 11:42");
         assert_eq!(escaped.action, SidebarAction::None);
         let after = fixture.frame(&ctx, 0.4, vec![], "Locks in 11:42");
-        assert!(after.painted.text(NEW_FOLDER_LABEL).is_some());
+        assert!(after.painted.text(new_folder_label()).is_some());
     }
 
     #[test]
@@ -5398,7 +5431,7 @@ mod v2_rail_tests {
         let mut fixture = Fixture::new(vec![]);
         fixture.size = DESIGN;
         let rail = fixture.frame(&ctx, 0.0, vec![], "Locks in 11:42");
-        let lock = y_of(&rail.painted, LOCK_ROW_LABEL);
+        let lock = y_of(&rail.painted, lock_row_label());
         let time = y_of(&rail.painted, "11:42");
         assert!((lock - time).abs() < 2.0, "the countdown sits on the Lock row");
         assert!(rail.panel.bottom() - lock < 16.0 + ROW_HEIGHT, "Lock is at the foot: {lock}");
@@ -5413,7 +5446,7 @@ mod v2_rail_tests {
         let mut fixture = Fixture::new(folders);
         fixture.size = DESIGN;
         let rail = fixture.frame(&ctx, 0.0, vec![], "Locks in 11:42");
-        let lock = rail.painted.text(LOCK_ROW_LABEL).unwrap().2;
+        let lock = rail.painted.text(lock_row_label()).unwrap().2;
         assert!(lock.bottom() < rail.panel.bottom(), "Lock at {lock:?} is off the panel");
         // What a person can SEE of each folder row: its rect inside the clip
         // it was painted under. None of it reaches the Lock row.

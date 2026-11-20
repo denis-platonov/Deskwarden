@@ -26,7 +26,9 @@ pub const AVATAR: f32 = 38.0;
 /// One caption button (design 1a: 46 by 34, flush to the top-right).
 pub const CAPTION: egui::Vec2 = egui::vec2(46.0, 34.0);
 /// The search field's placeholder (design 1a, verbatim).
-pub const SEARCH_PLACEHOLDER: &str = "Search your vault";
+pub fn search_placeholder() -> &'static str {
+    crate::i18n::t("topbar.search_placeholder")
+}
 /// The field's chip while it is empty: the chord that focuses it.
 const SEARCH_CHIP: &str = "Ctrl K";
 /// The chip once something is typed: what clears it.
@@ -49,6 +51,14 @@ pub struct SyncPill {
     pub hint: String,
 }
 
+/// The part of `text` that stands where the NUL sits in `probe`, if `text` is
+/// `probe` with something put there -- how a label that was built from a
+/// catalog template is taken apart again without knowing its language.
+pub(crate) fn unfill<'a>(probe: &str, text: &'a str) -> Option<&'a str> {
+    let (head, tail) = probe.split_once('\u{0}')?;
+    text.strip_prefix(head)?.strip_suffix(tail)
+}
+
 impl SyncPill {
     /// The v2 pill for what `vault_window::sync_pill` decided -- that function
     /// keeps the precedence between the app's sync states, and this only says
@@ -62,21 +72,34 @@ impl SyncPill {
     ///   the age a failure carries is the thing a reader needs), in amber;
     /// - before any sync, a neutral "Sync".
     pub fn from_v1(dot: Color32, label: &str) -> SyncPill {
-        const SYNC_NOW: &str = "Sync now";
-        let with = |detail: &str| format!("{SYNC_NOW} \u{2014} {detail}");
-        if label.starts_with("Syncing") {
-            return SyncPill { label: "Syncing…".into(), tone: PillTone::Green, hint: SYNC_NOW.into() };
+        // The label arrives already worded (`vault_window::sync_pill`), so what
+        // it is has to be recognised against the catalog's own text for each
+        // state, never against English words.
+        let sync_now = || crate::i18n::t("topbar.sync_now").to_string();
+        let with = |detail: &str| crate::i18n::tf("topbar.sync_now_detail", &[("detail", detail)]);
+        if label == crate::i18n::t("vault.pill_syncing") {
+            return SyncPill { label: crate::i18n::t("vault.pill_syncing").into(), tone: PillTone::Green, hint: sync_now() };
         }
         if dot == theme::ERROR {
-            return SyncPill { label: label.into(), tone: PillTone::Amber, hint: SYNC_NOW.into() };
+            return SyncPill { label: label.into(), tone: PillTone::Amber, hint: sync_now() };
         }
-        if let Some(age) = label.strip_prefix("Synced ") {
-            return SyncPill { label: "Synced".into(), tone: PillTone::Green, hint: with(&format!("synced {age}")) };
+        let synced = crate::i18n::tf("vault.pill_synced", &[("ago", "\u{0}")]);
+        if let Some(age) = unfill(&synced, label) {
+            return SyncPill {
+                label: crate::i18n::t("topbar.pill_synced").into(),
+                tone: PillTone::Green,
+                hint: with(&crate::i18n::tf("topbar.hint_synced", &[("age", age)])),
+            };
         }
-        if let Some(age) = label.strip_prefix("Loaded from cache · ") {
-            return SyncPill { label: "Offline".into(), tone: PillTone::Amber, hint: with(&format!("saved copy {age}")) };
+        let cached = crate::i18n::tf("vault.pill_cached", &[("age", "\u{0}")]);
+        if let Some(age) = unfill(&cached, label) {
+            return SyncPill {
+                label: crate::i18n::t("topbar.pill_offline").into(),
+                tone: PillTone::Amber,
+                hint: with(&crate::i18n::tf("topbar.hint_saved_copy", &[("age", age)])),
+            };
         }
-        SyncPill { label: label.into(), tone: PillTone::Neutral, hint: SYNC_NOW.into() }
+        SyncPill { label: label.into(), tone: PillTone::Neutral, hint: sync_now() }
     }
 }
 
@@ -248,7 +271,7 @@ fn search_field(ui: &mut Ui, rect: Rect, value: &mut String, placeholder: &str) 
         if chip_response.clicked() {
             super::sidebar::request_shell(ui.ctx(), super::sidebar::ShellRequest::OpenPalette);
         }
-        tips::hint(ui, &chip_response, "Quick search", &["Mod", "K"]);
+        tips::hint(ui, &chip_response, crate::i18n::t("topbar.quick_search"), &["Mod", "K"]);
     }
 
     let font = tokens::font_id(tokens::BODY);
@@ -354,7 +377,7 @@ mod tests {
         let mut text = search.to_owned();
         let mut action = TopBarAction::None;
         let painted = testing::frame(ctx, time, size, events, |ui| {
-            action = draw(ui, bar, &mut text, SEARCH_PLACEHOLDER, pill, false, controls_only, |ui| {
+            action = draw(ui, bar, &mut text, search_placeholder(), pill, false, controls_only, |ui| {
                 ui.allocate_exact_size(egui::Vec2::splat(AVATAR), egui::Sense::click());
             });
         });
@@ -382,7 +405,7 @@ mod tests {
             field.iter().any(|f| f.size() == vec2(460.0, 46.0) && f.left() == BAR.left() + 28.0),
             "{field:?}"
         );
-        assert!(r.painted.text(SEARCH_PLACEHOLDER).is_some());
+        assert!(r.painted.text(search_placeholder()).is_some());
         assert!(r.painted.text("Ctrl K").is_some());
     }
 
@@ -390,7 +413,7 @@ mod tests {
     fn typing_in_the_top_bar_search_fills_the_vault_search() {
         let ctx = testing::ctx();
         let first = run(&ctx, 0.0, SCREEN, BAR, &green(), "", vec![]);
-        let field = first.painted.text(SEARCH_PLACEHOLDER).unwrap().2.center();
+        let field = first.painted.text(search_placeholder()).unwrap().2.center();
         run(&ctx, 0.1, SCREEN, BAR, &green(), "", testing::click_at(field));
         assert_eq!(
             ctx.memory(|m| m.focused()),
@@ -518,7 +541,7 @@ mod tests {
         let ctx = testing::ctx();
         let shown = run(&ctx, 0.0, SCREEN, BAR, &green(), "", vec![]);
         let pill = shown.painted.text("Synced").unwrap().2.center();
-        let field = shown.painted.text(SEARCH_PLACEHOLDER).unwrap().2.center();
+        let field = shown.painted.text(search_placeholder()).unwrap().2.center();
         let ctx = testing::ctx();
         run_mode(&ctx, 0.0, SCREEN, BAR, &green(), "", vec![], true);
         let pressed = run_mode(&ctx, 0.1, SCREEN, BAR, &green(), "", testing::click_at(pill), true);
@@ -557,7 +580,7 @@ mod tests {
             .painted
             .texts
             .iter()
-            .find(|(t, _, _)| t == text || t == SEARCH_PLACEHOLDER)
+            .find(|(t, _, _)| t == text || t == search_placeholder())
             .unwrap()
             .2
             .center();

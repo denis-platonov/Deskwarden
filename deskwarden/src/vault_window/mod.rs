@@ -61,7 +61,9 @@ use std::time::{Duration, Instant};
 /// indistinguishable from a timer that has stopped working. Saying so out
 /// loud also means the one place this window can tell you the vault will not
 /// lock itself is the same place it otherwise tells you when it will.
-const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
+fn auto_lock_off_label() -> &'static str {
+    crate::i18n::t("vault.auto_lock_off")
+}
 
 /// What a modal shows about the item it is asking about: **the very row the
 /// results list draws for it** -- the item's own tile, its name, and its
@@ -262,16 +264,15 @@ pub(crate) fn idle_frame(auto_lock: AutoLock, idle: Duration) -> IdleFrame {
     // the timer having broken rather than as a setting the user themselves
     // turned off.
     match auto_lock {
-        AutoLock::Never => IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned()),
+        AutoLock::Never => IdleFrame::Sidebar(auto_lock_off_label().to_owned()),
         AutoLock::After(timeout) => {
             if idle >= timeout {
                 return IdleFrame::Lock;
             }
             let remaining = timeout.saturating_sub(idle);
-            IdleFrame::Sidebar(format!(
-                "Locks in {}:{:02}",
-                remaining.as_secs() / 60,
-                remaining.as_secs() % 60
+            IdleFrame::Sidebar(crate::i18n::tf(
+                "vault.locks_in",
+                &[("time", &format!("{}:{:02}", remaining.as_secs() / 60, remaining.as_secs() % 60)[..])],
             ))
         }
     }
@@ -2553,7 +2554,7 @@ pub fn build_frame_with_search(
                 log::warn!("manual vault sync failed: {e}");
             }
             if std::mem::take(&mut retry_from_banner) && result.is_err() {
-                crate::kit::toast::show(ui.ctx(), STILL_OFFLINE_TOAST);
+                crate::kit::toast::show(ui.ctx(), still_offline_toast());
             }
             sync_status = Some(result);
         }
@@ -3271,7 +3272,7 @@ pub fn build_frame_with_search(
                             crate::loading_ui::waiting_stack(
                                 ui,
                                 260.0,
-                                crate::loading_ui::LOADING_HEADING,
+                                crate::i18n::t("loading.heading"),
                                 None,
                             );
                         });
@@ -3581,7 +3582,7 @@ pub fn build_frame_with_search(
                     }
                     // A drop the sidebar refused -- the virtual "No Folder"
                     // bucket, or the folder the item is already in. Carried
-                    // out rather than swallowed: see `sidebar::CANNOT_UNFILE`.
+                    // out rather than swallowed: see `sidebar::cannot_unfile()`.
                     SidebarAction::RefusedMove(reason) => folder_drop = Some(Err(reason)),
                     SidebarAction::None => {}
                 }
@@ -8047,7 +8048,7 @@ pub fn build_frame_with_search(
                     }
                     crate::kit::toast::show(
                         ui.ctx(),
-                        if failed.is_some() { "Couldn't empty the whole trash" } else { trash_modal::EMPTIED_TOAST },
+                        if failed.is_some() { crate::i18n::t("trash.empty_failed") } else { trash_modal::emptied_toast() },
                     );
                 }
             }
@@ -8320,7 +8321,7 @@ pub fn build_frame_with_search(
                             // meaningless rather than merely wrong.
                             Ok(written) => {
                                 // Spec B §8.
-                                crate::kit::toast::show(ui.ctx(), totp_add::SAVED_TOAST);
+                                crate::kit::toast::show(ui.ctx(), totp_add::saved_toast());
                                 // **An open edit form is told**, or its next
                                 // Save clears the seed this write just made.
                                 //
@@ -15177,7 +15178,7 @@ fn account_menu(
 /// wording no longer depends on one.
 fn synced_ago_text(elapsed: Duration) -> String {
     if elapsed.as_secs() < 60 {
-        "just now".to_string()
+        crate::i18n::t("vault.just_now").to_string()
     } else {
         relative_time::ago(elapsed)
     }
@@ -15186,7 +15187,9 @@ fn synced_ago_text(elapsed: Duration) -> String {
 /// What the toolbar pill says when the most recent load produced nothing to
 /// paint but the sync that triggered it worked. Deliberately NOT "Sync
 /// failed": the sync is not what failed.
-const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
+fn vault_not_refreshed_pill() -> &'static str {
+    crate::i18n::t("vault.pill_not_refreshed")
+}
 
 /// The toolbar sync pill's dot colour and label -- the ONLY place any of
 /// these states is spelled for the user, which is why it is a function with
@@ -15218,7 +15221,9 @@ const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
 /// the user sees and the distinction collapses SILENTLY. Anyone loosening that
 /// gate owes this function a second label.
 /// The toast after the offline banner's Retry fails again (spec 3.1).
-pub(crate) const STILL_OFFLINE_TOAST: &str = "Still can\u{2019}t reach Bitwarden";
+pub(crate) fn still_offline_toast() -> &'static str {
+    crate::i18n::t("vault.still_offline")
+}
 
 /// Spec 3.1's offline banner condition: the vault on screen is the disk
 /// cache's and the last sync could not refresh it. Not while a sync is in
@@ -15235,22 +15240,22 @@ fn sync_pill(
     from_disk_age: Option<Duration>,
 ) -> (egui::Color32, String) {
     if sync_in_progress {
-        return (theme::TEXT_GHOST, "Syncing…".to_string());
+        return (theme::TEXT_GHOST, crate::i18n::t("vault.pill_syncing").to_string());
     }
     // Blue for success (there's no dedicated "success" green in this app's
     // palette -- see `theme.rs`'s module doc on "one blue hue... red reserved
     // for actual errors"), the design's error red for failure, and a neutral
     // ghost dot before the first sync has reported anything.
     match (sync_status, vault_load_error) {
-        (Some(Err(_)), _) => (theme::ERROR, with_age("Sync failed", from_disk_age)),
-        (_, Some(_)) => (theme::ERROR, with_age(VAULT_NOT_REFRESHED_PILL, from_disk_age)),
-        (Some(Ok(())), None) => (theme::BLUE, format!("Synced {}", synced_ago_text(since_last_sync))),
+        (Some(Err(_)), _) => (theme::ERROR, with_age(crate::i18n::t("vault.pill_sync_failed"), from_disk_age)),
+        (_, Some(_)) => (theme::ERROR, with_age(vault_not_refreshed_pill(), from_disk_age)),
+        (Some(Ok(())), None) => (theme::BLUE, crate::i18n::tf("vault.pill_synced", &[("ago", &synced_ago_text(since_last_sync))])),
         (None, None) => match from_disk_age {
             Some(age) => (
                 theme::TEXT_GHOST,
-                format!("Loaded from cache · {}", cache_age_text(age)),
+                crate::i18n::tf("vault.pill_cached", &[("age", &cache_age_text(age))]),
             ),
-            None => (theme::TEXT_GHOST, "Sync".to_string()),
+            None => (theme::TEXT_GHOST, crate::i18n::t("vault.pill_idle").to_string()),
         },
     }
 }
@@ -15265,7 +15270,7 @@ fn sync_pill(
 /// predates the weekend.
 fn with_age(label: &str, from_disk_age: Option<Duration>) -> String {
     match from_disk_age {
-        Some(age) => format!("{label} · {}", cache_age_text(age)),
+        Some(age) => crate::i18n::tf("vault.pill_with_age", &[("label", label), ("age", &cache_age_text(age))]),
         None => label.to_string(),
     }
 }
@@ -15284,13 +15289,13 @@ fn with_age(label: &str, from_disk_age: Option<Duration>) -> String {
 pub(crate) fn cache_age_text(age: Duration) -> String {
     let secs = age.as_secs();
     if secs < 60 {
-        "just written".to_string()
+        crate::i18n::t("vault.cache_just_written").to_string()
     } else if secs < 3600 {
-        format!("{} min old", secs / 60)
+        crate::i18n::tn("vault.cache_minutes", secs / 60, &[])
     } else if secs < 86_400 {
-        format!("{} h old", secs / 3600)
+        crate::i18n::tn("vault.cache_hours", secs / 3600, &[])
     } else {
-        format!("{} d old", secs / 86_400)
+        crate::i18n::tn("vault.cache_days", secs / 86_400, &[])
     }
 }
 
@@ -22871,7 +22876,7 @@ mod sync_pill_tests {
     // spelled for the user, and until this function existed the wording was
     // an `if` chain inside a 3000-line `eframe` closure that nothing could
     // call.
-    use super::{cache_age_text, list_offline, sync_pill, theme, STILL_OFFLINE_TOAST, VAULT_NOT_REFRESHED_PILL};
+    use super::{cache_age_text, list_offline, sync_pill, theme, still_offline_toast, vault_not_refreshed_pill};
     use std::time::Duration;
 
     /// Spec 3.1's offline banner: a vault off the disk cache whose last sync
@@ -22886,7 +22891,7 @@ mod sync_pill_tests {
         assert!(!list_offline(true, false, Some(&ok), None), "a cached vault that synced is not offline");
         assert!(!list_offline(true, false, None, None), "nothing has failed yet");
         assert!(!list_offline(true, true, Some(&failed), None), "a sync in flight may be the answer");
-        assert_eq!(STILL_OFFLINE_TOAST, "Still can\u{2019}t reach Bitwarden");
+        assert_eq!(still_offline_toast(), "Still can\u{2019}t reach Bitwarden");
     }
 
     /// Three hours, as a snapshot that came off the encrypted disk cache.
@@ -22902,7 +22907,7 @@ mod sync_pill_tests {
             None,
         );
         assert_eq!(
-            label, VAULT_NOT_REFRESHED_PILL,
+            label, vault_not_refreshed_pill(),
             "\"Sync failed\" would be a red pill on a sync that worked; \"Synced just now\" \
              would claim a refresh that never landed"
         );
@@ -23020,7 +23025,7 @@ mod sync_pill_tests {
         );
         assert_eq!(
             sync_pill(false, Some(&Ok(())), Some("locked"), Duration::ZERO, None).1,
-            VAULT_NOT_REFRESHED_PILL
+            vault_not_refreshed_pill()
         );
     }
 
@@ -24660,7 +24665,7 @@ mod auto_lock_never_wiring_tests {
     const MATCH_HEAD: &str =
         concat!("fn idle_frame(auto_lock: AutoLock, idle: ", "Duration) -> IdleFrame {");
     const NEVER_ARM: &str =
-        concat!("AutoLock::Never => IdleFrame::Sidebar(AUTO_LOCK_OFF_", "LABEL.to_owned()),");
+        concat!("AutoLock::Never => IdleFrame::Sidebar(auto_lock_off_", "label().to_owned()),");
     const AFTER_ARM: &str = concat!("AutoLock::After(timeout) ", "=> {");
     const ELAPSED_CHECK: &str = concat!("if idle >= ", "timeout {");
     const LOCKS: &str = concat!("IdleFrame::", "Lock");
@@ -24812,7 +24817,7 @@ mod the_idle_timer_follows_the_edited_setting {
 
         assert_eq!(
             frame(Some(&off), idle),
-            IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned()),
+            IdleFrame::Sidebar(auto_lock_off_label().to_owned()),
             "auto-lock was turned off in the gear and the already-open window locked anyway -- \
              this is the reported defect, where the setting only took effect on reopen"
         );
@@ -24833,7 +24838,7 @@ mod the_idle_timer_follows_the_edited_setting {
         );
 
         let line = sidebar_line(frame(Some(&off), idle));
-        assert_eq!(line, AUTO_LOCK_OFF_LABEL);
+        assert_eq!(line, auto_lock_off_label());
 
         // And it is really PAINTED. A string in a local is not what the user
         // reported; they reported a pane. `painted_sidebar_text` runs
@@ -24843,8 +24848,8 @@ mod the_idle_timer_follows_the_edited_setting {
         let painted = painted_sidebar_text(&line);
         // The v2 Lock row carries the countdown as its count: "Off".
         assert!(
-            painted.iter().any(|t| t == sidebar::lock_count(AUTO_LOCK_OFF_LABEL)),
-            "the sidebar did not paint {AUTO_LOCK_OFF_LABEL:?}; it painted {painted:?}"
+            painted.iter().any(|t| t == sidebar::lock_count(auto_lock_off_label())),
+            "the sidebar did not paint {:?}; it painted {painted:?}", auto_lock_off_label()
         );
         assert!(
             !painted.iter().any(|t| t == sidebar::lock_count("Locks in 4:00")),
@@ -24875,7 +24880,7 @@ mod the_idle_timer_follows_the_edited_setting {
         let long_idle = Duration::from_secs(3600);
         assert_eq!(
             idle_frame(effective_auto_lock(None, never), long_idle),
-            IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned())
+            IdleFrame::Sidebar(auto_lock_off_label().to_owned())
         );
 
         // Turned on in the gear, the already-open window starts locking --

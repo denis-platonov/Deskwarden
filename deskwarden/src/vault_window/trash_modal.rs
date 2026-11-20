@@ -8,15 +8,25 @@ use crate::kit::modal::{Dialog, ModalOutcome};
 
 /// The scrim's area name (listed in `item_list::MODAL_SCRIM_AREAS`).
 pub const ID: &str = "empty-trash";
-pub const TITLE: &str = "Empty trash?";
-pub const CONFIRM: &str = "Delete forever";
-pub const CANCEL: &str = "Cancel";
-pub const EMPTIED_TOAST: &str = "Trash emptied";
+pub fn title() -> &'static str {
+    crate::i18n::t("trash.title")
+}
+
+pub fn confirm() -> &'static str {
+    crate::i18n::t("trash.confirm")
+}
+
+pub fn cancel() -> &'static str {
+    crate::i18n::t("trash.cancel")
+}
+
+pub fn emptied_toast() -> &'static str {
+    crate::i18n::t("trash.emptied_toast")
+}
 
 /// What the dialog says will go.
 pub fn body(count: usize) -> String {
-    let noun = if count == 1 { "item" } else { "items" };
-    format!("{count} {noun} will be deleted for good. This can't be undone.")
+    crate::i18n::tn("trash.body", count as u64, &[])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,14 +42,14 @@ pub fn confirm_id() -> egui::Id {
 
 pub fn draw(ctx: &egui::Context, count: usize) -> EmptyTrashAnswer {
     let text = body(count);
-    let (outcome, answer) = Dialog::new(ID, 480.0).title(TITLE).sub(&text).show(ctx, |ui| {
+    let (outcome, answer) = Dialog::new(ID, 480.0).title(title()).sub(&text).show(ctx, |ui| {
         let mut answer = EmptyTrashAnswer::Open;
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
         ui.columns(2, |columns| {
-            if controls::button_filling(&mut columns[0], ButtonKind::Outline, size, CANCEL).clicked() {
+            if controls::button_filling(&mut columns[0], ButtonKind::Outline, size, cancel()).clicked() {
                 answer = EmptyTrashAnswer::Cancel;
             }
-            let confirm = controls::button_filling(&mut columns[1], ButtonKind::Danger, size, CONFIRM);
+            let confirm = controls::button_filling(&mut columns[1], ButtonKind::Danger, size, confirm());
             let _ = columns[1].interact(confirm.rect, confirm_id(), egui::Sense::hover());
             if confirm.clicked() {
                 answer = EmptyTrashAnswer::Confirm;

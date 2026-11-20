@@ -12,7 +12,9 @@ use crate::vault_bridge::ItemKind;
 
 /// The scrim's area name (listed in `item_list::MODAL_SCRIM_AREAS`).
 pub const ID: &str = "new-item";
-pub const TITLE: &str = "What are you adding?";
+pub fn title() -> &'static str {
+    crate::i18n::t("new_item.title")
+}
 const WIDTH: f32 = 660.0;
 const CARD_HEIGHT: f32 = 168.0;
 const GAP: f32 = 12.0;
@@ -41,11 +43,11 @@ pub struct Choice {
 pub fn choices() -> [Choice; 5] {
     let rgb = Color32::from_rgb;
     [
-        Choice { kind: ItemKind::Login, title: "Login", sub: "For an app or a website", glyph: glyph::LOGIN, tile: rgb(0xee, 0xf2, 0xfc), ink: rgb(0x1b, 0x3f, 0xa0) },
-        Choice { kind: ItemKind::Card, title: "Card", sub: "Pay without hunting for your wallet", glyph: glyph::CARD, tile: rgb(0xe8, 0xf3, 0xec), ink: rgb(0x17, 0x67, 0x3a) },
-        Choice { kind: ItemKind::SecureNote, title: "Secure note", sub: "Text only you can read", glyph: glyph::NOTE, tile: rgb(0xfe, 0xf6, 0xe7), ink: rgb(0x8a, 0x5a, 0x06) },
-        Choice { kind: ItemKind::Identity, title: "Identity", sub: "Your name, address and ID numbers", glyph: glyph::IDENTITY, tile: rgb(0xf1, 0xf0, 0xee), ink: rgb(0x4a, 0x47, 0x45) },
-        Choice { kind: ItemKind::SshKey, title: "SSH key", sub: "A key pair for signing in to servers", glyph: glyph::SSH, tile: rgb(0xf1, 0xf0, 0xee), ink: rgb(0x4a, 0x47, 0x45) },
+        Choice { kind: ItemKind::Login, title: crate::i18n::t("new_item.login"), sub: crate::i18n::t("new_item.login_sub"), glyph: glyph::LOGIN, tile: rgb(0xee, 0xf2, 0xfc), ink: rgb(0x1b, 0x3f, 0xa0) },
+        Choice { kind: ItemKind::Card, title: crate::i18n::t("new_item.card"), sub: crate::i18n::t("new_item.card_sub"), glyph: glyph::CARD, tile: rgb(0xe8, 0xf3, 0xec), ink: rgb(0x17, 0x67, 0x3a) },
+        Choice { kind: ItemKind::SecureNote, title: crate::i18n::t("new_item.note"), sub: crate::i18n::t("new_item.note_sub"), glyph: glyph::NOTE, tile: rgb(0xfe, 0xf6, 0xe7), ink: rgb(0x8a, 0x5a, 0x06) },
+        Choice { kind: ItemKind::Identity, title: crate::i18n::t("new_item.identity"), sub: crate::i18n::t("new_item.identity_sub"), glyph: glyph::IDENTITY, tile: rgb(0xf1, 0xf0, 0xee), ink: rgb(0x4a, 0x47, 0x45) },
+        Choice { kind: ItemKind::SshKey, title: crate::i18n::t("new_item.ssh"), sub: crate::i18n::t("new_item.ssh_sub"), glyph: glyph::SSH, tile: rgb(0xf1, 0xf0, 0xee), ink: rgb(0x4a, 0x47, 0x45) },
     ]
 }
 
@@ -55,7 +57,7 @@ pub fn card_id(kind: ItemKind) -> egui::Id {
 }
 
 pub fn draw(ctx: &egui::Context) -> ChooserAnswer {
-    let (outcome, picked) = Dialog::new(ID, WIDTH).title(TITLE).show(ctx, |ui| {
+    let (outcome, picked) = Dialog::new(ID, WIDTH).title(title()).show(ctx, |ui| {
         let mut picked = None;
         let width = ui.available_width();
         let card_w = ((width - 2.0 * GAP) / 3.0).floor();
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn the_chooser_offers_login_card_and_note_first() {
         let (_, p) = settled();
-        assert!(p.texts.iter().any(|(t, _, _)| t == TITLE));
+        assert!(p.texts.iter().any(|(t, _, _)| t == title()));
         let (login, card, note) = (at(&p, "Login"), at(&p, "Card"), at(&p, "Secure note"));
         assert!(login.left() < card.left() && card.left() < note.left(), "the first row is login, card, note");
         assert!((login.top() - note.top()).abs() < 1.0);

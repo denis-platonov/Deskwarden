@@ -314,7 +314,14 @@ pub fn dispatch_with<T>(
 /// now, so it leads every sentence [`refusal_notice`] composes instead -- the
 /// user still reads "Nothing sent" first, in the one place a refusal now
 /// reaches them.
+/// English only, and only for `notice_card::notice_for`, which strips it off a
+/// notice before the title says it. The sentence itself leads with
+/// [`refused_heading`].
 pub const REFUSED_HEADING: &str = "Nothing sent";
+
+pub fn refused_heading() -> &'static str {
+    crate::i18n::t("preflight.refused_heading")
+}
 
 /// What the user is told when a gated fill did not happen. Reaches them
 /// through the same [`crate::injector::sequence::Notifier`] every other
@@ -342,11 +349,10 @@ pub const REFUSED_HEADING: &str = "Nothing sent";
 /// `picker_prompt`, which is where every other copy in this app already lives.
 pub fn refusal_notice(gated_reason: Option<Refusal>) -> String {
     let why = match gated_reason {
-        Some(Refusal::WrongProcess) => "The window in front is not the one this item's rule was \
-             written for. Deskwarden will not type a password there.",
-        None => "Deskwarden could not tell which window is in front, so it did not type anything.",
+        Some(Refusal::WrongProcess) => crate::i18n::t("preflight.wrong_process"),
+        None => crate::i18n::t("preflight.unknown_window"),
     };
-    format!("{REFUSED_HEADING}. {why}")
+    crate::i18n::tf("preflight.refusal", &[("heading", refused_heading()), ("reason", why)])
 }
 
 /// A gate whose foreground is a **fixture**, for the tests that drive a whole
@@ -412,7 +418,7 @@ mod tests {
         let unknown = refusal_notice(None);
         for notice in [&wrong, &unknown] {
             assert!(
-                notice.starts_with(REFUSED_HEADING),
+                notice.starts_with(refused_heading()),
                 "{notice:?} does not lead with the design's word for this state"
             );
             // The masking refusal is gone on the owner's ruling, so no notice

@@ -377,7 +377,7 @@ impl Rehearsal {
         let held = locked(&self.inner);
         let (headline, finished) = match held.stage {
             Stage::Opening { .. } | Stage::Typing { .. } => {
-                (rehearsal::WAITING_NOTE.to_string(), false)
+                (rehearsal::waiting_note().to_string(), false)
             }
             Stage::Over { elapsed } => (rehearsal::finished_line(elapsed, held.sent.len()), true),
         };
@@ -693,7 +693,7 @@ pub fn act_row(act: &Arrival) -> (String, String) {
 }
 
 /// The heading over the list of acts the sender was handed, in the same tracked
-/// uppercase mono 4d gives [`rehearsal::ARRIVED_HEADING`].
+/// uppercase mono 4d gives [`rehearsal::arrived_heading()`].
 pub fn sent_heading() -> &'static str {
     crate::i18n::t("scratch.sent_heading")
 }
@@ -747,7 +747,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.label(tokens::job(tokens::SECTION, rehearsal::ARRIVED_HEADING, theme::TEXT_GHOST));
+                    ui.label(tokens::job(tokens::SECTION, rehearsal::arrived_heading(), theme::TEXT_GHOST));
                     let font = egui::FontId::new(14.0, egui::FontFamily::Monospace);
                     if view.finished {
                         // The invisible keys, drawn, in the design's blue.
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(rehearsal.in_flight(), "the run is typing and the frames have stopped");
         let view = rehearsal.view();
         assert!(!view.finished);
-        assert_eq!(view.headline, rehearsal::WAITING_NOTE);
+        assert_eq!(view.headline, rehearsal::waiting_note());
         assert_eq!(
             view.sent,
             design_transcript(),
@@ -1559,7 +1559,7 @@ mod tests {
     fn the_live_panel_takes_keyboard_focus() {
         let ctx = themed();
         let live = RehearsalView {
-            headline: rehearsal::WAITING_NOTE.to_string(),
+            headline: rehearsal::waiting_note().to_string(),
             finished: false,
             sent: Vec::new(),
             failure: None,

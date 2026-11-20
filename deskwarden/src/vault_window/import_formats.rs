@@ -69,8 +69,8 @@ impl ImportSource {
             ImportSource::OnePassword => "1Password",
             ImportSource::Keeper => "Keeper",
             ImportSource::LastPass => "LastPass",
-            ImportSource::Browser => "Chrome or Edge",
-            ImportSource::GenericCsv => "CSV file",
+            ImportSource::Browser => crate::i18n::t("import.source_browser"),
+            ImportSource::GenericCsv => crate::i18n::t("import.source_csv"),
         }
     }
 
@@ -108,14 +108,12 @@ pub enum ParseError {
 impl ParseError {
     pub fn sentence(self) -> &'static str {
         match self {
-            ParseError::Empty => "That file is empty.",
-            ParseError::TooLarge => "That file is too large to be a password export.",
-            ParseError::Encrypted => {
-                "That export is encrypted. Export it again as an unencrypted file, import it here, then delete the file."
-            }
-            ParseError::NotThisFormat => "That file doesn't look like an export from this source.",
-            ParseError::NothingToImport => "There was nothing in that file to import.",
-            ParseError::Unreadable => "That file couldn't be read.",
+            ParseError::Empty => crate::i18n::t("import.err_empty"),
+            ParseError::TooLarge => crate::i18n::t("import.err_too_large"),
+            ParseError::Encrypted => crate::i18n::t("import.err_encrypted"),
+            ParseError::NotThisFormat => crate::i18n::t("import.err_not_this_format"),
+            ParseError::NothingToImport => crate::i18n::t("import.err_nothing"),
+            ParseError::Unreadable => crate::i18n::t("import.err_unreadable"),
         }
     }
 }

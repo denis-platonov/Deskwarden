@@ -7210,7 +7210,7 @@ mod keyboard_selection_tests {
                     ui,
                     bar,
                     search,
-                    crate::vault_window::top_bar::SEARCH_PLACEHOLDER,
+                    crate::vault_window::top_bar::search_placeholder(),
                     &pill,
                     false,
                     false,

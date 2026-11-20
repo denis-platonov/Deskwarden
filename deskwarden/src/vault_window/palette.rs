@@ -10,10 +10,21 @@ use crate::vault_bridge::VaultItem;
 
 /// The scrim's area name (listed in `item_list::MODAL_SCRIM_AREAS`).
 pub const ID: &str = "palette";
-pub const PLACEHOLDER: &str = "Search or jump to\u{2026}";
-pub const NOTHING_FOUND: &str = "Nothing found";
-pub const ITEMS_HEADING: &str = "ITEMS";
-pub const ACTIONS_HEADING: &str = "ACTIONS";
+pub fn placeholder() -> &'static str {
+    crate::i18n::t("palette.placeholder")
+}
+
+pub fn nothing_found() -> &'static str {
+    crate::i18n::t("palette.nothing_found")
+}
+
+pub fn items_heading() -> &'static str {
+    crate::i18n::t("palette.items_heading")
+}
+
+pub fn actions_heading() -> &'static str {
+    crate::i18n::t("palette.actions_heading")
+}
 const WIDTH: f32 = 640.0;
 const TOP: f32 = 90.0;
 const MAX_ITEMS: usize = 5;
@@ -78,15 +89,15 @@ pub fn matching_items<'a>(items: &'a [VaultItem], query: &str) -> Vec<&'a VaultI
 pub fn matching_actions(selected: Option<&str>, query: &str) -> Vec<ActionRow> {
     let query = query.trim().to_lowercase();
     let mut rows = vec![
-        ActionRow { action: PaletteAction::NewLogin, label: "New login".into(), hint: "Ctrl N", glyph: glyph::LOGIN },
-        ActionRow { action: PaletteAction::Generate, label: "Generate a password".into(), hint: "", glyph: glyph::GEN },
+        ActionRow { action: PaletteAction::NewLogin, label: crate::i18n::t("palette.new_login").into(), hint: "Ctrl N", glyph: glyph::LOGIN },
+        ActionRow { action: PaletteAction::Generate, label: crate::i18n::t("palette.generate").into(), hint: "", glyph: glyph::GEN },
     ];
     if let Some(name) = selected {
-        rows.push(ActionRow { action: PaletteAction::Share, label: format!("Share {name}"), hint: "", glyph: glyph::SHARED });
+        rows.push(ActionRow { action: PaletteAction::Share, label: crate::i18n::tf("palette.share", &[("name", name)]), hint: "", glyph: glyph::SHARED });
     }
-    rows.push(ActionRow { action: PaletteAction::Import, label: "Import passwords".into(), hint: "", glyph: super::import_ui::DOWNLOAD_TRAY });
-    rows.push(ActionRow { action: PaletteAction::Settings, label: "Open settings".into(), hint: "", glyph: glyph::SETTINGS });
-    rows.push(ActionRow { action: PaletteAction::Lock, label: "Lock now".into(), hint: "Ctrl L", glyph: glyph::LOCK });
+    rows.push(ActionRow { action: PaletteAction::Import, label: crate::i18n::t("palette.import").into(), hint: "", glyph: super::import_ui::DOWNLOAD_TRAY });
+    rows.push(ActionRow { action: PaletteAction::Settings, label: crate::i18n::t("palette.settings").into(), hint: "", glyph: glyph::SETTINGS });
+    rows.push(ActionRow { action: PaletteAction::Lock, label: crate::i18n::t("palette.lock").into(), hint: "Ctrl L", glyph: glyph::LOCK });
     rows.retain(|row| row.label.to_lowercase().contains(&query));
     rows
 }
@@ -144,7 +155,7 @@ pub fn draw(ctx: &egui::Context, state: &mut PaletteState, items: &[VaultItem], 
                     egui::TextEdit::singleline(&mut state.query)
                         .id(input_id())
                         .frame(egui::Frame::NONE)
-                        .hint_text(PLACEHOLDER)
+                        .hint_text(placeholder())
                         .font(egui::FontId::proportional(19.0))
                         .desired_width(width),
                 );
@@ -167,12 +178,12 @@ pub fn draw(ctx: &egui::Context, state: &mut PaletteState, items: &[VaultItem], 
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 if total == 0 {
                     ui.add_space(32.0);
-                    ui.vertical_centered(|ui| ui.label(egui::RichText::new(NOTHING_FOUND).size(15.0).color(MUTED)));
+                    ui.vertical_centered(|ui| ui.label(egui::RichText::new(nothing_found()).size(15.0).color(MUTED)));
                     ui.add_space(32.0);
                     return;
                 }
                 if !found.is_empty() {
-                    heading(ui, ITEMS_HEADING, 10.0);
+                    heading(ui, items_heading(), 10.0);
                 }
                 for (i, item) in found.iter().enumerate() {
                     let user = item.login.as_ref().and_then(|l| l.username.clone()).unwrap_or_default();
@@ -188,7 +199,7 @@ pub fn draw(ctx: &egui::Context, state: &mut PaletteState, items: &[VaultItem], 
                     }
                 }
                 if !actions.is_empty() {
-                    heading(ui, ACTIONS_HEADING, 12.0);
+                    heading(ui, actions_heading(), 12.0);
                 }
                 for (j, action) in actions.iter().enumerate() {
                     let index = found.len() + j;
@@ -314,7 +325,7 @@ mod tests {
         let _ = frame(&ctx, 0.0, &mut state, vec![]);
         let (answer, p) = frame(&ctx, 0.1, &mut state, vec![key(egui::Key::Enter)]);
         assert_eq!(answer, PaletteAnswer::Open, "Enter with nothing to take does nothing");
-        assert!(p.texts.iter().any(|(t, _, _)| t == NOTHING_FOUND));
+        assert!(p.texts.iter().any(|(t, _, _)| t == nothing_found()));
     }
 
     #[test]
