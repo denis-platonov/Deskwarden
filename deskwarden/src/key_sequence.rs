@@ -81,7 +81,9 @@ use crate::vault_window::detail::TotpState;
 pub struct KeyDef {
     /// The text between the braces, exactly as stored.
     pub token: &'static str,
-    /// What the palette button says.
+    /// The key's English name. Kept for the table's own identity and for the
+    /// tests; **every screen asks [`Self::name`]**, which is the same word in
+    /// the language's Windows convention (German "Strg", "Entf", ...).
     pub label: &'static str,
     /// What the preview draws instead of the word. An `{ENTER}` in a sequence
     /// is a key press, and rendering it as the word "ENTER" in a preview whose
@@ -90,6 +92,34 @@ pub struct KeyDef {
     pub symbol: &'static str,
     /// Whether the palette offers a button for this spelling.
     pub palette: bool,
+}
+
+impl KeyDef {
+    /// What a chip, a palette button and a keycap call the key, in the active
+    /// language. **Display only**: the stored sequence spells the key by
+    /// [`Self::token`], which no language touches. The `F1`..`F12` caps read
+    /// the same everywhere and keep their [`Self::label`].
+    pub fn name(&self) -> &'static str {
+        let key = match self.token {
+            "ENTER" => "seqkey.enter",
+            "TAB" => "seqkey.tab",
+            "ESC" => "seqkey.esc",
+            "SPACE" => "seqkey.space",
+            "BACKSPACE" | "BKSP" | "BS" => "seqkey.backspace",
+            "DELETE" | "DEL" => "seqkey.delete",
+            "INSERT" | "INS" => "seqkey.insert",
+            "HOME" => "seqkey.home",
+            "END" => "seqkey.end",
+            "PGUP" => "seqkey.page_up",
+            "PGDN" => "seqkey.page_down",
+            "UP" => "seqkey.up",
+            "DOWN" => "seqkey.down",
+            "LEFT" => "seqkey.left",
+            "RIGHT" => "seqkey.right",
+            _ => return self.label,
+        };
+        crate::i18n::t(key)
+    }
 }
 
 /// Every key spelling this build recognises.
@@ -174,8 +204,8 @@ impl FieldRef {
     /// What a chip and a palette button call it.
     pub fn label(&self) -> String {
         match self {
-            Self::Username => "Username".to_string(),
-            Self::Password => "Password".to_string(),
+            Self::Username => crate::i18n::t("field.username").to_string(),
+            Self::Password => crate::i18n::t("field.password").to_string(),
             Self::Totp => "TOTP".to_string(),
             Self::Custom(name) => name.clone(),
         }
@@ -213,12 +243,27 @@ impl Modifier {
         }
     }
 
+    /// The English chip caption. **Only the injector's refusal sentences read
+    /// this**; every screen asks [`Self::chip`].
     pub fn label(self) -> &'static str {
         match self {
             Self::Shift => "Shift+",
             Self::Ctrl => "Ctrl+",
             Self::Alt => "Alt+",
             Self::Enter => "Enter",
+        }
+    }
+}
+
+impl Modifier {
+    /// The chip caption in the active language: the key-cap name and the `+`
+    /// the chip row reads as "and then" (a bare `~` is the Enter key itself).
+    pub fn chip(self) -> String {
+        match self {
+            Self::Shift => format!("{}+", crate::i18n::t("seqkey.shift")),
+            Self::Ctrl => format!("{}+", crate::i18n::t("seqkey.ctrl")),
+            Self::Alt => format!("{}+", crate::i18n::t("seqkey.alt")),
+            Self::Enter => crate::i18n::t("seqkey.enter").to_string(),
         }
     }
 }
@@ -262,10 +307,10 @@ impl Token {
         match self {
             Self::Literal(text) => text.clone(),
             Self::Field(field) => field.label(),
-            Self::Key(key) => key.label.to_string(),
+            Self::Key(key) => key.name().to_string(),
             Self::Delay(ms) => wait_label(*ms),
-            Self::DelayRate(ms) => format!("Type every {ms} ms"),
-            Self::Modifier(m) => m.label().to_string(),
+            Self::DelayRate(ms) => rate_label(*ms),
+            Self::Modifier(m) => m.chip(),
             Self::Grouping(c) => c.to_string(),
             Self::Unknown(raw) => format!("{{{raw}}}"),
         }
@@ -289,15 +334,36 @@ impl Token {
 /// rounding to "Wait 0s" -- a wait the user set and the app claims is nothing.
 /// Sub-50ms waits, which no number of seconds can show, are given in ms.
 pub fn wait_label(ms: u32) -> String {
+    crate::i18n::tf("seqchip.wait", &[("amount", &wait_amount(ms))])
+}
+
+/// The duration alone -- "0.3s", "2s", "20 ms" -- for the step row, whose
+/// kind chip already says WAIT. The same rounding as [`wait_label`], which is
+/// this with the word in front; the row reads the number from the step
+/// (`StepRow::wait_ms`), never from the sentence.
+pub fn wait_amount(ms: u32) -> String {
     if ms < 50 {
-        return format!("Wait {ms} ms");
+        return crate::i18n::tf("time.ms", &[("ms", &ms.to_string())]);
     }
     let tenths = (ms + 50) / 100;
     if tenths.is_multiple_of(10) {
-        format!("Wait {}s", tenths / 10)
+        crate::i18n::tf("seqchip.wait_seconds", &[("seconds", &(tenths / 10).to_string())])
     } else {
-        format!("Wait {}.{}s", tenths / 10, tenths % 10)
+        crate::i18n::tf(
+            "seqchip.wait_seconds_tenths",
+            &[("whole", &(tenths / 10).to_string()), ("tenth", &(tenths % 10).to_string())],
+        )
     }
+}
+
+/// "Type every 50 ms": a `{DELAY=n}` chip.
+pub fn rate_label(ms: u32) -> String {
+    crate::i18n::tf("seqchip.rate", &[("ms", &ms.to_string())])
+}
+
+/// "50 ms/key": a `{DELAY=n}` in the resolved preview.
+pub fn rate_per_key(ms: u32) -> String {
+    crate::i18n::tf("seqchip.rate_per_key", &[("ms", &ms.to_string())])
 }
 
 /// Seconds as the user typed them into the wait box, as milliseconds.
@@ -688,8 +754,12 @@ pub enum PreviewPart {
     /// A key, as its symbol. Never as its name: this preview says what would
     /// be *typed*, and `{ENTER}` does not type the word "ENTER".
     Key(&'static str),
-    /// A pause, in the user's words.
-    Wait(String),
+    /// A pause, in milliseconds. Worded where it is drawn
+    /// ([`wait_label`]), not here.
+    Wait(u32),
+    /// `{DELAY=n}`: from here on, this many milliseconds between keystrokes
+    /// ([`rate_per_key`]).
+    Rate(u32),
     /// Something that cannot be resolved, with the reason. **Never an empty
     /// string**: a `{S:Missing}` rendered as nothing is a preview that says
     /// the sequence is fine when it is not, and the sequence would type
@@ -754,14 +824,14 @@ pub fn resolve_preview(tokens: &[Token], source: &ResolveSource<'_>) -> Vec<Prev
             Token::Literal(text) => PreviewPart::Text(text.clone()),
             Token::Field(FieldRef::Username) => {
                 if source.username.is_empty() {
-                    missing("no username on this item")
+                    missing(crate::i18n::t("seqchip.no_username"))
                 } else {
                     PreviewPart::Value(source.username.to_string())
                 }
             }
             Token::Field(FieldRef::Password) => {
                 if source.password.is_empty() {
-                    missing("no password on this item")
+                    missing(crate::i18n::t("seqchip.no_password"))
                 } else {
                     PreviewPart::Value(source.password.to_string())
                 }
@@ -769,19 +839,19 @@ pub fn resolve_preview(tokens: &[Token], source: &ResolveSource<'_>) -> Vec<Prev
             Token::Field(FieldRef::Totp) => match source.totp {
                 TotpState::Code { code, .. } => PreviewPart::Value(code.clone()),
                 TotpState::Fetching => PreviewPart::Pending,
-                TotpState::NoSecret => missing("no TOTP on this item"),
-                TotpState::NoCodeReported => missing("no current TOTP"),
-                TotpState::Unavailable => missing("TOTP unavailable"),
+                TotpState::NoSecret => missing(crate::i18n::t("seqchip.no_totp")),
+                TotpState::NoCodeReported => missing(crate::i18n::t("seqchip.no_current_totp")),
+                TotpState::Unavailable => missing(crate::i18n::t("seqchip.totp_unavailable")),
             },
             Token::Field(FieldRef::Custom(name)) => match source.custom_value(name) {
                 Some(value) if !value.is_empty() => PreviewPart::Value(value.to_string()),
-                Some(_) => missing(&format!("{name} is empty")),
-                None => missing(&format!("no field called {name}")),
+                Some(_) => missing(&crate::i18n::tf("seqchip.field_empty", &[("name", name)])),
+                None => missing(&crate::i18n::tf("seqchip.no_field", &[("name", name)])),
             },
             Token::Key(key) => PreviewPart::Key(key.symbol),
-            Token::Delay(ms) => PreviewPart::Wait(wait_label(*ms)),
-            Token::DelayRate(ms) => PreviewPart::Wait(format!("{ms} ms/key")),
-            Token::Modifier(m) => PreviewPart::Opaque(m.label().to_string()),
+            Token::Delay(ms) => PreviewPart::Wait(*ms),
+            Token::DelayRate(ms) => PreviewPart::Rate(*ms),
+            Token::Modifier(m) => PreviewPart::Opaque(m.chip()),
             Token::Grouping(c) => PreviewPart::Opaque(c.to_string()),
             Token::Unknown(raw) => PreviewPart::Opaque(format!("{{{raw}}}")),
         })

@@ -1263,7 +1263,7 @@ impl AppMatchDraft {
     /// See [`template_fault`] for what "will not parse" means against a parser
     /// that cannot fail, and [`Self::template_touched`] for why an inherited
     /// string is not judged by it.
-    pub fn template_fault(&self) -> Option<&'static str> {
+    pub fn template_fault(&self) -> Option<String> {
         if !self.template_touched {
             return None;
         }
@@ -2943,7 +2943,7 @@ impl EditDraft {
     /// about a box the user has not filled in, and this is about a string the
     /// user wrote that this build cannot read back. A single bool would have
     /// one caption for two faults.
-    pub fn sequence_fault(&self) -> Option<&'static str> {
+    pub fn sequence_fault(&self) -> Option<String> {
         self.app.as_ref().and_then(AppMatchDraft::template_fault)
     }
 
@@ -6701,6 +6701,10 @@ pub struct StepRow {
     /// Whether this build knows what the step is. `false` draws it faintly and
     /// says [`SEQUENCE_UNKNOWN_TIP`] on hover.
     pub understood: bool,
+    /// The pause, in milliseconds, on a wait row and `None` on every other.
+    /// Carried beside [`Self::label`] so a row that shows the duration alone
+    /// ([`key_sequence::wait_amount`]) never takes it back out of a sentence.
+    pub wait_ms: Option<u32>,
 }
 
 impl StepRow {
@@ -6784,6 +6788,10 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
                 _ => None,
             },
             understood: token.is_understood(),
+            wait_ms: match token {
+                Token::Delay(ms) => Some(*ms),
+                _ => None,
+            },
         });
     }
     rows
@@ -7026,9 +7034,13 @@ pub fn template_with(template: &str, chip: &str) -> String {
 }
 
 /// The refusal shown under an unparseable template, and the reason Save is off.
-pub const TEMPLATE_UNPARSED: &str =
-    "This template has a `{` that is never closed, so the steps below are not what it says. \
-     Close the brace, or write `{{}` to type a brace.";
+///
+/// A `String`, not a `&'static str`: the sentence holds literal braces, which
+/// `i18n::t` refuses, so it is read through `tf` (`{{` and `}}` in the
+/// catalog are one brace each).
+pub fn template_unparsed() -> String {
+    crate::i18n::tf("edit.template_unparsed", &[])
+}
 
 /// Whether `template` is a string this build can hold without changing it.
 ///
@@ -7047,12 +7059,12 @@ pub const TEMPLATE_UNPARSED: &str =
 /// the string the user is looking at and the string that would be typed differ.
 /// That is precisely the case the design says cannot be saved, and it is the
 /// only one, so nothing well-formed is caught by it.
-pub fn template_fault(template: &str) -> Option<&'static str> {
+pub fn template_fault(template: &str) -> Option<String> {
     if template.is_empty() {
         return None;
     }
     let tokens = key_sequence::parse(template);
-    (key_sequence::render(&tokens) != template).then_some(TEMPLATE_UNPARSED)
+    (key_sequence::render(&tokens) != template).then(template_unparsed)
 }
 
 // The note under an empty template box (`edit.template_empty_note`) names the default
@@ -8659,7 +8671,8 @@ fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
                 // In brackets, so a key cannot be misread as the characters
                 // of its own name sitting in the typed text.
                 PreviewPart::Key(symbol) => (format!("[{symbol}]"), theme::TEXT_FAINT),
-                PreviewPart::Wait(label) => (format!("[{label}]"), theme::TEXT_FAINT),
+                PreviewPart::Wait(ms) => (format!("[{}]", key_sequence::wait_label(*ms)), theme::TEXT_FAINT),
+                PreviewPart::Rate(ms) => (format!("[{}]", key_sequence::rate_per_key(*ms)), theme::TEXT_FAINT),
                 PreviewPart::Unresolved(why) => (why.clone(), theme::ERROR),
                 PreviewPart::Pending => (crate::i18n::t("edit.fetching_code").to_string(), theme::TEXT_FAINT),
                 PreviewPart::Opaque(raw) => (raw.clone(), theme::TEXT_FAINT),
@@ -8856,7 +8869,7 @@ fn app_sequence_block(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-            if ui.add(palette_button(key.label)).clicked() {
+            if ui.add(palette_button(key.name())).clicked() {
                 app.sequence = sequence_with(&app.sequence, Token::Key(key));
             }
         }
@@ -9011,7 +9024,7 @@ pub(crate) fn template_editor(
     template_draft: &mut String,
     sequence: &mut String,
     touched: &mut bool,
-    fault: Option<&'static str>,
+    fault: Option<String>,
 ) {
     // **4c's own box**: `border: 1px solid; border-radius: 8px; padding:
     // 12px 13px`, mono 13 on a line box wide enough for the token chips
@@ -20173,7 +20186,7 @@ mod sequence_builder_tests {
             );
         }
         for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-            assert!(strings.contains(&key.label), "{} is not a button: {strings:?}", key.label);
+            assert!(strings.contains(&key.name()), "{} is not a button: {strings:?}", key.name());
         }
         assert!(strings.contains(&"Add text"), "{strings:?}");
         assert!(strings.contains(&"Add wait"), "{strings:?}");
@@ -20292,7 +20305,7 @@ mod sequence_builder_tests {
         // user has to type from memory, which is the whole thing they asked
         // not to have to do.
         for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-            for rect in painted.rects_of(key.label) {
+            for rect in painted.rects_of(key.name()) {
                 assert!(
                     bounds.contains_rect(rect),
                     "the {} button is painted at {rect:?}, off a {}pt-wide pane",
@@ -21182,7 +21195,7 @@ mod sequence_builder_tests {
         for bad in ["{", "{USERNAME}{TAB", "a{FOO", "{{"] {
             assert_eq!(
                 template_fault(bad),
-                Some(TEMPLATE_UNPARSED),
+                Some(template_unparsed()),
                 "the malformed {bad:?} was accepted"
             );
         }
@@ -21195,12 +21208,12 @@ mod sequence_builder_tests {
     fn an_inherited_bad_sequence_does_not_block_a_save_but_an_edited_one_does() {
         let item = item();
         let mut draft = draft_for(&item, "{USERNAME}{TAB");
-        assert_eq!(template_fault(&draft.app.as_ref().unwrap().sequence), Some(TEMPLATE_UNPARSED));
+        assert_eq!(template_fault(&draft.app.as_ref().unwrap().sequence), Some(template_unparsed()));
         assert!(draft.is_saveable(), "an inherited unreadable sequence blocked the save");
         assert_eq!(draft.sequence_fault(), None);
 
         draft.app.as_mut().unwrap().template_touched = true;
-        assert_eq!(draft.sequence_fault(), Some(TEMPLATE_UNPARSED));
+        assert_eq!(draft.sequence_fault(), Some(template_unparsed()));
         assert!(!draft.is_saveable(), "an edited unparseable template was still saveable");
         // ...and it is the TEMPLATE and not the name that is wrong, so the two
         // refusals stay distinguishable.
@@ -21515,7 +21528,7 @@ mod sequence_builder_tests {
         // v2: the header says "Save"; the reason is its hint.
         assert_eq!(save_label(&draft), save_template_blocked(), "{:?}", painted.strings());
         assert!(
-            painted.strings().contains(&TEMPLATE_UNPARSED),
+            painted.strings().contains(&template_unparsed().as_str()),
             "the refusal itself is not on screen: {:?}",
             painted.strings()
         );
@@ -21529,7 +21542,7 @@ mod sequence_builder_tests {
         assert!(draft.is_saveable(), "a fixed template did not re-enable the save");
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let fixed = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
-        assert!(!fixed.strings().contains(&TEMPLATE_UNPARSED));
+        assert!(!fixed.strings().contains(&template_unparsed().as_str()));
         assert!(!fixed.strings().contains(&save_template_blocked()));
     }
 
@@ -28483,7 +28496,7 @@ mod edit_pane_layout_tests {
             // One `Changed` pill on the card, plus -- where the rail is drawn
             // -- one `Changed` heading in it. Never zero.
             assert!(
-                painted.strings().contains(&theme::CHANGED_PILL),
+                painted.strings().contains(&theme::changed_pill()),
                 "{pane:?}: nothing on screen says a field changed: {:?}",
                 painted.strings()
             );
@@ -32293,7 +32306,7 @@ mod v2_editor_tests {
         let mut draft = EditDraft::from_item(&a_login());
         let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
         assert!(!p.texts.iter().any(|t| t.0.contains("hunter2")), "the password is painted in clear");
-        assert!(p.text(crate::kit::input::GENERATE).is_some(), "Generate is in the field");
+        assert!(p.text(crate::kit::input::generate_label()).is_some(), "Generate is in the field");
         assert!(["Weak", "Fair", "Strong", "Very strong"].iter().any(|w| p.texts.iter().any(|t| t.0 == *w)), "the meter names the strength");
     }
 

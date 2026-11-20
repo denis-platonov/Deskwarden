@@ -757,7 +757,7 @@ impl SequenceDraft {
     /// judged by it -- [`detail_edit::AppMatchDraft::template_fault`]'s rule,
     /// for its reason: a sequence written by another password manager must not
     /// become unsaveable merely by being looked at.
-    pub fn fault(&self) -> Option<&'static str> {
+    pub fn fault(&self) -> Option<String> {
         if !self.template_touched {
             return None;
         }
@@ -2240,19 +2240,20 @@ fn row_run(ui: &mut egui::Ui, text: &str, font: egui::FontId, ink: egui::Color32
 ///
 /// The row's label is `key_sequence::wait_label`'s -- `Wait 0.3s` -- which
 /// is right everywhere it is read as a sentence: the resolved preview's
-/// `[Wait 0.3s]`, the edit form's chips. On a step row it is said twice,
-/// because the row's kind chip two cells to the left already reads `WAIT`.
-/// The owner: "wait wait 0.3 s - remove second wait". 4a's own wait row is
-/// `250 ms`, the duration alone, for exactly this reason.
+/// `[Wait 0.3s]`, the edit form's chips. On a step row it would be said
+/// twice, because the row's kind chip two cells to the left already reads
+/// `WAIT`. The owner: "wait wait 0.3 s - remove second wait". 4a's own wait
+/// row is `250 ms`, the duration alone, for exactly this reason.
 ///
-/// Trimmed here rather than in `wait_label`, because the other two readers
-/// have no chip beside them and need the word.
-fn wait_duration(label: &str) -> &str {
-    label.strip_prefix(WAIT_WORD).unwrap_or(label)
+/// Worded from the row's own `wait_ms`, not by stripping a prefix off the
+/// sentence: a translation has no English "Wait " to strip. A row that is not
+/// a wait (never drawn here) falls back to its label.
+fn wait_duration(row: &detail_edit::StepRow) -> String {
+    match row.wait_ms {
+        Some(ms) => key_sequence::wait_amount(ms),
+        None => row.label.clone(),
+    }
 }
-
-/// What [`wait_duration`] takes off the front.
-const WAIT_WORD: &str = "Wait ";
 
 /// **Where a hand-painted galley's top goes so its INK sits on `middle`.**
 /// [`theme::face_ink_middle`] is where the face inks its cap-height band
@@ -2481,7 +2482,7 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
             StepKind::Wait => {
                 row_run(
                     ui,
-                    wait_duration(&step.rows[0].label),
+                    &wait_duration(&step.rows[0]),
                     egui::FontId::new(
                         STEP_WAIT_PX,
                         egui::FontFamily::Name(theme::MONO_BOLD.into()),
@@ -2803,7 +2804,7 @@ fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
                 for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-                    if keycap_button(ui, key_name(key.label)).clicked() {
+                    if keycap_button(ui, key_name(key.name())).clicked() {
                         draft.sequence =
                             detail_edit::sequence_with(&draft.sequence, Token::Key(key));
                         ui.close();
@@ -4366,10 +4367,11 @@ mod tests {
             painted.strings()
         );
         // The word itself is not wrong everywhere -- only beside the chip.
-        assert_eq!(wait_duration("Wait 0.3s"), "0.3s");
-        assert_eq!(wait_duration("Wait 20 ms"), "20 ms");
-        // Anything not spelled that way is left exactly as it is.
-        assert_eq!(wait_duration("250 ms"), "250 ms");
+        let rows = detail_edit::step_rows("{DELAY 250}{DELAY 20}{TAB}", &source(), false);
+        assert_eq!(wait_duration(&rows[0]), "0.3s");
+        assert_eq!(wait_duration(&rows[1]), "20 ms");
+        // A row that is not a wait keeps its label.
+        assert_eq!(wait_duration(&rows[2]), rows[2].label);
     }
 
     /// How far inside a row's right edge a click lands on the row itself:

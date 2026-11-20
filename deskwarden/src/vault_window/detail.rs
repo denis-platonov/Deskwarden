@@ -2820,19 +2820,9 @@ const V2_ROW_GAP: f32 = 18.0;
 /// The action row's buttons, and the star's and more's squares.
 const V2_ACTION_HEIGHT: f32 = 48.0;
 
-/// The item type's name as the user reads it. `ItemKind::label` is English and sits in a
-/// module the translation system does not reach (`vault_bridge`), so every screen that
-/// draws a type name asks here.
+/// The item type's name as the user reads it: [`ItemKind::label`], which reads the catalog.
 pub(crate) fn kind_label(kind: ItemKind) -> String {
-    match kind {
-        ItemKind::Login => crate::i18n::t("new_item.login"),
-        ItemKind::SecureNote => crate::i18n::t("new_item.note"),
-        ItemKind::Card => crate::i18n::t("new_item.card"),
-        ItemKind::Identity => crate::i18n::t("edit.sec_identity"),
-        ItemKind::SshKey => crate::i18n::t("new_item.ssh"),
-        ItemKind::Unknown(_) => crate::i18n::t("detail.unsupported_item"),
-    }
-    .to_string()
+    kind.label()
 }
 
 /// The kind as the header names it (spec 3.3: a card is a "Payment card").

@@ -105,7 +105,7 @@ pub struct AccountsMenuPlan {
 
 /// The label the "Remove..." item carries for `active`.
 pub fn remove_account_label(active: &str) -> String {
-    format!("Remove {active}...")
+    crate::i18n::tf("tray.remove_account", &[("active", active)])
 }
 
 /// Decides the submenu's contents. See [`AccountsMenuPlan`].
@@ -338,7 +338,7 @@ pub fn build_tray() -> AppTray {
     // (`prefs_ui::draw_update_card`), where it can say "no update" as easily
     // as "update", where the release notes fit, and where the download it
     // starts can report back to the page that started it.
-    let preferences = MenuItem::new("Preferences...", true, None);
+    let preferences = MenuItem::new(crate::i18n::t("tray.preferences"), true, None);
     // Empty here and filled by `rebuild_accounts_menu`, which `main` calls
     // once the account list exists and again after every change to it. Built
     // empty rather than not at all so there is exactly one place that decides

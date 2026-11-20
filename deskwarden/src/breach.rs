@@ -424,15 +424,11 @@ fn group_thousands(count: u64) -> String {
 /// The advice still appears -- on each row -- and it still does not vary by
 /// count; this is the number without it.
 pub fn breach_count_phrase(count: u64) -> String {
-    let times = if count == 1 { "time" } else { "times" };
-    format!("Seen {} {times}", group_thousands(count))
+    crate::i18n::tn("breach.seen_times", count, &[("count", &group_thousands(count))])
 }
 
 pub fn breach_phrase(count: u64) -> String {
-    format!(
-        "Found in a known data breach ({} times). Change this password.",
-        group_thousands(count)
-    )
+    crate::i18n::tf("breach.found_phrase", &[("count", &group_thousands(count))])
 }
 
 /// Where a range lookup may be addressed -- the other half of [`Prefix`].
@@ -1997,22 +1993,23 @@ mod tests {
         // The two that cannot be banned, pinned instead.
         assert_eq!(
             source.matches(concat!("forma", "t!")).count(),
-            4,
-            "a new `format!` in breach.rs production code. The four are the range URL, the \
-             breach phrase, the bare count phrase and `BaseUrl::loopback`, and the thing most \
-             worth formatting here is the hash -- so a fifth has to be added to this count \
+            2,
+            "a new `format!` in breach.rs production code. The two are the range URL and \
+             `BaseUrl::loopback` (the two phrases moved to the catalog), and the thing most \
+             worth formatting here is the hash -- so a third has to be added to this count \
              deliberately"
         );
-        // Each of the four pinned to what it may build, so the count cannot
-        // be satisfied by a *different* four.
+        // Each pinned to what it may build, so the count cannot be satisfied
+        // by a *different* two -- and the two catalog sentences are pinned
+        // to the one argument they may be given, the grouped count.
         for target in [
             concat!("format!(\"{}/{}\", base_url.as_str(), ", "prefix.as_str())"),
-            concat!("\"Found in a known data breach ({} times).", " Change this password.\","),
             concat!("format!(\"http://127.0.0.1:{port}", "/range\")"),
             // The magnitude without the advice, for a heading over a group of
             // items that share a count. Carries the grouped count and nothing
             // else -- no hash, no suffix, no password.
-            concat!("format!(\"Seen {} {times}\", ", "group_thousands(count))"),
+            concat!("tn(\"breach.seen_times\", count, ", "&[(\"count\", &group_thousands(count))])"),
+            concat!("tf(\"breach.found_phrase\", ", "&[(\"count\", &group_thousands(count))])"),
         ] {
             assert!(
                 source.contains(target),

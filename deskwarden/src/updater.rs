@@ -75,7 +75,9 @@ pub const SELF_UPDATE: bool = !cfg!(feature = "store");
 
 /// What the Updates page says in place of its check and download controls
 /// when [`SELF_UPDATE`] is off.
-pub const STORE_UPDATES_NOTICE: &str = "Updates come from the Microsoft Store";
+pub fn store_updates_text() -> &'static str {
+    crate::i18n::t("updater.store_notice")
+}
 
 /// The one hook the Preferences -> Updates page reads: `Some(sentence)` in
 /// the Store edition (show it, hide the check/download/install controls and
@@ -85,7 +87,7 @@ pub fn store_updates_notice() -> Option<&'static str> {
     if SELF_UPDATE {
         None
     } else {
-        Some(STORE_UPDATES_NOTICE)
+        Some(store_updates_text())
     }
 }
 

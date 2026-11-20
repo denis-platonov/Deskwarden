@@ -1091,11 +1091,11 @@ pub fn populated_rows(candidates: usize) -> Vec<ListRow> {
 /// two voices.
 pub fn search_row_label(truncated: bool) -> (&'static str, &'static str) {
     (
-        "Search the vault",
+        crate::i18n::t("picker.search_title"),
         if truncated {
-            "More accounts match than fit on this card"
+            crate::i18n::t("picker.search_truncated")
         } else {
-            "Look for it under another name"
+            crate::i18n::t("picker.empty_search_sub")
         },
     )
 }
