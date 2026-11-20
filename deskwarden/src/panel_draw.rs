@@ -636,6 +636,34 @@ pub fn tile_rect(rect: RECT, scale: i32) -> RECT {
     RECT { left, top, right: left + side, bottom: top + side }
 }
 
+/// Line boxes of a row's two text lines (D 1.3: the text column is a flex
+/// column with `gap 2`; a 16 px line is ~19 high and a 14 px line ~17, so the
+/// 38 px block sits centred on the 42 px tile, 2 px off its top).
+pub const NAME_LINE_H: i32 = 19;
+pub const SUB_LINE_H: i32 = 17;
+pub const TEXT_GAP: i32 = 2;
+
+/// The wash's rectangle inside a row `rect` (DEVICE pixels): the design's 64 px
+/// row, centred in whatever pitch the caller gave. A 66 px pitch (64 + the 2 px
+/// gap) is inset 1 px top and bottom; a rect already 64 or shorter is not
+/// inset at all. Pure.
+pub fn wash_rect(rect: RECT, scale: i32) -> RECT {
+    let spare = ((rect.bottom - rect.top) - px(ROW_H, scale)).max(0);
+    RECT { top: rect.top + spare / 2, bottom: rect.bottom - (spare - spare / 2), ..rect }
+}
+
+/// The name line's and the sub line's bands (DEVICE pixels, full tile height
+/// of text block), `left`/`right` still to be set by the caller. Pure.
+pub fn text_bands(tile: RECT, scale: i32) -> (RECT, RECT) {
+    let block = NAME_LINE_H + TEXT_GAP + SUB_LINE_H;
+    let side = tile.bottom - tile.top;
+    let top = tile.top + (side - px(block, scale)) / 2;
+    let name = RECT { left: 0, right: 0, top, bottom: top + px(NAME_LINE_H, scale) };
+    let sub_top = name.bottom + px(TEXT_GAP, scale);
+    let sub = RECT { left: 0, right: 0, top: sub_top, bottom: sub_top + px(SUB_LINE_H, scale) };
+    (name, sub)
+}
+
 /// **One account row, as design 1b draws it**: a rounded wash over the row
 /// (blue when selected, soft grey on hover), the tile, a bold line and a faint
 /// one under it, the blue `Enter` badge on the selected row and a hint chip for
@@ -651,7 +679,7 @@ pub fn draw_account_row(
     fonts: &RowFonts,
     scale: i32,
 ) -> RECT {
-    let wash = RECT { top: rect.top + 1, bottom: rect.bottom - 1, ..rect };
+    let wash = wash_rect(rect, scale);
     if look.selected {
         round_rect(hdc, wash, px(ROW_RADIUS, scale), crate::theme::BLUE_WASH, None);
     } else if look.hovered {
@@ -684,20 +712,20 @@ pub fn draw_account_row(
         tile.right + px(ROW_TEXT_GAP, scale)
     };
     let right = rect.right - crate::theme::TEXT_CLIP_INSET as i32 - lane;
-    let mid = tile.top + (tile.bottom - tile.top) * 11 / 20;
+    let (name_band, sub_band) = text_bands(tile, scale);
     let line = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
 
         SetTextColor(hdc, rgb(crate::theme::INK));
         let old = SelectObject(hdc, fonts.name);
-        let mut at = RECT { left, top: tile.top, right, bottom: mid };
+        let mut at = RECT { left, right, ..name_band };
         draw_text(hdc, look.name, &mut at, line);
         SelectObject(hdc, old);
 
         SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
         let old = SelectObject(hdc, fonts.sub);
-        let mut at = RECT { left, top: mid, right, bottom: tile.bottom };
+        let mut at = RECT { left, right, ..sub_band };
         draw_text(hdc, look.sub, &mut at, line);
         SelectObject(hdc, old);
     }
@@ -857,6 +885,29 @@ mod tests {
     #[test]
     fn an_account_row_is_its_avatar_and_the_designs_padding() {
         assert_eq!(ROW_H, 42 + 2 * 11);
+    }
+
+    /// D 1.3's row, in device pixels at 100% and at 150%: the wash is the
+    /// design's 64 whatever pitch the caller gave, the tile sits 10 px in, and
+    /// the two text lines (19 + 2 + 17) are centred on the tile.
+    #[test]
+    fn a_row_paints_the_designs_64_wash_and_centres_its_text_on_the_tile() {
+        for (scale, pitch) in [(100, 66), (100, 64), (150, 99), (150, 96)] {
+            let rc = RECT { left: 8, top: 100, right: 392, bottom: 100 + pitch };
+            let wash = wash_rect(rc, scale);
+            assert_eq!(wash.bottom - wash.top, px(ROW_H, scale), "scale {scale} pitch {pitch}");
+            let tile = tile_rect(rc, scale);
+            assert_eq!(tile.left - rc.left, px(ROW_PAD_X, scale));
+            let (name, sub) = text_bands(tile, scale);
+            assert_eq!(name.bottom - name.top, px(NAME_LINE_H, scale));
+            assert_eq!(sub.top - name.bottom, px(TEXT_GAP, scale));
+            let block = sub.bottom - name.top;
+            let spare = (tile.bottom - tile.top) - block;
+            assert!((name.top - tile.top - spare / 2).abs() <= 1, "block not centred on the tile");
+        }
+        assert_eq!((NAME_LINE_H, SUB_LINE_H, TEXT_GAP), (19, 17, 2));
+        assert_eq!((ROW_NAME_PX, ROW_SUB_PX, BADGE_PX, ENTER_INSET), (16, 14, 13, 10));
+        assert_eq!((ENTER_H, ENTER_PAD_X, ENTER_RADIUS, ROW_RADIUS, ROW_TEXT_GAP), (28, 10, 8, 13, 13));
     }
 
     #[test]

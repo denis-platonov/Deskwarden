@@ -12156,14 +12156,14 @@ mod tests {
             // picker_prompt: 400 - 32 = 368; a palette row's lane is
             // 368 - 3 - 65 - 24 = 276 (206 selected); the search rows 285;
             // the footer buttons 180 less their chip lane; hints 202.
-            b("picker.list_title", "Archivo-ExtraBold", 17, 368),
-            b("picker.palette_title", "Archivo-ExtraBold", 17, 368),
-            b("picker.search_title", "Archivo-ExtraBold", 17, 368),
-            b("picker.empty_title", "Archivo-ExtraBold", 17, 368),
-            b("picker.list_sub", "Archivo-Regular", 14, 368),
-            b("picker.palette_sub", "Archivo-Regular", 14, 368),
-            b("picker.search_sub", "Archivo-Regular", 14, 368),
-            b("picker.empty_body", "Archivo-Regular", 14, 368),
+            b("picker.list_title", "Archivo-ExtraBold", 19, 368),
+            b("picker.palette_title", "Archivo-ExtraBold", 19, 368),
+            b("picker.search_title", "Archivo-ExtraBold", 19, 368),
+            b("picker.empty_title", "Archivo-ExtraBold", 19, 368),
+            b("picker.list_sub", "Archivo-Regular", 15, 368),
+            b("picker.palette_sub", "Archivo-Regular", 15, 368),
+            b("picker.search_sub", "Archivo-Regular", 15, 368),
+            b("picker.empty_body", "Archivo-Regular", 15, 368),
             b("picker.send_all", "Archivo-Bold", 16, 206),
             b("picker.send_sequence", "Archivo-Bold", 16, 206),
             b("picker.send_all_sub", "Archivo-Regular", 14, 206),
