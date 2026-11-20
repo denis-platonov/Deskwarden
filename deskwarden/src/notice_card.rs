@@ -428,7 +428,7 @@ pub fn done_copy(case: DoneCase) -> (&'static str, &'static str) {
 
 /// The done card's width: the design's overlay is the host window; this is a
 /// card of its own, as wide as the disc and the longest subtitle need.
-pub const DONE_WIDTH: i32 = 320;
+pub const DONE_WIDTH: i32 = 400;
 const DONE_PAD: i32 = 28;
 const DONE_GAP: i32 = 16;
 

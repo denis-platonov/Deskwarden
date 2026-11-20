@@ -271,7 +271,7 @@ picker.palette_sub = Wähle ein Feld. Es wird nichts getippt, bis du es tust.
 picker.list_title = Aus Tresor ausfüllen
 picker.list_sub = Diese Konten scheinen zu dieser App zu gehören.
 picker.cancel = Abbrechen
-picker.edit_binding = Zuordnung bearbeiten
+picker.edit_binding = Zuordnung ändern
 
 region.drag_title = Ziehe ein Rechteck um den QR-Code
 region.drag_hint = Deskwarden liest ihn, sobald du loslässt. Noch wird nichts gespeichert.

@@ -1240,7 +1240,7 @@ const VALUE_H: i32 = 28;
 /// ones: `Password` and `Passphrase` where the old run said `Words` and
 /// `Characters`. The whole run plus the *Regenerate* button has to fit one
 /// 352-pixel row, which `the_control_row_fits_the_body` is what proves.
-const KIND_W: [i32; 3] = [66, 78, 40];
+const KIND_W: [i32; 3] = [84, 78, 40];
 
 /// The one-pixel overlap that puts two adjacent cells' strokes on one column.
 /// `theme::SEGMENT_SEAM`, pinned by [`the_cards_dimensions_are_the_themes`].

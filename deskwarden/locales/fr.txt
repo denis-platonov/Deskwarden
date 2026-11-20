@@ -206,7 +206,7 @@ generate.avoid_lookalikes = Éviter les caractères ambigus
 generate.working = Génération…
 generate.failed = Impossible de générer un mot de passe. Réessayez.
 generate.kind_password = Mot de passe
-generate.kind_passphrase = Phrase secrète
+generate.kind_passphrase = Phrase
 generate.length = Longueur
 generate.words = Mots
 
@@ -271,7 +271,7 @@ picker.palette_sub = Choisissez un champ. Rien n'est saisi tant que vous ne le f
 picker.list_title = Remplir depuis le coffre
 picker.list_sub = Ces comptes semblent appartenir à cette appli.
 picker.cancel = Annuler
-picker.edit_binding = Modifier l'association
+picker.edit_binding = Modifier le lien
 
 region.drag_title = Tracez un cadre autour du code QR
 region.drag_hint = Deskwarden le lit dès que vous relâchez. Rien n'est encore enregistré.

@@ -343,7 +343,7 @@ const BODY_H: i32 = 22;
 const BUTTON_H: i32 = crate::panel_draw::TALL_BUTTON_H;
 
 /// The status pill's width: "Locked" at 12/700 and the design's 10 px padding.
-const PILL_W: i32 = 64;
+const PILL_W: i32 = 80;
 
 /// Every rectangle the card paints, computed once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

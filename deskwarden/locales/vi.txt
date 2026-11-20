@@ -206,7 +206,7 @@ generate.avoid_lookalikes = Tránh ký tự dễ nhầm
 generate.working = Đang tạo…
 generate.failed = Không thể tạo mật khẩu. Hãy thử lại.
 generate.kind_password = Mật khẩu
-generate.kind_passphrase = Cụm mật khẩu
+generate.kind_passphrase = Cụm từ
 generate.length = Độ dài
 generate.words = Từ
 

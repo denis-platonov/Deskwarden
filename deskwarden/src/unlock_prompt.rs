@@ -535,7 +535,7 @@ pub fn layout() -> Layout {
 
     let label = Box2 { x: card_inner_x, y: card_y + CARD_PAD, w: card_inner_w, h: 16 };
     let field = Box2 { x: card_inner_x, y: label.bottom() + LABEL_GAP, w: card_inner_w, h: FIELD_H };
-    let unlock = Box2 { x: card_inner_x, y: field.bottom() + GROUP_GAP, w: 108, h: BUTTON_H };
+    let unlock = Box2 { x: card_inner_x, y: field.bottom() + GROUP_GAP, w: 124, h: BUTTON_H };
     let cancel = Box2 { x: unlock.right() + 10, y: unlock.y, w: 88, h: BUTTON_H };
     // The 3px track beside the button, `theme::BAR_HEIGHT` on
     // `login_ui::AUTH_BAR_WIDTH`, vertically centred on the button row.
