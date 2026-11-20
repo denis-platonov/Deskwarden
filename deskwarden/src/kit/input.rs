@@ -195,18 +195,26 @@ pub fn strength_level(rating: Strength, p: &tokens::Palette) -> StrengthLevel {
 }
 
 /// The meter under the password: a 6pt track, filled to the rating, and the
-/// word right-aligned in an 86pt column beside it. `None` (no password) is
-/// the empty track and no word.
+/// word right-aligned in a column beside it -- 86pt, the design's width, or
+/// wider when the word is (a translated "Very strong" often is), so the two
+/// never overlap. `None` (no password) is the empty track and no word.
 pub fn strength_meter(ui: &mut Ui, rating: Option<Strength>, width: f32) {
+    const WORD_COLUMN: f32 = 86.0;
+    const GAP: f32 = 12.0;
     let p = tokens::palette(ui.ctx());
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::hover());
-    let track = Rect::from_min_max(egui::pos2(rect.left(), rect.center().y - 3.0), egui::pos2(rect.right() - 86.0 - 12.0, rect.center().y + 3.0));
+    let level = rating.map(|r| strength_level(r, &p));
+    let word = level.as_ref().map(|level| {
+        let role = tokens::Role { size: 13.0, face: crate::theme::BOLD, tracking_em: 0.0 };
+        ui.fonts_mut(|f| f.layout_job(tokens::job(role, level.label, level.colour)))
+    });
+    let column = word.as_ref().map_or(WORD_COLUMN, |w| w.size().x.max(WORD_COLUMN));
+    let track_right = (rect.right() - column - GAP).max(rect.left());
+    let track = Rect::from_min_max(egui::pos2(rect.left(), rect.center().y - 3.0), egui::pos2(track_right, rect.center().y + 3.0));
     ui.painter().rect_filled(track, CornerRadius::same(255), p.meter_track);
-    if let Some(level) = rating.map(|r| strength_level(r, &p)) {
+    if let (Some(level), Some(word)) = (level, word) {
         let fill = Rect::from_min_size(track.min, Vec2::new(track.width() * level.fraction, track.height()));
         ui.painter().rect_filled(fill, CornerRadius::same(255), level.colour);
-        let role = tokens::Role { size: 13.0, face: crate::theme::BOLD, tracking_em: 0.0 };
-        let word = ui.fonts_mut(|f| f.layout_job(tokens::job(role, level.label, level.colour)));
         let size = word.size();
         ui.painter().galley(egui::pos2(rect.right() - size.x, rect.center().y - size.y / 2.0), word, level.colour);
     }
@@ -314,6 +322,30 @@ mod tests {
         let ctx = testing::ctx();
         let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| strength_meter(ui, Some(Strength::Good), 400.0));
         assert_eq!(p.text("Strong").expect("the label").1, P.blue);
+    }
+
+    /// The word sits clear of the track in every language: "Очень надёжный"
+    /// is wider than the English column, and the track gives way to it.
+    #[test]
+    fn the_strength_word_never_overlaps_its_track_in_any_language() {
+        let ctx = testing::ctx();
+        for locale in crate::i18n::available() {
+            crate::i18n::with_language(locale.tag, || {
+                for rating in [Strength::Weak, Strength::Fair, Strength::Good, Strength::Strong] {
+                    let level = strength_level(rating, &P);
+                    let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| strength_meter(ui, Some(rating), 400.0));
+                    let word = p.text(level.label).expect("the word").2;
+                    let track = p.rects.iter().find(|r| r.fill == P.meter_track).expect("the track").rect;
+                    assert!(
+                        track.right() + 8.0 <= word.left(),
+                        "{} {rating:?}: track ends at {} but the word starts at {}",
+                        locale.tag,
+                        track.right(),
+                        word.left()
+                    );
+                }
+            });
+        }
     }
 
     #[test]
