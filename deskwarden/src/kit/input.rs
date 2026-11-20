@@ -3,6 +3,7 @@
 //! its eye and Generate, the strength meter, and the card number's grouping.
 
 use crate::kit::{controls, icon, tokens};
+use crate::generator_mode::GeneratorLevel;
 use crate::password_strength::Strength;
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Rect, Response, Sense, Stroke, Ui, Vec2};
 
@@ -184,10 +185,10 @@ pub struct StrengthLevel {
 /// 1.4 A): Weak red, Fair amber, Strong blue, Very strong green.
 pub fn strength_level(rating: Strength, p: &tokens::Palette) -> StrengthLevel {
     match rating {
-        Strength::Weak => StrengthLevel { label: "Weak", colour: p.error, fraction: 0.25 },
-        Strength::Fair => StrengthLevel { label: "Fair", colour: p.caution_dot, fraction: 0.5 },
-        Strength::Good => StrengthLevel { label: "Strong", colour: p.blue, fraction: 0.75 },
-        Strength::Strong => StrengthLevel { label: "Very strong", colour: p.done_mark, fraction: 1.0 },
+        Strength::Weak => StrengthLevel { label: GeneratorLevel::Weak.label(), colour: p.error, fraction: 0.25 },
+        Strength::Fair => StrengthLevel { label: GeneratorLevel::Fair.label(), colour: p.caution_dot, fraction: 0.5 },
+        Strength::Good => StrengthLevel { label: GeneratorLevel::Strong.label(), colour: p.blue, fraction: 0.75 },
+        Strength::Strong => StrengthLevel { label: GeneratorLevel::VeryStrong.label(), colour: p.done_mark, fraction: 1.0 },
     }
 }
 

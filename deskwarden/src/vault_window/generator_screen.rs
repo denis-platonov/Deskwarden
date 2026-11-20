@@ -4,7 +4,7 @@
 use eframe::egui::{self, Color32, Vec2};
 use zeroize::Zeroizing;
 
-use crate::generator_mode::{generator_strength, GeneratorMode};
+use crate::generator_mode::{generator_strength, GeneratorLevel, GeneratorMode};
 use crate::kit::controls::{self, ButtonKind, ButtonSize};
 use crate::settings::GeneratorPrefs;
 use crate::theme;
@@ -204,14 +204,14 @@ fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
             }
         });
         ui.add_space(10.0);
-        let (bits, label) = generator_strength(state.prefs.mode, state.size(), state.pool());
-        let ink = match label {
-            "Weak" => theme::ERROR,
-            "Fair" => Color32::from_rgb(0x8a, 0x5a, 0x06),
+        let (bits, level) = generator_strength(state.prefs.mode, state.size(), state.pool());
+        let ink = match level {
+            GeneratorLevel::Weak => theme::ERROR,
+            GeneratorLevel::Fair => Color32::from_rgb(0x8a, 0x5a, 0x06),
             _ => Color32::from_rgb(0x17, 0x67, 0x3a),
         };
         ui.horizontal(|ui| {
-            ui.label(theme::bold(label, 15.0).color(ink));
+            ui.label(theme::bold(level.label(), 15.0).color(ink));
             ui.label(egui::RichText::new(crate::i18n::tf("generator.bits", &[("bits", &(bits.round() as u32).to_string())])).size(14.0).color(MUTED));
         });
     });

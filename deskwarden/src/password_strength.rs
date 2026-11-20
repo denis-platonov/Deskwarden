@@ -61,16 +61,16 @@ impl CharClasses {
     pub fn names(self) -> Vec<&'static str> {
         let mut names = Vec::new();
         if self.lower {
-            names.push("lowercase letters");
+            names.push(crate::i18n::t("strength.class_lower"));
         }
         if self.upper {
-            names.push("uppercase letters");
+            names.push(crate::i18n::t("strength.class_upper"));
         }
         if self.digit {
-            names.push("digits");
+            names.push(crate::i18n::t("strength.class_digits"));
         }
         if self.symbol {
-            names.push("symbols");
+            names.push(crate::i18n::t("strength.class_symbols"));
         }
         names
     }
@@ -85,12 +85,14 @@ pub enum Strength {
 }
 
 impl Strength {
+    /// The rating's word in the active language. Callers that branch on a
+    /// rating match the enum, never this text.
     pub fn label(self) -> &'static str {
         match self {
-            Strength::Weak => "Weak",
-            Strength::Fair => "Fair",
-            Strength::Good => "Good",
-            Strength::Strong => "Strong",
+            Strength::Weak => crate::i18n::t("strength.weak"),
+            Strength::Fair => crate::i18n::t("strength.fair"),
+            Strength::Good => crate::i18n::t("strength.good"),
+            Strength::Strong => crate::i18n::t("strength.strong"),
         }
     }
 }

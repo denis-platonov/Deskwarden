@@ -470,15 +470,18 @@ impl ItemKind {
         }
     }
 
+    /// The type's name in the active language. Every screen reads this (the
+    /// vault window's `detail::kind_label` is the same call).
     pub fn label(self) -> String {
         match self {
-            ItemKind::Login => "Login".to_string(),
-            ItemKind::SecureNote => "Secure note".to_string(),
-            ItemKind::Card => "Card".to_string(),
-            ItemKind::Identity => "Identity".to_string(),
-            ItemKind::SshKey => "SSH key".to_string(),
-            ItemKind::Unknown(_) => "Unsupported item".to_string(),
+            ItemKind::Login => crate::i18n::t("new_item.login"),
+            ItemKind::SecureNote => crate::i18n::t("new_item.note"),
+            ItemKind::Card => crate::i18n::t("new_item.card"),
+            ItemKind::Identity => crate::i18n::t("edit.sec_identity"),
+            ItemKind::SshKey => crate::i18n::t("new_item.ssh"),
+            ItemKind::Unknown(_) => crate::i18n::t("detail.unsupported_item"),
         }
+        .to_string()
     }
 }
 
