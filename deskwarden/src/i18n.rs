@@ -620,9 +620,26 @@ mod tests {
         for (actual, english) in pins {
             assert_eq!(actual, english);
         }
-        // And the same screens in another language fall back to those words while its
-        // catalog is empty, so a half-translated build never shows a key.
-        with_language("de", || assert_eq!(auth::lock_heading(), "Welcome back"));
+    }
+
+    /// In every language, a sentence its catalog has reads in that language and one
+    /// it lacks reads in English -- so a half-translated build never shows a key.
+    /// Asked of every non-plural English key, whatever the catalogs hold today.
+    #[test]
+    fn every_language_says_its_own_words_or_english_never_a_key() {
+        let english = catalog_of(ENGLISH);
+        for locale in available() {
+            let own = catalog_for(locale);
+            with_language(locale.tag, || {
+                for (entry, english_text) in english.entries() {
+                    if entry.plural.is_some() || english_text.contains('{') {
+                        continue;
+                    }
+                    let expected = own.get(entry.key, None).unwrap_or(english_text);
+                    assert_eq!(t(entry.key), expected, "{} in {}", entry.key, locale.tag);
+                }
+            });
+        }
     }
 
     #[test]
