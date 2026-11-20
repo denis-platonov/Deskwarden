@@ -3411,7 +3411,7 @@ pub fn draw_detail_read(
                 if writable {
                     if !compact {
                         let share = controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, SHARE_LABEL, Some(kit::icon::glyph::SHARED));
-                        kit::tips::hint(ui, &share, record_ui::SEND_RECORD_LABEL, &["Mod", "Shift", "S"]);
+                        kit::tips::hint(ui, &share, record_ui::send_record_label(), &["Mod", "Shift", "S"]);
                         if share.clicked() {
                             action = DetailAction::SendRecord;
                         }
@@ -3510,7 +3510,7 @@ pub fn draw_detail_read(
                         Some(ShareControl::Share) => {
                             if ui
                                 .button(SHARE_WITH_PERSON_LABEL)
-                                .on_hover_text(super::share_ui::SHARE_TOOLTIP)
+                                .on_hover_text(super::share_ui::share_tooltip())
                                 .clicked()
                             {
                                 action = DetailAction::ShareRecord;
@@ -3937,7 +3937,7 @@ pub fn draw_detail_read(
     // pointer is over a row cannot push the row out from under it.
     let has_people = !people.people.is_empty();
     if shared.is_some() || has_people || people.notice.is_some() {
-        let side = has_people.then_some(super::share_ui::SHARING_SIDE);
+        let side = has_people.then_some(super::share_ui::sharing_side());
         card_with_side(ui, SHARING_CARD_HEADING, side, |ui| {
             if has_people {
                 super::share_ui::draw_people_block(ui, &item.name, &people, &mut action);
@@ -3946,7 +3946,7 @@ pub fn draw_detail_read(
                 sharing_card(ui, shared, &crate::send::SystemClock, &mut action);
             }
             let note = if has_people {
-                Some(super::share_ui::PEOPLE_NOTE)
+                Some(super::share_ui::people_note())
             } else {
                 shared.map(|_| SHARING_NOTE)
             };
@@ -5661,7 +5661,7 @@ fn sharing_card(
                     // hold, and one more click here would be a second child
                     // for one Send.
                     ui.label(
-                        RichText::new(send_ui::DELETING_LABEL)
+                        RichText::new(send_ui::deleting_label())
                             .size(ROW_LABEL_SIZE)
                             .color(theme::TEXT_MUTED),
                     );
@@ -5669,7 +5669,7 @@ fn sharing_card(
                 }
                 if shared.confirming {
                     // In Revoke's slot: the first control laid right to left.
-                    if theme::row_button(ui, send_ui::CANCEL_LABEL).clicked() {
+                    if theme::row_button(ui, send_ui::cancel_label()).clicked() {
                         *action = DetailAction::CancelRevokeSend;
                     }
                     return;
@@ -5697,12 +5697,12 @@ fn sharing_card(
         if shared.confirming && !shared.revoking {
             super::share_ui::entry_extra(ui, |ui| {
                 ui.add(egui::Label::new(
-                    theme::semibold(send_ui::CONFIRM_PROMPT, ROW_VALUE_SIZE).color(theme::ERROR),
+                    theme::semibold(send_ui::confirm_prompt(), ROW_VALUE_SIZE).color(theme::ERROR),
                 ).wrap());
                 ui.add_space(10.0);
                 // Cancel wins an ambiguous frame: the safe answer to one on a
                 // destructive control is not to destroy.
-                if theme::destructive_button(ui, send_ui::CONFIRM_LABEL).clicked()
+                if theme::destructive_button(ui, send_ui::confirm_label()).clicked()
                     && *action != DetailAction::CancelRevokeSend
                 {
                     *action = DetailAction::ConfirmRevokeSend;
@@ -15310,7 +15310,7 @@ mod tests {
         let idle = idle_pane.idle(&item, &totp);
         assert!(idle.painted(SHARING_CARD_HEADING), "no SHARING card: {:?}", idle.strings());
         assert!(idle.painted(SEND_AGAIN_LABEL), "{:?}", idle.strings());
-        assert!(!idle.painted(send_ui::CONFIRM_LABEL), "{:?}", idle.strings());
+        assert!(!idle.painted(send_ui::confirm_label()), "{:?}", idle.strings());
         let revoke_at = idle.rect_of(REVOKE_LABEL).center();
         let pressed = idle_pane.click(&item, &totp, revoke_at);
         assert_eq!(
@@ -15323,20 +15323,20 @@ mod tests {
         // the pointer that pressed Revoke.
         let mut asking_pane = Pane::new().sharing(a_live_send(), true, false);
         let asking = asking_pane.idle(&item, &totp);
-        assert!(asking.painted(send_ui::CONFIRM_PROMPT), "{:?}", asking.strings());
+        assert!(asking.painted(send_ui::confirm_prompt()), "{:?}", asking.strings());
         assert!(!asking.painted(REVOKE_LABEL), "Revoke is still offered while it asks");
         assert!(
             !asking.painted(SEND_AGAIN_LABEL),
             "Send again stayed beside a question about destroying the link: {:?}",
             asking.strings()
         );
-        let (cancel_box, _) = asking.menu_row_of(send_ui::CANCEL_LABEL);
+        let (cancel_box, _) = asking.menu_row_of(send_ui::cancel_label());
         assert!(
             cancel_box.contains(revoke_at),
             "Cancel ({cancel_box:?}) is not where Revoke was ({revoke_at:?}), so a second \
              rapid click lands on something else"
         );
-        let (delete_box, _) = asking.menu_row_of(send_ui::CONFIRM_LABEL);
+        let (delete_box, _) = asking.menu_row_of(send_ui::confirm_label());
         assert!(
             !delete_box.contains(revoke_at),
             "the destructive button sits under the pointer that pressed Revoke"
@@ -15353,7 +15353,7 @@ mod tests {
         );
         let mut answering_pane = Pane::new().sharing(a_live_send(), true, false);
         let answering = answering_pane.idle(&item, &totp);
-        let confirm_at = answering.rect_of(send_ui::CONFIRM_LABEL).center();
+        let confirm_at = answering.rect_of(send_ui::confirm_label()).center();
         assert_eq!(
             answering_pane.click(&item, &totp, confirm_at).action,
             DetailAction::ConfirmRevokeSend,
@@ -15363,8 +15363,8 @@ mod tests {
         // Deleting: it says so, and there is nothing left to press.
         let mut busy_pane = Pane::new().sharing(a_live_send(), false, true);
         let busy = busy_pane.idle(&item, &totp);
-        assert!(busy.painted(send_ui::DELETING_LABEL), "{:?}", busy.strings());
-        for label in [REVOKE_LABEL, SEND_AGAIN_LABEL, send_ui::CANCEL_LABEL, send_ui::CONFIRM_LABEL] {
+        assert!(busy.painted(send_ui::deleting_label()), "{:?}", busy.strings());
+        for label in [REVOKE_LABEL, SEND_AGAIN_LABEL, send_ui::cancel_label(), send_ui::confirm_label()] {
             assert!(!busy.painted(label), "{label:?} is offered while the Send is being deleted");
         }
         assert_eq!(
@@ -15398,8 +15398,8 @@ mod tests {
 
         let people_only = Pane::new().with_people(anna_shared()).idle(&item, &totp);
         assert!(people_only.painted(SHARING_CARD_HEADING), "{:?}", people_only.strings());
-        assert!(people_only.painted("anna@x.io") && people_only.painted(crate::vault_window::share_ui::STOP_LABEL));
-        assert!(people_only.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
+        assert!(people_only.painted("anna@x.io") && people_only.painted(crate::vault_window::share_ui::stop_label()));
+        assert!(people_only.painted(crate::vault_window::share_ui::people_note()));
         assert!(!people_only.painted(ACTIVE_SEND_LABEL), "an Active Send with no Send out");
 
         let both = Pane::new().with_people(anna_shared()).sharing(a_live_send(), false, false).idle(&item, &totp);
@@ -15408,8 +15408,8 @@ mod tests {
         assert!(people_label.bottom() < send_label.top(), "People are not above the Active Send");
         assert!(both.rect_of("anna@x.io").bottom() < send_label.top());
         assert!(send_label.bottom() < both.rect_of(SEND_REACH).top(), "the label is stacked over its entry");
-        assert!(both.painted(crate::vault_window::share_ui::SHARING_SIDE), "{:?}", both.strings());
-        assert!(both.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
+        assert!(both.painted(crate::vault_window::share_ui::sharing_side()), "{:?}", both.strings());
+        assert!(both.painted(crate::vault_window::share_ui::people_note()));
         assert!(!both.painted(SHARING_NOTE), "two notes on one card");
         assert_eq!(
             both.card_headings().iter().filter(|(h, _)| *h == SHARING_CARD_HEADING).count(),
@@ -15419,8 +15419,8 @@ mod tests {
 
         let send_only = Pane::new().sharing(a_live_send(), false, false).idle(&item, &totp);
         assert!(send_only.painted(SHARING_NOTE));
-        assert!(!send_only.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
-        assert!(!send_only.painted(crate::vault_window::share_ui::SHARING_SIDE), "the side note is about people");
+        assert!(!send_only.painted(crate::vault_window::share_ui::people_note()));
+        assert!(!send_only.painted(crate::vault_window::share_ui::sharing_side()), "the side note is about people");
 
         let neither = Pane::new().idle(&item, &totp);
         assert!(!neither.painted(SHARING_CARD_HEADING));
@@ -15445,10 +15445,10 @@ mod tests {
         let quiet = Pane::new().with_people(anna_shared()).idle(&item, &totp);
         let saying = Pane::new().with_people(anna_shared()).with_sharing_notice(notice).idle(&item, &totp);
         assert!(saying.rect_of(notice).top() > saying.rect_of("anna@x.io").bottom());
-        assert!(saying.rect_of(notice).bottom() <= saying.rect_of(crate::vault_window::share_ui::PEOPLE_NOTE).top());
+        assert!(saying.rect_of(notice).bottom() <= saying.rect_of(crate::vault_window::share_ui::people_note()).top());
         assert_eq!(
-            quiet.rect_of(crate::vault_window::share_ui::STOP_LABEL),
-            saying.rect_of(crate::vault_window::share_ui::STOP_LABEL),
+            quiet.rect_of(crate::vault_window::share_ui::stop_label()),
+            saying.rect_of(crate::vault_window::share_ui::stop_label()),
             "the sentence moved a control"
         );
     }
@@ -15470,7 +15470,7 @@ mod tests {
         let mut pane = Pane::wide(MIN_PANE).tall().with_people(people);
         let frame = pane.idle(&item, &totp);
         let card_right = MIN_PANE - f32::from(BODY_PAD_X);
-        let reinvite = frame.rect_of(crate::vault_window::share_ui::REINVITE_LABEL);
+        let reinvite = frame.rect_of(crate::vault_window::share_ui::reinvite_label());
         assert!(reinvite.right() <= card_right && reinvite.left() >= 0.0, "{reinvite:?} is off the card");
         let carol = frame.rect_of("carol@x.io");
         assert!(reinvite.top() > carol.bottom(), "the controls did not go under the words");
@@ -15481,7 +15481,7 @@ mod tests {
         let stop = frame
             .texts
             .iter()
-            .filter(|(t, _)| t == crate::vault_window::share_ui::STOP_LABEL)
+            .filter(|(t, _)| t == crate::vault_window::share_ui::stop_label())
             .map(|(_, r)| *r)
             .next()
             .expect("anna's Stop sharing");

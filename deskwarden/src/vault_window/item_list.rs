@@ -2124,7 +2124,7 @@ fn list_header(ui: &mut egui::Ui, title: &str, count: usize) -> Option<ItemListA
                     // The import is not a kind (its type comes from the
                     // payload), so it sits below a separator.
                     ui.separator();
-                    if ui.button(super::record_ui::IMPORT_FROM_SEND_LABEL).clicked() {
+                    if ui.button(super::record_ui::import_from_send_label()).clicked() {
                         chosen = Some(ItemListAction::ImportFromSend);
                         ui.close();
                     }
@@ -5789,7 +5789,7 @@ mod row_tile_tests {
             .iter()
             .map(|s| s.to_string())
             .chain(std::iter::once(
-                super::super::record_ui::IMPORT_FROM_SEND_LABEL.to_string(),
+                super::super::record_ui::import_from_send_label().to_string(),
             ))
             .collect();
         assert_eq!(
@@ -5811,7 +5811,7 @@ mod row_tile_tests {
         let items = [full_login("Ledgerline")];
         let row = text_centre(
             &open_new_menu(&items),
-            super::super::record_ui::IMPORT_FROM_SEND_LABEL,
+            super::super::record_ui::import_from_send_label(),
         );
         let at = new_button_centre(&items);
         let mut frames = click_frames(at, egui::PointerButton::Primary);

@@ -701,9 +701,9 @@ impl SendScope {
         use crate::vault_window::send_ui;
         match self {
             SendScope::All => SENDS_ROW_LABEL,
-            SendScope::Waiting => send_ui::WAITING_LABEL,
-            SendScope::Opened => send_ui::OPENED_LABEL,
-            SendScope::Used => send_ui::USED_LABEL,
+            SendScope::Waiting => send_ui::waiting_label(),
+            SendScope::Opened => send_ui::opened_label(),
+            SendScope::Used => send_ui::used_label(),
             SendScope::Ended => ENDED_ROW_LABEL,
         }
     }
@@ -732,7 +732,7 @@ impl SendScope {
     /// tells callers to hand it a literal already in the design's case.
     pub fn eyebrow(self) -> &'static str {
         match self {
-            SendScope::All => crate::vault_window::send_ui::SENDS_HEADING,
+            SendScope::All => crate::vault_window::send_ui::sends_heading(),
             SendScope::Waiting => "WAITING",
             SendScope::Opened => "OPENED",
             SendScope::Used => "USED",
@@ -749,7 +749,7 @@ impl SendScope {
     /// for the states they select.
     ///
     /// `All` returns `None` rather than a fourth sentence: the pane already
-    /// prints [`crate::vault_window::send_ui::SCOPE_SUBTEXT`] there, which
+    /// prints [`crate::vault_window::send_ui::scope_subtext()`] there, which
     /// says what this app can and cannot do with a Send, and two lines of
     /// standing explanation on the unfiltered screen is one too many.
     pub fn gloss(self) -> Option<&'static str> {
@@ -3806,7 +3806,7 @@ mod tests {
         // And an opened live link is counted on its own row, not as waiting.
         let counts = SendCounts::over([SendState::Waiting, SendState::Opened, SendState::Opened]);
         assert_eq!((counts.waiting, counts.opened, counts.all), (1, 2, 3), "{counts:?}");
-        assert_eq!(SendScope::Opened.label(), crate::vault_window::send_ui::OPENED_LABEL);
+        assert_eq!(SendScope::Opened.label(), crate::vault_window::send_ui::opened_label());
     }
 
     /// **The rail's `Ended` and the pill's `Expired`/`Revoked` are different
@@ -3820,17 +3820,17 @@ mod tests {
     #[test]
     fn the_ended_row_says_a_different_word_from_the_pills_and_explains_which_ones() {
         use crate::vault_window::send_ui;
-        assert_ne!(ENDED_ROW_LABEL, send_ui::EXPIRED_LABEL);
-        assert_ne!(ENDED_ROW_LABEL, send_ui::REVOKED_LABEL);
+        assert_ne!(ENDED_ROW_LABEL, send_ui::expired_label());
+        assert_ne!(ENDED_ROW_LABEL, send_ui::revoked_label());
         // The two rows that do NOT merge anything borrow the pill's own word,
         // so the only row spelled differently is the only row that differs.
-        assert_eq!(SendScope::Waiting.label(), send_ui::WAITING_LABEL);
-        assert_eq!(SendScope::Used.label(), send_ui::USED_LABEL);
+        assert_eq!(SendScope::Waiting.label(), send_ui::waiting_label());
+        assert_eq!(SendScope::Used.label(), send_ui::used_label());
 
         let gloss = SendScope::Ended
             .gloss()
             .expect("the merging row has no gloss, so nothing on screen bridges the two words");
-        for word in [send_ui::EXPIRED_LABEL, send_ui::REVOKED_LABEL] {
+        for word in [send_ui::expired_label(), send_ui::revoked_label()] {
             assert!(
                 gloss.to_lowercase().contains(&word.to_lowercase()),
                 "the `Ended` gloss does not name {word:?}, so a pill saying it reads as a \

@@ -28,11 +28,11 @@
 //! wanted a file Send so a browser offers a download rather than rendering a
 //! seed on screen, and `send.rs` has no file path at all. A hidden text Send
 //! masks the content until the viewer deliberately reveals it. That is weaker,
-//! and [`SEED_WARNING`] is what makes it honest.
+//! and [`seed_warning()`] is what makes it honest.
 //!
 //! # The seed warning is a safety control, not decoration
 //!
-//! [`SEED_WARNING`] is pinned by content, the way this crate pins its refusal
+//! [`seed_warning()`] is pinned by content, the way this crate pins its refusal
 //! messages: a seed cannot be rotated, so "whoever opens this link" is a
 //! permanent grant and the sentence is the only place the user is told so. A
 //! reworded one must be a deliberate edit that reds a test, not a tidy-up.
@@ -96,13 +96,13 @@
 //! **The password row's red treatment** (`background: #fdf3f2`, a red tick,
 //! and the badge "visible to anyone with the link"). New copy, and safety
 //! copy at that; this file already has one pinned safety sentence in
-//! [`SEED_WARNING`] and a second belongs to whoever owns the wording.
+//! [`seed_warning()`] and a second belongs to whoever owns the wording.
 //!
 //! **§5a's field set.** The mockup's five rows are Username, Password,
 //! One-time code, Notes and **Autofill targets**; this form's five are
 //! Username, Password, **Website**, Notes and TOTP seed. `Autofill targets`
 //! is not something [`crate::record::payload::Record`] can carry, and the
-//! seed sits last rather than third because [`SEED_WARNING`] and its
+//! seed sits last rather than third because [`seed_warning()`] and its
 //! passphrase field hang off it and belong at the end of the list rather than
 //! through the middle of it.
 
@@ -170,21 +170,31 @@ pub fn send_plan_from(record: &Record, access: SendPlan) -> SendPlan {
 /// as per design - it is not 100% as". Precision the design did not ask for
 /// is still a departure from it, and this one bought nothing: the chip
 /// answers `which record` a line later, in bold, with its own tile.
-pub const EXPORT_HEADING: &str = "Send a record";
+pub fn export_heading() -> &'static str {
+    crate::i18n::t("record.export_heading")
+}
 
 /// The tick-box labels, in the order they are drawn.
-pub const USERNAME_LABEL: &str = "Username";
-/// See [`USERNAME_LABEL`].
-pub const PASSWORD_LABEL: &str = "Password";
-/// See [`USERNAME_LABEL`]. **§5a's word, which is the READ pane's card
+pub fn username_label() -> &'static str {
+    crate::i18n::t("record.username_label")
+}
+/// See [`username_label()`].
+pub fn password_label() -> &'static str {
+    crate::i18n::t("record.password_label")
+}
+/// See [`username_label()`]. **§5a's word, which is the READ pane's card
 /// title too**: a login's addresses are where it is OFFERED, and the row
 /// counts them rather than naming one. `Website` was this file's own word
 /// for the same field and the singular was wrong the moment a record had
 /// two.
-pub const URI_LABEL: &str = "Autofill targets";
-/// See [`USERNAME_LABEL`].
-pub const NOTES_LABEL: &str = "Notes";
-/// See [`USERNAME_LABEL`]. **Not ticked by default.** A seed is not a
+pub fn uri_label() -> &'static str {
+    crate::i18n::t("record.uri_label")
+}
+/// See [`username_label()`].
+pub fn notes_label() -> &'static str {
+    crate::i18n::t("record.notes_label")
+}
+/// See [`username_label()`]. **Not ticked by default.** A seed is not a
 /// default.
 ///
 /// §5a's word, and the one the rest of this app uses for the same thing --
@@ -192,7 +202,9 @@ pub const NOTES_LABEL: &str = "Notes";
 /// `One-time code`. `TOTP seed` was accurate and was the only place in the
 /// app that said it; the sentence under the row is where the word SEED
 /// belongs, because that is the sentence about what a seed is.
-pub const TOTP_LABEL: &str = "One-time code";
+pub fn totp_label() -> &'static str {
+    crate::i18n::t("record.totp_label")
+}
 
 /// Design §5a's first section eyebrow, over the record the composer was
 /// opened against.
@@ -202,11 +214,15 @@ pub const TOTP_LABEL: &str = "One-time code";
 /// [`theme::eyebrow`] deliberately does not uppercase for the caller -- see
 /// that function -- so the constant carries the case the glyphs are painted
 /// in and a paint test can look for it.
-pub const RECORD_EYEBROW: &str = "RECORD";
+pub fn record_eyebrow() -> &'static str {
+    crate::i18n::t("record.record_eyebrow")
+}
 
 /// Design §5a's second section eyebrow, over the tick list. See
-/// [`RECORD_EYEBROW`].
-pub const INCLUDE_EYEBROW: &str = "INCLUDE";
+/// [`record_eyebrow()`].
+pub fn include_eyebrow() -> &'static str {
+    crate::i18n::t("record.include_eyebrow")
+}
 
 /// How many fields the tick list offers, and therefore the denominator in
 /// [`include_counter`].
@@ -219,7 +235,7 @@ pub const INCLUDE_EYEBROW: &str = "INCLUDE";
 /// what holds the two together.
 pub const INCLUDE_FIELD_COUNT: usize = 5;
 
-/// Design §5a's `2 of 5 fields`, beside the [`INCLUDE_EYEBROW`].
+/// Design §5a's `2 of 5 fields`, beside the [`include_eyebrow()`].
 ///
 /// **A pure function of the draft**, like every other answer these two forms
 /// paint, so the sentence can be asserted without running a frame. It is also
@@ -244,23 +260,25 @@ pub fn include_counter(draft: &RecordDraft) -> String {
 
 /// **The safety control of this whole feature, verbatim.**
 ///
-/// Shown whenever [`TOTP_LABEL`] is ticked, and pinned by content in
+/// Shown whenever [`totp_label()`] is ticked, and pinned by content in
 /// `the_seed_warning_is_the_spec_s_own_sentence`. A username and a password can
 /// be rotated, so sending them is a bargain the sender can undo. A seed cannot
 /// be: "rotating" it means re-enrolling the second factor with the service,
 /// which this app can neither do nor offer.
-pub const SEED_WARNING: &str = "Sending a seed is not sharing a code \u{2014} it is cloning the \
-     second factor, permanently. Anyone who opens this can generate valid codes indefinitely. \
-     Revoking stops new recipients; it cannot retract what was already fetched.";
+pub fn seed_warning() -> &'static str {
+    crate::i18n::t("record.seed_warning")
+}
 
 /// The hint in the passphrase box that appears with the seed tick.
-pub const PASSPHRASE_HINT: &str = "Passphrase for the seed";
+pub fn passphrase_hint() -> &'static str {
+    crate::i18n::t("record.passphrase_hint")
+}
 
 /// The line under the passphrase box. The passphrase layer is worth nothing if
 /// it travels beside the link, so the surface says where it must not go.
-pub const PASSPHRASE_NOTE: &str =
-    "Tell the recipient this passphrase some other way. Sending it with the link protects \
-     nothing.";
+pub fn passphrase_note() -> &'static str {
+    crate::i18n::t("record.passphrase_note")
+}
 
 /// The label on the export form's submit button.
 ///
@@ -280,7 +298,9 @@ pub const PASSPHRASE_NOTE: &str =
 /// copy of a new link was a sentence in a toast -- a label, unselectable,
 /// gone when dismissed. The button was honest about an app that could not
 /// hand the user the thing it had just made.
-pub const EXPORT_SUBMIT_LABEL: &str = "Create & copy link";
+pub fn export_submit_label() -> &'static str {
+    crate::i18n::t("record.export_submit_label")
+}
 
 /// The export form's way out.
 ///
@@ -289,14 +309,19 @@ pub const EXPORT_SUBMIT_LABEL: &str = "Create & copy link";
 /// `the_export_footer_wears_the_design_systems_two_buttons` finds the
 /// secondary button by, and a literal that only exists inside a closure is a
 /// literal a paint test has to restate.
-pub const EXPORT_CANCEL_LABEL: &str = "Cancel";
+pub fn export_cancel_label() -> &'static str {
+    crate::i18n::t("record.export_cancel_label")
+}
 
 /// Why the export button is grey: the seed tick with nothing to seal under.
-pub const NEEDS_PASSPHRASE: &str =
-    "A seed can only be sent sealed, so it needs a passphrase to seal it under.";
+pub fn needs_passphrase_text() -> &'static str {
+    crate::i18n::t("record.needs_passphrase")
+}
 
 /// Why the export button is grey: an empty record.
-pub const NOTHING_TICKED: &str = "Tick at least one field to send.";
+pub fn nothing_ticked() -> &'static str {
+    crate::i18n::t("record.nothing_ticked")
+}
 
 /// What the sender ticked, and the passphrase they typed for the seed.
 ///
@@ -397,11 +422,11 @@ impl RecordDraft {
 }
 
 /// **What a whole-record Send carries**: username, password, websites and
-/// notes -- and not the one-time code's seed. See [`WHOLE_RECORD_LEAD`].
+/// notes -- and not the one-time code's seed. See [`whole_record_lead()`].
 ///
 /// The seed is left out because sending one is cloning the authenticator,
 /// which the card warns about and seals under a passphrase the sender types
-/// ([`SEED_WARNING`]); a default that did that without asking would be the
+/// ([`seed_warning()`]); a default that did that without asking would be the
 /// one thing the whole-record default must not do. It travels only with
 /// advanced sharing, where it is a tick of its own.
 pub fn whole_record_selection() -> RecordSelection {
@@ -409,16 +434,21 @@ pub fn whole_record_selection() -> RecordSelection {
 }
 
 /// The lead-in on the whole-record line, before its pills.
-pub const WHOLE_RECORD_LEAD: &str = "The whole record";
+pub fn whole_record_lead() -> &'static str {
+    crate::i18n::t("record.whole_record_lead")
+}
 
 /// The pill for a record's websites on the whole-record line. The tick list
-/// calls the same field [`URI_LABEL`]; a pill is a noun for what travels.
-pub const WEBSITES_LABEL: &str = "Websites";
+/// calls the same field [`uri_label()`]; a pill is a noun for what travels.
+pub fn websites_label() -> &'static str {
+    crate::i18n::t("record.websites_label")
+}
 
 /// Said under the whole-record line when the record has a seed that is not
 /// going with it.
-pub const SEED_STAYS_NOTE: &str = "The one-time code's seed is not included. Turn on Use \
-    advanced sharing in Preferences to send it, sealed.";
+pub fn seed_stays_note() -> &'static str {
+    crate::i18n::t("record.seed_stays_note")
+}
 
 /// **The whole-record line's pills: what this item actually has**, in the
 /// order the tick list draws them, with the password marked secret. An item
@@ -433,16 +463,16 @@ pub fn whole_record_fields(
     let filled = |value: Option<&str>| value.is_some_and(|v| !v.trim().is_empty());
     let mut fields = Vec::new();
     if filled(login.and_then(|l| l.username.as_deref())) {
-        fields.push((USERNAME_LABEL, false));
+        fields.push((username_label(), false));
     }
     if filled(login.and_then(|l| l.password.as_ref().map(|p| p.as_str()))) {
-        fields.push((PASSWORD_LABEL, true));
+        fields.push((password_label(), true));
     }
     if login.is_some_and(|l| l.uris.iter().any(|u| filled(u.uri.as_deref()))) {
-        fields.push((WEBSITES_LABEL, false));
+        fields.push((websites_label(), false));
     }
     if filled(item.notes.as_ref().map(|n| n.as_str())) {
-        fields.push((NOTES_LABEL, false));
+        fields.push((notes_label(), false));
     }
     fields
 }
@@ -458,17 +488,17 @@ pub fn fields_travelling(
 ) -> Vec<String> {
     let mut labels: Vec<String> = whole_record_fields(Some(item))
         .into_iter()
-        .filter(|(label, _)| match *label {
-            USERNAME_LABEL => selection.username,
-            PASSWORD_LABEL => selection.password,
-            WEBSITES_LABEL => selection.uri,
-            NOTES_LABEL => selection.notes,
-            _ => false,
+        .filter(|(label, _)| {
+            let label = *label;
+            (label == username_label() && selection.username)
+                || (label == password_label() && selection.password)
+                || (label == websites_label() && selection.uri)
+                || (label == notes_label() && selection.notes)
         })
         .map(|(label, _)| label.to_string())
         .collect();
     if seed_sealed {
-        labels.push(TOTP_LABEL.to_string());
+        labels.push(totp_label().to_string());
     }
     labels
 }
@@ -489,10 +519,10 @@ pub fn export_problem(
 ) -> Option<&'static str> {
     let sel = &draft.selection;
     if sel.totp && draft.passphrase.trim().is_empty() {
-        return Some(NEEDS_PASSPHRASE);
+        return Some(needs_passphrase_text());
     }
     if !(sel.username || sel.password || sel.uri || sel.notes || sel.totp) {
-        return Some(NOTHING_TICKED);
+        return Some(nothing_ticked());
     }
     // **The Access block's own refusals, in the words `crate::send` already
     // has for them**, and delegated rather than restated: the sentence under
@@ -526,7 +556,7 @@ pub fn export_can_submit(problem: Option<&str>, in_flight: bool) -> bool {
     problem.is_none() && !in_flight
 }
 
-/// Whether [`SEED_WARNING`] is on screen. The tick and nothing else.
+/// Whether [`seed_warning()`] is on screen. The tick and nothing else.
 pub fn warning_is_shown(draft: &RecordDraft) -> bool {
     draft.selection.totp
 }
@@ -536,26 +566,36 @@ pub fn warning_is_shown(draft: &RecordDraft) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The heading over the import form.
-pub const IMPORT_HEADING: &str = "Import a record from a Send";
+pub fn import_heading() -> &'static str {
+    crate::i18n::t("record.import_heading")
+}
 
 /// The hint in the link box.
-pub const LINK_HINT: &str = "The Send link you were given";
+pub fn link_hint() -> &'static str {
+    crate::i18n::t("record.link_hint")
+}
 
 /// The line under it. The link is the input; there is no box to paste a
 /// payload into, and this says why rather than leaving it looking like an
 /// omission.
-pub const LINK_NOTE: &str =
-    "Paste the link, not the record itself. Deskwarden fetches the contents so the record \
-     never has to sit on your clipboard.";
+pub fn link_note() -> &'static str {
+    crate::i18n::t("record.link_note")
+}
 
 /// The heading over the field-name list shown before anything is created.
-pub const WILL_IMPORT_HEADING: &str = "What this record carries";
+pub fn will_import_heading() -> &'static str {
+    crate::i18n::t("record.will_import_heading")
+}
 
 /// The hint in the import passphrase box, shown only for a sealed seed.
-pub const IMPORT_PASSPHRASE_HINT: &str = "Passphrase the sender set for the seed";
+pub fn import_passphrase_hint() -> &'static str {
+    crate::i18n::t("record.import_passphrase_hint")
+}
 
 /// The label on the import form's submit button.
-pub const IMPORT_SUBMIT_LABEL: &str = "Import into my vault";
+pub fn import_submit_label() -> &'static str {
+    crate::i18n::t("record.import_submit_label")
+}
 
 /// The label on the import form's other button: the one that goes and gets
 /// the Send the link names.
@@ -564,18 +604,24 @@ pub const IMPORT_SUBMIT_LABEL: &str = "Import into my vault";
 /// pass inline**, because it is the only label on either of these two cards
 /// that was not one -- and the paint test that says which of this footer's
 /// two buttons is the filled primary has to name both of them to say it.
-pub const FETCH_LABEL: &str = "Fetch";
+pub fn fetch_label() -> &'static str {
+    crate::i18n::t("record.fetch_label")
+}
 
 /// Why the import button is grey: nothing to fetch yet.
-pub const NEEDS_LINK: &str = "Paste the Send link to see what it carries.";
+pub fn needs_link() -> &'static str {
+    crate::i18n::t("record.needs_link")
+}
 
 /// Why the import button is grey: a sealed seed and no passphrase offered.
-pub const NEEDS_SEED_PASSPHRASE: &str =
-    "This record carries a sealed one-time code seed. Enter the passphrase the sender set.";
+pub fn needs_seed_passphrase() -> &'static str {
+    crate::i18n::t("record.needs_seed_passphrase")
+}
 
 /// Why the import button is grey: a name collision with nothing chosen.
-pub const NEEDS_COLLISION_CHOICE: &str =
-    "Choose whether to add a second item or replace the one already there.";
+pub fn needs_collision_choice() -> &'static str {
+    crate::i18n::t("record.needs_collision_choice")
+}
 
 /// **The advisory staleness sentence, verbatim, pinned by content.**
 ///
@@ -597,10 +643,14 @@ pub enum CollisionChoice {
 }
 
 /// The label on the [`CollisionChoice::CreateSecond`] button.
-pub const CREATE_SECOND_LABEL: &str = "Create a second item";
+pub fn create_second_label() -> &'static str {
+    crate::i18n::t("record.create_second_label")
+}
 
 /// The label on the [`CollisionChoice::Replace`] button.
-pub const REPLACE_LABEL: &str = "Replace the existing one";
+pub fn replace_label() -> &'static str {
+    crate::i18n::t("record.replace_label")
+}
 
 /// The question above the two buttons.
 pub fn collision_prompt(name: &str) -> String {
@@ -641,25 +691,27 @@ pub struct ImportDraft {
 pub fn fields_present(record: &Record) -> Vec<&'static str> {
     let mut out = Vec::new();
     if record.username.is_some() {
-        out.push(USERNAME_LABEL);
+        out.push(username_label());
     }
     if record.password.is_some() {
-        out.push(PASSWORD_LABEL);
+        out.push(password_label());
     }
     if record.uri.is_some() {
-        out.push(URI_LABEL);
+        out.push(uri_label());
     }
     if record.notes.is_some() {
-        out.push(NOTES_LABEL);
+        out.push(notes_label());
     }
     if record.totp_sealed.is_some() {
-        out.push(SEALED_SEED_LABEL);
+        out.push(sealed_seed_label());
     }
     out
 }
 
 /// How a sealed seed is named in [`fields_present`].
-pub const SEALED_SEED_LABEL: &str = "TOTP seed (sealed)";
+pub fn sealed_seed_label() -> &'static str {
+    crate::i18n::t("record.sealed_seed_label")
+}
 
 /// Whether to show the passphrase box at all.
 ///
@@ -707,18 +759,18 @@ pub fn import_problem(
     collision: &Collision,
 ) -> Option<&'static str> {
     if draft.link.trim().is_empty() {
-        return Some(NEEDS_LINK);
+        return Some(needs_link());
     }
     let Some(record) = record else {
-        return Some(NEEDS_LINK);
+        return Some(needs_link());
     };
     if needs_passphrase(record) && draft.passphrase.trim().is_empty() {
-        return Some(NEEDS_SEED_PASSPHRASE);
+        return Some(needs_seed_passphrase());
     }
     // Last, and unskippable: a collision with no answer stops the import
     // however complete the rest of the draft is.
     if matches!(collision, Collision::SameName { .. }) && draft.choice.is_none() {
-        return Some(NEEDS_COLLISION_CHOICE);
+        return Some(needs_collision_choice());
     }
     None
 }
@@ -825,14 +877,19 @@ pub(crate) fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &
 /// the defect this project has now shipped twice and has notes about in two
 /// other modules. The first clause is true, is actionable, and is what a
 /// reader does something about.
-pub const PASSWORD_TRAVELS: &str =
-    "This Send contains a password. Rotate it after the recipient is done.";
+pub fn password_travels() -> &'static str {
+    crate::i18n::t("record.password_travels")
+}
 
 /// §5a's own words on the password row's pill.
-pub const VISIBLE_PILL: &str = "visible to anyone with the link";
+pub fn visible_pill() -> &'static str {
+    crate::i18n::t("record.visible_pill")
+}
 
 /// §5a's note beside the one-time code row.
-pub const TOTP_ROW_NOTE: &str = "rotates \u{2014} the recipient sees a live code";
+pub fn totp_row_note() -> &'static str {
+    crate::i18n::t("record.totp_row_note")
+}
 
 /// Which of [`RecordSelection`]'s five a row is about.
 ///
@@ -890,14 +947,14 @@ pub fn include_rows(
     vec![
         IncludeRow {
             field: IncludeField::Username,
-            label: USERNAME_LABEL,
+            label: username_label(),
             ticked: draft.selection.username,
             value: username,
             secret: false,
         },
         IncludeRow {
             field: IncludeField::Password,
-            label: PASSWORD_LABEL,
+            label: password_label(),
             ticked: draft.selection.password,
             // **A fixed mask, not one that tracks the password's length.**
             // §5a draws twelve bullets and this draws ten, and the difference
@@ -911,14 +968,14 @@ pub fn include_rows(
         },
         IncludeRow {
             field: IncludeField::Totp,
-            label: TOTP_LABEL,
+            label: totp_label(),
             ticked: draft.selection.totp,
-            value: if has_seed { TOTP_ROW_NOTE.to_string() } else { String::new() },
+            value: if has_seed { totp_row_note().to_string() } else { String::new() },
             secret: false,
         },
         IncludeRow {
             field: IncludeField::Notes,
-            label: NOTES_LABEL,
+            label: notes_label(),
             ticked: draft.selection.notes,
             // §5a draws nothing beside Notes, and nor does this: a note is a
             // paragraph, and a one-line preview of one is a paragraph's first
@@ -928,7 +985,7 @@ pub fn include_rows(
         },
         IncludeRow {
             field: IncludeField::Uri,
-            label: URI_LABEL,
+            label: uri_label(),
             ticked: draft.selection.uri,
             value: uri_count(uris),
             secret: false,
@@ -993,10 +1050,10 @@ pub fn draw_import_form(
 
     // The link, and what it is for.
     ui.add_enabled_ui(enabled, |ui| {
-        crate::kit::input::text(ui, egui::Id::new((IMPORT_ID, "link")), &mut draft.link, LINK_HINT, false, width)
+        crate::kit::input::text(ui, egui::Id::new((IMPORT_ID, "link")), &mut draft.link, link_hint(), false, width)
     });
     ui.add_space(8.0);
-    ui.add(egui::Label::new(egui::RichText::new(LINK_NOTE).size(14.0).color(p.text_faint)).wrap());
+    ui.add(egui::Label::new(egui::RichText::new(link_note()).size(14.0).color(p.text_faint)).wrap());
 
     let ok = match record {
         Some(Err(refusal)) => {
@@ -1019,7 +1076,7 @@ pub fn draw_import_form(
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 4.0;
-                ui.label(theme::bold(WILL_IMPORT_HEADING, 15.0).color(p.ink));
+                ui.label(theme::bold(will_import_heading(), 15.0).color(p.ink));
                 for name in fields_present(record) {
                     ui.label(egui::RichText::new(name).size(14.0).color(p.text_nav));
                 }
@@ -1039,7 +1096,7 @@ pub fn draw_import_form(
                     id,
                     &mut draft.passphrase,
                     &mut revealed,
-                    IMPORT_PASSPHRASE_HINT,
+                    import_passphrase_hint(),
                     width,
                     crate::kit::input::SIGN_IN,
                 )
@@ -1061,8 +1118,8 @@ pub fn draw_import_form(
             // a question nobody was asked. This is the one question in the
             // feature whose wrong answer destroys data the user already had.
             let choices = [
-                (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
-                (REPLACE_LABEL, CollisionChoice::Replace),
+                (create_second_label(), CollisionChoice::CreateSecond),
+                (replace_label(), CollisionChoice::Replace),
             ];
             let labels = [choices[0].0, choices[1].0];
             let selected = choices.iter().position(|(_, c)| draft.choice == Some(*c)).unwrap_or(usize::MAX);
@@ -1093,14 +1150,14 @@ pub fn draw_import_form(
     let can_fetch = enabled && !draft.link.trim().is_empty();
     ui.columns(2, |columns| {
         if columns[0]
-            .add_enabled_ui(can_fetch, |ui| controls::button_filling(ui, ButtonKind::Outline, ANSWER, FETCH_LABEL))
+            .add_enabled_ui(can_fetch, |ui| controls::button_filling(ui, ButtonKind::Outline, ANSWER, fetch_label()))
             .inner
             .clicked()
         {
             action = RecordUiAction::FetchLink;
         }
         if columns[1]
-            .add_enabled_ui(can_proceed, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, IMPORT_SUBMIT_LABEL))
+            .add_enabled_ui(can_proceed, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, import_submit_label()))
             .inner
             .clicked()
         {
@@ -1126,9 +1183,11 @@ pub fn draw_import_form(
 /// Still a named constant, and still paired with the chord below on that
 /// hover, for the rule every binding in this app follows: a chord with
 /// nothing on screen naming it is a chord nobody finds.
-pub const SEND_RECORD_LABEL: &str = "Send a record";
+pub fn send_record_label() -> &'static str {
+    crate::i18n::t("record.send_record_label")
+}
 
-/// See [`SEND_RECORD_LABEL`]. Spelled the way `detail.rs`'s copy chords are,
+/// See [`send_record_label()`]. Spelled the way `detail.rs`'s copy chords are,
 /// and — like them — **the only place this chord is spelled for a human**.
 /// `the_record_chord_is_spelled_the_way_it_is_bound` compares it against
 /// `SEND_RECORD_MODIFIERS` and `SEND_RECORD_KEY`, the values the key handler
@@ -1192,22 +1251,51 @@ impl RecordSend {
 
 /// The scrim's area name (listed in `item_list::MODAL_SCRIM_AREAS`).
 pub const ID: &str = "record-send";
-pub const SHARE_SUB: &str = "Send a secure link. Revoke it any time.";
-pub const WHAT_TO_SHARE: &str = "What to share";
-pub const WHAT_TO_SHARE_TIP: &str =
-    "Only what you pick travels. The person never gets access to the rest of your vault.";
-pub const LINK_WORKS_FOR: &str = "Link works for";
-pub const OPEN_ONCE: &str = "Open only once";
-pub const OPEN_ONCE_TIP: &str = "The link stops working right after it's opened, even if it hasn't expired.";
-pub const CREATE_LINK: &str = "Create link";
-pub const CREATING_LINK: &str = "Creating link\u{2026}";
-pub const NOTHING_PICKED: &str = "Pick at least one thing to share";
-pub const MORE_OPTIONS: &str = "More options";
-pub const LINK_READY: &str = "Link ready";
-pub const LINK_COPIED: &str = "Link copied";
-pub const COPY_LINK: &str = "Copy";
-pub const DONE: &str = "Done";
-pub const SEE_IN_SHARED: &str = "See in Shared";
+pub fn share_sub() -> &'static str {
+    crate::i18n::t("record.share_sub")
+}
+pub fn what_to_share() -> &'static str {
+    crate::i18n::t("record.what_to_share")
+}
+pub fn what_to_share_tip() -> &'static str {
+    crate::i18n::t("record.what_to_share_tip")
+}
+pub fn link_works_for() -> &'static str {
+    crate::i18n::t("record.link_works_for")
+}
+pub fn open_once() -> &'static str {
+    crate::i18n::t("record.open_once")
+}
+pub fn open_once_tip() -> &'static str {
+    crate::i18n::t("record.open_once_tip")
+}
+pub fn create_link() -> &'static str {
+    crate::i18n::t("record.create_link")
+}
+pub fn creating_link() -> &'static str {
+    crate::i18n::t("record.creating_link")
+}
+pub fn nothing_picked() -> &'static str {
+    crate::i18n::t("record.nothing_picked")
+}
+pub fn more_options() -> &'static str {
+    crate::i18n::t("record.more_options")
+}
+pub fn link_ready() -> &'static str {
+    crate::i18n::t("record.link_ready")
+}
+pub fn link_copied() -> &'static str {
+    crate::i18n::t("record.link_copied")
+}
+pub fn copy_link() -> &'static str {
+    crate::i18n::t("record.copy_link")
+}
+pub fn done() -> &'static str {
+    crate::i18n::t("record.done")
+}
+pub fn see_in_shared() -> &'static str {
+    crate::i18n::t("record.see_in_shared")
+}
 const SHARE_WIDTH: f32 = 560.0;
 
 /// Spec B §6.1's expiry choices.
@@ -1224,11 +1312,11 @@ pub fn lifetime_choice(lifetime: &crate::send::SendLifetime) -> Option<usize> {
 /// The chips, in order: label, which field, whether it is the password.
 pub fn share_chips() -> [(&'static str, IncludeField); 5] {
     [
-        (USERNAME_LABEL, IncludeField::Username),
-        (PASSWORD_LABEL, IncludeField::Password),
+        (username_label(), IncludeField::Username),
+        (password_label(), IncludeField::Password),
         ("2FA code", IncludeField::Totp),
-        (WEBSITES_LABEL, IncludeField::Uri),
-        (NOTES_LABEL, IncludeField::Notes),
+        (websites_label(), IncludeField::Uri),
+        (notes_label(), IncludeField::Notes),
     ]
 }
 
@@ -1247,7 +1335,7 @@ pub fn done_summary(draft: &RecordDraft, advanced: bool) -> String {
     let picked: Vec<&str> = if advanced {
         share_chips().iter().filter(|(_, f)| chip_on(&draft.selection, *f)).map(|(l, _)| *l).collect()
     } else {
-        vec![WHOLE_RECORD_LEAD]
+        vec![whole_record_lead()]
     };
     let mut line = picked.join(", ");
     if let Some(i) = lifetime_choice(&draft.access.lifetime) {
@@ -1308,7 +1396,7 @@ pub fn draw_export_modal(
     let busy = in_flight || state.waiting;
     let mut dialog = crate::kit::modal::Dialog::new(ID, SHARE_WIDTH);
     if state.done.is_none() {
-        dialog = dialog.title(&title).sub(SHARE_SUB);
+        dialog = dialog.title(&title).sub(share_sub());
     }
     let (outcome, action) = dialog.show(ctx, |ui| match state.done.as_ref() {
         Some(link) => draw_share_done(ui, &state.summary, link),
@@ -1343,13 +1431,13 @@ pub fn draw_share_form(
             ui.label(theme::bold(text, 15.0).color(theme::INK));
             if let Some(tip) = tip {
                 // Spec B 0.4: the 18 px dot, its bubble above (250 for "once").
-                let width = if text == OPEN_ONCE { 250.0 } else { 260.0 };
+                let width = if text == open_once() { 250.0 } else { 260.0 };
                 crate::kit::tips::help_dot(ui, egui::Id::new(("share-tip", text)), tip, width, crate::kit::tips::Placement::Above);
             }
         });
     };
 
-    label(ui, WHAT_TO_SHARE, Some(WHAT_TO_SHARE_TIP));
+    label(ui, what_to_share(), Some(what_to_share_tip()));
     ui.add_space(10.0);
     if advanced {
         ui.horizontal_wrapped(|ui| {
@@ -1369,28 +1457,28 @@ pub fn draw_share_form(
         });
         if warning_is_shown(draft) {
             ui.add_space(8.0);
-            crate::kit::modal::note(ui, crate::kit::modal::Tone::Danger, SEED_WARNING);
+            crate::kit::modal::note(ui, crate::kit::modal::Tone::Danger, seed_warning());
             ui.add_space(8.0);
             let field_id = egui::Id::new("share-passphrase");
             let mut revealed = ui.data(|d| d.get_temp::<bool>(field_id.with("revealed"))).unwrap_or(false);
             let width = ui.available_width();
             ui.add_enabled_ui(!busy, |ui| {
-                crate::kit::input::secret(ui, field_id, &mut draft.passphrase, &mut revealed, PASSPHRASE_HINT, width, crate::kit::input::SIGN_IN)
+                crate::kit::input::secret(ui, field_id, &mut draft.passphrase, &mut revealed, passphrase_hint(), width, crate::kit::input::SIGN_IN)
             });
             ui.data_mut(|d| d.insert_temp(field_id.with("revealed"), revealed));
             ui.add_space(4.0);
-            note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
+            note(ui, passphrase_note(), theme::TEXT_FAINT);
         }
     } else {
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(WHOLE_RECORD_LEAD).size(15.0).color(theme::INK));
+            ui.label(egui::RichText::new(whole_record_lead()).size(15.0).color(theme::INK));
             ui.add_space(4.0);
             super::send_ui::field_pills(ui, &whole_record_fields(item));
         });
     }
     ui.add_space(22.0);
 
-    label(ui, LINK_WORKS_FOR, None);
+    label(ui, link_works_for(), None);
     ui.add_space(10.0);
     let labels: Vec<&str> = LINK_LIFETIMES.iter().map(|(l, _)| *l).collect();
     let chosen = lifetime_choice(&draft.access.lifetime).unwrap_or(usize::MAX);
@@ -1403,7 +1491,7 @@ pub fn draw_share_form(
     ui.add_space(22.0);
 
     ui.horizontal(|ui| {
-        label(ui, OPEN_ONCE, Some(OPEN_ONCE_TIP));
+        label(ui, open_once(), Some(open_once_tip()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let mut once = draft.access.max_access_count == Some(1);
             if ui.add_enabled_ui(!busy, |ui| crate::kit::controls::switch(ui, &mut once)).inner.changed() {
@@ -1415,7 +1503,7 @@ pub fn draw_share_form(
 
     // 0.15's access block (a password, a date, a view cap) and the
     // recipient row, folded under one link: nothing 0.15 offered is gone.
-    if theme::action_link(ui, MORE_OPTIONS, 14.0).clicked() {
+    if theme::action_link(ui, more_options(), 14.0).clicked() {
         state.more = !state.more;
     }
     let draft = &mut state.draft;
@@ -1442,23 +1530,23 @@ pub fn draw_share_form(
 
     let problem = export_problem(draft, now);
     if draft.selection.password {
-        note(ui, PASSWORD_TRAVELS, theme::DANGER_INK);
+        note(ui, password_travels(), theme::DANGER_INK);
         ui.add_space(8.0);
     }
-    if let Some(problem) = problem.filter(|p| *p != NOTHING_TICKED) {
+    if let Some(problem) = problem.filter(|p| *p != nothing_ticked()) {
         note(ui, problem, theme::ERROR);
         ui.add_space(8.0);
     }
     // Spec B 6.1: Create link is the dialog's full-width primary, 54 high.
     let size = crate::kit::controls::ButtonSize { height: 54.0, pad_x: 22.0, radius: 16, font_px: 17.0 };
-    let text = if busy { CREATING_LINK } else { CREATE_LINK };
+    let text = if busy { creating_link() } else { create_link() };
     let button = ui
         .add_enabled_ui(!busy, |ui| crate::kit::controls::button_filling(ui, crate::kit::controls::ButtonKind::Primary, size, text))
         .inner;
     let _ = ui.interact(button.rect, create_link_id(), egui::Sense::hover());
     if button.clicked() {
         if advanced && !share_chips().iter().any(|(_, f)| chip_on(&draft.selection, *f)) {
-            crate::kit::toast::show(ui.ctx(), NOTHING_PICKED);
+            crate::kit::toast::show(ui.ctx(), nothing_picked());
         } else if export_can_submit(problem, busy) {
             action = RecordUiAction::SubmitExport;
         }
@@ -1510,7 +1598,7 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
         );
         ui.add_space(16.0);
         ui.label(
-            egui::RichText::new(LINK_READY)
+            egui::RichText::new(link_ready())
                 .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
                 .color(theme::INK),
         );
@@ -1527,7 +1615,7 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let size = crate::kit::controls::ButtonSize { height: 42.0, pad_x: 18.0, radius: 12, font_px: 15.0 };
-                let copy_w = crate::kit::controls::button_width(ui.ctx(), crate::kit::controls::ButtonKind::Primary, size, COPY_LINK, false);
+                let copy_w = crate::kit::controls::button_width(ui.ctx(), crate::kit::controls::ButtonKind::Primary, size, copy_link(), false);
                 let room = (ui.available_width() - copy_w - 12.0).max(40.0);
                 ui.add_sized(
                     egui::vec2(room, 42.0),
@@ -1538,21 +1626,21 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
                     )
                     .truncate(),
                 );
-                let copy = crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, size, COPY_LINK, None);
+                let copy = crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, size, copy_link(), None);
                 let _ = ui.interact(copy.rect, copy_link_id(), egui::Sense::hover());
                 if copy.clicked() {
                     crate::clipboard::copy_secret(link);
-                    crate::kit::toast::show(ui.ctx(), LINK_COPIED);
+                    crate::kit::toast::show(ui.ctx(), link_copied());
                 }
             });
         });
     ui.add_space(16.0);
     ui.columns(2, |columns| {
         let size = crate::kit::controls::ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
-        if crate::kit::controls::button_filling(&mut columns[0], crate::kit::controls::ButtonKind::Outline, size, DONE).clicked() {
+        if crate::kit::controls::button_filling(&mut columns[0], crate::kit::controls::ButtonKind::Outline, size, done()).clicked() {
             action = RecordUiAction::Cancel;
         }
-        if crate::kit::controls::button_filling(&mut columns[1], crate::kit::controls::ButtonKind::Outline, size, SEE_IN_SHARED).clicked() {
+        if crate::kit::controls::button_filling(&mut columns[1], crate::kit::controls::ButtonKind::Outline, size, see_in_shared()).clicked() {
             action = RecordUiAction::SeeInShared;
         }
     });
@@ -1587,7 +1675,9 @@ pub fn forget_confirm_label(count: usize) -> String {
 }
 
 /// The safe answer.
-pub const FORGET_KEEP: &str = "No";
+pub fn forget_keep() -> &'static str {
+    crate::i18n::t("record.forget_keep")
+}
 
 /// What [`draw_forget_confirm`] was answered with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1611,7 +1701,7 @@ pub fn draw_forget_confirm(ctx: &egui::Context, email: &str, names: &[String]) -
         &title,
         Some(&body),
         (&yes, ButtonKind::Danger),
-        (FORGET_KEEP, ButtonKind::Outline),
+        (forget_keep(), ButtonKind::Outline),
     ) {
         Confirmed::Pressed(Side::Left) => Some(ForgetAnswer::DeleteShares),
         Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(ForgetAnswer::Keep),
@@ -1628,7 +1718,7 @@ pub const FORGET_ID: &str = "record-forget";
 
 /// The label on the `+ New` menu's import row.
 ///
-/// **The import lives on `+ New` and not beside [`SEND_RECORD_LABEL`] in the
+/// **The import lives on `+ New` and not beside [`send_record_label()`] in the
 /// titlebar, and the two are not symmetric on purpose.** Sending narrows an
 /// item the user has SELECTED, which is why design §5b draws its control in
 /// the header next to the account avatar -- the header is where this window
@@ -1642,7 +1732,9 @@ pub const FORGET_ID: &str = "record-forget";
 ///
 /// The ellipsis is this app's usual "this opens something and does not act",
 /// the way `Export vault...` reads on the account menu.
-pub const IMPORT_FROM_SEND_LABEL: &str = "Import from a Send...";
+pub fn import_from_send_label() -> &'static str {
+    crate::i18n::t("record.import_from_send_label")
+}
 
 /// The import form's per-open state: the draft, what the link fetched, and
 /// whether a `bw send receive` is running.
@@ -1708,7 +1800,7 @@ pub fn draw_import_modal(
     // refused while a `bw send receive` is in flight -- a child writing into
     // state that goes away with the card.
     let busy = state.in_flight;
-    let (outcome, action) = Dialog::new(IMPORT_ID, IMPORT_WIDTH).title(IMPORT_HEADING).esc_closes(!busy).show(ctx, |ui| {
+    let (outcome, action) = Dialog::new(IMPORT_ID, IMPORT_WIDTH).title(import_heading()).esc_closes(!busy).show(ctx, |ui| {
         let action = draw_import_form(
             ui,
             &mut state.draft,
@@ -1927,7 +2019,7 @@ mod tests {
             access: SendPlan { max_access_count: Some(0), ..SendPlan::default() },
             ..RecordDraft::default()
         };
-        assert_eq!(export_problem(&both, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&both, &FixedClock(NOW)), Some(needs_passphrase_text()));
     }
 
     /// The production half of this file, for the source pins below.
@@ -2005,7 +2097,7 @@ mod tests {
         assert!(export_can_submit(export_problem(&draft, &FixedClock(NOW)), false), "control: live before the tick");
 
         draft.set_totp(true);
-        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(needs_passphrase_text()));
         assert!(
             !export_can_submit(export_problem(&draft, &FixedClock(NOW)), false),
             "a seed can be published with nothing to seal it under"
@@ -2013,7 +2105,7 @@ mod tests {
 
         // Whitespace is not a passphrase.
         draft.passphrase = Zeroizing::new("   ".to_string());
-        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(needs_passphrase_text()));
 
         draft.passphrase = Zeroizing::new("correct horse battery staple".to_string());
         assert_eq!(export_problem(&draft, &FixedClock(NOW)), None);
@@ -2031,7 +2123,7 @@ mod tests {
             selection: RecordSelection::default(),
             ..RecordDraft::default()
         };
-        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NOTHING_TICKED));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(nothing_ticked()));
         let ticked = RecordDraft { selection: RecordSelection { uri: true, ..Default::default() }, ..RecordDraft::default() };
         assert_eq!(export_problem(&ticked, &FixedClock(NOW)), None, "control: one tick is enough");
     }
@@ -2049,7 +2141,7 @@ mod tests {
         assert!(draft.passphrase.is_empty(), "the passphrase survived an untick");
         draft.set_totp(true);
         assert!(draft.passphrase.is_empty(), "a re-tick brought the old passphrase back");
-        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(needs_passphrase_text()));
     }
 
     /// The seed and its passphrase leave this form as one value, so no caller
@@ -2094,14 +2186,14 @@ mod tests {
     /// **The sentence itself, pinned by content.**
     ///
     /// Written out here in full rather than compared against the constant by
-    /// name — comparing `SEED_WARNING` with itself is not a pin. Every clause
+    /// name — comparing `seed_warning()` with itself is not a pin. Every clause
     /// is load-bearing: *cloning* rather than sharing, *permanently*,
     /// *indefinitely*, and the last clause, which is the only place the user
     /// is told that revoking does not undo what already happened.
     #[test]
     fn the_seed_warning_is_the_specs_own_sentence() {
         assert_eq!(
-            SEED_WARNING,
+            seed_warning(),
             "Sending a seed is not sharing a code \u{2014} it is cloning the second factor, \
              permanently. Anyone who opens this can generate valid codes indefinitely. \
              Revoking stops new recipients; it cannot retract what was already fetched.",
@@ -2112,8 +2204,8 @@ mod tests {
         );
         // And it is the sentence the form actually paints -- see
         // `the_form_paints_the_warning_only_with_the_seed_ticked`.
-        assert!(SEED_WARNING.contains("permanently"));
-        assert!(SEED_WARNING.contains("cannot retract what was already fetched"));
+        assert!(seed_warning().contains("permanently"));
+        assert!(seed_warning().contains("cannot retract what was already fetched"));
     }
 
     // -- Task 10 ----------------------------------------------------------
@@ -2125,7 +2217,7 @@ mod tests {
         let names = fields_present(&record);
         assert_eq!(
             names,
-            [USERNAME_LABEL, PASSWORD_LABEL, URI_LABEL, NOTES_LABEL, SEALED_SEED_LABEL],
+            [username_label(), password_label(), uri_label(), notes_label(), sealed_seed_label()],
             "the preview must name every field the record carries, in order"
         );
         // No value from the record is anywhere in the preview.
@@ -2145,7 +2237,7 @@ mod tests {
             ..a_record()
         };
         assert!(fields_present(&bare).is_empty());
-        assert_eq!(fields_present(&a_record()), [USERNAME_LABEL, PASSWORD_LABEL, URI_LABEL]);
+        assert_eq!(fields_present(&a_record()), [username_label(), password_label(), uri_label()]);
     }
 
     /// The passphrase prompt appears **only** for a sealed seed.
@@ -2166,7 +2258,7 @@ mod tests {
         assert_eq!(draft.link, "", "control: the link starts empty");
         assert_eq!(
             import_problem(None, &draft, &Collision::Fresh),
-            Some(NEEDS_LINK),
+            Some(needs_link()),
             "an import with no link must not proceed"
         );
         // And a link cleared *after* a fetch is still a refusal. Measured:
@@ -2175,7 +2267,7 @@ mod tests {
         // no record and was caught one branch further down.
         assert_eq!(
             import_problem(Some(&a_record()), &ImportDraft::default(), &Collision::Fresh),
-            Some(NEEDS_LINK),
+            Some(needs_link()),
             "a record whose link was cleared imported anyway"
         );
         // Control: the same record, with the link still there, proceeds.
@@ -2316,7 +2408,7 @@ mod tests {
         assert_eq!(base.choice, None, "a collision answer was preselected");
         assert_eq!(
             import_problem(Some(&record), &base, &collision),
-            Some(NEEDS_COLLISION_CHOICE)
+            Some(needs_collision_choice())
         );
         assert!(
             !import_can_proceed(Some(&record), &base, &collision, false),
@@ -2352,12 +2444,12 @@ mod tests {
         let mut draft = ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
         assert_eq!(
             import_problem(Some(&record), &draft, &Collision::Fresh),
-            Some(NEEDS_SEED_PASSPHRASE)
+            Some(needs_seed_passphrase())
         );
         draft.passphrase = Zeroizing::new("  ".to_string());
         assert_eq!(
             import_problem(Some(&record), &draft, &Collision::Fresh),
-            Some(NEEDS_SEED_PASSPHRASE),
+            Some(needs_seed_passphrase()),
             "whitespace was accepted as a passphrase"
         );
         draft.passphrase = Zeroizing::new("correct horse battery staple".to_string());
@@ -2374,9 +2466,9 @@ mod tests {
     /// offers rather than one written twice.
     #[test]
     fn the_collision_offers_the_two_choices_by_name() {
-        assert_eq!(CREATE_SECOND_LABEL, "Create a second item");
-        assert_eq!(REPLACE_LABEL, "Replace the existing one");
-        assert_ne!(CREATE_SECOND_LABEL, REPLACE_LABEL);
+        assert_eq!(create_second_label(), "Create a second item");
+        assert_eq!(replace_label(), "Replace the existing one");
+        assert_ne!(create_second_label(), replace_label());
         assert!(collision_prompt("SAP Production").contains("SAP Production"));
     }
 }
@@ -2501,17 +2593,17 @@ mod paint_tests {
                 .find(|r| r.label == label)
                 .unwrap_or_else(|| panic!("no {label:?} row: {:?}", rows.iter().map(|r| r.label).collect::<Vec<_>>()))
         };
-        assert_eq!(by(USERNAME_LABEL).value, "a.novak@ledgerline.com");
-        assert_eq!(by(URI_LABEL).value, "1 address", "the word has to agree with the number");
-        assert_eq!(by(TOTP_LABEL).value, TOTP_ROW_NOTE);
+        assert_eq!(by(username_label()).value, "a.novak@ledgerline.com");
+        assert_eq!(by(uri_label()).value, "1 address", "the word has to agree with the number");
+        assert_eq!(by(totp_label()).value, totp_row_note());
         // §5a draws nothing beside Notes even on a record that has one.
         assert!(item.notes.is_some(), "control: the fixture has a note to have elided");
-        assert!(by(NOTES_LABEL).value.is_empty());
+        assert!(by(notes_label()).value.is_empty());
 
         // **The mask does not track the password's length.** §5a draws twelve
         // bullets; `theme::MASKED_BULLETS`'s doc forbids a mask that counts,
         // because it tells a shoulder-surfer how many characters to expect.
-        let password = by(PASSWORD_LABEL);
+        let password = by(password_label());
         assert!(password.secret, "the password row is not marked a secret");
         assert_eq!(password.value, theme::masked_readout());
         let real = item.login.as_ref().and_then(|l| l.password.as_ref()).expect("fixture");
@@ -2542,12 +2634,12 @@ mod paint_tests {
         let item = a_login();
         assert_eq!(
             fields_travelling(&whole_record_selection(), &item, false),
-            [USERNAME_LABEL, PASSWORD_LABEL, WEBSITES_LABEL, NOTES_LABEL]
+            [username_label(), password_label(), websites_label(), notes_label()]
         );
         let mut narrow = whole_record_selection();
         narrow.password = false;
         narrow.notes = false;
-        assert_eq!(fields_travelling(&narrow, &item, true), [USERNAME_LABEL, WEBSITES_LABEL, TOTP_LABEL]);
+        assert_eq!(fields_travelling(&narrow, &item, true), [username_label(), websites_label(), totp_label()]);
     }
 
     /// **The confirmation names what goes, and counts it.** The owner: "we
@@ -2575,13 +2667,13 @@ mod paint_tests {
     fn the_whole_record_pills_are_only_what_the_record_holds() {
         assert_eq!(
             whole_record_fields(Some(&a_login())),
-            [(USERNAME_LABEL, false), (PASSWORD_LABEL, true), (WEBSITES_LABEL, false), (NOTES_LABEL, false)]
+            [(username_label(), false), (password_label(), true), (websites_label(), false), (notes_label(), false)]
         );
         let bare: crate::vault_bridge::VaultItem = serde_json::from_str(
             r#"{"id":"b","type":1,"name":"Bare","fields":[],"login":{"username":"u","uris":[]}}"#,
         )
         .expect("valid item JSON");
-        assert_eq!(whole_record_fields(Some(&bare)), [(USERNAME_LABEL, false)]);
+        assert_eq!(whole_record_fields(Some(&bare)), [(username_label(), false)]);
         assert!(whole_record_fields(None).is_empty());
     }
 
@@ -2647,11 +2739,11 @@ mod paint_tests {
         });
         assert!(painted.has("surprise"), "the refused field was not named: {:?}", painted.text);
         assert!(
-            !painted.has(WILL_IMPORT_HEADING),
+            !painted.has(will_import_heading()),
             "a refused payload was previewed as if it had been read: {:?}",
             painted.text
         );
-        for name in [USERNAME_LABEL, PASSWORD_LABEL, SEALED_SEED_LABEL] {
+        for name in [username_label(), password_label(), sealed_seed_label()] {
             assert!(!painted.has(name), "{name} was previewed for a payload that was refused");
         }
     }
@@ -2680,8 +2772,8 @@ mod paint_tests {
         let painted = paint(|ui| {
             draw_import_form(ui, &mut draft, Some(&fetched), &Collision::Fresh, false, &FixedClock(NOW));
         });
-        let create = painted.rect_of(IMPORT_SUBMIT_LABEL).expect("the create is painted");
-        let fetch = painted.rect_of(FETCH_LABEL).expect("Fetch is painted");
+        let create = painted.rect_of(import_submit_label()).expect("the create is painted");
+        let fetch = painted.rect_of(fetch_label()).expect("Fetch is painted");
         // The primary's own fill is behind the label (its shadow is another,
         // fainter one the same size).
         let blue = painted
@@ -2691,7 +2783,7 @@ mod paint_tests {
             .map(|(r, _)| *r)
             .expect("the import's create is not the filled primary. It is the answer this card is FOR");
         assert_eq!(blue.height(), 48.0, "the v2 answer buttons are 48 high");
-        let (outline, outline_fill) = painted.button_under(FETCH_LABEL);
+        let (outline, outline_fill) = painted.button_under(fetch_label());
         assert_eq!(outline_fill, theme::CARD, "`Fetch` is not the outlined secondary");
         assert_eq!(outline.height(), 48.0, "the two answers are different heights");
         assert!(
@@ -2724,7 +2816,7 @@ mod paint_tests {
         let before = paint(|ui| {
             draw_import_form(ui, &mut untouched, Some(&fetched), &collision, false, &FixedClock(NOW));
         });
-        for label in [CREATE_SECOND_LABEL, REPLACE_LABEL] {
+        for label in [create_second_label(), replace_label()] {
             let (_, fill) = before.button_under(label);
             assert_eq!(
                 fill, palette.hover,
@@ -2732,8 +2824,8 @@ mod paint_tests {
                  frame may turn that into a default"
             );
         }
-        let (first, _) = before.button_under(CREATE_SECOND_LABEL);
-        let (second, _) = before.button_under(REPLACE_LABEL);
+        let (first, _) = before.button_under(create_second_label());
+        let (second, _) = before.button_under(replace_label());
         // One track holds both: the same cell is drawn behind neither, and
         // the two labels sit on one line.
         assert!(
@@ -2749,12 +2841,12 @@ mod paint_tests {
         let after = paint(|ui| {
             draw_import_form(ui, &mut replacing, Some(&fetched), &collision, false, &FixedClock(NOW));
         });
-        let chosen = after.rect_of(REPLACE_LABEL).expect("painted");
+        let chosen = after.rect_of(replace_label()).expect("painted");
         assert!(
             after.fills.iter().any(|(r, f)| *f == palette.card && r.contains_rect(chosen) && r.width() < 300.0),
             "the chosen answer is not the lifted white cell"
         );
-        assert_eq!(after.button_under(CREATE_SECOND_LABEL).1, palette.hover);
+        assert_eq!(after.button_under(create_second_label()).1, palette.hover);
     }
 
     #[test]
@@ -2790,8 +2882,8 @@ mod paint_tests {
             );
         });
 
-        assert!(painted.has(WILL_IMPORT_HEADING), "{:?}", painted.text);
-        for name in [USERNAME_LABEL, PASSWORD_LABEL, URI_LABEL, SEALED_SEED_LABEL] {
+        assert!(painted.has(will_import_heading()), "{:?}", painted.text);
+        for name in [username_label(), password_label(), uri_label(), sealed_seed_label()] {
             assert!(painted.has(name), "{name} was not listed: {:?}", painted.text);
         }
         for value in ["dplatonov", "hunter2", "sap.example"] {
@@ -2800,9 +2892,9 @@ mod paint_tests {
         // The staleness line, the two collision offers, and the reason the
         // button is grey -- all on screen, with nothing chosen.
         assert!(painted.has("It will still import."), "{:?}", painted.text);
-        assert!(painted.has(CREATE_SECOND_LABEL));
-        assert!(painted.has(REPLACE_LABEL));
-        assert!(painted.has(NEEDS_COLLISION_CHOICE), "{:?}", painted.text);
+        assert!(painted.has(create_second_label()));
+        assert!(painted.has(replace_label()));
+        assert!(painted.has(needs_collision_choice()), "{:?}", painted.text);
         assert_eq!(draft.choice, None, "a frame chose an answer on the user's behalf");
     }
 
@@ -2967,7 +3059,7 @@ mod v2_share_tests {
         assert!(!state.draft.selection.username && !state.draft.selection.password);
         let action = click_id(&ctx, 0.7, &mut state, create_link_id());
         assert_eq!(action, RecordUiAction::None, "nothing is sent");
-        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(NOTHING_PICKED));
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(nothing_picked()));
     }
 
     #[test]
@@ -2996,11 +3088,11 @@ mod v2_share_tests {
         state.summary = "Username, Password \u{b7} 1 day \u{b7} opens once".into();
         state.done = Some(zeroize::Zeroizing::new("https://vault.example/#/send/abc/def".into()));
         let (ctx, p) = settled(&mut state);
-        for text in [LINK_READY, "https://vault.example/#/send/abc/def", COPY_LINK, DONE, SEE_IN_SHARED, "Username, Password \u{b7} 1 day \u{b7} opens once"] {
+        for text in [link_ready(), "https://vault.example/#/send/abc/def", copy_link(), done(), see_in_shared(), "Username, Password \u{b7} 1 day \u{b7} opens once"] {
             assert!(p.texts.iter().any(|(t, _, _)| t == text), "no {text}");
         }
         assert!(ctx.read_response(copy_link_id()).is_some(), "the link bar's Copy");
-        let see = p.texts.iter().find(|(t, _, _)| t == SEE_IN_SHARED).unwrap().2.center();
+        let see = p.texts.iter().find(|(t, _, _)| t == see_in_shared()).unwrap().2.center();
         assert_eq!(frame(&ctx, 0.3, &mut state, click_at(see)).0, RecordUiAction::SeeInShared);
     }
 }

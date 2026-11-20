@@ -3859,7 +3859,7 @@ pub fn build_frame_with_search(
                         // ends in an ellipsis may do.
                         //
                         // It needs no selection and reads none -- see
-                        // `record_ui::IMPORT_FROM_SEND_LABEL` for why the row
+                        // `record_ui::import_from_send_label()` for why the row
                         // is on `+ New` rather than beside the titlebar's
                         // send pill.
                         //
@@ -7458,7 +7458,7 @@ pub fn build_frame_with_search(
                         crate::clipboard::copy_secret(share_ui::invite_text(code));
                         // "Invite code copied", drawn by the dialog over its
                         // own card (`detail::draw_copy_toast`).
-                        detail::note_copied(ui.ctx(), share_ui::INVITE_CODE_LABEL);
+                        detail::note_copied(ui.ctx(), share_ui::invite_code_label());
                     }
                 }
                 share_ui::ShareDialogAction::None
@@ -9722,7 +9722,7 @@ fn permit_share(
 ///
 /// Answers the call to send, or `None` -- with the reason said: a refusal
 /// the way [`permit_share`] says one, and no fingerprint on screen as
-/// `share_ui::CHECK_FINGERPRINT_FIRST`. The call is only ever
+/// `share_ui::check_fingerprint_first()`. The call is only ever
 /// `SharingPane::share_anyway`'s, bound to the key whose words were shown;
 /// this is the one place this file asks for it
 /// (`the_only_confirm_this_window_sends_comes_through_permit_share_anyway`).
@@ -9738,7 +9738,7 @@ fn permit_share_anyway(
     match crate::reprompt::permit(gate, protected, proof, Instant::now(), || sharing.share_anyway(email)) {
         crate::reprompt::Outcome::Done(Some(call)) => Some(call),
         crate::reprompt::Outcome::Done(None) => {
-            sharing.say(share_ui::CHECK_FINGERPRINT_FIRST.to_string(), None);
+            sharing.say(share_ui::check_fingerprint_first().to_string(), None);
             None
         }
         crate::reprompt::Outcome::Refused => {
@@ -11530,7 +11530,7 @@ mod backend_tasks {
 
         /// **No vault credential in hand at all**: the key is in the link. So
         /// this arm reaches the same `RecordImportReport::Read` as the CLI's
-        /// with nothing of the account's, and `send_ui::RECEIVE_NEEDS_THE_CLI`
+        /// with nothing of the account's, and `send_ui::receive_needs_the_cli()`
         /// -- which is about a missing `bw.exe` -- is unreachable from it.
         fn send_receive(&self, link: &str) -> RecordImportReport {
             match crate::rest::send::receive_on_active_account(link, None) {
@@ -11711,7 +11711,7 @@ mod backend_tasks {
                     | crate::send::SendError::SpawnFailed(_)),
                 ) => RecordImportReport::Failed(format!(
                     "{} ({})",
-                    crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI,
+                    crate::vault_window::send_ui::receive_needs_the_cli(),
                     error.user_message()
                 )),
                 Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
@@ -12995,7 +12995,7 @@ fn apply_send_action(
         // here would do.
         send_ui::SendUiAction::CopyLink(url) => {
             copy(&url);
-            crate::kit::toast::show(ctx, send_ui::LINK_COPIED_TOAST);
+            crate::kit::toast::show(ctx, send_ui::link_copied_toast());
         }
         // Refresh and a dismissed band are the same operation: forget the
         // answer, so `wants_fetch` is true on the next frame and the list is
@@ -32246,7 +32246,7 @@ mod export_wiring {
         // assertion below.
         let painted_now: Vec<String> = labels(&output).iter().map(|(t, _)| t.clone()).collect();
         assert!(
-            !painted_now.iter().any(|t| t == record_ui::IMPORT_HEADING),
+            !painted_now.iter().any(|t| t == record_ui::import_heading()),
             "the import form was on screen before anybody opened it: {painted_now:?}"
         );
 
@@ -32260,9 +32260,9 @@ mod export_wiring {
         // The menu is up and the row is on it. Positive control on the
         // harness: without it, a failure to open the popup would look exactly
         // like a row that does nothing.
-        let import_at = locate(&menu, record_ui::IMPORT_FROM_SEND_LABEL);
+        let import_at = locate(&menu, record_ui::import_from_send_label());
         assert!(
-            !labels(&menu).iter().any(|(t, _)| t == record_ui::IMPORT_HEADING),
+            !labels(&menu).iter().any(|(t, _)| t == record_ui::import_heading()),
             "merely opening the `+ New` menu opened the import form, so the assertion below \
              is about the menu and not about the row"
         );
@@ -32274,16 +32274,16 @@ mod export_wiring {
         // its heading, the sentence that explains why the input is a link and
         // not a pasted payload, and the reason its Import button is grey.
         for expected in [
-            record_ui::IMPORT_HEADING,
-            record_ui::LINK_NOTE,
-            record_ui::NEEDS_LINK,
+            record_ui::import_heading(),
+            record_ui::link_note(),
+            record_ui::needs_link(),
         ] {
             assert!(
                 painted.iter().any(|t| t == expected),
                 "clicking {:?} on a real frame painted no {expected:?}, so the import \
                  surface is STILL unreachable -- which is the entire defect this work \
                  exists to fix. Painted: {painted:?}",
-                record_ui::IMPORT_FROM_SEND_LABEL
+                record_ui::import_from_send_label()
             );
         }
 
@@ -32295,7 +32295,7 @@ mod export_wiring {
         // **Nothing was imported by opening the form.** The form paints field
         // NAMES only once something has been fetched, and nothing has.
         assert!(
-            !painted.iter().any(|t| t == record_ui::WILL_IMPORT_HEADING),
+            !painted.iter().any(|t| t == record_ui::will_import_heading()),
             "the form claims to have fetched a record it never asked for: {painted:?}"
         );
     }
@@ -34267,15 +34267,15 @@ mod send_delete_wiring {
         // which is what a user does, and which makes "the Send this acted on"
         // a real question rather than a coincidence of row order.
         output = click(&ctx, &mut frame_fn, locate(&output, FRAME_SEND_NAME));
-        let delete_at = locate(&output, send_ui::REVOKE_LABEL);
+        let delete_at = locate(&output, send_ui::revoke_label());
         let armed = click(&ctx, &mut frame_fn, delete_at);
         assert!(
-            find(&armed, send_ui::CONFIRM_LABEL).is_some(),
+            find(&armed, send_ui::confirm_label()).is_some(),
             "Delete was pressed on a real Sends row and no {:?} confirmation came up, so the \
              action the pane reported reached nothing -- the row is inert. This is the \
              symptom a brace-depth pin over the applier cannot see: a shadowed action leaves \
              the call, its arguments and its depth byte-identical. What was painted: {:?}",
-            send_ui::CONFIRM_LABEL,
+            send_ui::confirm_label(),
             texts(&armed)
         );
         let asked = FRAME_REVOKES.lock().expect("not poisoned").clone();
@@ -34286,7 +34286,7 @@ mod send_delete_wiring {
         );
 
         // 3. The confirmation revokes, once, for the row it names.
-        let confirm_at = locate(&armed, send_ui::CONFIRM_LABEL);
+        let confirm_at = locate(&armed, send_ui::confirm_label());
         let after = click(&ctx, &mut frame_fn, confirm_at);
         let started = std::mem::take(&mut *FRAME_REVOKES.lock().expect("not poisoned"));
         assert_eq!(
@@ -34341,7 +34341,7 @@ mod send_delete_wiring {
         // its modal is still open over the page.
         let delete_rect = labels(&showing)
             .into_iter()
-            .rfind(|(t, _)| t == send_ui::REVOKE_LABEL)
+            .rfind(|(t, _)| t == send_ui::revoke_label())
             .map(|(_, r)| r)
             .unwrap_or_else(|| {
             panic!(
@@ -34358,12 +34358,12 @@ mod send_delete_wiring {
 
         let armed_again = click(&ctx, &mut frame_fn, delete_rect.center());
         assert!(
-            find(&armed_again, send_ui::CONFIRM_LABEL).is_some(),
+            find(&armed_again, send_ui::confirm_label()).is_some(),
             "with a revoke report on screen, pressing Delete on a Send row put up no {:?} \
              confirmation. A previous answer is not a reason to refuse the next revoke, and \
              a pane that silently does nothing until some other control is dismissed is the \
              same defect as a pane that never works. What was painted: {:?}",
-            send_ui::CONFIRM_LABEL,
+            send_ui::confirm_label(),
             texts(&armed_again)
         );
         assert!(
@@ -34410,7 +34410,7 @@ mod send_delete_wiring {
         );
 
         FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
-        let retry_at = locate(&failed, send_ui::TRY_AGAIN_LABEL);
+        let retry_at = locate(&failed, send_ui::try_again_label());
         let settled = click(&ctx, &mut frame_fn, retry_at);
         assert!(
             find(&settled, FRAME_SEND_NAME).is_some(),
@@ -34434,16 +34434,16 @@ mod send_delete_wiring {
         let selected = click(&ctx, &mut frame_fn, item_at);
         let sends_at = locate(&selected, sidebar::SENDS_ROW_LABEL);
         let back_on_sends = click(&ctx, &mut frame_fn, sends_at);
-        let delete_at = locate(&back_on_sends, send_ui::REVOKE_LABEL);
+        let delete_at = locate(&back_on_sends, send_ui::revoke_label());
         let armed_with_selection = click(&ctx, &mut frame_fn, delete_at);
         assert!(
-            find(&armed_with_selection, send_ui::CONFIRM_LABEL).is_some(),
+            find(&armed_with_selection, send_ui::confirm_label()).is_some(),
             "with a real item selected in a real, non-empty vault, pressing Delete on a \
              Send row put up no {:?} confirmation. What the vault holds and what is \
              selected in it are not reasons to refuse a revoke -- and a shadow gated on \
              either is exactly the one this harness shipped, because it loaded no items \
              and made no selection. What was painted: {:?}",
-            send_ui::CONFIRM_LABEL,
+            send_ui::confirm_label(),
             texts(&armed_with_selection)
         );
 
@@ -34603,14 +34603,14 @@ mod send_delete_wiring {
         // not stop a row being pickable either, and this is where that would
         // show.
         let picked = click(&ctx, &mut frame_fn, locate(&on_sends, FRAME_SEND_NAME));
-        let delete_at = locate(&picked, send_ui::REVOKE_LABEL);
+        let delete_at = locate(&picked, send_ui::revoke_label());
         let armed = click(&ctx, &mut frame_fn, delete_at);
         assert!(
-            find(&armed, send_ui::CONFIRM_LABEL).is_some(),
+            find(&armed, send_ui::confirm_label()).is_some(),
             "on an account whose vault is empty, pressing Delete on a picked Send put up no \
              {:?} confirmation. An empty vault is not a reason to refuse a revoke, and it \
              is the state every account is in on its first day. What was painted: {:?}",
-            send_ui::CONFIRM_LABEL,
+            send_ui::confirm_label(),
             texts(&armed)
         );
         assert_eq!(
@@ -34706,7 +34706,7 @@ mod send_delete_wiring {
         ///
         /// **This is what stops [`Reached::on_the_sends_screen`] being a
         /// free hatch.** Measured: with the `ItemSelected` click deleted and
-        /// its witness swapped for `send_ui::REVOKE_LABEL` -- a label every
+        /// its witness swapped for `send_ui::revoke_label()` -- a label every
         /// state paints -- the matrix went green again, which is the same
         /// defect the witness was introduced to close, one indirection
         /// further out. A label that `Fresh` already paints on the Sends
@@ -34849,8 +34849,8 @@ mod send_delete_wiring {
         match state {
             ReachableState::Fresh => Witness::Baseline,
             ReachableState::RevokeInFlight => Witness::OwnBlock,
-            ReachableState::NoticeUp => Witness::OnTheSendsScreen(send_ui::FAILED_HEADLINE),
-            ReachableState::FetchInFlight => Witness::OnTheSendsScreen(send_ui::LOADING_LABEL),
+            ReachableState::NoticeUp => Witness::OnTheSendsScreen(send_ui::failed_headline()),
+            ReachableState::FetchInFlight => Witness::OnTheSendsScreen(send_ui::loading_label()),
             ReachableState::EmptyVault => Witness::NeverPaints(FRAME_ITEM_NAME),
             // The folder row scopes the list to the folder: the item that is
             // IN the folder stays, the one that is in no folder goes, and the
@@ -36024,7 +36024,7 @@ mod send_delete_wiring {
         //    test ends up pressing whatever has since moved under it.
         matrix_locate_envelope(state, &output);
         assert!(
-            matrix_find(&output, record_ui::SHARE_SUB).is_none(),
+            matrix_find(&output, record_ui::share_sub()).is_none(),
             "control: the composer is already on screen with nothing pressed, so pressing \
              the envelope below would prove nothing"
         );
@@ -36042,7 +36042,7 @@ mod send_delete_wiring {
         let row_at = matrix_locate(state, &output, FRAME_ITEM_NAME);
         let selected = matrix_click(&ctx, &mut frame_fn, row_at);
         assert!(
-            matrix_find(&selected, record_ui::SHARE_SUB).is_none(),
+            matrix_find(&selected, record_ui::share_sub()).is_none(),
             "control: selecting a row opened the composer on its own, so the press below \
              proves nothing"
         );
@@ -36051,10 +36051,10 @@ mod send_delete_wiring {
         let envelope_at = matrix_locate_envelope(state, &selected);
         let opened = matrix_click(&ctx, &mut frame_fn, envelope_at);
         assert!(
-            matrix_find(&opened, record_ui::SHARE_SUB).is_some(),
+            matrix_find(&opened, record_ui::share_sub()).is_some(),
             "pressing the {:?} envelope with {FRAME_ITEM_NAME:?} selected painted no \
              composer, so the surface is still unreachable. What was painted: {:?}",
-            record_ui::SEND_RECORD_LABEL,
+            record_ui::send_record_label(),
             matrix_texts(&opened)
         );
         // It is THAT item's composer: the form names the record it will send.
@@ -36067,7 +36067,7 @@ mod send_delete_wiring {
         // The seed warning is NOT up: the seed is not ticked by default, and
         // a warning shown unconditionally is a warning nobody reads.
         assert!(
-            matrix_find(&opened, record_ui::SEED_WARNING).is_none(),
+            matrix_find(&opened, record_ui::seed_warning()).is_none(),
             "the seed warning is on screen before the seed was ticked"
         );
 
@@ -36075,7 +36075,7 @@ mod send_delete_wiring {
         //    `Zeroizing` passphrase buffer.
         let closed = matrix_click(&ctx, &mut frame_fn, egui::pos2(6.0, 400.0));
         assert!(
-            matrix_find(&closed, record_ui::SHARE_SUB).is_none(),
+            matrix_find(&closed, record_ui::share_sub()).is_none(),
             "Cancel left the composer open, so the draft it holds is never dropped: {:?}",
             matrix_texts(&closed)
         );
@@ -36219,7 +36219,7 @@ mod send_delete_wiring {
         // exists -- which is true in every state, including the ones where
         // the window body is blank.
         assert_ne!(
-            send_ui::SHARED_SUB,
+            send_ui::shared_sub(),
             sidebar::SENDS_ROW_LABEL,
             "the Sends pane's own heading and the sidebar row that leads to it are the same \
              string again, so finding it below no longer proves the PANE painted -- it is \
@@ -36235,14 +36235,14 @@ mod send_delete_wiring {
         //    !show_sends` and the pane by the gate, and the user is left
         //    looking at an empty window for the rest of the session.
         assert!(
-            matrix_find(&output, send_ui::SHARED_SUB).is_some(),
+            matrix_find(&output, send_ui::shared_sub()).is_some(),
             "in state {state:?} the Sends row was pressed and the Sends PANE never painted \
              its own heading ({:?}) -- only the sidebar row that leads to it is on screen. \
              The SENDS SCREEN is blank: the item list is skipped because `show_sends` is \
              true and the pane was not asked for, so the window keeps its sidebar and its \
              detail-pane placeholder and the user has no Sends feature at all. What was \
              painted: {:?}",
-            send_ui::SHARED_SUB,
+            send_ui::shared_sub(),
             matrix_texts(&output)
         );
 
@@ -36267,9 +36267,9 @@ mod send_delete_wiring {
                 &mut frame_fn,
                 matrix_locate(state, &output, FRAME_SEND_NAME),
             );
-            let delete_at = matrix_locate(state, &picked, send_ui::REVOKE_LABEL);
+            let delete_at = matrix_locate(state, &picked, send_ui::revoke_label());
             let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
-            let confirm_at = matrix_locate(state, &armed, send_ui::CONFIRM_LABEL);
+            let confirm_at = matrix_locate(state, &armed, send_ui::confirm_label());
             output = matrix_click(&ctx, &mut frame_fn, confirm_at);
             assert_eq!(
                 FRAME_REVOKES.lock().expect("not poisoned").len(),
@@ -36278,10 +36278,10 @@ mod send_delete_wiring {
                  {state:?} is not the state being driven"
             );
             assert!(
-                matrix_find(&output, send_ui::DELETING_LABEL).is_some(),
+                matrix_find(&output, send_ui::deleting_label()).is_some(),
                 "control: the row does not say {:?} with a revoke in flight, so the pane is \
                  not in the state this iteration is about. What was painted: {:?}",
-                send_ui::DELETING_LABEL,
+                send_ui::deleting_label(),
                 matrix_texts(&output)
             );
         }
@@ -36362,7 +36362,7 @@ mod send_delete_wiring {
         let sends_at = matrix_locate(state, &away, sidebar::SENDS_ROW_LABEL);
         let failed = matrix_click(&ctx, &mut frame_fn, sends_at);
         assert!(
-            matrix_find(&failed, send_ui::FAILED_HEADLINE).is_some(),
+            matrix_find(&failed, send_ui::failed_headline()).is_some(),
             "in state {state:?} the Sent screen was left and returned to with the send list set \
              to fail and the pane never reached its error screen, so the list was never asked \
              for again. What was painted: {:?}",
@@ -36370,7 +36370,7 @@ mod send_delete_wiring {
         );
 
         FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
-        let retry_at = matrix_locate(state, &failed, send_ui::TRY_AGAIN_LABEL);
+        let retry_at = matrix_locate(state, &failed, send_ui::try_again_label());
         let recovered = matrix_click(&ctx, &mut frame_fn, retry_at);
         assert!(
             matrix_find(&recovered, FRAME_SEND_NAME).is_some(),
@@ -36414,7 +36414,7 @@ mod send_delete_wiring {
             &mut frame_fn,
             matrix_locate(state, &output, FRAME_SECOND_SEND_NAME),
         );
-        let copy_at = matrix_locate(state, &second_picked, send_ui::COPY_LINK_LABEL);
+        let copy_at = matrix_locate(state, &second_picked, send_ui::copy_link_label());
         let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
         assert_eq!(
             copied.suppressed,
@@ -36456,13 +36456,13 @@ mod send_delete_wiring {
             matrix_locate(state, &after_copy, FRAME_SEND_NAME),
         );
         FRAME_REVOKES.lock().expect("not poisoned").clear();
-        let delete_at = matrix_locate(state, &output, send_ui::REVOKE_LABEL);
+        let delete_at = matrix_locate(state, &output, send_ui::revoke_label());
         let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
         assert!(
-            matrix_find(&armed, send_ui::CONFIRM_LABEL).is_some(),
+            matrix_find(&armed, send_ui::confirm_label()).is_some(),
             "in state {state:?} pressing Delete on a real Send put up no {:?} \
              confirmation, so the control is inert. What was painted: {:?}",
-            send_ui::CONFIRM_LABEL,
+            send_ui::confirm_label(),
             matrix_texts(&armed)
         );
         let started = FRAME_REVOKES.lock().expect("not poisoned").clone();
@@ -36472,17 +36472,17 @@ mod send_delete_wiring {
              {started:?} -- so the confirmation is a decoration"
         );
 
-        let cancel_at = matrix_locate(state, &armed, send_ui::CANCEL_LABEL);
+        let cancel_at = matrix_locate(state, &armed, send_ui::cancel_label());
         let disarmed = matrix_click(&ctx, &mut frame_fn, cancel_at);
         assert!(
-            matrix_find(&disarmed, send_ui::CONFIRM_LABEL).is_none(),
+            matrix_find(&disarmed, send_ui::confirm_label()).is_none(),
             "in state {state:?} Cancel was pressed and the destructive button is still on \
              screen, so the way out of a confirmation does nothing -- and the next click in \
              that rectangle destroys a public link. What was painted: {:?}",
             matrix_texts(&disarmed)
         );
         assert!(
-            matrix_find(&disarmed, send_ui::REVOKE_LABEL).is_some(),
+            matrix_find(&disarmed, send_ui::revoke_label()).is_some(),
             "in state {state:?} Cancel left the detail pane with no Delete button at all. \
              What was painted: {:?}",
             matrix_texts(&disarmed)
@@ -41668,7 +41668,7 @@ mod reprompt_gating_tests {
         // No words on screen: nothing to confirm, and the card says why.
         pane.hide_fingerprint();
         assert!(permit_share_anyway(&ctx, "eve@x.io", &plain_items, &mut pane, &never_asks(), &mut Proof::default()).is_none());
-        assert_eq!(pane.notice.as_deref(), Some(share_ui::CHECK_FINGERPRINT_FIRST));
+        assert_eq!(pane.notice.as_deref(), Some(share_ui::check_fingerprint_first()));
     }
 
     /// **A Gone person's Re-invite asks first** where a protected record is

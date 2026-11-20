@@ -30,10 +30,18 @@ use crate::vault_window::share_ui::{self as sharing, PeopleAsk, PeopleRows, Rece
 pub const ID: &str = "send-detail";
 
 /// Spec A 4: the page's title, its sub-line and the `?` bubble's words.
-pub const TITLE: &str = "Shared";
-pub const RECEIVED_TITLE: &str = "Shared with me";
-pub const SUB: &str = "Links you've sent. Revoke any of them instantly.";
-pub const STATUS_TIP: &str = "Waiting \u{2014} nobody has opened it yet. Opened \u{2014} the person has seen it. Links stop working when they expire or you revoke them.";
+pub fn title() -> &'static str {
+    crate::i18n::t("sends.title")
+}
+pub fn received_title() -> &'static str {
+    crate::i18n::t("sends.received_title")
+}
+pub fn sub() -> &'static str {
+    crate::i18n::t("sends.sub")
+}
+pub fn status_tip() -> &'static str {
+    crate::i18n::t("sends.status_tip")
+}
 /// The page's padding and the grid's gap (spec A 4).
 const PAGE_PAD_X: i8 = 40;
 const PAGE_PAD_Y: i8 = 32;
@@ -216,8 +224,8 @@ fn paint_card(ui: &mut egui::Ui, rect: Rect, face: &Face<'_>, records: RecordTil
         let w = (rect.width() - CARD_PAD * 2.0 - 8.0) / 2.0;
         let copy = Rect::from_min_size(pos2(rect.left() + CARD_PAD, top), vec2(w, ACTION_HEIGHT));
         let revoke = Rect::from_min_size(pos2(copy.right() + 8.0, top), vec2(w, ACTION_HEIGHT));
-        hit.copy = foot_button(ui, copy, egui::Id::new(("shared-card-copy", face.key)), super::COPY_LINK_LABEL, false);
-        hit.revoke = foot_button(ui, revoke, egui::Id::new(("shared-card-revoke", face.key)), super::REVOKE_LABEL, true);
+        hit.copy = foot_button(ui, copy, egui::Id::new(("shared-card-copy", face.key)), super::copy_link_label(), false);
+        hit.revoke = foot_button(ui, revoke, egui::Id::new(("shared-card-revoke", face.key)), super::revoke_label(), true);
         hit.opened = hit.opened && !hit.copy && !hit.revoke;
     }
     hit
@@ -343,7 +351,7 @@ fn received_face(row: &ReceivedRow) -> Face<'_> {
         key: &row.key,
         record: None,
         name: &row.name,
-        line: super::RECEIVED_KIND.to_string(),
+        line: super::received_kind().to_string(),
         pill: Some((word.to_string(), fill, ink)),
         clock: Some(row.when.clone()),
         eye: None,
@@ -394,14 +402,14 @@ pub(super) fn draw(
                             let in_scope = super::rows_in_scope(rows, *scope);
                             if in_scope.is_empty() && shares.is_empty() {
                                 let head = super::scope_empty_headline(*scope);
-                                placeholder(ui, &head, super::SCOPE_EMPTY_DETAIL, p.ink);
+                                placeholder(ui, &head, super::scope_empty_detail(), p.ink);
                             }
                             entries.extend(in_scope.into_iter().map(Entry::Send));
                             grid(ui, &entries, delete, selected, records, people, &mut action);
                         }
                         SendPaneState::Empty => {
                             if shares.is_empty() {
-                                placeholder(ui, super::EMPTY_HEADLINE, super::EMPTY_DETAIL, p.ink);
+                                placeholder(ui, super::empty_headline(), super::empty_detail(), p.ink);
                             } else {
                                 grid(ui, &entries, delete, selected, records, people, &mut action);
                             }
@@ -414,7 +422,7 @@ pub(super) fn draw(
                                 ui.add_space(8.0);
                                 ui.label(tokens::job(
                                     Role { size: 14.0, face: theme::REGULAR, tracking_em: 0.0 },
-                                    super::LOADING_LABEL,
+                                    super::loading_label(),
                                     p.text_faint,
                                 ));
                             });
@@ -482,18 +490,18 @@ fn header(ui: &mut egui::Ui, view: &SendView<'_>, _people: &PeopleRows<'_>) {
     let p = tokens::palette(ui.ctx());
     let (title, sub) = match view {
         SendView::Mine(scope) => {
-            (if *scope == crate::vault_window::sidebar::SendScope::All { TITLE } else { scope.label() }, scope.gloss().unwrap_or(SUB))
+            (if *scope == crate::vault_window::sidebar::SendScope::All { title() } else { scope.label() }, scope.gloss().unwrap_or(sub()))
         }
         SendView::Received(_) if !_people.received.is_empty() || !_people.waiting.is_empty() => {
-            (RECEIVED_TITLE, super::RECEIVED_PEOPLE_SUBTEXT)
+            (received_title(), super::received_people_subtext())
         }
-        SendView::Received(_) => (RECEIVED_TITLE, super::RECEIVED_SCOPE_SUBTEXT),
+        SendView::Received(_) => (received_title(), super::received_scope_subtext()),
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         ui.label(tokens::job(tokens::PAGE_TITLE, title, p.ink));
         if matches!(view, SendView::Mine(_)) {
-            let _ = tips::help_dot_sized(ui, egui::Id::new("shared-status-tip"), STATUS_TIP, 280.0, Placement::Below, 20.0);
+            let _ = tips::help_dot_sized(ui, egui::Id::new("shared-status-tip"), status_tip(), 280.0, Placement::Below, 20.0);
         }
     });
     ui.add_space(6.0);
@@ -515,16 +523,16 @@ fn placeholder(ui: &mut egui::Ui, head: &str, detail: &str, ink: Color32) {
 fn failure(ui: &mut egui::Ui, message: &str, ambiguous: bool) -> Option<SendUiAction> {
     let p = tokens::palette(ui.ctx());
     let mut action = None;
-    ui.label(theme::bold(super::FAILED_HEADLINE, 15.0).color(p.error));
+    ui.label(theme::bold(super::failed_headline(), 15.0).color(p.error));
     ui.add_space(4.0);
     ui.add(egui::Label::new(egui::RichText::new(message).size(14.0).color(p.text_muted)).wrap());
     if ambiguous {
         ui.add_space(4.0);
-        ui.add(egui::Label::new(egui::RichText::new(super::AMBIGUOUS_DETAIL).size(14.0).color(p.text_muted)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(super::ambiguous_detail()).size(14.0).color(p.text_muted)).wrap());
     }
     ui.add_space(12.0);
     ui.horizontal(|ui| {
-        if controls::button(ui, ButtonKind::Outline, controls::SMALL, super::TRY_AGAIN_LABEL, None).clicked() {
+        if controls::button(ui, ButtonKind::Outline, controls::SMALL, super::try_again_label(), None).clicked() {
             action = Some(SendUiAction::Refresh);
         }
     });
@@ -534,13 +542,13 @@ fn failure(ui: &mut egui::Ui, message: &str, ambiguous: bool) -> Option<SendUiAc
 /// The two standing statements the 0.15 list kept under its column.
 fn footnotes(ui: &mut egui::Ui, view: &SendView<'_>, no_shares: bool, file_note: bool) {
     let p = tokens::palette(ui.ctx());
-    let gloss = if no_shares { super::SCOPE_SUBTEXT } else { super::SHARES_SUBTEXT };
+    let gloss = if no_shares { super::scope_subtext() } else { super::shares_subtext() };
     let _ = view;
     ui.add_space(24.0);
     ui.add(egui::Label::new(egui::RichText::new(gloss).size(14.0).color(p.text_ghost)).wrap());
     if file_note {
         ui.add_space(6.0);
-        ui.add(egui::Label::new(egui::RichText::new(super::FILE_SEND_EXPLANATION).size(14.0).color(p.text_ghost)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(super::file_send_explanation()).size(14.0).color(p.text_ghost)).wrap());
     }
 }
 
@@ -640,12 +648,12 @@ fn received_page(
     }
     let from_people = !people.received.is_empty() || !people.waiting.is_empty();
     if rows.is_empty() && people.received.is_empty() && people.waiting.is_empty() {
-        placeholder(ui, super::RECEIVED_EMPTY_HEADLINE, super::RECEIVED_EMPTY_DETAIL, p.ink);
+        placeholder(ui, super::received_empty_headline(), super::received_empty_detail(), p.ink);
         return;
     }
     let received = people.received;
     if !received.is_empty() {
-        group_label(ui, sharing::FROM_PEOPLE_EYEBROW);
+        group_label(ui, sharing::from_people_eyebrow());
         // Each organisation's records stand together, and a hairline parts
         // one organisation's from the next: two that claim one sharer are two
         // groups, not one sharer's.
@@ -662,7 +670,7 @@ fn received_page(
     }
     if !rows.is_empty() {
         if from_people {
-            group_label(ui, sharing::FROM_SENDS_EYEBROW);
+            group_label(ui, sharing::from_sends_eyebrow());
         }
         let entries: Vec<Entry<'_>> = rows.iter().map(Entry::Received).collect();
         grid(ui, &entries, delete, selected, records, people, action);
@@ -845,7 +853,7 @@ pub fn activity_events(row: &SendRow) -> Vec<(String, String)> {
         SendState::Revoked => ("Switched off".to_string(), "The link no longer answers".to_string()),
         SendState::Used => ("Every permitted view is spent".to_string(), "The link no longer answers".to_string()),
         SendState::Expired => ("The link ran out of time".to_string(), row.expires.clone()),
-        _ if row.expires != super::NO_EXPIRY_OF_ITS_OWN && !row.expires.is_empty() => {
+        _ if row.expires != super::no_expiry_of_its_own() && !row.expires.is_empty() => {
             ("The link stops working".to_string(), row.expires.clone())
         }
         _ => ("Removed automatically".to_string(), row.deletes.clone()),
@@ -973,17 +981,17 @@ fn seen_band(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
                 crate::kit::icon::stroke(ui.painter(), slot, modal::WARNING_GLYPH, 2.0, p.caution_mark);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(theme::bold(super::SEEN_TITLE, 15.0).color(p.caution_ink));
-                    ui.label(egui::RichText::new(super::SEEN_BODY).size(14.0).color(p.caution_ink));
+                    ui.label(theme::bold(super::seen_title(), 15.0).color(p.caution_ink));
+                    ui.label(egui::RichText::new(super::seen_body()).size(14.0).color(p.caution_ink));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let size = ButtonSize { height: 40.0, pad_x: 14.0, radius: 11, font_px: 14.0 };
                     let (rect, response) = ui.allocate_exact_size(
-                        vec2(controls::button_width(ui.ctx(), ButtonKind::Outline, size, super::CHANGE_PASSWORD, false), 40.0),
+                        vec2(controls::button_width(ui.ctx(), ButtonKind::Outline, size, super::change_password(), false), 40.0),
                         Sense::click(),
                     );
                     ui.painter().rect(rect, CornerRadius::same(11), p.card, Stroke::new(1.0, p.caution_edge), StrokeKind::Inside);
-                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, super::CHANGE_PASSWORD, bold(14.0), p.caution_ink);
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, super::change_password(), bold(14.0), p.caution_ink);
                     pressed = response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
                 });
             });
@@ -1010,11 +1018,11 @@ fn send_modal(
         let mut action: Option<SendUiAction> = None;
         ui.spacing_mut().item_spacing.y = 0.0;
         let kind = if row.sent.is_some() {
-            super::RECORD_SEND_KIND
+            super::record_send_kind()
         } else if row.is_file {
-            super::FILE_SEND_KIND
+            super::file_send_kind()
         } else {
-            super::TEXT_SEND_KIND
+            super::text_send_kind()
         };
         modal_header(
             ui,
@@ -1030,29 +1038,29 @@ fn send_modal(
         pinned_body(ui, &row.id, confirming, budget, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if confirming {
-                modal::note(ui, Tone::Danger, super::CONFIRM_PROMPT);
+                modal::note(ui, Tone::Danger, super::confirm_prompt());
                 ui.add_space(12.0);
-                if controls::button_filling(ui, ButtonKind::Danger, BUTTON, super::CONFIRM_LABEL).clicked() && has_id {
+                if controls::button_filling(ui, ButtonKind::Danger, BUTTON, super::confirm_label()).clicked() && has_id {
                     action = Some(SendUiAction::ConfirmDelete { id: row.id.clone(), name: row.name.clone() });
                 }
                 ui.add_space(22.0);
             }
             fact_tiles(ui, &[("Opens", views_words(row)), ("Link", ends_words(row)), ("Includes", includes_words(row))]);
             ui.add_space(22.0);
-            let opens_with = if row.has_password { super::PASSWORD_SEGMENT } else { super::LINK_ONLY };
+            let opens_with = if row.has_password { super::password_segment() } else { super::link_only() };
             let address = if row.access_url.is_empty() {
-                Value::Plain(super::ADDRESS_MISSING)
+                Value::Plain(super::address_missing())
             } else {
                 Value::Address { url: row.access_url.as_str(), dead: !row.state.is_live() }
             };
-            let mut rows: Vec<(&str, Value<'_>)> = vec![(super::ADDRESS_ROW, address)];
+            let mut rows: Vec<(&str, Value<'_>)> = vec![(super::address_row(), address)];
             if let Some(who) = row.sent.as_ref().map(|s| s.recipient.as_str()).filter(|r| !r.is_empty()) {
-                rows.push((super::RECIPIENT_ROW, Value::Plain(who)));
+                rows.push((super::recipient_row(), Value::Plain(who)));
             }
-            rows.push((super::OPENS_WITH_ROW, Value::Plain(opens_with)));
-            rows.push((super::VIEWS_ROW, Value::Views { used: row.access_count, cap: row.max_access_count }));
-            rows.push((super::EXPIRES_ROW, Value::Plain(row.expires.as_str())));
-            rows.push((super::DELETED_ROW, Value::Plain(row.deletes.as_str())));
+            rows.push((super::opens_with_row(), Value::Plain(opens_with)));
+            rows.push((super::views_row(), Value::Views { used: row.access_count, cap: row.max_access_count }));
+            rows.push((super::expires_row(), Value::Plain(row.expires.as_str())));
+            rows.push((super::deleted_row(), Value::Plain(row.deletes.as_str())));
             detail_rows(ui, &rows);
             ui.add_space(22.0);
             activity(ui, row);
@@ -1090,23 +1098,23 @@ fn send_modal(
             let held = |kind, label| Slot { draw: (!confirming).then_some((kind, label)), measure: (kind, label) };
             let mut plan: Vec<(Which, Slot<'_>)> = Vec::new();
             if live {
-                plan.push((Which::Copy, held(ButtonKind::Primary, super::COPY_LINK_LABEL)));
+                plan.push((Which::Copy, held(ButtonKind::Primary, super::copy_link_label())));
             }
             if row.extendable {
-                plan.push((Which::Extend, held(ButtonKind::Outline, super::EXTEND_LABEL)));
+                plan.push((Which::Extend, held(ButtonKind::Outline, super::extend_label())));
             }
             if row.sent.is_some() {
-                plan.push((Which::Open, held(ButtonKind::Outline, super::OPEN_RECORD_LABEL)));
+                plan.push((Which::Open, held(ButtonKind::Outline, super::open_record_label())));
             }
             plan.push((
                 Which::Revoke,
                 Slot {
                     draw: Some(if confirming {
-                        (ButtonKind::Outline, super::CANCEL_LABEL)
+                        (ButtonKind::Outline, super::cancel_label())
                     } else {
-                        (ButtonKind::Danger, super::REVOKE_LABEL)
+                        (ButtonKind::Danger, super::revoke_label())
                     }),
-                    measure: (ButtonKind::Danger, super::REVOKE_LABEL),
+                    measure: (ButtonKind::Danger, super::revoke_label()),
                 },
             ));
             let slots: Vec<Slot<'_>> = plan.iter().map(|(_, s)| Slot { draw: s.draw, measure: s.measure }).collect();
@@ -1153,7 +1161,7 @@ fn share_modal(
             records,
             Some(&share.item_id),
             &share.name,
-            sharing::SHARED_WITH_A_PERSON,
+            sharing::shared_with_a_person(),
             Some((kind.label().to_string(), tone.fill, tone.ink)),
         );
         ui.add_space(22.0);
@@ -1163,38 +1171,38 @@ fn share_modal(
             if confirming {
                 modal::note(ui, Tone::Danger, &sharing::stop_question(&share.name, &share.email));
                 ui.add_space(6.0);
-                ui.add(egui::Label::new(egui::RichText::new(sharing::STOP_HINT).size(13.0).color(p.text_faint)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(sharing::stop_hint()).size(13.0).color(p.text_faint)).wrap());
                 ui.add_space(12.0);
-                if controls::button_filling(ui, ButtonKind::Danger, BUTTON, sharing::REMOVE_LABEL).clicked() {
+                if controls::button_filling(ui, ButtonKind::Danger, BUTTON, sharing::remove_label()).clicked() {
                     people.asked = Some(PeopleAsk::ConfirmStop(key.to_string()));
                 }
                 ui.add_space(22.0);
             }
-            let since = share.since.as_deref().unwrap_or(sharing::SINCE_UNKNOWN);
+            let since = share.since.as_deref().unwrap_or(sharing::since_unknown());
             fact_tiles(
                 ui,
                 &[
-                    (sharing::SHARED_WITH_ROW, share.email.clone()),
-                    (sharing::SINCE_ROW, since.to_string()),
-                    (sharing::ACCESS_ROW, sharing::VIEW_ONLY.to_string()),
+                    (sharing::shared_with_row(), share.email.clone()),
+                    (sharing::since_row(), since.to_string()),
+                    (sharing::access_row(), sharing::view_only().to_string()),
                 ],
             );
             ui.add_space(22.0);
             let copy = if share.state == crate::rest::sharing::PersonState::Shared {
-                (sharing::THEIR_COPY_ROW, Value::Plain(sharing::FOLLOWS_EDITS))
+                (sharing::their_copy_row(), Value::Plain(sharing::follows_edits()))
             } else {
-                (sharing::STATUS_ROW, Value::Plain(share.state_words()))
+                (sharing::status_row(), Value::Plain(share.state_words()))
             };
             detail_rows(
                 ui,
                 &[
-                    (sharing::CAN_ROW, Value::Plain(sharing::CAN_VALUE)),
-                    (sharing::CANNOT_ROW, Value::Plain(sharing::CANNOT_VALUE)),
+                    (sharing::can_row(), Value::Plain(sharing::can_value())),
+                    (sharing::cannot_row(), Value::Plain(sharing::cannot_value())),
                     copy,
                 ],
             );
             ui.add_space(10.0);
-            ui.add(egui::Label::new(egui::RichText::new(sharing::WHOLE_RECORD).size(14.0).color(p.text_faint)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(sharing::whole_record()).size(14.0).color(p.text_faint)).wrap());
             if let Some(notice) = people.notice.as_deref() {
                 ui.add_space(12.0);
                 modal::note(ui, Tone::Danger, notice);
@@ -1204,22 +1212,22 @@ fn share_modal(
         if stopping {
             ui.label(tokens::job(
                 Role { size: 15.0, face: theme::SEMIBOLD, tracking_em: 0.0 },
-                sharing::STOPPING_LABEL,
+                sharing::stopping_label(),
                 p.text_faint,
             ));
         } else {
             let slots = [
                 Slot {
-                    draw: (!confirming).then_some((ButtonKind::Outline, super::OPEN_RECORD_LABEL)),
-                    measure: (ButtonKind::Outline, super::OPEN_RECORD_LABEL),
+                    draw: (!confirming).then_some((ButtonKind::Outline, super::open_record_label())),
+                    measure: (ButtonKind::Outline, super::open_record_label()),
                 },
                 Slot {
                     draw: Some(if confirming {
-                        (ButtonKind::Outline, sharing::CANCEL_BUTTON)
+                        (ButtonKind::Outline, sharing::cancel_button())
                     } else {
-                        (ButtonKind::Danger, sharing::STOP_LABEL)
+                        (ButtonKind::Danger, sharing::stop_label())
                     }),
-                    measure: (ButtonKind::Danger, sharing::STOP_LABEL),
+                    measure: (ButtonKind::Danger, sharing::stop_label()),
                 },
             ];
             if let Some(i) = button_row(ui, &slots) {
@@ -1241,17 +1249,17 @@ fn received_modal(ctx: &egui::Context, row: &ReceivedRow) -> ModalOutcome {
     let (outcome, ()) = Dialog::new(ID, 600.0).show(ctx, |ui| {
         let p = tokens::palette(ui.ctx());
         ui.spacing_mut().item_spacing.y = 0.0;
-        modal_header(ui, RecordTiles::default(), None, &row.name, super::RECEIVED_KIND, None);
+        modal_header(ui, RecordTiles::default(), None, &row.name, super::received_kind(), None);
         ui.add_space(22.0);
         let (sentence, ink) = if row.still_in_vault {
-            (super::RECEIVED_ITEM_PRESENT, p.ink)
+            (super::received_item_present(), p.ink)
         } else {
-            (super::RECEIVED_ITEM_GONE, p.text_faint)
+            (super::received_item_gone(), p.text_faint)
         };
         ui.add(egui::Label::new(tokens::job(Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, sentence, ink)).wrap());
         ui.add_space(22.0);
-        let short = if row.still_in_vault { super::IN_VAULT_YES } else { super::IN_VAULT_NO };
-        detail_rows(ui, &[(super::ARRIVED_ROW, Value::Plain(&row.when)), (super::IN_VAULT_ROW, Value::Plain(short))]);
+        let short = if row.still_in_vault { super::in_vault_yes() } else { super::in_vault_no() };
+        detail_rows(ui, &[(super::arrived_row(), Value::Plain(&row.when)), (super::in_vault_row(), Value::Plain(short))]);
     });
     outcome
 }

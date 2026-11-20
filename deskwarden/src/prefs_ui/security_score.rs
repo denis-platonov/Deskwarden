@@ -65,28 +65,23 @@ pub fn offered(ctx: &egui::Context) -> Option<Score> {
 /// The card's headline.
 pub fn headline(score: &Score) -> &'static str {
     match score.points {
-        90..=100 => "Your vault is in good shape",
-        60..=89 => "Your vault is mostly in good shape",
-        _ => "Your vault needs attention",
+        90..=100 => crate::i18n::t("settings.score_good"),
+        60..=89 => crate::i18n::t("settings.score_mostly_good"),
+        _ => crate::i18n::t("settings.score_needs_attention"),
     }
 }
 
 /// The line under the headline.
 pub fn subline(score: &Score) -> String {
     match score.to_fix {
-        0 => "Nothing to fix.".to_string(),
-        1 => "Fix 1 item to reach 100.".to_string(),
-        n => format!("Fix {n} items to reach 100."),
+        0 => crate::i18n::t("settings.score_nothing_to_fix").to_string(),
+        n => crate::i18n::tn("settings.score_fix_to_reach", n as u64, &[]),
     }
 }
 
 /// The primary button's label.
 pub fn fix_label(score: &Score) -> String {
-    if score.to_fix == 1 {
-        "Fix 1 item".to_string()
-    } else {
-        format!("Fix {} items", score.to_fix)
-    }
+    crate::i18n::tn("settings.score_fix_button", score.to_fix as u64, &[])
 }
 
 /// What the card asks the window for: the Password health screen under a
@@ -132,9 +127,9 @@ pub fn draw(ui: &mut Ui) {
             ui.spacing_mut().item_spacing.x = 10.0;
             let width = ((ui.available_width() - 20.0) / 3.0).floor();
             let tiles = [
-                (score.weak, "Weak passwords", theme::ERROR, HealthFilter::Weak),
-                (score.reused, "Reused passwords", AMBER, HealthFilter::Reused),
-                (score.old, "Older than a year", p.blue_deep, HealthFilter::Old),
+                (score.weak, crate::i18n::t("settings.score_weak"), theme::ERROR, HealthFilter::Weak),
+                (score.reused, crate::i18n::t("settings.score_reused"), AMBER, HealthFilter::Reused),
+                (score.old, crate::i18n::t("settings.score_old"), p.blue_deep, HealthFilter::Old),
             ];
             for (count, label, colour, filter) in tiles {
                 if tile(ui, width, count, label, colour) {
@@ -158,7 +153,7 @@ fn tile(ui: &mut Ui, width: f32, count: usize, label: &str, colour: Color32) -> 
     for (role, text, ink) in [
         (TILE_NUMBER, count.to_string(), colour),
         (TILE_LABEL, label.to_string(), p.ink),
-        (TILE_LINK, "Review".to_string(), p.blue_deep),
+        (TILE_LINK, crate::i18n::t("settings.score_review").to_string(), p.blue_deep),
     ] {
         let galley = ui.fonts_mut(|f| f.layout_job(tokens::job(role, &text, ink)));
         let h = galley.size().y;

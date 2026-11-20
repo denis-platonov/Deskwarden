@@ -394,6 +394,9 @@ fn main() {
     // conditional.
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
+    // The language the daemon's own words (tray, cards, message boxes) are in:
+    // the saved one, else the Windows UI language, else English.
+    deskwarden::i18n::init(settings.language.as_deref());
     // **A test profile does not start without its account list.** The
     // default copy runs on with no account of its own (`NoAccountList`, in
     // the account block below) and leaves the Bitwarden CLI on its own
@@ -12034,6 +12037,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
 
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
+    deskwarden::i18n::init(settings.language.as_deref());
     // This process is the one that makes the copies, so it is the one whose
     // clearing timers matter. The daemon configures its own separately.
     deskwarden::clipboard::configure(settings.clipboard_clearing());
@@ -13840,11 +13844,17 @@ fn apply_edited_settings(
         settings.cache_vault_to_disk,
         edited.cache_vault_to_disk,
     ) && edited.cache_vault_to_disk;
+    let language_changed = settings.language != edited.language;
     *settings = settings::Settings { cache_vault_to_disk: keep_disk_cache, ..edited };
     if let Err(e) = settings.persist_preferences(settings_path) {
         log::warn!("could not save settings: {e}");
     }
     deskwarden::clipboard::configure(settings.clipboard_clearing());
+    // A language chosen in Settings is live in the tray and the cards at once,
+    // without a restart; the window that chose it re-initialised itself.
+    if language_changed {
+        deskwarden::i18n::init(settings.language.as_deref());
+    }
 }
 
 fn disk_cache_dir(config_dir: &Path, active_account: Option<&Account>) -> std::path::PathBuf {

@@ -30,7 +30,7 @@
 //!
 //! **The page says all of this in words**, because a rule the user has to
 //! infer from behaviour is not a rule they have agreed to. See
-//! [`SCAN_CONSENT_NOTE`].
+//! [`scan_consent_note()`].
 //!
 //! # Distinct passwords, not items
 //!
@@ -128,10 +128,9 @@ pub const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(120);
 /// **It says the rule rather than leaving the user to discover it.** See the
 /// module docs: a button whose behaviour contradicts a pill two rows above it
 /// needs to say so where both are on screen at once.
-pub const SCAN_CONSENT_NOTE: &str =
-    "This button always checks, whatever the setting above says: pressing it is you asking for \
-     the check. The setting governs what Deskwarden does on its own \u{2014} the breach badge on an \
-     item you open \u{2014} and nothing here runs on its own, ever.";
+pub fn scan_consent_note() -> &'static str {
+    crate::i18n::t("prefs.scan_consent_note")
+}
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -637,7 +636,7 @@ impl ScanPanel {
     /// is a click.**
     ///
     /// Nothing here consults `Settings::check_breaches`; see the module docs
-    /// for why, and [`SCAN_CONSENT_NOTE`] for where the user is told.
+    /// for why, and [`scan_consent_note()`] for where the user is told.
     ///
     /// A no-op while one is already running: two concurrent scans would race
     /// to be the one whose findings are published.
@@ -1153,11 +1152,11 @@ mod tests {
     /// user has to infer from behaviour is not a rule they agreed to.
     #[test]
     fn the_page_says_that_the_button_ignores_the_setting() {
-        assert!(SCAN_CONSENT_NOTE.contains("always checks"), "{SCAN_CONSENT_NOTE:?}");
+        assert!(scan_consent_note().contains("always checks"), "{scan_consent_note:?}", scan_consent_note = scan_consent_note());
         assert!(
-            SCAN_CONSENT_NOTE.contains("on its own"),
+            scan_consent_note().contains("on its own"),
             "the note has to say what the setting DOES govern, or it reads as the setting being \
-             pointless: {SCAN_CONSENT_NOTE:?}"
+             pointless: {scan_consent_note:?}", scan_consent_note = scan_consent_note()
         );
     }
 
