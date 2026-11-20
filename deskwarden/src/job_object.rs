@@ -3208,7 +3208,21 @@ mod tests {
             // feature, +525, and `Win32_Globalization`, +267), merged on v1.
             // Recomputed by the same FNV-1a/64 implementation, first run against
             // the v1 pair (30230, 0x5ed9_4133_1732_0372) and reproduced it.
-            (30497, 0xa904_68e2_4a66_8243_u64),
+            // **30780 bytes, new hash: the `windows` crate gained four FEATURES** (the
+            // Store edition's package identity and startup task: `Win32_Storage_Packaging_Appx`,
+            // `ApplicationModel`, `ApplicationModel_Activation`, `Foundation_Collections`)
+            // and a 550-byte comment saying why. The crate and its version did not move,
+            // nothing was added to `Cargo.lock`, no `[patch]`/`[replace]` table, path or fork
+            // appeared, and `[build-dependencies]` still reads exactly `winresource = "0.1"`.
+            // Recomputed in a separate implementation outside this crate, first run against
+            // the PREVIOUS pinned pair, which it reproduced (30230, 0x5ed9_4133_1732_0372).
+            //
+            // **31047 bytes, new hash: the i18n and Store-startup features together**
+            // (`Win32_Globalization` beside the four packaging/activation features),
+            // merged on v1. Same FNV-1a/64 implementation, first run against the v1
+            // pair (30497, 0xa904_68e2_4a66_8243) and the slice-15f pair
+            // (30780, 0x2bdb_3a18_b87d_81a1), reproducing both.
+            (31047, 0x2ca1_25c6_7fa6_fee0_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

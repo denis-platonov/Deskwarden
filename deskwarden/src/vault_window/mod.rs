@@ -3693,44 +3693,11 @@ pub fn build_frame_with_search(
         // `VaultItem`s and must not be forced through a pane that filters a
         // list of them; the Sends rows are drawn in the central panel below
         // instead, at the full width the two panes would have shared.
-        // **The Password health report takes the item-list column and leaves
-        // the detail pane standing**, which is the whole reason it is not a
-        // whole-body screen like Sends: a click on a finding writes
-        // `selected_id`, and the pane on the right fills in with that item
-        // without the report going anywhere. See `password_health`.
-        //
-        // Its own panel id, and the same `exact_size` as the item list's --
-        // so the column does not move when the two swap, while
-        // `send_ui::source_pins::the_item_list_is_drawn_only_inside_the_not_sends_gate`
-        // can still require the string `Panel::left("vault-item-list")` to
-        // appear exactly once in this file. Two panels sharing an id would
-        // make that guard unable to tell an item list drawn here from one
-        // drawn on the Sends screen.
-        if !show_sends && on_health && !generator_selected && !settings_selected {
-            egui::Panel::left("vault-password-health")
-                .exact_size(LIST_WIDTH)
-                .resizable(false)
-                .frame(egui::Frame::new().fill(theme::CANVAS))
-                .show(ui, |ui| {
-                    // The live preference, read exactly the way the detail
-                    // pane's own breach badge reads it -- the modal's edited
-                    // value if the gear has been opened this session, else
-                    // what was on disk when the window opened. **Only to say
-                    // what state the setting is in.** Nothing on this screen
-                    // performs a lookup in either state; see
-                    // `password_health::breach_note`.
-                    let check_breaches = edited_settings_for_closure
-                        .borrow()
-                        .as_ref()
-                        .map_or(check_breaches_at_open, |s| s.check_breaches);
-                    password_health::draw_password_health(
-                        ui,
-                        &health,
-                        &mut selected_id,
-                        check_breaches,
-                    );
-                });
-        }
+        // **The Password health report is a whole-body page** (spec A 4), drawn
+        // in the central panel below like Settings and the Generator: it takes
+        // the item-list column AND the detail pane, and a finding opens its
+        // item (or its editor) through the same `open_record` door the Shared
+        // page's Open record uses.
         // The detail pane's width this frame, and therefore the list's.
         //
         // Computed HERE, once, above both panels: the item list is sized from
@@ -4653,6 +4620,9 @@ pub fn build_frame_with_search(
             waiting: &waiting_from,
             busy: sharing.is_busy(),
         };
+        // A finding on the Password health page that was opened (`false`) or
+        // asked to change (`true`), by item id; folded into `open_record` below.
+        let mut health_open: Option<(String, bool)> = None;
         let open_record = apply_send_action(
             egui::CentralPanel::default()
             // NO INNER MARGIN, and that is the fix for the band the owner
@@ -4693,6 +4663,26 @@ pub fn build_frame_with_search(
                 // Slice 7: Settings takes the list's and the pane's place. Its
                 // edits go into the same cell the modal wrote, every frame, so
                 // a change the user can see is never the one that gets lost.
+                // The Password health page takes the list's and the pane's place.
+                if on_health && !show_sends && !generator_selected && !settings_selected {
+                    // The live preference, read exactly the way the detail
+                    // pane's own breach badge reads it -- the modal's edited
+                    // value if the gear has been opened this session, else
+                    // what was on disk when the window opened. **Only to say
+                    // what state the setting is in.** Nothing on this screen
+                    // performs a lookup in either state; see
+                    // `password_health::breach_note`.
+                    let check_breaches = edited_settings_for_closure
+                        .borrow()
+                        .as_ref()
+                        .map_or(check_breaches_at_open, |s| s.check_breaches);
+                    match password_health::draw_password_health(ui, &health, check_breaches) {
+                        password_health::HealthAction::None => {}
+                        password_health::HealthAction::Open(id) => health_open = Some((id, false)),
+                        password_health::HealthAction::ChangePassword(id) => health_open = Some((id, true)),
+                    }
+                    return send_ui::no_sends_screen_this_frame();
+                }
                 if settings_selected && !show_sends {
                     if let Some(state) = prefs.as_mut() {
                         let before = state.settings.generator.clone();
@@ -6960,6 +6950,17 @@ pub fn build_frame_with_search(
         // looks there too), so the record is opened under the list that holds
         // it -- the item pane resolves a selection against the filter's own
         // list, and under All an archived id would be "Select an item.".
+        // A finding on the Password health page opens its item through this same
+        // door -- and, for Change password, asks for the editor the way the
+        // Shared page's Change password does.
+        let open_record = open_record.or_else(|| {
+            health_open.take().map(|(id, edit)| {
+                if edit {
+                    ctx_edit_after_open(true);
+                }
+                id
+            })
+        });
         if let Some(item_id) = open_record {
             generator_selected = false;
             // Spec B §7's Change password asked for the editor; taken here so a
@@ -36218,7 +36219,7 @@ mod send_delete_wiring {
         // exists -- which is true in every state, including the ones where
         // the window body is blank.
         assert_ne!(
-            send_ui::SHARED_TITLE,
+            send_ui::SHARED_SUB,
             sidebar::SENDS_ROW_LABEL,
             "the Sends pane's own heading and the sidebar row that leads to it are the same \
              string again, so finding it below no longer proves the PANE painted -- it is \
@@ -36234,14 +36235,14 @@ mod send_delete_wiring {
         //    !show_sends` and the pane by the gate, and the user is left
         //    looking at an empty window for the rest of the session.
         assert!(
-            matrix_find(&output, send_ui::SHARED_TITLE).is_some(),
+            matrix_find(&output, send_ui::SHARED_SUB).is_some(),
             "in state {state:?} the Sends row was pressed and the Sends PANE never painted \
              its own heading ({:?}) -- only the sidebar row that leads to it is on screen. \
              The SENDS SCREEN is blank: the item list is skipped because `show_sends` is \
              true and the pane was not asked for, so the window keeps its sidebar and its \
              detail-pane placeholder and the user has no Sends feature at all. What was \
              painted: {:?}",
-            send_ui::SHARED_TITLE,
+            send_ui::SHARED_SUB,
             matrix_texts(&output)
         );
 
@@ -38410,12 +38411,12 @@ mod send_delete_wiring {
             "the frame draws the Sends pane {} times, not once",
             code.matches(concat!("draw_send_", "pane(")).count()
         );
-        // Three: the detail pane's, the Generator screen's (slice 6) and the
-        // Settings screen's (slice 7) -- none is the Sends screen, and each is
-        // the panel's only answer.
+        // Four: the detail pane's, the Generator screen's (slice 6), the
+        // Settings screen's (slice 7) and the Password health page's (slice
+        // 15f) -- none is the Sends screen, and each is the panel's only answer.
         assert_eq!(
             code.matches(concat!("no_sends_screen_this_", "frame()")).count(),
-            3,
+            4,
             "the one verdict this module may mint without drawing the pane is written {} \
              times, not once. Each extra one is a place the real verdict can be dropped \
              for an inert one",

@@ -708,44 +708,46 @@ const ACT_LABEL_WIDTH: f32 = 104.0;
 /// The two jobs are the same widget on purpose: the box the user watches and
 /// the box the keys land in cannot be allowed to differ.
 pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bool {
+    use crate::kit::tokens::{self, Role};
     theme::paint_window_background(ui);
+    let p = tokens::palette(ui.ctx());
     let mut close = false;
+    // The v2 dialog's own frame (spec B 2): a white card on the window, 20
+    // radius, 24 of padding, the title in 20/800 and the one primary button at
+    // the foot.
     egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .fill(p.card)
+        .stroke(Stroke::new(1.0, p.border))
         .corner_radius(CornerRadius::same(20))
+        .inner_margin(Margin::same(22))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
 
-            // ---- the header rule -------------------------------------------
-            egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    check_mark(ui, view.finished);
-                    ui.add_space(9.0);
-                    ui.label(theme::bold(view.headline.clone(), 16.0).color(theme::INK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("scratch window").size(13.0).color(theme::TEXT_GHOST),
-                        );
-                    });
-                });
+            // ---- the header ------------------------------------------------
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                check_mark(ui, view.finished);
+                ui.add(
+                    egui::Label::new(tokens::job(
+                        Role { size: 20.0, face: theme::EXTRABOLD, tracking_em: -0.01 },
+                        &view.headline,
+                        p.ink,
+                    ))
+                    .truncate(),
+                );
             });
-            theme::hairline(ui);
+            ui.add_space(16.0);
 
-            // ---- WHAT ARRIVED, on the design's dark panel -------------------
+            // ---- WHAT ARRIVED, on a dark panel ------------------------------
             egui::Frame::new()
                 .fill(theme::INK)
+                .corner_radius(CornerRadius::same(14))
                 .inner_margin(Margin::symmetric(16, 14))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.label(theme::letterspaced_mono(
-                        rehearsal::ARRIVED_HEADING,
-                        12.0,
-                        0.66,
-                        theme::TEXT_GHOST,
-                    ));
+                    ui.label(tokens::job(tokens::SECTION, rehearsal::ARRIVED_HEADING, theme::TEXT_GHOST));
                     let font = egui::FontId::new(14.0, egui::FontFamily::Monospace);
                     if view.finished {
                         // The invisible keys, drawn, in the design's blue.
@@ -776,42 +778,43 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
                         }
                     }
                 });
+            ui.add_space(18.0);
 
             // ---- WHAT WAS SENT ---------------------------------------------
-            egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(theme::letterspaced_mono(sent_heading(), 12.0, 0.66, theme::TEXT_FAINT));
-                for act in &view.sent {
-                    let (label, value) = act_row(act);
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [ACT_LABEL_WIDTH, 18.0],
-                            egui::Label::new(
-                                RichText::new(label).size(14.0).color(theme::TEXT_FAINT),
-                            )
-                            .halign(egui::Align::LEFT),
-                        );
-                        ui.label(theme::semibold(value, 14.0).color(theme::INK));
-                    });
+            ui.label(tokens::job(tokens::SECTION, sent_heading(), p.text_ghost));
+            ui.add_space(8.0);
+            for (at, act) in view.sent.iter().enumerate() {
+                let (label, value) = act_row(act);
+                if at > 0 {
+                    crate::kit::card::row_rule(ui);
                 }
-                if let Some(failure) = &view.failure {
-                    ui.add_space(2.0);
-                    failure_band(ui, failure);
-                }
-            });
-
-            // ---- the footer -------------------------------------------------
-            theme::hairline(ui);
-            egui::Frame::new()
-                .fill(theme::CARD_TINT)
-                .inner_margin(Margin::symmetric(16, 12))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, crate::i18n::t("scratch.close"), None).clicked();
-                    });
+                ui.horizontal(|ui| {
+                    ui.set_height(30.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ACT_LABEL_WIDTH, 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(tokens::job(tokens::SUBTITLE, &label, p.text_faint));
+                        },
+                    );
+                    ui.label(tokens::job(Role { size: 14.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, &value, p.ink));
                 });
+            }
+            if let Some(failure) = &view.failure {
+                ui.add_space(10.0);
+                failure_band(ui, failure);
+            }
+
+            // ---- the foot ---------------------------------------------------
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, crate::i18n::t("scratch.close"), None).clicked();
+                // What the window is, quietly, where the pill used to crowd
+                // the headline.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(tokens::job(tokens::SUBTITLE, crate::i18n::t("scratch.caption"), p.text_ghost));
+                });
+            });
         });
     close
 }
@@ -824,18 +827,20 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
 /// Reserves its space whether or not it is drawn, so the headline does not
 /// shift sideways the moment a rehearsal finishes.
 fn check_mark(ui: &mut egui::Ui, drawn: bool) {
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+    let p = crate::kit::tokens::palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(36.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 18.0, if drawn { p.done_wash } else { p.blue_wash });
     if !drawn {
         return;
     }
-    let stroke = Stroke::new(2.0, CHECK_GREEN);
+    let stroke = Stroke::new(2.4, CHECK_GREEN);
     let c = rect.center();
     ui.painter().line_segment(
-        [egui::pos2(c.x - 5.5, c.y + 0.5), egui::pos2(c.x - 1.5, c.y + 4.5)],
+        [egui::pos2(c.x - 6.5, c.y + 0.5), egui::pos2(c.x - 2.0, c.y + 5.0)],
         stroke,
     );
     ui.painter().line_segment(
-        [egui::pos2(c.x - 1.5, c.y + 4.5), egui::pos2(c.x + 6.0, c.y - 4.5)],
+        [egui::pos2(c.x - 2.0, c.y + 5.0), egui::pos2(c.x + 7.0, c.y - 5.0)],
         stroke,
     );
 }

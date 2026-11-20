@@ -390,6 +390,7 @@ scratch.pressed = Pressed
 scratch.paused = Paused
 scratch.sent_heading = WHAT WAS SENT
 scratch.close = Close
+scratch.caption = scratch window
 
 # ---- main.rs (message boxes the daemon raises) ----
 main.second_lock_exit = Your vault is locked and Deskwarden has closed.\n\nStart Deskwarden again to sign back in.

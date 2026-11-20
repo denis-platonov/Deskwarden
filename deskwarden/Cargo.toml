@@ -133,6 +133,16 @@ windows = { version = "0.58", features = [
     # order the user ranked them, and shows the first one this app has a
     # catalog for.
     "Win32_Globalization",
+    # Package identity and the manifest's startup task, for the Microsoft
+    # Store (MSIX) edition (src/autostart_repair.rs): GetCurrentPackageFullName
+    # says whether this process is packaged, `StartupTask` is the packaged
+    # app's "open when I sign in", and `AppInstance::GetActivatedEventArgs`
+    # says a launch was that task (it passes no command line). Already in the
+    # `windows` crate; no new dependency.
+    "Win32_Storage_Packaging_Appx",
+    "ApplicationModel",
+    "ApplicationModel_Activation",
+    "Foundation_Collections",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

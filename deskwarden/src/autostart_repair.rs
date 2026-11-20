@@ -91,6 +91,11 @@ pub fn repair_logon_entry() {
         KEY_READ, KEY_SET_VALUE, REG_SZ,
     };
 
+    // **A package has no Run entry to repair**: its startup is the manifest's
+    // task, and a Run write from inside a package is virtualised.
+    if mechanism(is_packaged()) == Mechanism::StartupTask {
+        return;
+    }
     // **A test copy never touches the logon entry.** It is the installed
     // copy's, and a profiled copy (`crate::app_profile`) would "repair" it to
     // point at itself.
@@ -243,13 +248,29 @@ fn read_run_value() -> Option<String> {
 /// The startup switches as they stand now. Reads the registry.
 #[must_use]
 pub fn read_startup() -> Startup {
-    startup_of(read_run_value().as_deref())
+    match mechanism(is_packaged()) {
+        Mechanism::RunKey => startup_of(read_run_value().as_deref()),
+        Mechanism::StartupTask => match startup_task().and_then(|task| task.State()) {
+            Ok(state) => startup_of_task(state.0),
+            Err(e) => {
+                log::warn!("the startup task's state could not be read: {e}");
+                Startup { open_at_sign_in: false, in_tray: false }
+            }
+        },
+    }
 }
 
 /// Writes the startup switches to the logon entry. A test copy
 /// (`DESKWARDEN_PROFILE`) never touches the installed copy's entry. Returns
 /// whether the entry now says what was asked.
 pub fn write_startup(startup: Startup) -> bool {
+    if mechanism(is_packaged()) == Mechanism::StartupTask {
+        return write_startup_task(startup);
+    }
+    write_run_value(startup)
+}
+
+fn write_run_value(startup: Startup) -> bool {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
@@ -285,6 +306,184 @@ pub fn write_startup(startup: Startup) -> bool {
             log::warn!("the logon entry could not be changed to {startup:?}");
         }
         done
+    }
+}
+
+/// The packaged (Microsoft Store, MSIX) edition's id for the manifest's
+/// `windows.startupTask`. `scripts/store/AppxManifest.xml` declares it and
+/// `the_manifest_declares_the_task_this_module_drives` reads it back.
+pub const STARTUP_TASK_ID: &str = "DeskwardenStartup";
+
+/// What keeps "open when I sign in to Windows".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mechanism {
+    /// `HKCU\...\Run`: every unpackaged build, the installer's and the
+    /// portable one. 0.x behaviour, unchanged.
+    RunKey,
+    /// The manifest's startup task. In a package the Run key write is
+    /// virtualised and does nothing.
+    StartupTask,
+}
+
+/// Which mechanism a process uses, from whether it has package identity.
+#[must_use]
+pub const fn mechanism(packaged: bool) -> Mechanism {
+    if packaged {
+        Mechanism::StartupTask
+    } else {
+        Mechanism::RunKey
+    }
+}
+
+/// Whether a launch is Windows signing the user in. The Run key carries
+/// [`AUTOSTART_FLAG`]; a startup task passes no command line at all, so a
+/// packaged launch that the task activated counts as the flag having been
+/// there. An unpackaged process never asks the second question.
+#[must_use]
+pub const fn counts_as_autostart(flag_present: bool, packaged: bool, activated_by_startup_task: bool) -> bool {
+    flag_present || (packaged && activated_by_startup_task)
+}
+
+/// The command line the launch decision reads: the real one, plus
+/// [`AUTOSTART_FLAG`] when the startup task started this process.
+///
+/// Only an EMPTY command line is rewritten: a launch with arguments
+/// (`--ui vault`, `--service`) is the daemon's own child or somebody's
+/// explicit request, and is never a startup-task activation.
+#[must_use]
+pub fn args_with_activation(args: Vec<String>, activated_by_startup_task: bool) -> Vec<String> {
+    if activated_by_startup_task && args.is_empty() {
+        vec![AUTOSTART_FLAG.to_string()]
+    } else {
+        args
+    }
+}
+
+/// `StartupTaskState`'s numbers (Windows.ApplicationModel.StartupTaskState).
+pub mod task_state {
+    pub const DISABLED: i32 = 0;
+    pub const DISABLED_BY_USER: i32 = 1;
+    pub const ENABLED: i32 = 2;
+    pub const DISABLED_BY_POLICY: i32 = 3;
+    pub const ENABLED_BY_POLICY: i32 = 4;
+}
+
+/// The switches a task state reads as. A startup task always starts the app
+/// to the tray (it has no way to carry `--window`), so "in the tray" is true
+/// whenever it is on.
+#[must_use]
+pub fn startup_of_task(state: i32) -> Startup {
+    let on = state == task_state::ENABLED || state == task_state::ENABLED_BY_POLICY;
+    Startup { open_at_sign_in: on, in_tray: on }
+}
+
+/// What to do to the task to reach a wanted state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskPlan {
+    /// Already as wanted.
+    Nothing,
+    /// `RequestEnableAsync`.
+    Enable,
+    /// `Disable`.
+    Disable,
+    /// Cannot be done from inside the app.
+    Refuse(&'static str),
+}
+
+/// The whole decision of [`write_startup_task`], pure.
+#[must_use]
+pub fn task_plan(state: i32, wanted: Startup) -> TaskPlan {
+    use task_state::*;
+    if wanted.open_at_sign_in {
+        if !wanted.in_tray {
+            return TaskPlan::Refuse("a startup task always starts in the tray; a window at sign-in cannot be asked of it");
+        }
+        return match state {
+            ENABLED | ENABLED_BY_POLICY => TaskPlan::Nothing,
+            DISABLED => TaskPlan::Enable,
+            DISABLED_BY_USER => TaskPlan::Refuse("Windows has the task switched off in Settings > Apps > Startup; only the user can switch it back on there"),
+            DISABLED_BY_POLICY => TaskPlan::Refuse("startup for this app is disabled by policy"),
+            _ => TaskPlan::Refuse("the startup task is in a state this app does not know"),
+        };
+    }
+    match state {
+        ENABLED => TaskPlan::Disable,
+        DISABLED | DISABLED_BY_USER | DISABLED_BY_POLICY => TaskPlan::Nothing,
+        ENABLED_BY_POLICY => TaskPlan::Refuse("startup for this app is required by policy"),
+        _ => TaskPlan::Refuse("the startup task is in a state this app does not know"),
+    }
+}
+
+/// `GetCurrentPackageFullName`'s answer for "this process has no package".
+const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
+
+/// Whether this process runs with package identity (the Store edition).
+/// Asked once; a process does not gain or lose its package.
+#[must_use]
+pub fn is_packaged() -> bool {
+    static PACKAGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PACKAGED.get_or_init(|| {
+        use windows::core::PWSTR;
+        use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+        let mut len: u32 = 0;
+        // SAFETY: a null buffer with a zero length is the documented way to
+        // ask whether there is a package at all.
+        let rc = unsafe { GetCurrentPackageFullName(&mut len, PWSTR::null()) };
+        rc.0 != APPMODEL_ERROR_NO_PACKAGE
+    })
+}
+
+/// Whether the startup task is what started this process. Only a packaged
+/// process can have been; anything that cannot be read is "no".
+#[must_use]
+pub fn launched_by_startup_task() -> bool {
+    if !is_packaged() {
+        return false;
+    }
+    use windows::ApplicationModel::Activation::ActivationKind;
+    match windows::ApplicationModel::AppInstance::GetActivatedEventArgs().and_then(|args| args.Kind()) {
+        Ok(kind) => kind == ActivationKind::StartupTask,
+        Err(e) => {
+            log::debug!("the activation kind could not be read: {e}");
+            false
+        }
+    }
+}
+
+fn startup_task() -> windows::core::Result<windows::ApplicationModel::StartupTask> {
+    use windows::core::HSTRING;
+    windows::ApplicationModel::StartupTask::GetAsync(&HSTRING::from(STARTUP_TASK_ID))?.get()
+}
+
+/// The packaged edition's [`write_startup`]. Returns whether the task now
+/// says what was asked.
+fn write_startup_task(wanted: Startup) -> bool {
+    if !crate::app_profile::touches_the_installed_copy() {
+        log::info!("{}", crate::app_profile::installed_copy_refusal("changes the startup task"));
+        return false;
+    }
+    let task = match startup_task() {
+        Ok(task) => task,
+        Err(e) => {
+            log::warn!("the startup task could not be opened: {e}");
+            return false;
+        }
+    };
+    let state = task.State().map_or(-1, |s| s.0);
+    match task_plan(state, wanted) {
+        TaskPlan::Nothing => true,
+        TaskPlan::Refuse(why) => {
+            log::warn!("the startup task was left as it is: {why}");
+            false
+        }
+        TaskPlan::Disable => task.Disable().is_ok(),
+        TaskPlan::Enable => match task.RequestEnableAsync().and_then(|op| op.get()) {
+            Ok(after) => startup_of_task(after.0).open_at_sign_in,
+            Err(e) => {
+                log::warn!("the startup task could not be enabled: {e}");
+                false
+            }
+        },
     }
 }
 
@@ -450,5 +649,77 @@ mod tests {
             "the installer's Run value lost its --autostart flag, so every NEW install would \
              draw a window at sign-in and map the graphics driver: {run_line}"
         );
+    }
+    #[test]
+    fn a_package_uses_the_startup_task_and_anything_else_the_run_key() {
+        assert_eq!(mechanism(true), Mechanism::StartupTask);
+        assert_eq!(mechanism(false), Mechanism::RunKey);
+    }
+
+    #[test]
+    fn a_startup_task_launch_counts_as_the_autostart_flag_only_when_packaged() {
+        assert!(counts_as_autostart(true, false, false), "the Run key's flag still counts");
+        assert!(counts_as_autostart(false, true, true), "a packaged task launch counts");
+        assert!(!counts_as_autostart(false, true, false), "a packaged double-click is a user launch");
+        assert!(!counts_as_autostart(false, false, true), "an unpackaged process was never activated by a task");
+    }
+
+    #[test]
+    fn only_an_empty_command_line_is_read_as_the_task() {
+        assert_eq!(args_with_activation(vec![], true), vec![AUTOSTART_FLAG.to_string()]);
+        assert!(args_with_activation(vec![], false).is_empty());
+        let ui = vec!["--ui".to_string(), "vault".to_string()];
+        assert_eq!(args_with_activation(ui.clone(), true), ui, "a child process is not an activation");
+    }
+
+    #[test]
+    fn a_task_state_reads_as_the_switches() {
+        use task_state::*;
+        let on = Startup { open_at_sign_in: true, in_tray: true };
+        let off = Startup { open_at_sign_in: false, in_tray: false };
+        assert_eq!(startup_of_task(ENABLED), on);
+        assert_eq!(startup_of_task(ENABLED_BY_POLICY), on);
+        for state in [DISABLED, DISABLED_BY_USER, DISABLED_BY_POLICY, 99] {
+            assert_eq!(startup_of_task(state), off);
+        }
+    }
+
+    #[test]
+    fn the_task_is_enabled_disabled_or_left_as_the_state_allows() {
+        use task_state::*;
+        let on = Startup { open_at_sign_in: true, in_tray: true };
+        let off = Startup { open_at_sign_in: false, in_tray: false };
+        assert_eq!(task_plan(DISABLED, on), TaskPlan::Enable);
+        assert_eq!(task_plan(ENABLED, on), TaskPlan::Nothing);
+        assert_eq!(task_plan(ENABLED, off), TaskPlan::Disable);
+        assert_eq!(task_plan(DISABLED, off), TaskPlan::Nothing);
+        assert_eq!(task_plan(DISABLED_BY_USER, off), TaskPlan::Nothing);
+        // What only the user or an administrator can change is not forced.
+        assert!(matches!(task_plan(DISABLED_BY_USER, on), TaskPlan::Refuse(_)));
+        assert!(matches!(task_plan(DISABLED_BY_POLICY, on), TaskPlan::Refuse(_)));
+        assert!(matches!(task_plan(ENABLED_BY_POLICY, off), TaskPlan::Refuse(_)));
+        assert!(matches!(task_plan(77, on), TaskPlan::Refuse(_)));
+    }
+
+    #[test]
+    fn a_window_at_sign_in_is_refused_for_a_task_that_cannot_carry_it() {
+        use task_state::*;
+        let window = Startup { open_at_sign_in: true, in_tray: false };
+        for state in [DISABLED, ENABLED] {
+            assert!(matches!(task_plan(state, window), TaskPlan::Refuse(_)));
+        }
+    }
+
+    #[test]
+    fn the_manifest_declares_the_task_this_module_drives() {
+        let manifest = include_str!("../../scripts/store/AppxManifest.xml");
+        assert!(manifest.contains(&format!("TaskId=\"{STARTUP_TASK_ID}\"")), "the manifest has no startup task called {STARTUP_TASK_ID}");
+    }
+
+    #[test]
+    fn an_unpackaged_test_process_is_not_packaged() {
+        assert!(!is_packaged());
+        assert!(!launched_by_startup_task());
+        assert_eq!(mechanism(is_packaged()), Mechanism::RunKey);
     }
 }

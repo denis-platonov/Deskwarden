@@ -5079,7 +5079,7 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
     // The form's own button rather than egui's bare `selectable_label`, which
     // drew an unframed word at its own inset beside framed buttons everywhere
     // else on the form.
-    if theme::secondary_button(ui, SLOT_ADD_BUTTON).clicked() {
+    if crate::kit::controls::row_button(ui, SLOT_ADD_BUTTON).clicked() {
         *open = !*open;
     }
     if *open {
@@ -5089,7 +5089,7 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
             for slot in addable {
-                if theme::secondary_button(ui, slot.label()).clicked() {
+                if crate::kit::controls::row_button(ui, slot.label()).clicked() {
                     chosen = Some(*slot);
                 }
             }
@@ -5820,7 +5820,7 @@ fn custom_fields_block(
                             theme::section_text_field(ui, &mut field.value, false);
                         }
                         ui.add_space(4.0);
-                        if theme::secondary_button(ui, FIELD_REMOVE_BUTTON).clicked() {
+                        if crate::kit::controls::row_button(ui, FIELD_REMOVE_BUTTON).clicked() {
                             remove = Some(i);
                         }
                     },
@@ -5841,10 +5841,10 @@ fn custom_fields_block(
     // for the same reason.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
-        if theme::secondary_button(ui, FIELD_ADD_TEXT_BUTTON).clicked() {
+        if crate::kit::controls::row_button(ui, FIELD_ADD_TEXT_BUTTON).clicked() {
             fields.push(FieldDraft::new_of(FieldRole::Text));
         }
-        if theme::secondary_button(ui, FIELD_ADD_HIDDEN_BUTTON).clicked() {
+        if crate::kit::controls::row_button(ui, FIELD_ADD_HIDDEN_BUTTON).clicked() {
             fields.push(FieldDraft::new_of(FieldRole::Hidden));
         }
     });
@@ -7868,7 +7868,7 @@ fn field_with_remove(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui, f32)) 
     let mut clicked = false;
     row_with_buttons(ui, &[SLOT_REMOVE_BUTTON], |ui, room| {
         field(ui, room);
-        clicked = theme::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked();
+        clicked = crate::kit::controls::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked();
     });
     clicked
 }
@@ -8150,14 +8150,14 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
         if picker.clicked() {
             card.bank_picking = !card.bank_picking;
         }
-        cleared = theme::row_button_danger(ui, BANK_CLEAR).clicked();
+        cleared = crate::kit::controls::row_button_danger(ui, BANK_CLEAR).clicked();
     });
 
     if !card.bank_picking {
         return cleared;
     }
     ui.add_space(6.0);
-    if theme::secondary_button(ui, BANK_CLOSE_LIST).clicked() {
+    if crate::kit::controls::row_button(ui, BANK_CLOSE_LIST).clicked() {
         card.bank_picking = false;
     }
     ui.add_space(6.0);
@@ -8402,14 +8402,37 @@ pub(crate) fn sequence_steps(
 /// the app is 28 and a run two points shorter in this one form would read as a
 /// mismeasurement rather than as a decision. One control, one height.
 pub(crate) fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
-    view_toggle_run(ui, template_view, theme::segmented_control)
+    view_toggle_run(ui, template_view, |ui, cells| kit_segments(ui, cells, crate::kit::controls::SEG_APPS))
+}
+
+/// The heading band's box: the same control a little tighter.
+fn compact_toggle_style() -> crate::kit::controls::SegmentStyle {
+    crate::kit::controls::SegmentStyle { pad: egui::vec2(11.0, 5.0), font_px: 13.0, ..crate::kit::controls::SEG_APPS }
+}
+
+/// How tall [`view_toggle_compact`] draws, for the band that centres its caption
+/// on it.
+pub(crate) fn view_toggle_compact_height(ui: &egui::Ui) -> f32 {
+    use crate::kit::tokens::{self, Role};
+    let style = compact_toggle_style();
+    let role = Role { size: style.font_px, face: theme::BOLD, tracking_em: 0.0 };
+    let text = ui.ctx().fonts_mut(|f| f.layout_job(tokens::job(role, "Steps", egui::Color32::BLACK)).size().y);
+    text + style.pad.y * 2.0 + 8.0
+}
+
+/// The view toggle's cells over the kit's segmented control (a grey track with
+/// the chosen cell lifted onto white), as every other choice row is drawn.
+fn kit_segments(ui: &mut egui::Ui, cells: &[theme::Segment<'_>], style: crate::kit::controls::SegmentStyle) -> Option<usize> {
+    let labels: Vec<&str> = cells.iter().map(|c| c.label).collect();
+    let selected = cells.iter().position(|c| c.selected).unwrap_or(0);
+    crate::kit::controls::segmented(ui, &labels, selected, style)
 }
 
 /// [`view_toggle`] at the design's own height, for 4a's heading band -- see
 /// [`theme::segmented_control_compact`] for why the band gets a different
 /// box from the one this form draws among its fields.
 pub(crate) fn view_toggle_compact(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
-    view_toggle_run(ui, template_view, theme::segmented_control_compact)
+    view_toggle_run(ui, template_view, move |ui, cells| kit_segments(ui, cells, compact_toggle_style()))
 }
 
 /// The toggle's cells and its one rule, over whichever run paints them.
@@ -8545,7 +8568,7 @@ fn app_sequence_block(
                     ui.set_width(room);
                     sequence_chip_row(ui, &app.sequence, source);
                 });
-                if theme::row_button(ui, SEQUENCE_EDIT_BUTTON).clicked() {
+                if crate::kit::controls::row_button(ui, SEQUENCE_EDIT_BUTTON).clicked() {
                     // **On a saved item this opens design 4a's own screen.**
                     //
                     // The rule is one thing and had two editors: a three-column
@@ -8630,7 +8653,7 @@ fn app_sequence_block(
             if rehearse_button(ui).clicked() {
                 action = Some(EditAction::Rehearse);
             }
-            if theme::secondary_button(ui, APP_SEQUENCE_CLOSE).clicked() {
+            if crate::kit::controls::row_button(ui, APP_SEQUENCE_CLOSE).clicked() {
                 app.sequence_open = false;
                 app.previewing = false;
             }
@@ -8674,7 +8697,7 @@ fn app_sequence_block(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         ui.add(egui::TextEdit::singleline(&mut app.literal_draft).desired_width(120.0));
-        let add = theme::secondary_button(ui, "Add text");
+        let add = crate::kit::controls::row_button(ui, "Add text");
         if add.clicked() {
             // Escaping is this app's job, not the user's: they typed a `+`,
             // they get a `+`. See `key_sequence::escape_literal`.
@@ -8721,14 +8744,14 @@ fn app_sequence_block(
             action = Some(EditAction::Rehearse);
         }
         let caption = if app.previewing { APP_SEQUENCE_HIDE } else { APP_SEQUENCE_REVEAL };
-        if theme::secondary_button(ui, caption).clicked() {
+        if crate::kit::controls::row_button(ui, caption).clicked() {
             app.previewing = !app.previewing;
         }
-        if !view.is_default && theme::secondary_button(ui, "Use the default").clicked() {
+        if !view.is_default && crate::kit::controls::row_button(ui, "Use the default").clicked() {
             // The empty string, not the default's own spelling: see `store`.
             app.sequence = String::new();
         }
-        if theme::secondary_button(ui, APP_SEQUENCE_CLOSE).clicked() {
+        if crate::kit::controls::row_button(ui, APP_SEQUENCE_CLOSE).clicked() {
             app.sequence_open = false;
             // Shutting the builder shuts the eye with it. A reveal that
             // survived being scrolled past and came back open later would be
@@ -8763,7 +8786,7 @@ fn app_sequence_block(
 pub const APP_SEQUENCE_REHEARSE: &str = "Rehearse with fake data";
 
 fn rehearse_button(ui: &mut egui::Ui) -> egui::Response {
-    theme::secondary_button(ui, APP_SEQUENCE_REHEARSE)
+    crate::kit::controls::row_button(ui, APP_SEQUENCE_REHEARSE)
 }
 
 /// **4c -- the template view.** The same sequence as one editable line, with
@@ -10136,7 +10159,7 @@ fn app_block(
                         // the box beside it is `theme::SECTION_FIELD_HEIGHT`, 28
                         // points, which is `ROW_BUTTON_HEIGHT_2B`, where
                         // `secondary_button` is 32.
-                        if theme::row_button(ui, APP_BROWSE_BUTTON).clicked() {
+                        if crate::kit::controls::row_button(ui, APP_BROWSE_BUTTON).clicked() {
                             action = Some(EditAction::PickAppFile);
                         }
                     });
@@ -11145,7 +11168,7 @@ fn row_with_buttons(ui: &mut egui::Ui, buttons: &[&str], add: impl FnOnce(&mut e
     // puts the last button flush against the edge.
     let reserved: f32 = buttons
         .iter()
-        .map(|label| theme::row_button_width(ui, label) + theme::ROW_BUTTON_GAP)
+        .map(|label| crate::kit::controls::row_button_width(ui, label) + theme::ROW_BUTTON_GAP)
         .sum();
     let room = (ui.available_width() - reserved).max(FIELD_FLOOR);
     ui.horizontal_wrapped(|ui| {
@@ -11153,7 +11176,7 @@ fn row_with_buttons(ui: &mut egui::Ui, buttons: &[&str], add: impl FnOnce(&mut e
         // The row's three kinds of widget agree on one height the way the
         // generator row's do -- see its comment for why `interact_size.y` is
         // the one dial all of them read.
-        ui.spacing_mut().interact_size.y = theme::ROW_BUTTON_HEIGHT_2B;
+        ui.spacing_mut().interact_size.y = crate::kit::controls::SMALL.height;
         add(ui, room);
     });
 }
@@ -12268,7 +12291,7 @@ pub fn draw_detail_edit(
                                 false,
                                 room,
                             );
-                            if theme::row_button(ui, COPY_LABEL).clicked() {
+                            if crate::kit::controls::row_button(ui, COPY_LABEL).clicked() {
                                 action = EditAction::CopyUsername;
                             }
                         });
@@ -12322,7 +12345,7 @@ pub fn draw_detail_edit(
                             // asking for the first candidate are one thing to
                             // the user and are one thing here. See
                             // `draw_generator_modal`.
-                            if theme::row_button(ui, COPY_LABEL).clicked() {
+                            if crate::kit::controls::row_button(ui, COPY_LABEL).clicked() {
                                 action = EditAction::CopyPassword;
                             }
                         });
@@ -12549,7 +12572,7 @@ pub fn draw_detail_edit(
                                 number_room,
                             );
                             if offers_clear
-                                && theme::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked()
+                                && crate::kit::controls::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked()
                             {
                                 clear_card = true;
                             }
@@ -19562,21 +19585,6 @@ mod sequence_builder_tests {
             );
             found[0]
         }
-
-        /// Every filled box that wholly contains `inner` and is no more than
-        /// `slack` bigger than it on any side -- the box drawn *round* a
-        /// label, found without knowing where its owner put it.
-        fn boxes_around(&self, inner: Rect, slack: f32) -> Vec<PaintedRect> {
-            self.rects
-                .iter()
-                .copied()
-                .filter(|r| {
-                    r.rect.contains_rect(inner)
-                        && r.rect.width() - inner.width() <= slack
-                        && r.rect.height() - inner.height() <= slack
-                })
-                .collect()
-        }
     }
 
     fn walk(shape: &egui::Shape, painted: &mut Painted) {
@@ -21056,87 +21064,40 @@ mod sequence_builder_tests {
 
     // -- 4a/4c: the Steps/Template toggle ----------------------------------
 
-    /// **One pill, and the view in force is the filled cell.**
+    /// **One track, and the view in force is the lifted cell.**
     ///
-    /// 4a and 4c draw this toggle identically: a run outlined `#d7d3d3` at
-    /// `border-radius: 7px`, with the current view `background: #1b3fa0;
-    /// color: #ffffff` and the other on white. That is
-    /// [`theme::segmented_control`] and nothing else in the app, which is the
-    /// whole reason this is asserted in colour rather than only in position:
-    /// this function used to draw two independent `egui::Button`s with the
-    /// current one washed in `BLUE_WASH`, and a test that only found the two
-    /// captions could not tell that apart from the control the design asks
-    /// for.
-    ///
-    /// The fill is read off the box painted AROUND each caption, so a run that
-    /// took the right colours from the right constants and then laid its cells
-    /// out somewhere else still reds.
+    /// The toggle is the kit's segmented control, as every other choice row:
+    /// a grey track with the cell in force lifted onto white (spec part C
+    /// 0.3). The cells are read off the boxes painted around each caption.
     #[test]
-    fn the_view_toggle_is_one_segmented_run_with_the_current_view_filled() {
+    fn the_view_toggle_is_one_segmented_track_with_the_current_view_lifted() {
         let item = item();
         let ctx = styled_context(PANE);
         let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}");
         let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let p = crate::kit::tokens::palette(&ctx);
 
-        // The builder opens on Steps, so Steps is the cell in force.
-        let cell = |painted: &Painted, caption: &str| -> PaintedRect {
+        // The cell in force is the white one around its caption; the other
+        // caption has no cell of its own, only the grey track under it.
+        let lifted = |painted: &Painted, caption: &str| -> bool {
             let label = painted.rect_of(caption);
-            let found = painted.boxes_around(label, theme::SEGMENT_PADDING + 4.0);
-            assert_eq!(
-                found.len(),
-                1,
-                "{caption:?} has {} boxes drawn round it rather than one cell",
-                found.len()
-            );
-            found[0]
+            painted.rects.iter().any(|r| r.fill == p.card && r.rect.contains_rect(label) && r.rect.height() < 60.0)
         };
+        let track = |painted: &Painted, caption: &str| -> bool {
+            let label = painted.rect_of(caption);
+            painted.rects.iter().any(|r| r.fill == p.hover && r.rect.contains_rect(label))
+        };
+        assert!(lifted(&open, VIEW_STEPS), "the view in force is not lifted onto white");
+        assert!(!lifted(&open, VIEW_TEMPLATE), "the view NOT in force is lifted too");
+        assert!(track(&open, VIEW_STEPS) && track(&open, VIEW_TEMPLATE), "the two cells are not on one track");
 
-        let steps = cell(&open, VIEW_STEPS);
-        let template = cell(&open, VIEW_TEMPLATE);
-        assert_eq!(
-            steps.fill,
-            theme::BLUE,
-            "the view in force is not filled #1b3fa0. `BLUE_WASH` is the weight this design \
-             system reserves for a nav row, and this is a two-answer question"
-        );
-        assert_eq!(template.fill, theme::CARD, "the view NOT in force is not left on white");
-        assert_eq!(template.stroke, theme::BORDER, "the run is not outlined #dedbd9");
-
-        // **One pill and not two buttons.** The cells are joined -- they touch
-        // to within `SEGMENT_SEAM` -- and they are the same height, which is
-        // what says "two positions of one control" rather than "two things you
-        // might press".
-        assert!(
-            (template.rect.left() - steps.rect.right()).abs() <= theme::SEGMENT_SEAM + 0.5,
-            "the two cells are {} apart; a segmented run has no gap at its seam",
-            template.rect.left() - steps.rect.right()
-        );
-        assert!(
-            (steps.rect.height() - theme::SEGMENT_HEIGHT).abs() <= 0.5
-                && (template.rect.height() - theme::SEGMENT_HEIGHT).abs() <= 0.5,
-            "a cell is {} tall and the app's one segmented control is {}",
-            steps.rect.height(),
-            theme::SEGMENT_HEIGHT
-        );
-
-        // **The rounding belongs to the run.** The first cell rounds its left
-        // corners only and the last its right corners only, which is the
-        // geometric difference between a pill and two rounded buttons.
-        assert_eq!(steps.radius.ne, 0, "the first cell rounds its interior corner");
-        assert_eq!(template.radius.nw, 0, "the last cell rounds its interior corner");
-        assert!(steps.radius.nw > 0 && template.radius.ne > 0, "the run has no outer rounding");
-
-        // And it still *works*: pressing the unlit cell moves the control, and
-        // the lit cell is then the other one.
-        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(template.rect.center()));
+        // And it still works: pressing the unlit cell moves the control.
+        let at = open.rect_of(VIEW_TEMPLATE).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
         let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         assert!(draft.app.as_ref().unwrap().template_view, "pressing Template did not take");
-        assert_eq!(
-            cell(&after, VIEW_TEMPLATE).fill,
-            theme::BLUE,
-            "the control moved but the fill did not follow it"
-        );
-        assert_eq!(cell(&after, VIEW_STEPS).fill, theme::CARD);
+        assert!(lifted(&after, VIEW_TEMPLATE), "the control moved but the lift did not follow it");
+        assert!(!lifted(&after, VIEW_STEPS));
     }
 
     /// **Pressing the cell already in force changes nothing.**
@@ -22867,7 +22828,10 @@ mod edit_pane_layout_tests {
     #[test]
     fn the_brand_sits_left_of_the_number_on_the_same_line() {
         let mut draft = revealed_full_card_draft();
-        let painted = full_card_frame(&[], &mut draft);
+        // 900 wide: the row's Remove is the kit's 40-high button now, and at
+        // 700 the number no longer fits beside the chooser and wraps (that
+        // width is `the_card_rows_remove_ends_where...`'s concern).
+        let painted = full_card_frame_at(900.0, &mut draft);
         let brand = painted.frame_around(painted.rect_of("Visa"));
         let number = painted.frame_around(painted.rect_of("4111111111111111"));
         assert!(brand.right() < number.left(), "the brand {brand:?} is not left of {number:?}");
@@ -22991,7 +22955,7 @@ mod edit_pane_layout_tests {
             "the picker {picker:?} and Clear {clear:?} are not centred on one line"
         );
         assert!((picker.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5, "picker {picker:?}");
-        assert!((clear.height() - theme::ROW_BUTTON_HEIGHT_2B).abs() <= 0.5, "Clear {clear:?}");
+        assert!((clear.height() - crate::kit::controls::SMALL.height).abs() <= 0.5, "Clear {clear:?}");
         assert!(picker.right() < clear.left(), "Clear is not after the picker");
         // Clear is the Remove buttons' own control, in their own ink.
         assert_eq!(ink_of_run(&painted, BANK_CLEAR), ink_of_run_first(&painted, SLOT_REMOVE_BUTTON));
@@ -23182,7 +23146,7 @@ mod edit_pane_layout_tests {
         let output = ctx.run_ui(raw_input(pane, &[]), |ui| {
             ui.horizontal(|ui| {
                 // The row's own height dial, as `row_with_buttons` sets it.
-                ui.spacing_mut().interact_size.y = theme::ROW_BUTTON_HEIGHT_2B;
+                ui.spacing_mut().interact_size.y = crate::kit::controls::SMALL.height;
                 combo = ui
                     .scope(|ui| {
                         form_combo(ui, "probe-brand")
@@ -24487,10 +24451,9 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
         let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
-        // `theme::row_button`'s own `ROW_BUTTON_TEXT_SIZE` and the
-        // proportional family it sets, which is what `theme::apply`'s default
-        // `TextStyle::Button` is NOT at (13pt).
-        let expected = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+        // The kit's row button (slice 15f): 14pt Archivo SemiBold, which is
+        // what `theme::apply`'s default `TextStyle::Button` is NOT at (13pt).
+        let expected = egui::FontId::new(14.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
         let browse = painted.font_of(BROWSE);
         assert_eq!(
             browse, expected,
@@ -24504,11 +24467,11 @@ mod edit_pane_layout_tests {
         // also the height of the box it now sits beside.
         let frame_rect = painted.frame_around(painted.rect_of(BROWSE));
         assert!(
-            (frame_rect.height() - theme::ROW_BUTTON_HEIGHT_2B).abs() <= 0.5,
-            "{BROWSE:?} paints a {}pt-tall frame, not theme::ROW_BUTTON_HEIGHT_2B ({}) -- a \
+            (frame_rect.height() - crate::kit::controls::SMALL.height).abs() <= 0.5,
+            "{BROWSE:?} paints a {}pt-tall frame, not crate::kit::controls::SMALL.height ({}) -- a \
              button with no height floor sits short of the box beside it",
             frame_rect.height(),
-            theme::ROW_BUTTON_HEIGHT_2B
+            crate::kit::controls::SMALL.height
         );
     }
 

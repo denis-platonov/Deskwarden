@@ -606,9 +606,10 @@ pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
 /// The Sends row's label, spelled once so the rail and the tests that press
 /// it cannot drift apart.
 ///
-/// **`Sent`**, the owner's word for it -- "prob only have Sent and Shared with
-/// me (both ways folders) - that's it": two folders, one for each direction.
-pub const SENDS_ROW_LABEL: &str = "Sent";
+/// **`Shared`**, the design's word for it (spec A 4, and the page's own title).
+/// The owner's earlier "Sent" is retired: the rail, the page and the palette
+/// say one word. "Shared with me" is the other direction.
+pub const SENDS_ROW_LABEL: &str = "Shared";
 
 /// Design 5b's `Shared with me` row: the Sends **other people** sent to this
 /// user and this app imported.
@@ -5060,7 +5061,7 @@ mod tests {
         let near = |label: &str| painted.iter().find(|(t, _)| t == label).map(|(_, r)| *r).expect(label);
         let sent = near(SENDS_ROW_LABEL);
         let received = near(RECEIVED_ROW_LABEL);
-        assert!(painted.iter().any(|(t, r)| t == "3" && (r.center().y - sent.center().y).abs() < 2.0), "Sent does not count 3: {painted:?}");
+        assert!(painted.iter().any(|(t, r)| t == "3" && (r.center().y - sent.center().y).abs() < 2.0), "Shared does not count 3: {painted:?}");
         assert!(painted.iter().any(|(t, r)| t == "2" && (r.center().y - received.center().y).abs() < 2.0), "Shared with me does not count 2: {painted:?}");
     }
 
