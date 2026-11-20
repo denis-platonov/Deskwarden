@@ -4766,7 +4766,9 @@ const CLOSE_MARK_STROKE: f32 = 1.3;
 
 /// What the pointer is told the mark does. One word, and the same word on
 /// every card: "Close" would be a promise about the window.
-const CLOSE_MARK_TOOLTIP: &str = "Dismiss";
+fn close_mark_tooltip() -> &'static str {
+    crate::i18n::t("vault.dismiss")
+}
 
 /// **How far the mark's hit box is held off the card's right-hand edge**, and
 /// the one number in this family that had to be CHOSEN rather than lifted.
@@ -4862,7 +4864,7 @@ fn paint_close_mark(ui: &Ui, rect: Rect, response: &Response, ink: CloseInk) {
 /// widgets in a layout. A card that knows the rectangle its header occupies --
 /// which is every modal in this crate -- wants [`modal_dismiss_mark`].
 pub fn close_glyph(ui: &mut Ui) -> Response {
-    close_glyph_titled(ui, CLOSE_MARK_TOOLTIP)
+    close_glyph_titled(ui, close_mark_tooltip())
 }
 
 /// [`close_glyph`] **under a caption of the caller's own.**
@@ -4933,7 +4935,7 @@ pub fn modal_dismiss_mark(ui: &mut Ui, line: Rect, ink: CloseInk) -> Response {
     // layer-derived id would be shared with whatever else that layer marks.
     let response = ui.interact(at, ui.id().with("modal-dismiss"), Sense::click());
     paint_close_mark(ui, at, &response, ink);
-    response.on_hover_text(CLOSE_MARK_TOOLTIP)
+    response.on_hover_text(close_mark_tooltip())
 }
 
 // ---------------------------------------------------------------------------
@@ -5865,7 +5867,7 @@ fn tune_rows(center: Pos2) -> Vec<TuneRow> {
 /// [`close_glyph`]'s "Dismiss" is the precedent for an unlabelled drawn
 /// control naming itself on hover.
 pub fn tune_button(ui: &mut Ui) -> Response {
-    tune_mark(ui, TUNE_BUTTON_SIZE, false, "Preferences")
+    tune_mark(ui, TUNE_BUTTON_SIZE, false, crate::i18n::t("titlebar.preferences"))
 }
 
 /// The titlebar control's box.
@@ -5987,7 +5989,7 @@ pub fn account_switcher_button(ui: &mut Ui) -> Response {
         ],
         stroke,
     );
-    response.on_hover_text("Switch account")
+    response.on_hover_text(crate::i18n::t("titlebar.switch_account"))
 }
 
 /// How full each of the eye's lids is, as the exponent on `1 - t²`.
@@ -6119,7 +6121,7 @@ pub fn pencil_glyph_at(ui: &mut Ui, rect: Rect, id: egui::Id) -> Response {
     }
     let color = if response.hovered() { INK } else { TEXT_GHOST };
     paint_pencil(ui.painter(), rect, color);
-    response.on_hover_text("Edit folder")
+    response.on_hover_text(crate::i18n::t("folder.edit_tooltip"))
 }
 
 /// [`pencil_glyph_at`]'s SHAPE, with no interaction and no hover state: the
@@ -7496,7 +7498,7 @@ pub fn section_disabled_text_field_reserving(
 pub fn disabled_password_field(ui: &mut Ui) -> Rect {
     let box_rect = disabled_field_box(ui, &masked_readout(), 52.0, FIELD_HEIGHT, 14.0);
     let label = ui.painter().layout_no_wrap(
-        "Show".to_string(),
+        crate::i18n::t("field.show_toggle").to_string(),
         FontId::new(11.0, FontFamily::Name(SEMIBOLD.into())),
         TEXT_GHOST,
     );
@@ -8503,10 +8505,10 @@ impl SharePillKind {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Shared => "Shared",
-            Self::Invited => "Invited",
-            Self::KeyChanged => "Key changed",
-            Self::Gone => "Not receiving",
+            Self::Shared => crate::i18n::t("share_pill.shared"),
+            Self::Invited => crate::i18n::t("share_pill.invited"),
+            Self::KeyChanged => crate::i18n::t("share_pill.key_changed"),
+            Self::Gone => crate::i18n::t("share_pill.gone"),
         }
     }
 
@@ -9133,7 +9135,7 @@ pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R)
 /// login is offered` -- drawn at [`TEXT_GHOST`] because it explains the title
 /// rather than competing with it.
 ///
-/// `changed` draws the dirty mark: [`CHANGED_PILL`] in the caution tone,
+/// `changed` draws the dirty mark: [`changed_pill`] in the caution tone,
 /// pushed to the right edge of the band. §8a puts its `Changed` list in the
 /// rail; this puts a mark on each card as well, and the reason is the pane
 /// this form lives in -- the rail is chrome the form cannot always afford
@@ -9236,7 +9238,7 @@ pub fn section_card_header_at(
                     // card title and a pill do not both fit, and a
                     // right-to-left layout would push the pill out of the
                     // card rather than leave it off.
-                    let width = state_pill_width(ui.painter(), CHANGED_TONE, CHANGED_PILL);
+                    let width = state_pill_width(ui.painter(), CHANGED_TONE, changed_pill());
                     if ui.available_width() >= width {
                         // **Zero height, and centred on the TITLE.** The slot
                         // claims the width it needs and none of the height:
@@ -9252,7 +9254,7 @@ pub fn section_card_header_at(
                             ui.painter(),
                             Pos2::new(rect.right() - width, title_rect.center().y),
                             CHANGED_TONE,
-                            CHANGED_PILL,
+                            changed_pill(),
                         );
                     }
                 }
@@ -9681,7 +9683,9 @@ fn section_row_impl<R>(
 /// The word on the dirty mark. §8a's rail says `Changed`; the pill says the
 /// same word, because two spellings of one state is how a user learns that
 /// they are two states.
-pub const CHANGED_PILL: &str = "Changed";
+pub fn changed_pill() -> &'static str {
+    crate::i18n::t("edit.changed_pill")
+}
 
 /// The dirty mark's colours: §8a's `Unsaved changes` pill exactly --
 /// `color: #7a4f05; background: #fef6e7; border: 1px solid #f2d99b`, which is
@@ -9772,11 +9776,7 @@ pub fn strength_meter_inline(ui: &mut Ui, filled: usize, word: &str, characters:
     // the thing the user needs. Truncating instead would produce
     // `Strong \u{b7} 20 char\u{2026}`, which spends the width on the half
     // that matters least.
-    let counted = if characters == 1 {
-        "1 character".to_string()
-    } else {
-        format!("{characters} characters")
-    };
+    let counted = crate::i18n::tn("strength.characters", characters as u64, &[]);
     let long = format!("{word} \u{b7} {counted}");
     let room = ui.available_width();
     let fits = |text: &str| {

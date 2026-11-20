@@ -52,18 +52,18 @@ pub fn password(ui: &mut Ui, id: egui::Id, value: &mut String, revealed: &mut bo
     let p = tokens::palette(ui.ctx());
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::hover());
     field_box(ui, rect, ui.memory(|m| m.has_focus(id)));
-    let generate_w = controls::button_width(ui.ctx(), controls::ButtonKind::Tinted, controls::SMALL, GENERATE, true);
+    let generate_w = controls::button_width(ui.ctx(), controls::ButtonKind::Tinted, controls::SMALL, generate_label(), true);
     let generate = Rect::from_min_size(egui::pos2(rect.right() - 6.0 - generate_w, rect.center().y - 20.0), Vec2::new(generate_w, 40.0));
     let eye = Rect::from_min_size(egui::pos2(generate.left() - 6.0 - 40.0, rect.center().y - 20.0), Vec2::splat(40.0));
     let mut generate_ui = ui.new_child(egui::UiBuilder::new().max_rect(generate));
-    let generate_clicked = controls::button(&mut generate_ui, controls::ButtonKind::Tinted, controls::SMALL, GENERATE, Some(icon::glyph::GEN)).clicked();
+    let generate_clicked = controls::button(&mut generate_ui, controls::ButtonKind::Tinted, controls::SMALL, generate_label(), Some(icon::glyph::GEN)).clicked();
     let eye_response = ui.interact(eye, id.with("eye"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     if eye_response.hovered() {
         ui.painter().rect_filled(eye, CornerRadius::same(11), p.hover);
     }
     let d = if *revealed { icon::glyph::EYE_OFF } else { icon::glyph::EYE };
     icon::stroke(ui.painter(), Rect::from_center_size(eye.center(), Vec2::splat(19.0)), d, 2.0, p.text_icon);
-    crate::kit::tips::hint(ui, &eye_response, "Show or hide", &[]);
+    crate::kit::tips::hint(ui, &eye_response, crate::i18n::t("input.show_hide"), &[]);
     if eye_response.clicked() {
         *revealed = !*revealed;
     }
@@ -75,7 +75,7 @@ pub fn password(ui: &mut Ui, id: egui::Id, value: &mut String, revealed: &mut bo
             .password(!*revealed)
             .frame(egui::Frame::NONE)
             .font(FontId::new(17.0, FontFamily::Monospace))
-            .hint_text("Type or generate one")
+            .hint_text(crate::i18n::t("input.password_hint"))
             .desired_width(inner.width())
             .vertical_align(egui::Align::Center),
     );
@@ -84,7 +84,9 @@ pub fn password(ui: &mut Ui, id: egui::Id, value: &mut String, revealed: &mut bo
 }
 
 /// Generate's word.
-pub const GENERATE: &str = "Generate";
+pub fn generate_label() -> &'static str {
+    crate::i18n::t("input.generate")
+}
 
 /// The size of a sign-in or lock field: its height, corner radius and type.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,7 +131,7 @@ pub fn secret(
     }
     let d = if *revealed { icon::glyph::EYE_OFF } else { icon::glyph::EYE };
     icon::stroke(ui.painter(), Rect::from_center_size(eye.center(), Vec2::splat(19.0)), d, 2.0, p.text_icon);
-    crate::kit::tips::hint(ui, &eye_response, "Show or hide", &[]);
+    crate::kit::tips::hint(ui, &eye_response, crate::i18n::t("input.show_hide"), &[]);
     if eye_response.clicked() {
         *revealed = !*revealed;
     }

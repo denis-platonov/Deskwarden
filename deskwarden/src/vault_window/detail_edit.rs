@@ -28496,7 +28496,7 @@ mod edit_pane_layout_tests {
             // One `Changed` pill on the card, plus -- where the rail is drawn
             // -- one `Changed` heading in it. Never zero.
             assert!(
-                painted.strings().contains(&theme::CHANGED_PILL),
+                painted.strings().contains(&theme::changed_pill()),
                 "{pane:?}: nothing on screen says a field changed: {:?}",
                 painted.strings()
             );
@@ -32306,7 +32306,7 @@ mod v2_editor_tests {
         let mut draft = EditDraft::from_item(&a_login());
         let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
         assert!(!p.texts.iter().any(|t| t.0.contains("hunter2")), "the password is painted in clear");
-        assert!(p.text(crate::kit::input::GENERATE).is_some(), "Generate is in the field");
+        assert!(p.text(crate::kit::input::generate_label()).is_some(), "Generate is in the field");
         assert!(["Weak", "Fair", "Strong", "Very strong"].iter().any(|w| p.texts.iter().any(|t| t.0 == *w)), "the meter names the strength");
     }
 

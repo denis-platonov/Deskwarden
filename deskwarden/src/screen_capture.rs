@@ -261,29 +261,22 @@ impl CaptureRefusal {
     /// The headline, verbatim from design 6d for the variants it names.
     pub fn title(&self) -> &'static str {
         match self {
-            CaptureRefusal::Blocked => "Screen capture is blocked",
-            CaptureRefusal::OffScreen => "That region isn't on screen",
-            CaptureRefusal::TooSmall => "That region is too small",
-            CaptureRefusal::TooLarge => "That region is too large",
-            CaptureRefusal::GdiFailed => "Windows couldn't copy that region",
+            CaptureRefusal::Blocked => crate::i18n::t("capture.blocked_title"),
+            CaptureRefusal::OffScreen => crate::i18n::t("capture.off_screen_title"),
+            CaptureRefusal::TooSmall => crate::i18n::t("capture.too_small_title"),
+            CaptureRefusal::TooLarge => crate::i18n::t("capture.too_large_title"),
+            CaptureRefusal::GdiFailed => crate::i18n::t("capture.gdi_failed_title"),
         }
     }
 
     /// The sentence under the headline: what the user can do about it.
     pub fn detail(&self) -> &'static str {
         match self {
-            CaptureRefusal::Blocked => {
-                "The window is marked protected by its app. Use the secret the site prints \
-                 under the code instead."
-            }
-            CaptureRefusal::OffScreen => "Drag the box over the code again.",
-            CaptureRefusal::TooSmall => {
-                "Drag a box around the whole code, including its white margin."
-            }
-            CaptureRefusal::TooLarge => "Drag a box around the code rather than the whole desktop.",
-            CaptureRefusal::GdiFailed => {
-                "Try once more, or enter the secret the site prints under the code by hand."
-            }
+            CaptureRefusal::Blocked => crate::i18n::t("capture.blocked_detail"),
+            CaptureRefusal::OffScreen => crate::i18n::t("capture.off_screen_detail"),
+            CaptureRefusal::TooSmall => crate::i18n::t("capture.too_small_detail"),
+            CaptureRefusal::TooLarge => crate::i18n::t("capture.too_large_detail"),
+            CaptureRefusal::GdiFailed => crate::i18n::t("capture.gdi_failed_detail"),
         }
     }
 }

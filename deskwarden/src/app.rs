@@ -847,9 +847,9 @@ impl FillChoice {
     /// different things in two different parts of this UI.
     pub fn label(&self) -> String {
         match self {
-            Self::UserTabPass => "Username + Tab + Password".to_string(),
+            Self::UserTabPass => crate::i18n::t("picker.send_all").to_string(),
             Self::Just(field) => field.label(),
-            Self::Saved => "Saved sequence".to_string(),
+            Self::Saved => crate::i18n::t("picker.send_sequence").to_string(),
         }
     }
 }
@@ -1003,11 +1003,11 @@ impl FillShortcut {
     /// reader would go and look at.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Picker => "Fill the focused app",
-            Self::Username => "Type the username",
-            Self::Password => "Type the password",
-            Self::Totp => "Type the one-time code",
-            Self::Sequence => "Type the saved sequence",
+            Self::Picker => crate::i18n::t("shortcut.picker"),
+            Self::Username => crate::i18n::t("shortcut.username"),
+            Self::Password => crate::i18n::t("shortcut.password"),
+            Self::Totp => crate::i18n::t("shortcut.totp"),
+            Self::Sequence => crate::i18n::t("shortcut.sequence"),
         }
     }
 }
@@ -2066,7 +2066,9 @@ pub fn prompt_choices(item: Option<&VaultItem>) -> Vec<FillChoice> {
 /// It lives here rather than in `prompt_card` because it is a product
 /// decision this file's tests pin, and because the painter is handed the
 /// string rather than owning it -- see [`recall_rows`].
-pub const RECALL_BACK_LABEL: &str = "Pick a different record";
+pub fn recall_back_label() -> &'static str {
+    crate::i18n::t("recall.back")
+}
 
 /// The keycap the back row draws, and the key it accepts: **Backspace**.
 ///
@@ -2534,7 +2536,7 @@ pub trait PromptPresenter {
     ) -> Option<FillChoice>;
     /// Shows the **remembered-record card** -- the same overlay as
     /// [`Self::show`], with the fill rows numbered and
-    /// [`RECALL_BACK_LABEL`] under them -- and answers which row the user
+    /// [`recall_back_label`] under them -- and answers which row the user
     /// took.
     ///
     /// A separate method rather than a flag on [`Self::show`], for the reason
@@ -2733,7 +2735,7 @@ impl PromptPresenter for FnPresenter {
 /// [`crate::prompt_card::run_with`] over [`crate::prompt_card::REAL`] for the
 /// window -- and adds exactly one row and one mapping. It **decides** nothing
 /// that is not already decided in this file: which rows exist is
-/// [`recall_rows_from`], what the extra row says is [`RECALL_BACK_LABEL`], and
+/// [`recall_rows_from`], what the extra row says is [`recall_back_label`], and
 /// what an index means is [`recall_at`].
 ///
 /// The crate's rule is that a type whose only reader is a painter belongs
@@ -2789,7 +2791,7 @@ fn show_recall_card(
         rows.clear();
     }
     rows.push(crate::prompt_card::Row {
-        primary: RECALL_BACK_LABEL.to_string(),
+        primary: recall_back_label().to_string(),
         account,
         context,
     });

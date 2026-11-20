@@ -401,9 +401,9 @@ pub fn permit<T>(
 /// wording can drift into implying the operation happened.
 pub fn refusal_text(outcome_was_cannot: bool) -> &'static str {
     if outcome_was_cannot {
-        "This item asks for the master password. Turn on Windows Hello quick unlock to confirm it."
+        crate::i18n::t("reprompt.refusal_cannot")
     } else {
-        "Cancelled. This item asks for the master password, so nothing was revealed or copied."
+        crate::i18n::t("reprompt.refusal_cancelled")
     }
 }
 

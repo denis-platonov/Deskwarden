@@ -61,10 +61,10 @@ pub fn tag_role(size: TagSize) -> Role {
 /// A tag's word and colours.
 fn tag_look(p: &tokens::Palette, kind: TagKind) -> (&'static str, Color32, Color32) {
     match kind {
-        TagKind::App => ("App", p.tag_neutral_bg, p.tag_neutral_ink),
+        TagKind::App => (crate::i18n::t("detail.row_app"), p.tag_neutral_bg, p.tag_neutral_ink),
         TagKind::TwoFa => ("2FA", p.tag_2fa_bg, p.done_ink),
-        TagKind::Shared => ("Shared", p.blue, Color32::WHITE),
-        TagKind::ViewOnly => ("View only", p.tag_neutral_bg, p.tag_neutral_ink),
+        TagKind::Shared => (crate::i18n::t("list.shared_pill"), p.blue, Color32::WHITE),
+        TagKind::ViewOnly => (crate::i18n::t("list.view_only"), p.tag_neutral_bg, p.tag_neutral_ink),
     }
 }
 
