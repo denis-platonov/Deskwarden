@@ -85,10 +85,14 @@ use eframe::egui::{self, CornerRadius, Margin};
 
 mod shared_page;
 
-/// The Shared page's own title: a word only the pane paints (the rail row is
-/// "Sent"), which the window's reachability tests look for to know the PANE
-/// drew and not just the row that leads to it.
+/// The Shared page's own title. The rail row now says the same word (the
+/// design has one name for the screen), so it no longer proves the PANE drew.
 pub use shared_page::TITLE as SHARED_TITLE;
+
+/// The Shared page's sub-line: a sentence only the pane paints, which the
+/// window's reachability tests look for to know the PANE drew and not just the
+/// row that leads to it.
+pub use shared_page::SUB as SHARED_SUB;
 
 /// The one line of subtext under the heading. **It is what makes the excluded
 /// scope honest rather than hidden**: this screen shows every Send, including
@@ -2281,7 +2285,10 @@ pub const SUGGESTIONS_EYEBROW: &str = "SENT TO BEFORE";
 pub const FORGET_MARK: &str = "\u{00D7}";
 
 /// A suggestion's hover wash, rounded inside the list's own 9pt corner.
-const SUGGESTION_ROW_RADIUS: CornerRadius = CornerRadius::same(6);
+const SUGGESTION_ROW_RADIUS: CornerRadius = CornerRadius::same(10);
+
+/// A suggestion row (the v2 popover): a 30 tile with 7 above and below.
+const SUGGESTION_ROW_HEIGHT: f32 = 44.0;
 
 /// How many Sends this file holds for a person, beside their address.
 pub fn sent_count_words(count: usize) -> String {
@@ -2379,38 +2386,28 @@ pub(crate) fn draw_people_suggestions(
         .order(egui::Order::Foreground)
         .fixed_pos(field.rect.left_bottom() + egui::vec2(0.0, 4.0))
         .show(ui.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(theme::CARD)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                .corner_radius(CornerRadius::same(9))
-                .inner_margin(Margin::same(5))
-                .shadow(egui::Shadow {
-                    offset: [0, 10],
-                    blur: 24,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(40),
-                })
+            // The v2 popover: a white card at radius 14 with the design's ring
+            // and soft shadow, 8 of padding, tracked capitals over rows with
+            // an initials tile.
+            let palette = crate::kit::tokens::palette(ui.ctx());
+            crate::kit::tokens::card_frame(&palette, 14)
+                .inner_margin(Margin::same(8))
                 .show(ui, |ui| {
-                    let inner = (width - 10.0).max(120.0);
+                    let inner = (width - 16.0).max(160.0);
                     ui.set_width(inner);
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
-                    ui.add_space(3.0);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(eyebrow)
-                                .size(10.0)
-                                .strong()
-                                .color(theme::TEXT_GHOST),
-                        );
+                        crate::kit::card::section_label(ui, eyebrow, palette.text_ghost);
                     });
-                    ui.add_space(3.0);
+                    ui.add_space(4.0);
                     for person in &people {
                         let (row, pressed) =
-                            ui.allocate_exact_size(egui::vec2(inner, 30.0), egui::Sense::click());
+                            ui.allocate_exact_size(egui::vec2(inner, SUGGESTION_ROW_HEIGHT), egui::Sense::click());
                         let mark = egui::Rect::from_min_size(
-                            egui::pos2(row.right() - 26.0, row.top()),
-                            egui::vec2(26.0, row.height()),
+                            egui::pos2(row.right() - 32.0, row.top()),
+                            egui::vec2(32.0, row.height()),
                         );
                         let forget = ui.interact(
                             mark,
@@ -2419,30 +2416,37 @@ pub(crate) fn draw_people_suggestions(
                         );
                         let p = ui.painter();
                         if pressed.hovered() || forget.hovered() {
-                            p.rect_filled(row, SUGGESTION_ROW_RADIUS, theme::BLUE_WASH);
+                            p.rect_filled(row, SUGGESTION_ROW_RADIUS, palette.row_hover_blue);
                         }
-                        let text_left = row.left() + 8.0;
+                        let tile = egui::Rect::from_min_size(
+                            egui::pos2(row.left() + 6.0, row.center().y - 15.0),
+                            egui::Vec2::splat(30.0),
+                        );
+                        let (bg, fg) = crate::kit::avatar::initials_colours(&person.email);
+                        let initials: String = person.email.chars().take(2).flat_map(char::to_uppercase).collect();
+                        crate::kit::avatar::paint(p, tile, &crate::kit::avatar::Look::Initials { text: initials, bg, fg }, 9);
+                        let text_left = tile.right() + 10.0;
                         let count = p.text(
                             egui::pos2(mark.left() - 6.0, row.center().y),
                             egui::Align2::RIGHT_CENTER,
                             count(person),
-                            egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                            theme::TEXT_FAINT,
+                            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                            palette.text_faint,
                         );
                         let email = elided(
                             p,
                             &person.email,
-                            egui::FontId::new(13.0, egui::FontFamily::Proportional),
-                            theme::INK,
+                            egui::FontId::new(15.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+                            palette.ink,
                             (count.left() - 10.0 - text_left).max(0.0),
                         );
-                        p.galley(egui::pos2(text_left, row.center().y - email.size().y / 2.0), email, theme::INK);
+                        p.galley(egui::pos2(text_left, row.center().y - email.size().y / 2.0), email, palette.ink);
                         p.text(
                             mark.center(),
                             egui::Align2::CENTER_CENTER,
                             FORGET_MARK,
-                            egui::FontId::new(14.0, egui::FontFamily::Proportional),
-                            if forget.hovered() { theme::ERROR } else { theme::TEXT_FAINT },
+                            egui::FontId::new(15.0, egui::FontFamily::Proportional),
+                            if forget.hovered() { palette.error } else { palette.text_faint },
                         );
                         if forget.hovered() || pressed.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

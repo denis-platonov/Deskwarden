@@ -1485,17 +1485,13 @@ impl Surface {
             // the rail is measured against the window's floor, so a preview
             // drawn taller would hide exactly the overflow it is here to show.
             Surface::VaultRail => egui::vec2(SIDEBAR_WIDTH, PANE_HEIGHT),
-            // The same column the item list is drawn in, at the same height:
-            // Password health replaces the list in place, so a preview at any
-            // other width is a picture of a pane nobody ships -- and this
-            // surface is entirely about what happens at the column's right
-            // edge.
+            // A whole-body page now (spec A 4), so the Shared page's size.
             Surface::VaultHealth
             | Surface::VaultHealthBreached
             | Surface::VaultHealthReusedOnly
             | Surface::VaultHealthWeakOnly
             | Surface::VaultHealthBreachedOnly
-            | Surface::VaultHealthEmptyFilter => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            | Surface::VaultHealthEmptyFilter => egui::vec2(SENDS_WIDTH, PANE_HEIGHT),
             // The Sends screen is TWO columns and is only worth looking at as
             // one picture; see [`SENDS_WIDTH`].
             Surface::SendsSelected
@@ -1863,11 +1859,6 @@ fn main() -> eframe::Result {
                 rail_received: false,
                 rail_scope: sidebar::SendScope::All,
                 list_offline: false,
-                // The weak finding, so the health shot carries the selected
-                // treatment too -- and it is the row with a detail line
-                // under its name, which is the taller of the row's two
-                // layouts.
-                health_selected: Some("health-weak".to_string()),
                 // 5b's own picked row: the Used Send whose link is dead and
                 // whose views are spent. Picked because it is the ONE row
                 // where every cell of the detail pane is in its interesting
@@ -1998,8 +1989,6 @@ struct Preview {
     rail_scope: sidebar::SendScope,
     /// Whether the shell's list draws the offline banner.
     list_offline: bool,
-    /// The Password health shot's own selection state.
-    health_selected: Option<String>,
     /// Which row each Sends shot has picked.
     ///
     /// **One field per surface, not one shared field**, for
@@ -3596,11 +3585,10 @@ impl Preview {
         // no second frame to click on.
         password_health::show_filter(root.ctx(), chip.unwrap_or(password_health::HealthFilter::All));
 
-        let selected = &mut self.health_selected;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(root, |ui| {
-                password_health::draw_password_health(ui, &report, selected, false);
+                let _ = password_health::draw_password_health(ui, &report, false);
             });
     }
 

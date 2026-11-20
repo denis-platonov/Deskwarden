@@ -2908,8 +2908,8 @@ pub(crate) const PASTE_ACCEPT_LABEL: &str = "Accept";
 /// marks it unverified unless a roster names the owner -- so this toast is
 /// the whole answer until then.
 pub(crate) const LINK_ACCEPTED: &str = "Invitation accepted. The records arrive once the person sharing them finishes.";
-/// The paste row: one `theme::inline_field` high.
-pub(crate) const PASTE_ROW_HEIGHT: f32 = theme::BUTTON_HEIGHT;
+/// The paste row: one kit text field (50) high.
+pub(crate) const PASTE_ROW_HEIGHT: f32 = 50.0;
 const PASTE_BUTTON_GAP: f32 = 8.0;
 /// One [`waiting_line`]: 12pt words in a band as tall as a group eyebrow's
 /// row pair, inset as the eyebrows are.
@@ -2966,16 +2966,21 @@ fn one_line(painter: &egui::Painter, text: &str, font: egui::FontId, color: egui
 pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<'_>, width: f32) {
     if let Some(buffer) = people.paste.as_mut() {
         let (row, _) = ui.allocate_exact_size(egui::vec2(width, PASTE_ROW_HEIGHT), egui::Sense::hover());
-        let button_width = theme::small_button_width(ui.painter(), PASTE_ACCEPT_LABEL);
+        use crate::kit::controls::{self, ButtonKind};
+        let button_width = controls::button_width(ui.ctx(), ButtonKind::Primary, controls::ROW, PASTE_ACCEPT_LABEL, false);
         let field = egui::Rect::from_min_size(row.min, egui::vec2((width - button_width - PASTE_BUTTON_GAP).max(0.0), PASTE_ROW_HEIGHT));
         let mut field_ui = ui.new_child(egui::UiBuilder::new().max_rect(field));
-        let _ = theme::inline_field(&mut field_ui, buffer, PASTE_HINT, field.width(), false);
+        let _ = crate::kit::input::text(&mut field_ui, egui::Id::new("record-paste-invite"), buffer, PASTE_HINT, false, field.width());
         let button = egui::Rect::from_min_size(
-            egui::pos2(field.right() + PASTE_BUTTON_GAP, row.center().y - theme::SMALL_BUTTON_HEIGHT / 2.0),
-            egui::vec2(button_width, theme::SMALL_BUTTON_HEIGHT),
+            egui::pos2(field.right() + PASTE_BUTTON_GAP, row.center().y - controls::ROW.height / 2.0),
+            egui::vec2(button_width, controls::ROW.height),
         );
         let enabled = !people.busy && !buffer.trim().is_empty();
-        if theme::small_action_button(ui, button, PASTE_ACCEPT_LABEL, theme::ActionTone::Primary, enabled).clicked() {
+        let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(button));
+        let pressed = button_ui
+            .add_enabled_ui(enabled, |ui| controls::button(ui, ButtonKind::Primary, controls::ROW, PASTE_ACCEPT_LABEL, None).clicked())
+            .inner;
+        if pressed {
             people.asked = Some(PeopleAsk::AcceptLink);
         }
     }

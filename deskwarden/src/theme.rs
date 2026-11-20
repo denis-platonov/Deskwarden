@@ -7082,10 +7082,10 @@ pub fn section_password_field_within(
 /// expiry boxes) reserves the inset the box will really keep.
 pub const FIELD_PAD_RIGHT: f32 = 10.0;
 
-/// A field box's right inset **with the in-field `Show`/`Hide`** -- what
+/// A field box's right inset **with the in-field reveal eye** -- what
 /// [`password_field`] and its row variant keep clear of the toggle. Public
 /// for the same reason as [`FIELD_PAD_RIGHT`].
-pub const REVEAL_FIELD_PAD_RIGHT: f32 = 52.0;
+pub const REVEAL_FIELD_PAD_RIGHT: f32 = 44.0;
 
 /// Both password fields, in one body: the box `shape` describes, masked
 /// unless `revealed`, with the in-field toggle on its right.
@@ -7102,16 +7102,22 @@ fn password_field_shaped(
         FieldShape { password: !*revealed, right_pad: REVEAL_FIELD_PAD_RIGHT, ..shape },
     );
 
-    // 3h's in-field reveal: a click-sensing label, not a Button, so no
-    // padding or fill fights the field it sits inside.
-    let label = if *revealed { "Hide" } else { "Show" };
+    // The in-field reveal, as the v2 design draws it: an eye (struck through
+    // while the value shows), not the 0.x "Show"/"Hide" words. A click-sensing
+    // rect, not a Button, so no padding or fill fights the field it sits
+    // inside.
     let toggle_rect = Rect::from_min_max(
-        Pos2::new(box_rect.right() - 50.0, box_rect.top() + 1.0),
+        Pos2::new(box_rect.right() - 38.0, box_rect.top() + 1.0),
         Pos2::new(box_rect.right() - 6.0, box_rect.bottom() - 1.0),
     );
-    let toggle = ui.put(
-        toggle_rect,
-        egui::Label::new(semibold(label, 11.0).color(BLUE_DEEP)).sense(Sense::click()),
+    let toggle = ui.interact(toggle_rect, ui.id().with(("reveal-eye", box_rect.min.x as i32, box_rect.min.y as i32)), Sense::click());
+    let eye_colour = if toggle.hovered() { INK } else { TEXT_FAINT };
+    crate::kit::icon::stroke(
+        ui.painter(),
+        Rect::from_center_size(toggle_rect.center(), Vec2::splat(18.0)),
+        if *revealed { crate::kit::icon::glyph::EYE_OFF } else { crate::kit::icon::glyph::EYE },
+        1.8,
+        eye_colour,
     );
     if toggle.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

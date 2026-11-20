@@ -1092,7 +1092,9 @@ mod tests {
             .find(concat!("std::process::exit(refuse_the_", "profile(&why));"))
             .expect("a profiled process that could not mark itself is no longer refused");
         for later in [
-            concat!("launch_intent(std::env::", "args()"),
+            // The launch decision reads `process_args()` (the command line plus
+            // the Store startup task's activation), not `std::env::args()`.
+            concat!("launch_intent(process_", "args()"),
             concat!("app_mutex::", "acquire()"),
             concat!("app_profile::", "app_dirs()"),
             concat!("logging::", "init("),

@@ -179,6 +179,25 @@ pub fn button(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str, icon
     paint_button(ui, kind, size, width, label, icon)
 }
 
+/// The edit form's small row buttons (Copy, Remove field, Add a field...,
+/// Add a hidden field..., the sign-in steps' Edit and the like): the kit's
+/// outline button at [`SMALL`], so they read as the Replace / Remove beside
+/// the 2FA field and not as a 0.x boxed caption.
+pub fn row_button(ui: &mut Ui, label: &str) -> Response {
+    button(ui, ButtonKind::Outline, SMALL, label, None)
+}
+
+/// [`row_button`] for what cannot be undone: the red-edged outline.
+pub fn row_button_danger(ui: &mut Ui, label: &str) -> Response {
+    button(ui, ButtonKind::Danger, SMALL, label, None)
+}
+
+/// How wide [`row_button`] draws `label`, for the rows that reserve room for
+/// their buttons before drawing them.
+pub fn row_button_width(ui: &Ui, label: &str) -> f32 {
+    button_width(ui.ctx(), ButtonKind::Outline, SMALL, label, false)
+}
+
 /// A button as wide as the room it is given, its label centred (the modals'
 /// `flex: 1` pairs: Back and Save code).
 pub fn button_filling(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str) -> Response {

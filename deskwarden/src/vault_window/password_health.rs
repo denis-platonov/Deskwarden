@@ -7,24 +7,21 @@
 //!
 //! Preferences holds settings. This is data *about the vault's contents*, and
 //! a finding the user cannot click through to the item is a dead end -- so it
-//! is drawn in the vault window, in the **item-list column**, with the detail
-//! pane left standing beside it. Clicking a finding selects that item, and
-//! the pane on the right fills in with the ordinary read view: its password,
-//! its Edit button, its generator. The report stays up the whole time, so
-//! working through a list of twelve reused logins is twelve clicks and not
-//! twelve round trips through the sidebar.
+//! is a **page** of the vault window (spec A 4, like Settings and the
+//! Generator): a title, the tabs, and white cards of findings, each with a
+//! Change password button. A row opens its item and the button opens that
+//! item's editor; [`draw_password_health`] reports which as a
+//! [`HealthAction`] and the window applies it through the same door the
+//! Shared page's Open record uses. (Through 0.15 this was a column beside a
+//! standing detail pane.)
 //!
 //! It is a **screen**, not a [`super::sidebar::SidebarFilter`], for the same
 //! reason `Sends` is not one. A `SidebarFilter` is a per-item predicate
 //! (`scope_contains(&self, item)`) evaluated against one item at a time, and
 //! **reuse is not a property of an item** -- it is a property of a pair of
 //! them. There is no predicate over a single `VaultItem` that can answer it.
-//! And the item list is a fixed-pitch virtualized list (`ScrollArea::
-//! show_rows`, one tile per row); group headings inside it would put the
-//! scroll maths out of register with its own scrollbar, which is a defect
-//! that file already carries a comment about. So: its own pane, its own
-//! scroll area, group headings that are allowed to be a different height
-//! from a row.
+//! So: its own page, with group captions that are allowed to be a different
+//! height from a row.
 //!
 //! # The weakness rule, and why it is this one
 //!
@@ -122,7 +119,10 @@ use super::sidebar;
 use crate::password_strength::{rate, CharClasses, Strength};
 use crate::theme;
 use crate::vault_bridge::VaultItem;
-use eframe::egui::{self, CornerRadius, Margin};
+use crate::kit::card as kit_card;
+use crate::kit::controls::{self, ButtonKind};
+use crate::kit::tokens::{self, Role};
+use eframe::egui::{self, Margin};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -773,262 +773,12 @@ pub fn breach_note(breach_checking_on: bool) -> String {
     }
 }
 
-/// Vertical gap between finding rows, matching the item list's own `gap: 6px`.
-const ROW_GAP: f32 = 6.0;
-/// The pane's padding.
-///
-/// **Read off the item list rather than written out again.** This screen
-/// replaces that list in the same column of the same window, so a reader
-/// switching between them sees the two insets side by side in time -- and a
-/// second `10.0` here is a number that has to agree with one over there and
-/// has no mechanism making it. It is also what the scrollbar gutter measures:
-/// see the `scrollbar_in_gutter` call below.
-const PANE_PADDING: f32 = item_list::LIST_PADDING;
-/// Height of one finding row: two text lines plus the design's row padding.
-const ROW_HEIGHT: f32 = 46.0;
-/// How far a finding row's text is inset from the tile's edge, on BOTH sides.
-/// The right-hand one is what stops a long item name being painted out over
-/// the pane behind the tile; it is the same value as the left so a truncated
-/// name's ellipsis is not hung flush against the rounded corner.
-const ROW_TEXT_INSET: f32 = 12.0;
-
-/// The Password health screen, drawn in the item-list column.
-///
-/// Writes the clicked finding's id straight into `selected_id`, which is the
-/// same selection the detail pane on the right reads -- so a click here fills
-/// that pane in without this screen going anywhere. That is the whole reason
-/// the report replaces the item list rather than the whole window body: a
-/// finding you cannot click through to the item is a dead end.
-///
-/// Takes the report rather than the items, so every decision on screen has
-/// already been made by [`report_for`] and this function only paints.
-pub fn draw_password_health(
-    ui: &mut egui::Ui,
-    report: &HealthReport,
-    selected_id: &mut Option<String>,
-    breach_checking_on: bool,
-) {
-    // Zeroed before the strip, for the reason `draw_item_list` spells out:
-    // egui commits `item_spacing` as each widget is allocated, so a gap left
-    // at the ambient 8 here cannot be retracted afterwards.
-    ui.spacing_mut().item_spacing.y = 0.0;
-
-    // The same white header strip the item list carries, so the two columns
-    // read as one pane that changed its contents rather than two apps.
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // The search box's height, so this strip is exactly as tall as the
-            // item list's and the Sends list's: these panes take turns in one
-            // column, and a 38-point strip after a 58-point one moved
-            // everything under it up as the user switched.
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), theme::SEARCH_FIELD_HEIGHT),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| ui.label(theme::semibold(HEALTH_PANE_TITLE, 14.0).color(theme::INK)),
-            );
-        });
-    let strip_bottom = ui.min_rect().bottom();
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::Pos2::new(ui.min_rect().left(), strip_bottom - 1.0),
-            egui::Pos2::new(ui.min_rect().right(), strip_bottom),
-        ),
-        CornerRadius::ZERO,
-        theme::HAIRLINE,
-    );
-
-    egui::Frame::new()
-        .inner_margin(Margin {
-            left: PANE_PADDING as i8,
-            right: 0,
-            top: PANE_PADDING as i8,
-            bottom: PANE_PADDING as i8,
-        })
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = ROW_GAP;
-            // **The same three lines the item list uses, and for the same
-            // reason.** These two panes take turns in one column, so a gutter
-            // that is 10pt in one and 20pt in the other is a jump the user
-            // sees as soon as they switch -- which is what was reported
-            // ("paddings in this list don't match all items list (left and
-            // right with scroll)").
-            //
-            // `scrollbar_in_gutter` reserves exactly `PANE_PADDING` and draws
-            // the 6pt bar flush to its outer edge, INSIDE the padding; that
-            // reservation is why the frame above has `right: 0`. It only
-            // works with `AlwaysVisible`: egui lays a floating bar's gutter
-            // out only for a bar it is actually showing, so on the default
-            // `VisibleWhenNeeded` the reservation comes and goes with the
-            // pointer and the content, and the rows breathe in and out by
-            // 10pt with it. This pane used to be on the default and to
-            // subtract `PANE_PADDING` from its own width by hand to make up
-            // for the missing reservation -- which lands on the item list's
-            // geometry on exactly the frames where egui reserves nothing, and
-            // 10pt narrow on every frame where it does.
-            theme::scrollbar_in_gutter(ui, PANE_PADDING);
-            if content_fits(ui) {
-                // The report that fits paints no bar, exactly as the list
-                // that fits does: `AlwaysVisible` would otherwise run a 6pt
-                // line the whole height of a pane with nothing to scroll,
-                // leaving 2pt of clear space on the right against 10pt on the
-                // left. Only the PAINT is suppressed -- the lane stays
-                // reserved, so no row changes width when the last finding is
-                // fixed.
-                theme::hide_scrollbar(ui);
-            }
-            let scrolled = egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                // Required by `scrollbar_in_gutter` -- see above.
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                .show(ui, |ui| {
-                // The gutter is already reserved out of `available_width`, so
-                // this is the full row width and nothing is subtracted from
-                // it a second time.
-                ui.set_width(ui.available_width());
-                draw_summary(ui, report);
-                let filter = draw_filters(ui);
-
-                if filter.shows_reused() && !report.reused.is_empty() {
-                    section_heading(ui, REUSED_HEADING);
-                    for group in &report.reused {
-                        group_heading(ui, &reuse_group_heading(group));
-                        for (at, item) in group.items.iter().enumerate() {
-                            let detail = reuse_detail(group, at);
-                            let selected = selected_id.as_deref() == Some(item.id.as_str());
-                            if finding_row(ui, &item.name, Some(&detail), selected) {
-                                *selected_id = Some(item.id.clone());
-                            }
-                        }
-                    }
-                }
-                if filter.shows_weak() && !report.weak.is_empty() {
-                    section_heading(ui, WEAK_HEADING);
-                    for weak in &report.weak {
-                        let detail = weak_detail(weak);
-                        let selected = selected_id.as_deref() == Some(weak.item.id.as_str());
-                        if finding_row(ui, &weak.item.name, Some(&detail), selected) {
-                            *selected_id = Some(weak.item.id.clone());
-                        }
-                    }
-                }
-                if filter.shows_old() && !report.old.is_empty() {
-                    section_heading(ui, OLD_HEADING);
-                    for old in &report.old {
-                        let detail = old_detail(old);
-                        let selected = selected_id.as_deref() == Some(old.item.id.as_str());
-                        if finding_row(ui, &old.item.name, Some(&detail), selected) {
-                            *selected_id = Some(old.item.id.clone());
-                        }
-                    }
-                }
-                if filter.shows_breached() {
-                    if !report.breached.is_empty() {
-                        section_heading(ui, BREACHED_HEADING);
-                        for group in &report.breached {
-                            group_heading(ui, &breach_group_heading(group));
-                            for item in &group.items {
-                                // **`breach_phrase`, per row.** The heading
-                                // gives the magnitude and whether these rows
-                                // are one password; the row gives the thing
-                                // to do about it, which does not vary by
-                                // count and is addressed to this item.
-                                let detail = crate::breach::breach_phrase(group.count);
-                                let selected =
-                                    selected_id.as_deref() == Some(item.id.as_str());
-                                if finding_row(ui, &item.name, Some(&detail), selected) {
-                                    *selected_id = Some(item.id.clone());
-                                }
-                            }
-                        }
-                    }
-                    // **Always drawn when there are any, under both filters
-                    // that show breach findings.** An item nobody could check
-                    // is not an item that is fine, and leaving it off the list
-                    // is the one failure this section exists to avoid.
-                    if !report.unknown.is_empty() {
-                        section_heading(ui, UNKNOWN_HEADING);
-                        group_heading(ui, UNKNOWN_NOTE);
-                        for item in &report.unknown {
-                            let selected = selected_id.as_deref() == Some(item.id.as_str());
-                            if finding_row(ui, &item.name, Some(UNKNOWN_ROW_DETAIL), selected) {
-                                *selected_id = Some(item.id.clone());
-                            }
-                        }
-                    }
-                }
-
-                // **An empty filter says so.** A pane that simply stopped
-                // after the chips reads as a screen that failed to load, and
-                // "nothing is wrong" is the answer the user came for -- the
-                // same argument `Summary` makes about the whole report.
-                if report.shown_under(filter) == 0 {
-                    ui.add_space(6.0);
-                    empty_line(ui, &nothing_under(filter, report));
-                }
-
-                ui.add_space(6.0);
-                footer_note(ui, &breach_note(breach_checking_on));
-            });
-            remember_overflow(
-                ui,
-                scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
-            );
-        });
-}
-
 /// What a row under [`UNKNOWN_HEADING`] says about itself.
 ///
 /// Per row as well as in the band's note, because a row is what gets clicked
 /// through to an item and the pane behind it will show an ordinary password
 /// with no badge on it. "Unknown" has to travel with the row.
 pub const UNKNOWN_ROW_DETAIL: &str = "Not checked \u{2014} the lookup did not complete.";
-
-/// Height of a filter chip, and the gap between chips.
-const CHIP_HEIGHT: f32 = 26.0;
-const CHIP_GAP: f32 = 6.0;
-const CHIP_PAD_X: f32 = 12.0;
-
-/// The chip row, and the currently selected filter.
-///
-/// # The selection lives in egui's memory, not in the window's state
-///
-/// Deliberately. The vault window owns the vault, the selection and the
-/// screen; which of four cuts of ONE report is on screen is not a fact about
-/// the vault, it does not survive the window, and nothing outside this file
-/// reads it. Threading it through `vault_window::mod` would widen a signature
-/// two call sites away from the only thing that uses it -- and `content_fits`
-/// already keeps this pane's own per-frame memory here, under an `Id`, for
-/// the same reason.
-///
-/// It resets to `All` when the window closes, which is the right default: the
-/// screen opens on everything that is wrong.
-fn draw_filters(ui: &mut egui::Ui) -> HealthFilter {
-    let id = filter_id();
-    let mut chosen = ui
-        .ctx()
-        .data(|d| d.get_temp::<usize>(id))
-        .and_then(|i| HealthFilter::ALL.get(i).copied())
-        .unwrap_or(HealthFilter::All);
-
-    ui.add_space(2.0);
-    let previous_spacing = ui.spacing().item_spacing;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(CHIP_GAP, CHIP_GAP);
-        for filter in HealthFilter::ALL {
-            if chip(ui, filter.label(), filter == chosen) {
-                chosen = filter;
-                let index = HealthFilter::ALL.iter().position(|f| *f == filter).unwrap_or(0);
-                ui.ctx().data_mut(|d| d.insert_temp(id, index));
-            }
-        }
-    });
-    ui.spacing_mut().item_spacing = previous_spacing;
-    ui.add_space(2.0);
-    chosen
-}
 
 /// Where the chip row keeps its selection. One `Id`, named once, so the draw
 /// and [`show_filter`] cannot disagree about which slot they are using.
@@ -1049,101 +799,6 @@ fn filter_id() -> egui::Id {
 pub fn show_filter(ctx: &egui::Context, filter: HealthFilter) {
     let index = HealthFilter::ALL.iter().position(|f| *f == filter).unwrap_or(0);
     ctx.data_mut(|d| d.insert_temp(filter_id(), index));
-}
-
-/// One filter chip. Returns whether it was clicked.
-///
-/// The selected chip is the pane's own `BLUE_WASH` on `BLUE_DEEP`, which is
-/// what a selected finding row already uses -- so "this is the thing you are
-/// looking at" means one thing on this screen rather than two.
-fn chip(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        egui::FontId::new(11.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        theme::INK,
-    );
-    let width = galley.size().x + CHIP_PAD_X * 2.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, CHIP_HEIGHT), egui::Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(CHIP_HEIGHT as u8 / 2),
-        if selected {
-            theme::BLUE_WASH
-        } else if response.hovered() {
-            theme::CARD_TINT
-        } else {
-            theme::CARD
-        },
-    );
-    let at = egui::Pos2::new(
-        rect.center().x - galley.size().x / 2.0,
-        rect.center().y - galley.size().y / 2.0,
-    );
-    let colour = if selected { theme::BLUE_DEEP } else { theme::TEXT_SECONDARY };
-    ui.painter().galley(at, galley, colour);
-    response.clicked()
-}
-
-/// The "nothing under this filter" line. On the pane's canvas rather than on
-/// a card, so it reads as an answer about the list and not as another finding.
-fn empty_line(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::new()
-        .fill(theme::CANVAS)
-        .inner_margin(Margin::symmetric(2, 4))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new(text).size(12.0).color(theme::TEXT_SECONDARY));
-        });
-}
-
-/// Whether the report is short enough that there is nothing to scroll, which
-/// is when the bar is not painted.
-///
-/// **Read back from the LAST frame's scroll area, not predicted from the
-/// contents** -- which is the opposite of what the item list does, and the
-/// difference is worth spelling out. That list is a fixed-pitch virtualized
-/// list: `n * ROW_TILE_HEIGHT + (n - 1) * ROW_GAP` is its exact content
-/// height and can be computed before anything is drawn. This pane has no
-/// pitch at all -- a summary card whose sentence wraps, two section bands, a
-/// group caption per reuse group, rows of two different heights, and a footer
-/// note that wraps against the pane's width. Predicting that height here
-/// would be a second, worse copy of the layout below it, and a copy that
-/// disagreed with the real one would hide a bar on a report that really can
-/// scroll.
-///
-/// The cost is that the verdict is one frame old, so the frame on which a
-/// report first appears -- or changes size -- can paint a bar it is about to
-/// stop painting. [`remember_overflow`] asks for a repaint whenever the
-/// answer changes, so that is exactly one frame and never a bar left standing
-/// on an idle window.
-///
-/// **Nothing about the LAYOUT turns on this.** The lane stays reserved either
-/// way; only the bar's six opacities change. A stale verdict can therefore
-/// never move a row, which is what makes a one-frame lag affordable here at
-/// all.
-fn content_fits(ui: &egui::Ui) -> bool {
-    // Ties go to "can scroll", as they do in the item list: being wrong the
-    // other way hides a bar on a report the user really can move. The first
-    // frame has no memory and so shows the bar.
-    !ui.ctx().data(|d| d.get_temp::<bool>(overflow_id()).unwrap_or(true))
-}
-
-/// Stores what [`content_fits`] reads, and asks for one more frame when the
-/// answer changed -- see there.
-fn remember_overflow(ui: &egui::Ui, overflows: bool) {
-    let previous = ui.ctx().data(|d| d.get_temp::<bool>(overflow_id()));
-    if previous != Some(overflows) {
-        ui.ctx().data_mut(|d| d.insert_temp(overflow_id(), overflows));
-        ui.ctx().request_repaint();
-    }
-}
-
-fn overflow_id() -> egui::Id {
-    egui::Id::new("password_health_overflows")
 }
 
 /// The two section bands, spelled once so the tests that look for them and
@@ -1212,76 +867,236 @@ pub fn breach_group_heading(group: &BreachGroup) -> String {
     }
 }
 
-/// The headline block. Drawn on a card in ordinary ink, exactly as a block
-/// with findings is -- an all-clear vault gets a result, not a grey
-/// placeholder that reads like a load which never finished.
-fn draw_summary(ui: &mut egui::Ui, report: &HealthReport) {
-    let summary = summary_of(report);
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(theme::semibold(summary.headline(), 14.0).color(match summary {
-                // `theme::ERROR` is what this window uses for "something is
-                // wrong" everywhere else. The other two states are ordinary
-                // ink: there is no success colour in this design, and
-                // inventing a green one here would be one app's worth of
-                // visual language in a window that has another.
-                Summary::Findings(_) => theme::ERROR,
-                Summary::AllClear | Summary::NothingToCheck => theme::INK,
-            }));
-            ui.label(
-                egui::RichText::new(summary.detail(report))
-                    .size(12.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-        });
+/// What the page asks the window to do, once a frame at most.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthAction {
+    /// Nothing was pressed.
+    None,
+    /// A finding's row: leave the report and show that item.
+    Open(String),
+    /// A finding's Change password: the same, straight into the editor.
+    ChangePassword(String),
 }
 
-/// A "REUSED"/"WEAK" band, in the sidebar's own section-label idiom.
+/// The page's own measurements (spec A 4): the column is capped at 760, the
+/// page pads 32 / 40, a row is 16 / 22 around a 44 tile.
+const COLUMN_MAX: f32 = 760.0;
+const PAGE_PAD_X: f32 = 40.0;
+const PAGE_PAD_Y: f32 = 32.0;
+const ROW_PAD_X: f32 = 22.0;
+const ROW_PAD_Y: f32 = 16.0;
+const TILE: f32 = 44.0;
+const ROW_GAP_X: f32 = 14.0;
+const ROW_HEIGHT: f32 = ROW_PAD_Y * 2.0 + TILE;
+const CARD_RADIUS: u8 = tokens::R_CARD;
+/// Below this much room a row drops its button and the whole row is the click.
+const BUTTON_FROM: f32 = 440.0;
+/// What a Change password button says.
+pub const CHANGE_PASSWORD_LABEL: &str = "Change password";
+
+const TITLE: Role = Role { size: 30.0, face: theme::EXTRABOLD, tracking_em: -0.03 };
+const ROW_NAME: Role = Role { size: 16.0, face: theme::BOLD, tracking_em: 0.0 };
+const ROW_REASON: Role = Role { size: 14.0, face: theme::SEMIBOLD, tracking_em: 0.0 };
+const NOTE: Role = Role { size: 14.0, face: theme::REGULAR, tracking_em: 0.0 };
+const SUBLINE: Role = Role { size: 15.0, face: theme::REGULAR, tracking_em: 0.0 };
+
+/// The reason colours (spec A 4): weak and breached red, reused amber, old
+/// blue.
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xb7, 0x79, 0x1f);
+
+/// One line of the list card.
+struct Line<'a> {
+    id: &'a str,
+    name: &'a str,
+    reason: String,
+    colour: egui::Color32,
+    /// Offer Change password: not for an item whose check did not complete.
+    change: bool,
+}
+
+/// The Password health page (spec A 4), drawn into the whole body.
 ///
-/// [`theme::eyebrow`] and no longer five arguments spelled out here: the five
-/// were exactly that function's, and a private copy of a design-system
-/// element is how two surfaces come to draw the same band at two weights.
-fn section_heading(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(6.0);
-    theme::eyebrow(ui, text);
+/// Takes the report rather than the items, so every decision on screen has
+/// already been made by [`report_for`] and this function only paints. A
+/// finding's row opens that item; its button opens the item's editor -- both
+/// are reported, not performed, so the window applies them through the one
+/// door the Shared page's Open record uses.
+pub fn draw_password_health(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> HealthAction {
+    let mut action = HealthAction::None;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let room = ui.available_rect_before_wrap();
+        let width = (room.width() - PAGE_PAD_X * 2.0).clamp(1.0, COLUMN_MAX);
+        let left = room.left() + ((room.width() - width) / 2.0).max(0.0);
+        let column = egui::Rect::from_min_size(egui::pos2(left, room.top() + PAGE_PAD_Y), egui::vec2(width, 0.0));
+        let used = ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            action = page(ui, report, breach_checking_on);
+        });
+        // The page's bottom padding, and the scroll area's content height.
+        ui.allocate_space(egui::vec2(room.width(), used.response.rect.bottom() - room.top() + PAGE_PAD_Y));
+    });
+    action
 }
 
-/// "One password, 3 items", over the rows it covers.
-fn group_heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(11.0).color(theme::TEXT_MUTED));
+fn page(ui: &mut egui::Ui, report: &HealthReport, breach_checking_on: bool) -> HealthAction {
+    let p = tokens::palette(ui.ctx());
+    let mut action = HealthAction::None;
+
+    ui.label(tokens::job(TITLE, HEALTH_PANE_TITLE, p.ink));
+    ui.add_space(8.0);
+    let summary = summary_of(report);
+    let headline_ink = match summary {
+        Summary::Findings(_) => p.error,
+        Summary::AllClear | Summary::NothingToCheck => p.ink,
+    };
+    ui.add(egui::Label::new(tokens::job(Role { size: 17.0, face: theme::BOLD, tracking_em: 0.0 }, &summary.headline(), headline_ink)).wrap());
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(tokens::job(SUBLINE, &summary.detail(report), p.text_faint)).wrap());
+    ui.add_space(20.0);
+
+    let filter = draw_filters(ui);
+    ui.add_space(20.0);
+
+    let put = |found: Option<HealthAction>, action: &mut HealthAction| {
+        if let Some(found) = found {
+            *action = found;
+        }
+    };
+
+    if filter.shows_reused() && !report.reused.is_empty() {
+        section(ui, REUSED_HEADING);
+        let cards: Vec<(String, Vec<Line<'_>>)> = report
+            .reused
+            .iter()
+            .map(|group| {
+                let lines = group
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(at, item)| Line { id: &item.id, name: &item.name, reason: reuse_detail(group, at), colour: AMBER, change: true })
+                    .collect();
+                (reuse_group_heading(group), lines)
+            })
+            .collect();
+        for (caption, lines) in &cards {
+            let found = list_card(ui, Some(caption), lines);
+            put(found, &mut action);
+        }
+    }
+    if filter.shows_weak() && !report.weak.is_empty() {
+        section(ui, WEAK_HEADING);
+        let lines: Vec<Line<'_>> = report
+            .weak
+            .iter()
+            .map(|weak| Line { id: &weak.item.id, name: &weak.item.name, reason: weak_detail(weak), colour: p.error, change: true })
+            .collect();
+        let found = list_card(ui, None, &lines);
+        put(found, &mut action);
+    }
+    if filter.shows_old() && !report.old.is_empty() {
+        section(ui, OLD_HEADING);
+        let lines: Vec<Line<'_>> = report
+            .old
+            .iter()
+            .map(|old| Line { id: &old.item.id, name: &old.item.name, reason: old_detail(old), colour: p.blue_deep, change: true })
+            .collect();
+        let found = list_card(ui, None, &lines);
+        put(found, &mut action);
+    }
+    if filter.shows_breached() {
+        if !report.breached.is_empty() {
+            section(ui, BREACHED_HEADING);
+            for group in &report.breached {
+                let phrase = crate::breach::breach_phrase(group.count);
+                let lines: Vec<Line<'_>> = group
+                    .items
+                    .iter()
+                    .map(|item| Line { id: &item.id, name: &item.name, reason: phrase.clone(), colour: p.error, change: true })
+                    .collect();
+                let caption = breach_group_heading(group);
+                let found = list_card(ui, Some(&caption), &lines);
+                put(found, &mut action);
+            }
+        }
+        // Always drawn when there are any, under both filters that show
+        // breach findings: an item nobody could check is not an item that is
+        // fine, and leaving it off the list is the one failure this section
+        // exists to avoid.
+        if !report.unknown.is_empty() {
+            section(ui, UNKNOWN_HEADING);
+            let lines: Vec<Line<'_>> = report
+                .unknown
+                .iter()
+                .map(|item| Line { id: &item.id, name: &item.name, reason: UNKNOWN_ROW_DETAIL.to_string(), colour: p.text_faint, change: false })
+                .collect();
+            let found = list_card(ui, Some(UNKNOWN_NOTE), &lines);
+            put(found, &mut action);
+        }
+    }
+
+    // An empty filter says so: a page that stopped after the tabs reads as a
+    // screen that failed to load, and "nothing is wrong" is the answer the
+    // user came for.
+    if report.shown_under(filter) == 0 {
+        kit_card::card(ui, CARD_RADIUS, Margin::symmetric(ROW_PAD_X as i8, 22), |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(tokens::job(Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, &nothing_under(filter, report), p.text_muted)).wrap());
+        });
+    }
+
+    ui.add_space(14.0);
+    ui.add(egui::Label::new(tokens::job(NOTE, &breach_note(breach_checking_on), p.text_label)).wrap());
+    action
 }
 
-/// Where to paint `galley` so its left edge is at `left` and it is centred on
-/// `centre_y` -- i.e. what `Align2::LEFT_CENTER` did for the `Painter::text`
-/// calls this row used before it had to lay its own galleys out. `Painter::
-/// galley` positions by the galley's top-left corner and offers no alignment,
-/// so the half-height comes off here and the two baselines stay exactly where
-/// the design put them.
-fn centred_left(left: f32, centre_y: f32, galley: &egui::Galley) -> egui::Pos2 {
-    egui::Pos2::new(left, centre_y - galley.size().y / 2.0)
+/// "REUSED" / "WEAK": tracked capitals over a card.
+fn section(ui: &mut egui::Ui, text: &str) {
+    let p = tokens::palette(ui.ctx());
+    kit_card::section_label(ui, text, p.text_ghost);
+    ui.add_space(10.0);
+}
+
+/// One white card of findings, with an optional caption row at its head.
+/// Answers what was pressed on one of its rows.
+fn list_card(ui: &mut egui::Ui, caption: Option<&str>, lines: &[Line<'_>]) -> Option<HealthAction> {
+    let p = tokens::palette(ui.ctx());
+    let mut found = None;
+    kit_card::card(ui, CARD_RADIUS, Margin::ZERO, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        if let Some(caption) = caption {
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.add_space(ROW_PAD_X);
+                ui.add(egui::Label::new(tokens::job(Role { size: 13.0, face: theme::SEMIBOLD, tracking_em: 0.0 }, caption, p.text_faint)).wrap());
+            });
+            ui.add_space(12.0);
+            kit_card::row_rule(ui);
+        }
+        for (at, line) in lines.iter().enumerate() {
+            if at > 0 {
+                kit_card::row_rule(ui);
+            }
+            if let Some(hit) = finding_row(ui, line) {
+                found = Some(hit);
+            }
+        }
+    });
+    ui.add_space(16.0);
+    found
 }
 
 /// What a finding row calls an item that has no name of its own.
 ///
 /// **A finding that does not say WHICH item is unactionable.** The user
-/// cannot go and change a password they cannot find, and the row's whole job
-/// is to be clicked through to the item. An item with an empty `name` lays
-/// out to no glyphs at all, so without this the row would paint its grey
-/// detail line over blank space -- which reads exactly like a row whose name
-/// failed, and tells the reader nothing either way.
-///
-/// In square brackets and in the pane's own words, so it cannot be mistaken
-/// for an item really called this.
+/// cannot go and change a password they cannot find. In square brackets and in
+/// the page's own words, so it cannot be mistaken for an item really called
+/// this.
 pub const UNNAMED_ITEM: &str = "[No name]";
 
 /// The name a finding row paints for `name`: the item's own, or
-/// [`UNNAMED_ITEM`] when it has none. Whitespace counts as none -- a name of
-/// three spaces is as blank on screen as an empty one.
+/// [`UNNAMED_ITEM`] when it has none. Whitespace counts as none.
 fn finding_name(name: &str) -> &str {
     if name.trim().is_empty() {
         UNNAMED_ITEM
@@ -1290,80 +1105,87 @@ fn finding_name(name: &str) -> &str {
     }
 }
 
-/// One clickable finding. Returns whether it was clicked.
-fn finding_row(ui: &mut egui::Ui, name: &str, detail: Option<&str>, selected: bool) -> bool {
+/// One finding: a 44 tile, the name over a coloured reason, and the primary
+/// Change password button. The row opens the item; the button its editor.
+fn finding_row(ui: &mut egui::Ui, line: &Line<'_>) -> Option<HealthAction> {
+    let p = tokens::palette(ui.ctx());
     let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
-    if response.hovered() {
+    let (rect, row) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
+    if row.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, p.list_bg);
     }
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(8),
-        if selected {
-            theme::BLUE_WASH
-        } else if response.hovered() {
-            theme::CARD_TINT
-        } else {
-            theme::CARD
-        },
-    );
-    // Both runs are laid into the room the tile actually has BEFORE anything
-    // is painted, because `Painter::text` takes no width and would otherwise
-    // draw a long name straight out past the tile's right edge and over the
-    // pane behind it -- which is exactly the defect this row was reported
-    // for. Nothing at all sits at the right of a finding row (no chevron, no
-    // badge, no count), so the room is the tile less its inset on each side:
-    // the ellipsis lands the same 12pt in from the right edge that the name
-    // starts in from the left, rather than flush against the corner radius.
-    let room = rect.width() - ROW_TEXT_INSET * 2.0;
-    let name_galley = theme::truncated_galley(
-        ui,
-        theme::semibold(finding_name(name), 13.0)
-            .color(if selected { theme::BLUE_DEEP } else { theme::INK }),
-        room,
-        egui::TextStyle::Body,
-    );
-    // The detail line is ours, not the user's ("9 characters, lowercase
-    // letters and digits"), but it is still longer than a narrow pane at a
-    // long character-class list, so it is bounded by the same room.
-    let detail_galley = detail.map(|detail| {
-        theme::truncated_galley(
-            ui,
-            egui::RichText::new(detail).size(11.0).color(theme::TEXT_SECONDARY),
-            room,
-            egui::TextStyle::Body,
-        )
-    });
-    let left = rect.left() + ROW_TEXT_INSET;
-    // With a detail line the name sits on the upper of two baselines; alone,
-    // it is centred in the row.
-    let name_y = match detail {
-        Some(_) => rect.top() + 15.0,
-        None => rect.center().y,
-    };
-    ui.painter().galley(
-        centred_left(left, name_y, &name_galley),
-        name_galley,
-        if selected { theme::BLUE_DEEP } else { theme::INK },
-    );
-    if let Some(galley) = detail_galley {
-        let y = rect.bottom() - 15.0;
-        ui.painter().galley(centred_left(left, y, &galley), galley, theme::TEXT_SECONDARY);
+
+    let tile = egui::Rect::from_min_size(egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - TILE / 2.0), egui::vec2(TILE, TILE));
+    // `new_child`, not `scope_builder`: a scope moves the parent's cursor to
+    // its own bottom, which is 16 points ABOVE the row's, and the next row
+    // would start on top of this one.
+    let mut tile_ui = ui.new_child(egui::UiBuilder::new().max_rect(tile));
+    item_list::row_tile(&mut tile_ui, None, crate::vault_bridge::ItemKind::Login, finding_name(line.name), TILE, false);
+
+    let show_button = line.change && width >= BUTTON_FROM;
+    let button_width = controls::button_width(ui.ctx(), ButtonKind::Primary, controls::ROW, CHANGE_PASSWORD_LABEL, false);
+    let text_left = tile.right() + ROW_GAP_X;
+    let text_right = rect.right() - ROW_PAD_X - if show_button { button_width + ROW_GAP_X } else { 0.0 };
+    let room = (text_right - text_left).max(1.0);
+
+    let name = ui.fonts_mut(|f| f.layout_job(tokens::job(ROW_NAME, finding_name(line.name), p.ink)));
+    let reason = ui.fonts_mut(|f| f.layout_job(tokens::job(ROW_REASON, &line.reason, line.colour)));
+    let name = truncate(ui, name, room);
+    let reason = truncate(ui, reason, room);
+    let gap = 3.0;
+    let block = name.size().y + gap + reason.size().y;
+    let top = rect.center().y - block / 2.0;
+    ui.painter().galley(egui::pos2(text_left, top), name.clone(), p.ink);
+    ui.painter().galley(egui::pos2(text_left, top + name.size().y + gap), reason, line.colour);
+
+    let mut hit = row.clicked().then(|| HealthAction::Open(line.id.to_string()));
+    if show_button {
+        let slot = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - ROW_PAD_X - button_width, rect.center().y - controls::ROW.height / 2.0),
+            egui::vec2(button_width, controls::ROW.height),
+        );
+        let mut slot_ui = ui.new_child(egui::UiBuilder::new().max_rect(slot));
+        if controls::button(&mut slot_ui, ButtonKind::Primary, controls::ROW, CHANGE_PASSWORD_LABEL, None).clicked() {
+            hit = Some(HealthAction::ChangePassword(line.id.to_string()));
+        }
     }
-    response.clicked()
+    hit
 }
 
-/// The breach footer. Wrapped, muted, and always present in both states.
-fn footer_note(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::new()
-        .fill(theme::CANVAS)
-        .inner_margin(Margin::symmetric(2, 4))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new(text).size(11.0).color(theme::TEXT_MUTED));
-        });
+/// `galley` cut to `room` with an ellipsis, as one line.
+fn truncate(ui: &egui::Ui, galley: std::sync::Arc<egui::Galley>, room: f32) -> std::sync::Arc<egui::Galley> {
+    if galley.size().x <= room {
+        return galley;
+    }
+    let mut job = galley.job.as_ref().clone();
+    job.wrap = egui::text::TextWrapping { max_width: room, max_rows: 1, break_anywhere: true, overflow_character: Some('\u{2026}') };
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// The tabs, and the currently selected filter.
+///
+/// # The selection lives in egui's memory, not in the window's state
+///
+/// Deliberately. The vault window owns the vault, the selection and the
+/// screen; which of five cuts of ONE report is on screen is not a fact about
+/// the vault, it does not survive the window, and nothing outside this file
+/// reads it. It resets to `All` when the window closes, which is the right
+/// default: the screen opens on everything that is wrong.
+fn draw_filters(ui: &mut egui::Ui) -> HealthFilter {
+    let id = filter_id();
+    let mut chosen = ui
+        .ctx()
+        .data(|d| d.get_temp::<usize>(id))
+        .and_then(|i| HealthFilter::ALL.get(i).copied())
+        .unwrap_or(HealthFilter::All);
+    let labels: Vec<&str> = HealthFilter::ALL.iter().map(|f| f.label()).collect();
+    let at = HealthFilter::ALL.iter().position(|f| *f == chosen).unwrap_or(0);
+    if let Some(picked) = controls::segmented(ui, &labels, at, controls::SEG_TABS) {
+        chosen = HealthFilter::ALL[picked];
+        ui.ctx().data_mut(|d| d.insert_temp(id, picked));
+    }
+    chosen
 }
 
 /// The rail row this screen must leave selected behind it.
@@ -2454,73 +2276,30 @@ mod tests {
     }
 
     // ==================================================================
-    // The pane, driven
+    // The page, driven
     // ==================================================================
 
+    use crate::kit::testing::{click_at, ctx, frame, Painted};
+
+    const PAGE: egui::Vec2 = egui::vec2(1000.0, 800.0);
+
+    // The helpers the breach and filter tests were written against, now over
+    // the page: one frame, every string it painted with the rect it is in.
     fn styled_context() -> egui::Context {
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(raw_input(None), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(raw_input(None), |_ui| {});
-        ctx
+        ctx()
     }
 
-    fn raw_input(click_at: Option<egui::Pos2>) -> egui::RawInput {
-        let mut input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(320.0, 700.0),
-            )),
-            ..Default::default()
-        };
-        if let Some(at) = click_at {
-            input.events.push(egui::Event::PointerMoved(at));
-            input.events.push(egui::Event::PointerButton {
-                pos: at,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            });
-            input.events.push(egui::Event::PointerButton {
-                pos: at,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            });
-        }
-        input
-    }
-
-    /// Every string the pane painted, with the rect it was painted in.
     fn painted(
         ctx: &egui::Context,
         report: &HealthReport,
-        selected_id: &mut Option<String>,
+        _selected: &mut Option<String>,
         breach_on: bool,
-        click_at: Option<egui::Pos2>,
+        click_at_pos: Option<egui::Pos2>,
     ) -> Vec<(String, egui::Rect)> {
-        let output = ctx.run_ui(raw_input(click_at), |ui| {
-            draw_password_health(ui, report, selected_id, breach_on);
-        });
-        let mut out = Vec::new();
-        for clipped in &output.shapes {
-            collect_text(&clipped.shape, &mut out);
-        }
-        out
-    }
-
-    fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
-        match shape {
-            egui::Shape::Text(text) => {
-                out.push((text.galley.text().to_string(), text.galley.rect.translate(text.pos.to_vec2())))
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_text(shape, out);
-                }
-            }
-            _ => {}
-        }
+        let mut action = HealthAction::None;
+        let events = click_at_pos.map(click_at).unwrap_or_default();
+        let shown = page_frame(ctx, report, breach_on, events, &mut action);
+        shown.texts.into_iter().map(|(text, _, rect)| (text, rect)).collect()
     }
 
     fn locate(painted: &[(String, egui::Rect)], needle: &str) -> egui::Pos2 {
@@ -2528,789 +2307,194 @@ mod tests {
             .iter()
             .find(|(text, _)| text == needle)
             .map(|(_, rect)| rect.center())
-            .unwrap_or_else(|| panic!("the pane painted no {needle:?}: {painted:?}"))
+            .unwrap_or_else(|| panic!("the page painted no {needle:?}: {painted:?}"))
     }
 
     fn texts(painted: &[(String, egui::Rect)]) -> Vec<&str> {
         painted.iter().map(|(text, _)| text.as_str()).collect()
     }
 
-    /// **The click-through, driven end to end.** A finding you cannot click
-    /// through to the item is a dead end, and this is the assertion that the
-    /// row is not decoration -- with the counter-assertion that the selection
-    /// really did start out somewhere else.
-    #[test]
-    fn clicking_a_finding_selects_that_item() {
-        let ctx = styled_context();
-        let items = vec![
-            login("id-bank", "Bank", Some(STRONG_A)),
-            login("id-forum", "Forum", Some(STRONG_A)),
-        ];
-        let report = report_for(&items);
-        let mut selected: Option<String> = None;
-
-        let first = painted(&ctx, &report, &mut selected, false, None);
-        assert!(selected.is_none(), "the premise: nothing is selected before the click");
-        let forum_at = locate(&first, "Forum");
-
-        let _ = painted(&ctx, &report, &mut selected, false, Some(forum_at));
-        assert_eq!(
-            selected.as_deref(),
-            Some("id-forum"),
-            "the finding row is painted but clicking it selects nothing, so the report is a \
-             dead end"
-        );
+    fn page_frame(
+        ctx: &egui::Context,
+        report: &HealthReport,
+        breach_on: bool,
+        events: Vec<egui::Event>,
+        action: &mut HealthAction,
+    ) -> Painted {
+        frame(ctx, 0.0, PAGE, events, |ui| {
+            let got = draw_password_health(ui, report, breach_on);
+            if got != HealthAction::None {
+                *action = got;
+            }
+        })
     }
 
-    /// The counter-assertion for the one above: a click that lands on the
-    /// summary card, not on a row, must select nothing. Without this, a row
-    /// wired to "any click anywhere" passes the test above.
-    #[test]
-    fn clicking_away_from_a_finding_selects_nothing() {
-        let ctx = styled_context();
-        let items = vec![
-            login("id-bank", "Bank", Some(STRONG_A)),
-            login("id-forum", "Forum", Some(STRONG_A)),
-        ];
-        let report = report_for(&items);
-        let mut selected: Option<String> = None;
-
-        let first = painted(&ctx, &report, &mut selected, false, None);
-        let headline_at = locate(&first, &summary_of(&report).headline());
-
-        let _ = painted(&ctx, &report, &mut selected, false, Some(headline_at));
-        assert_eq!(selected, None, "a click on the headline selected an item");
-    }
-
-    /// The pane lists the findings it was given: both group members, under
-    /// the group's own heading, under the section band.
-    #[test]
-    fn the_pane_paints_the_groups_and_the_weak_rows_it_was_given() {
-        let ctx = styled_context();
-        let items = vec![
-            login("a", "Bank", Some(STRONG_A)),
-            login("b", "Forum", Some(STRONG_A)),
-            login("c", "Old wiki", Some("abc")),
-        ];
-        let report = report_for(&items);
-        let mut selected = None;
-        let shown = painted(&ctx, &report, &mut selected, false, None);
-        let shown = texts(&shown);
-
-        for expected in [
-            HEALTH_PANE_TITLE,
-            REUSED_HEADING,
-            "One password, 2 items",
-            "Bank",
-            "Forum",
-            WEAK_HEADING,
-            "Old wiki",
-            "3 characters, lowercase letters only",
-        ] {
-            assert!(shown.contains(&expected), "the pane never painted {expected:?}: {shown:?}");
+    /// Frames until the layout has settled, then the last one.
+    fn settled(ctx: &egui::Context, report: &HealthReport, breach_on: bool) -> Painted {
+        let mut action = HealthAction::None;
+        let mut painted = page_frame(ctx, report, breach_on, vec![], &mut action);
+        for _ in 0..3 {
+            painted = page_frame(ctx, report, breach_on, vec![], &mut action);
         }
-    }
-
-    /// **The empty state looks like success and not like a failed load.** It
-    /// paints its result, it paints what it checked, and it paints neither
-    /// section band -- because there is nothing under either.
-    #[test]
-    fn the_empty_state_paints_a_result_and_no_empty_sections() {
-        let ctx = styled_context();
-        let items = vec![
-            login("a", "Bank", Some(STRONG_A)),
-            login("b", "Shop", Some(STRONG_B)),
-        ];
-        let report = report_for(&items);
-        let mut selected = None;
-        let shown = painted(&ctx, &report, &mut selected, false, None);
-        let shown = texts(&shown);
-
-        assert!(shown.contains(&"No reused or weak passwords"), "{shown:?}");
-        assert!(shown.contains(&"Checked 2 passwords."), "{shown:?}");
-        assert!(!shown.contains(&REUSED_HEADING), "an empty REUSED band was painted: {shown:?}");
-        assert!(!shown.contains(&WEAK_HEADING), "an empty WEAK band was painted: {shown:?}");
-        for banned in ["Nothing here yet", "Loading\u{2026}", "No items match your search"] {
-            assert!(!shown.contains(&banned), "the item list's placeholder wording leaked in");
-        }
-    }
-
-    /// The breach footer is on screen in both states, not only when the
-    /// setting is off -- asserted from the painted frame, because a note that
-    /// is computed and never drawn tells the user nothing.
-    #[test]
-    fn the_breach_footer_is_painted_in_both_states() {
-        let ctx = styled_context();
-        let report = report_for(&[login("a", "Bank", Some(STRONG_A))]);
-        for on in [false, true] {
-            let mut selected = None;
-            let shown = painted(&ctx, &report, &mut selected, on, None);
-            let joined = texts(&shown).join(" | ");
-            assert!(
-                joined.contains("Check passwords against known breaches"),
-                "with the setting {on}, the pane never said where the breach setting is: \
-                 {joined}"
-            );
-        }
-    }
-
-    // ==================================================================
-    // Nothing is painted outside its tile
-    // ==================================================================
-
-    /// A name far longer than any pane this window can be dragged to -- the
-    /// one from the user's screenshot, which ran straight off the right of
-    /// its tile and over the pane behind it.
-    const LONG_NAME: &str =
-        "Visual Studio App Center | iOS, Android, Xamarin & React Native App Development";
-
-    /// A name that comfortably fits even the narrowest pane tested here, so
-    /// the counter-assertion has something real to be about.
-    const SHORT_NAME: &str = "Bank";
-
-    /// One run the pane painted: the string it was HANDED, the characters it
-    /// actually LAID OUT, and where those characters landed.
-    ///
-    /// The first two differ exactly when something was truncated --
-    /// `Galley::text()` reports the source string whatever the wrap mode did
-    /// to it, so a test that only read `text()` could never tell an
-    /// ellipsised run from an intact one, and would pass while the ink still
-    /// hung outside the tile.
-    struct Run {
-        source: String,
-        drawn: String,
-        rect: egui::Rect,
-    }
-
-    /// One frame of the real pane at a chosen pane width, with the finding
-    /// tiles located as well as the text.
-    struct Painted {
-        runs: Vec<Run>,
-        /// The rounded white rectangles `finding_row` allocates, found by
-        /// their exact `ROW_HEIGHT` -- so the summary card and the header
-        /// strip, which are neither this height, are not mistaken for rows.
-        tiles: Vec<egui::Rect>,
-    }
-
-    impl Painted {
-        /// The single run laid out from `source`, and the tile it sits in.
-        ///
-        /// Both halves panic rather than return an `Option`: this crate's
-        /// standing defect is a test that passes because it never reached the
-        /// thing it names, and "no such run" or "no tile around it" must be a
-        /// red test, not a silently skipped assertion.
-        fn run_and_tile(&self, source: &str) -> (&Run, egui::Rect) {
-            let found: Vec<&Run> = self.runs.iter().filter(|r| r.source == source).collect();
-            assert_eq!(
-                found.len(),
-                1,
-                "expected exactly one run laid out from {source:?}, found {}; painted: {:?}",
-                found.len(),
-                self.runs.iter().map(|r| r.source.as_str()).collect::<Vec<_>>()
-            );
-            let run = found[0];
-            let tile = self
-                .tiles
-                .iter()
-                .find(|tile| tile.contains(run.rect.left_center()))
-                .copied()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "the run from {source:?} at {:?} sits in none of the {} finding tiles \
-                         {:?} -- it was not painted on a finding row at all",
-                        run.rect,
-                        self.tiles.len(),
-                        self.tiles
-                    )
-                });
-            (run, tile)
-        }
-    }
-
-    /// Draws the real pane at `pane_width` and reports every run and tile.
-    ///
-    /// The width is a parameter because the defect is width-dependent: the
-    /// pane is the resizable item-list column, and a name that fits at 420
-    /// overflows at 220.
-    fn painted_at(report: &HealthReport, pane_width: f32) -> Painted {
-        let ctx = egui::Context::default();
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(pane_width, 700.0),
-            )),
-            ..Default::default()
-        };
-        // The two throwaway frames every harness in this crate runs: a font
-        // set registered during a frame is only usable from the next one.
-        let _ = ctx.run_ui(input(), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(input(), |_ui| {});
-        let mut selected = None;
-        let output = ctx.run_ui(input(), |ui| {
-            draw_password_health(ui, report, &mut selected, false);
-        });
-        let mut painted = Painted { runs: Vec::new(), tiles: Vec::new() };
-        for clipped in &output.shapes {
-            collect_runs(&clipped.shape, &mut painted);
-        }
-        assert!(
-            !painted.tiles.is_empty(),
-            "the pane painted no finding tiles at all at width {pane_width}, so nothing below \
-             is about a finding row"
-        );
         painted
     }
 
-    fn collect_runs(shape: &egui::Shape, out: &mut Painted) {
-        match shape {
-            egui::Shape::Text(text) => out.runs.push(Run {
-                source: text.galley.text().to_string(),
-                drawn: text
-                    .galley
-                    .rows
-                    .iter()
-                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
-                    .collect(),
-                rect: text.galley.rect.translate(text.pos.to_vec2()),
-            }),
-            egui::Shape::Rect(rect) if rect.rect.height() == ROW_HEIGHT => {
-                out.tiles.push(rect.rect)
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_runs(shape, out);
-                }
-            }
-            _ => {}
-        }
+    fn pair_report() -> HealthReport {
+        report_for(&[
+            login("id-bank", "Bank", Some(STRONG_A)),
+            login("id-forum", "Forum", Some(STRONG_A)),
+            login("id-wiki", "Old wiki", Some("abc")),
+        ])
     }
 
-    /// The three pane widths every case below is checked at, including one
-    /// narrower than the window's own default -- the column is resizable and
-    /// the defect only appears once the name is wider than the tile.
-    ///
-    /// Deliberately NOT derived from anything under test, and deliberately
-    /// nothing to do with the clock: a fixture that measured a rendered width
-    /// against a real date is how `main` went red at UTC midnight once
-    /// already.
-    const PANE_WIDTHS: [f32; 3] = [200.0, 320.0, 520.0];
-
-    /// **The reported defect: a long name's ink stays inside its tile.**
-    ///
-    /// Measured as ink against the tile's rect, not as "the string changed",
-    /// because the report is about paint crossing an edge. Both bands are
-    /// covered: a reused finding (name only) and a weak one (name over a
-    /// detail line), which are the two different vertical layouts the row
-    /// has.
     #[test]
-    fn a_long_finding_name_is_ellipsised_inside_its_tile() {
-        for width in PANE_WIDTHS {
-            for report in [
-                report_for(&[
-                    login("a", LONG_NAME, Some(STRONG_A)),
-                    login("b", "Other", Some(STRONG_A)),
-                ]),
-                report_for(&[login("a", LONG_NAME, Some("abc12345"))]),
-            ] {
-                let painted = painted_at(&report, width);
-                let (run, tile) = painted.run_and_tile(LONG_NAME);
-                assert!(
-                    run.drawn != run.source,
-                    "at width {width} the name was laid out whole ({:?}) -- nothing truncated \
-                     it",
-                    run.drawn
-                );
-                assert!(
-                    run.drawn.ends_with('\u{2026}'),
-                    "at width {width} the name was cut off with no ellipsis: {:?}",
-                    run.drawn
-                );
-                assert!(
-                    run.rect.right() <= tile.right() - ROW_TEXT_INSET + 0.5,
-                    "at width {width} the name's ink reaches {} but its tile ends at {} \
-                     (inset {ROW_TEXT_INSET}); drawn: {:?}",
-                    run.rect.right(),
-                    tile.right(),
-                    run.drawn
-                );
-                assert!(
-                    run.rect.left() >= tile.left(),
-                    "at width {width} the name's ink starts left of its own tile"
-                );
-            }
-        }
-    }
-
-    /// **The counter-assertion: a name that fits is left completely alone.**
-    ///
-    /// Without this, ellipsising every row unconditionally would satisfy the
-    /// test above.
-    #[test]
-    fn a_short_finding_name_is_not_touched() {
-        for width in PANE_WIDTHS {
-            let report = report_for(&[
-                login("a", SHORT_NAME, Some(STRONG_A)),
-                login("b", "Other", Some(STRONG_A)),
-            ]);
-            let painted = painted_at(&report, width);
-            let (run, tile) = painted.run_and_tile(SHORT_NAME);
-            assert_eq!(
-                run.drawn, SHORT_NAME,
-                "at width {width} a name that fits was altered anyway"
-            );
-            assert!(
-                !run.drawn.contains('\u{2026}'),
-                "at width {width} a short name was ellipsised: {:?}",
-                run.drawn
-            );
-            assert!(
-                run.rect.right() <= tile.right() - ROW_TEXT_INSET + 0.5,
-                "at width {width} even the short name left its tile"
-            );
-        }
-    }
-
-    /// **The weak band's detail line is bounded by the same tile.**
-    ///
-    /// It is our own wording rather than the user's, but "9 characters,
-    /// lowercase letters and digits" is longer than a narrow pane, and it was
-    /// painted by the very same unbounded `Painter::text` call the name was.
-    #[test]
-    fn the_weak_detail_line_stays_inside_its_tile() {
-        let report = report_for(&[login("a", "A", Some("abc12345"))]);
-        let detail = weak_detail(&report.weak[0]);
-        // The fixture is only worth anything if this line really is longer
-        // than the narrowest tile; assert that before asserting about it.
-        let narrow = painted_at(&report, PANE_WIDTHS[0]);
-        let (run, tile) = narrow.run_and_tile(&detail);
-        assert!(
-            run.drawn != detail,
-            "the detail line {detail:?} fits the {}pt pane whole, so this test would pass \
-             without any truncation at all -- it needs a longer fixture",
-            PANE_WIDTHS[0]
-        );
-        assert!(run.drawn.ends_with('\u{2026}'), "the detail line was cut with no ellipsis");
-        assert!(
-            run.rect.right() <= tile.right() - ROW_TEXT_INSET + 0.5,
-            "the detail line's ink reaches {} past a tile ending at {}",
-            run.rect.right(),
-            tile.right()
-        );
-        // ...and at a wide pane the same line is untouched.
-        let wide = painted_at(&report, PANE_WIDTHS[2]);
-        let (run, _) = wide.run_and_tile(&detail);
-        assert_eq!(run.drawn, detail, "a detail line that fits was ellipsised anyway");
-    }
-
-    /// **The group caption cannot overflow, and this is why.**
-    ///
-    /// "One password, 2 items" is drawn with `ui.label`, not `Painter::text`
-    /// -- an egui `Label` in a bounded `Ui` wraps at the available width, so
-    /// it grows downwards and never sideways. Same for the section bands and
-    /// the footer note. Asserted rather than merely reasoned about, because
-    /// "it's a Label" is exactly the kind of claim that stops being true when
-    /// someone adds `.truncate(false)` or an `Extend` wrap mode.
-    #[test]
-    fn every_run_the_pane_paints_stays_within_the_pane() {
-        for width in PANE_WIDTHS {
-            let report = report_for(&[
-                login("a", LONG_NAME, Some(STRONG_A)),
-                login("b", LONG_NAME, Some(STRONG_A)),
-                login("c", "A", Some("abc12345")),
-            ]);
-            let painted = painted_at(&report, width);
-            // The caption really is drawn, so the sweep below is about it.
-            let caption = reuse_group_heading(&report.reused[0]);
-            assert!(
-                painted.runs.iter().any(|r| r.source == caption),
-                "the pane painted no {caption:?} at width {width}: {:?}",
-                painted.runs.iter().map(|r| r.source.as_str()).collect::<Vec<_>>()
-            );
-            for run in &painted.runs {
-                assert!(
-                    run.rect.right() <= width + 0.5,
-                    "at width {width} the run {:?} was painted out to {}, past the pane's own \
-                     right edge",
-                    run.drawn,
-                    run.rect.right()
-                );
-            }
-        }
-    }
-
-    // ==================================================================
-    // The two panes that share one column line up
-    // ==================================================================
-
-    /// The rounded tiles a pane painted, at their exact row height,
-    /// deduplicated by their x extent.
-    ///
-    /// **X extent only.** The question is where a row starts and stops
-    /// horizontally, and a pane that painted its rows at two different widths
-    /// is exactly the defect -- so the answer has to be able to come back as
-    /// more than one value, and an assertion on a one-element vector is what
-    /// says there is only one.
-    fn tile_spans(shapes: &egui::Shape, height: f32, out: &mut Vec<(f32, f32)>) {
-        match shapes {
-            egui::Shape::Rect(rect) if (rect.rect.height() - height).abs() < 0.5 => {
-                let span = (rect.rect.left(), rect.rect.right());
-                if !out.iter().any(|s| (s.0 - span.0).abs() < 0.5 && (s.1 - span.1).abs() < 0.5) {
-                    out.push(span);
-                }
-            }
-            egui::Shape::Vec(inner) => {
-                for shape in inner {
-                    tile_spans(shape, height, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The width the two panes are compared at -- the item-list column's own,
-    /// so neither is drawn at a size the window never gives it.
-    const COLUMN: f32 = 390.0;
-
-    /// Raw input at [`COLUMN`], optionally with the pointer parked inside the
-    /// pane.
-    ///
-    /// **The pointer is the whole reason this parameter exists.** egui lays a
-    /// floating scrollbar's gutter out for a bar it is actually showing, and
-    /// on the default `VisibleWhenNeeded` it shows one only while the pointer
-    /// is in the area. A test run with the pointer permanently off-screen --
-    /// which is what a bare `RawInput` is -- therefore measures the one state
-    /// in which the old code happened to be right, and would have passed
-    /// against the bug it is here to pin.
-    fn column_input(pointer_inside: bool) -> egui::RawInput {
-        let mut input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(COLUMN, 700.0),
-            )),
-            ..Default::default()
-        };
-        if pointer_inside {
-            input.events.push(egui::Event::PointerMoved(egui::pos2(COLUMN - 4.0, 400.0)));
-        }
-        input
-    }
-
-    fn column_context() -> egui::Context {
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(column_input(false), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(column_input(false), |_ui| {});
-        ctx
-    }
-
-    /// Where the **Password health** pane puts its finding tiles, with `n`
-    /// weak findings and the pointer where `pointer_inside` says.
-    ///
-    /// Run for three frames so the one-frame-late overflow verdict (see
-    /// [`content_fits`]) has settled -- otherwise the bar's paint, though not
-    /// the layout, would be read mid-settle.
-    fn health_spans(n: usize, pointer_inside: bool) -> Vec<(f32, f32)> {
-        let ctx = column_context();
-        let items: Vec<VaultItem> = (0..n)
-            .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some("abc12345")))
-            .collect();
-        let report = report_for(&items);
-        let mut selected = None;
-        let mut spans = Vec::new();
-        for frame in 0..3 {
-            let output = ctx.run_ui(column_input(pointer_inside), |ui| {
-                draw_password_health(ui, &report, &mut selected, false);
-            });
-            if frame == 2 {
-                for clipped in &output.shapes {
-                    tile_spans(&clipped.shape, ROW_HEIGHT, &mut spans);
-                }
-            }
-        }
-        spans
-    }
-
-    /// Where the **item list** puts its row tiles, in the same column, at the
-    /// same width, with the same pointer.
-    fn list_spans(n: usize, pointer_inside: bool) -> Vec<(f32, f32)> {
-        let ctx = column_context();
-        let items: Vec<VaultItem> = (0..n)
-            .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some(STRONG_A)))
-            .collect();
-        let icons = item_list::IconCache::default();
-        // The first row selected: a v2 row paints its box only when it is
-        // selected (or hovered), so that is the row whose span is read.
-        let (mut search, mut selected, mut visible) = (String::new(), Some("id0".to_string()), Vec::new());
-        let mut spans = Vec::new();
-        for frame in 0..3 {
-            let output = ctx.run_ui(column_input(pointer_inside), |ui| {
-                let _ = item_list::draw_item_list(
-                    ui,
-                    Some(&items),
-                    &[],
-                    &sidebar::SidebarFilter::All,
-                    &mut search,
-                    &mut selected,
-                    &icons,
-                    false,
-                    &mut visible,
-                    None,
-                    false,
-                    // Not about the open gesture; the slide's arming is
-                    // covered where it lives.
-                    &mut false,
-                        &std::collections::HashSet::new(),
-                        &item_list::RowPeople::default(),
-                        "All items",
-                        false,
-                    );
-            });
-            if frame == 2 {
-                for clipped in &output.shapes {
-                    tile_spans(&clipped.shape, item_list::ROW_TILE_HEIGHT, &mut spans);
-                }
-            }
-        }
-        spans
-    }
-
-    /// **The reported defect: the two panes' rows start and stop at the same
-    /// x.**
-    ///
-    /// They take turns in one column of one window, so a reader switching
-    /// between them sees both insets in succession -- *"paddings in this list
-    /// don't match all items list (left and right with scroll)"*.
-    ///
-    /// Checked in four states, because the mismatch was not constant: a short
-    /// report and a long one (the bar's own reservation), each with the
-    /// pointer away and inside the pane (egui only lays a floating bar's
-    /// gutter out for a bar it is showing). The old code matched in exactly
-    /// one of the four.
-    #[test]
-    fn the_health_pane_and_the_item_list_lay_their_rows_out_identically() {
-        for n in [1usize, 40] {
-            for pointer_inside in [false, true] {
-                let health = health_spans(n, pointer_inside);
-                let list = list_spans(n, pointer_inside);
-                assert_eq!(
-                    health.len(),
-                    1,
-                    "with {n} findings and pointer_inside={pointer_inside} the health pane \
-                     painted its rows at {} different x extents: {health:?}",
-                    health.len()
-                );
-                assert_eq!(
-                    list.len(),
-                    1,
-                    "with {n} items and pointer_inside={pointer_inside} the item list painted \
-                     its rows at {} different x extents: {list:?}",
-                    list.len()
-                );
-                assert!(
-                    (health[0].0 - list[0].0).abs() < 0.5
-                        && (health[0].1 - list[0].1).abs() < 0.5,
-                    "with {n} rows and pointer_inside={pointer_inside} the health rows span \
-                     {:?} while the item list rows span {:?}",
-                    health[0],
-                    list[0]
-                );
-                // ...and against the numbers themselves, so a change that
-                // moved BOTH panes together could not pass this quietly.
-                assert!(
-                    (health[0].0 - PANE_PADDING).abs() < 0.5
-                        && (health[0].1 - (COLUMN - PANE_PADDING)).abs() < 0.5,
-                    "the rows span {:?}, not the expected {PANE_PADDING}..{}",
-                    health[0],
-                    COLUMN - PANE_PADDING
-                );
-            }
-        }
-    }
-
-    /// **The health pane's rows are ONE width across every one of those
-    /// states**, which is the constraint the item list already carries: a row
-    /// that resized when the pointer entered, or when the last finding was
-    /// fixed, is the *"window should not shrink/expand if more or less items"*
-    /// report all over again.
-    #[test]
-    fn the_health_pane_s_rows_never_change_width() {
-        let mut seen: Vec<(f32, f32)> = Vec::new();
-        for n in [1usize, 40] {
-            for pointer_inside in [false, true] {
-                for span in health_spans(n, pointer_inside) {
-                    if !seen.iter().any(|s: &(f32, f32)| {
-                        (s.0 - span.0).abs() < 0.5 && (s.1 - span.1).abs() < 0.5
-                    }) {
-                        seen.push(span);
-                    }
-                }
-            }
+    fn the_page_paints_the_title_the_tabs_the_groups_and_the_weak_rows() {
+        let ctx = ctx();
+        let shown = settled(&ctx, &pair_report(), false);
+        let texts: Vec<&str> = shown.texts.iter().map(|(t, _, _)| t.as_str()).collect();
+        for expected in [
+            HEALTH_PANE_TITLE,
+            "3 items need attention",
+            "All",
+            "Reused",
+            "Weak",
+            "Old",
+            "Breached",
+            "REUSED",
+            "One password, 2 items",
+            "Bank",
+            "Forum",
+            "WEAK",
+            "Old wiki",
+            "3 characters, lowercase letters only",
+        ] {
+            assert!(texts.contains(&expected), "the page never painted {expected:?}: {texts:?}");
         }
         assert_eq!(
-            seen.len(),
-            1,
-            "the finding rows were laid out at {} different x extents across the four \
-             pointer/length states: {seen:?}",
-            seen.len()
+            texts.iter().filter(|t| **t == CHANGE_PASSWORD_LABEL).count(),
+            3,
+            "every finding row carries the Change password button: {texts:?}"
         );
     }
 
-    // ==================================================================
-    // A finding always says which item it is about
-    // ==================================================================
-
-    /// **A finding with a blank name still names something.**
-    ///
-    /// The reported symptom was a row showing only its grey detail line, with
-    /// no name above it. That one is a row scrolled half under the pane's
-    /// header strip -- the name is the upper of the row's two lines, so a
-    /// part-clipped row shows exactly the lower one, and the pane's own
-    /// `ScrollArea` clips it. But the same picture is reachable for real: an
-    /// item whose `name` is empty lays out to no glyphs at all, so the row
-    /// would paint its detail line and nothing else.
-    ///
-    /// A finding that does not say WHICH item is unactionable -- the user
-    /// cannot fix a password they cannot find -- so the row falls back to a
-    /// stated placeholder rather than to blank space.
+    /// A finding you cannot click through to the item is a dead end.
     #[test]
-    fn a_finding_whose_item_has_no_name_still_paints_a_name() {
-        for name in ["", "   "] {
-            let report = report_for(&[login("id", name, Some("abc12345"))]);
-            let painted = painted_at(&report, COLUMN);
-            let (run, tile) = painted.run_and_tile(UNNAMED_ITEM);
-            assert!(!run.drawn.is_empty(), "the fallback name laid out no glyphs at all");
-            assert!(
-                run.rect.top() < tile.center().y,
-                "the fallback name was not painted on the row's upper line"
-            );
-            // The detail line is there too, so this is really the two-line
-            // row and not a row that lost its detail instead.
-            let detail = weak_detail(&report.weak[0]);
-            assert!(
-                painted.runs.iter().any(|r| r.source == detail),
-                "the row painted no detail line for name {name:?}"
-            );
+    fn a_row_opens_its_item_and_the_button_opens_the_editor() {
+        let ctx = ctx();
+        let report = pair_report();
+        let shown = settled(&ctx, &report, false);
+        let forum = shown.texts.iter().find(|(t, _, _)| t == "Forum").expect("Forum row").2.center();
+        let mut action = HealthAction::None;
+        let _ = page_frame(&ctx, &report, false, click_at(forum), &mut action);
+        assert_eq!(action, HealthAction::Open("id-forum".to_string()), "the row opens its item");
+
+        let shown = settled(&ctx, &report, false);
+        // The wiki's button is the last one painted.
+        let button = shown
+            .texts
+            .iter()
+            .filter(|(t, _, _)| t == CHANGE_PASSWORD_LABEL)
+            .map(|(_, _, r)| r.center())
+            .next_back()
+            .expect("a button");
+        let mut action = HealthAction::None;
+        let _ = page_frame(&ctx, &report, false, click_at(button), &mut action);
+        assert_eq!(action, HealthAction::ChangePassword("id-wiki".to_string()));
+    }
+
+    #[test]
+    fn a_click_off_every_row_asks_for_nothing() {
+        let ctx = ctx();
+        let report = pair_report();
+        let mut action = HealthAction::None;
+        let _ = page_frame(&ctx, &report, false, click_at(egui::pos2(10.0, 10.0)), &mut action);
+        assert_eq!(action, HealthAction::None);
+    }
+
+    #[test]
+    fn the_empty_state_paints_a_result_and_no_empty_sections() {
+        let ctx = ctx();
+        let report = report_for(&[login("a", "Bank", Some(STRONG_A)), login("b", "Shop", Some(STRONG_B))]);
+        let shown = settled(&ctx, &report, false);
+        let texts: Vec<&str> = shown.texts.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert!(texts.contains(&"No reused or weak passwords"), "{texts:?}");
+        assert!(texts.contains(&"Checked 2 passwords."), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("No reused, weak or breached")), "{texts:?}");
+        assert!(!texts.contains(&"REUSED"), "an empty REUSED band was painted: {texts:?}");
+        assert!(!texts.contains(&"WEAK"), "an empty WEAK band was painted: {texts:?}");
+        assert!(!texts.contains(&CHANGE_PASSWORD_LABEL), "a button with nothing to change: {texts:?}");
+    }
+
+    /// The breach footer is on screen in both states of the setting.
+    #[test]
+    fn the_breach_footer_is_painted_in_both_states() {
+        let ctx = ctx();
+        let report = report_for(&[login("a", "Bank", Some(STRONG_A))]);
+        for on in [false, true] {
+            let shown = settled(&ctx, &report, on);
+            let joined = shown.texts.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(joined.contains("known breaches"), "with the setting {on}, no word about where it is: {joined}");
         }
     }
 
-    /// The counter-assertion: an item that HAS a name is not given the
-    /// placeholder, and keeps its own name exactly.
     #[test]
-    fn a_named_finding_is_not_given_the_placeholder() {
-        let report = report_for(&[login("id", "Bank", Some("abc12345"))]);
-        let painted = painted_at(&report, COLUMN);
-        assert!(
-            painted.runs.iter().all(|r| r.source != UNNAMED_ITEM),
-            "a named item was painted as {UNNAMED_ITEM:?}"
-        );
-        let (run, _) = painted.run_and_tile("Bank");
-        assert_eq!(run.drawn, "Bank");
+    fn an_item_with_no_name_is_still_a_row_you_can_find() {
+        let ctx = ctx();
+        let report = report_for(&[login("id", "  ", Some("abc12345"))]);
+        let shown = settled(&ctx, &report, false);
+        assert!(shown.text(UNNAMED_ITEM).is_some(), "the nameless finding painted no name");
+        let named = report_for(&[login("id", "Bank", Some("abc12345"))]);
+        let shown = settled(&ctx, &named, false);
+        assert!(shown.text(UNNAMED_ITEM).is_none(), "a named item got the placeholder");
     }
 
-    /// Every visibly-inked rect the pane painted that is the scrollbar's own
-    /// width, at `settle` frames with the pointer parked over the gutter.
-    ///
-    /// **Keyed on visible ink, not on presence.** `theme::hide_scrollbar`
-    /// leaves the bar's rects being emitted and zeroes their six opacities,
-    /// so a probe that only counted `Shape::Rect`s of the right width would
-    /// find the bar in both states and could never tell them apart. egui also
-    /// fades a floating bar in over several frames, which is why this settles
-    /// rather than reading frame one -- an earlier version of the item list's
-    /// own test read frame one and asserted the placement of a bar that was
-    /// not being drawn yet.
-    fn inked_bars(n: usize, settle: usize) -> Vec<egui::Rect> {
-        let ctx = column_context();
-        let items: Vec<VaultItem> = (0..n)
-            .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some("abc12345")))
+    #[test]
+    fn a_long_name_is_ellipsised_inside_its_row_and_clear_of_the_button() {
+        let ctx = ctx();
+        let long = "Visual Studio App Center | iOS, Android, Xamarin & React Native App Development and more besides";
+        let report = report_for(&[login("id", long, Some("abc12345"))]);
+        let shown = settled(&ctx, &report, false);
+        let (drawn, _, rect) = shown.texts.iter().find(|(t, _, _)| t.starts_with("Visual")).expect("the name");
+        assert!(drawn.ends_with('\u{2026}'), "the long name was not cut: {drawn:?}");
+        let (_, _, button) = shown.texts.iter().find(|(t, _, _)| t == CHANGE_PASSWORD_LABEL).expect("the button");
+        assert!(rect.right() <= button.left(), "the name runs under the button");
+    }
+
+    /// The column is capped at 760 and centred, as the design has it.
+    #[test]
+    fn the_column_is_capped_and_centred() {
+        let ctx = ctx();
+        let shown = settled(&ctx, &pair_report(), false);
+        let title = shown.text(HEALTH_PANE_TITLE).expect("the title").2;
+        let expected_left = (PAGE.x - COLUMN_MAX) / 2.0;
+        assert!((title.left() - expected_left).abs() < 3.0, "the title starts at {}, not {expected_left}", title.left());
+    }
+
+    /// Rows in one card are one row apart (a row's tile must not move the
+    /// cursor back up into the row, which stacked them 16 points too close).
+    #[test]
+    fn rows_in_a_card_are_a_row_and_a_rule_apart() {
+        let ctx = ctx();
+        let shown = settled(&ctx, &pair_report(), false);
+        let tops: Vec<f32> = shown
+            .texts
+            .iter()
+            .filter(|(t, _, _)| t == CHANGE_PASSWORD_LABEL)
+            .map(|(_, _, r)| r.center().y)
             .collect();
-        let report = report_for(&items);
-        let mut selected = None;
-        let mut bars = Vec::new();
-        for frame in 0..settle {
-            let output = ctx.run_ui(column_input(true), |ui| {
-                draw_password_health(ui, &report, &mut selected, false);
-            });
-            if frame + 1 == settle {
-                for clipped in &output.shapes {
-                    collect_bars(&clipped.shape, &mut bars);
-                }
-            }
-        }
-        bars
+        assert!(tops.len() >= 2, "{tops:?}");
+        assert!((tops[1] - tops[0] - (ROW_HEIGHT + 1.0)).abs() < 1.5, "the rows are {} apart, not a row and its rule", tops[1] - tops[0]);
     }
 
-    fn collect_bars(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
-        match shape {
-            egui::Shape::Rect(rect)
-                if (rect.rect.width() - theme::SCROLLBAR_WIDTH).abs() < 0.5
-                    && rect.fill.a() > 0 =>
-            {
-                out.push(rect.rect)
-            }
-            egui::Shape::Vec(inner) => {
-                for shape in inner {
-                    collect_bars(shape, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Enough frames for egui's floating-bar fade AND for `content_fits`'
-    /// one-frame-late verdict to settle.
-    const SETTLE_FRAMES: usize = 12;
-
-    /// **The bar lives inside the pane's own 10pt padding, exactly where the
-    /// item list's does** -- flush to the gutter's outer edge, taking no
-    /// width from the rows.
-    ///
-    /// This is the half of "the paddings do not match" that is not about the
-    /// rows: a bar in a lane of its own outside the padding is what the user
-    /// rejected on the item list ("scroll should be included in those 10pt"),
-    /// and the health pane must not reintroduce it next door.
+    /// The reason colours: weak red, reused amber.
     #[test]
-    fn a_scrolling_report_draws_its_bar_inside_the_panes_own_padding() {
-        let bars = inked_bars(40, SETTLE_FRAMES);
-        assert!(
-            !bars.is_empty(),
-            "a 40-finding report painted no scrollbar at all, so nothing below is about a bar"
-        );
-        for bar in &bars {
-            assert!(
-                (bar.right() - COLUMN).abs() < 0.5
-                    && (bar.left() - (COLUMN - theme::SCROLLBAR_WIDTH)).abs() < 0.5,
-                "the bar spans {}..{}, expected {}..{COLUMN} -- flush to the outer edge of the \
-                 {PANE_PADDING}pt gutter, as the item list's is",
-                bar.left(),
-                bar.right(),
-                COLUMN - theme::SCROLLBAR_WIDTH
-            );
-        }
-    }
-
-    /// **A report that fits paints no bar at all**, which is the state the
-    /// reserved-lane trick would otherwise get wrong: `AlwaysVisible` is what
-    /// holds the rows at one width, and it would also run a 6pt line the full
-    /// height of a pane with nothing to scroll, leaving 2pt of clear space on
-    /// the right against 10pt on the left.
-    ///
-    /// The rows are asserted not to have moved either -- suppressing the
-    /// PAINT and not the reservation is the whole point, and a fix that
-    /// dropped `AlwaysVisible` instead would pass the first half of this and
-    /// fail the second.
-    #[test]
-    fn a_report_that_fits_paints_no_bar_and_still_does_not_move_its_rows() {
-        assert!(
-            inked_bars(1, SETTLE_FRAMES).is_empty(),
-            "a one-finding report drew a scrollbar down a pane with nothing to scroll: {:?}",
-            inked_bars(1, SETTLE_FRAMES)
-        );
-        assert_eq!(
-            health_spans(1, true),
-            health_spans(40, true),
-            "the rows moved between a report that fits and one that scrolls"
-        );
+    fn a_reason_is_in_its_categorys_colour() {
+        let ctx = ctx();
+        let shown = settled(&ctx, &pair_report(), false);
+        let p = crate::kit::tokens::palette(&ctx);
+        let colour_of = |needle: &str| shown.text(needle).unwrap_or_else(|| panic!("no {needle}")).1;
+        assert_eq!(colour_of("Also used by"), AMBER);
+        assert_eq!(colour_of("3 characters"), p.error);
     }
 }
 

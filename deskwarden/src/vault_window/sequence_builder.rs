@@ -1847,7 +1847,7 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
             // At the pill's height, which is the band's: 4a's `align-items:
             // center` puts the caption on the pill's middle, and egui does
             // that only for a row that knows its height first.
-            let line = theme::segment_height_compact(ui);
+            let line = detail_edit::view_toggle_compact_height(ui);
             centred_row(ui, line, |ui| {
                 ui.spacing_mut().item_spacing.x = SEQUENCE_BAND_GAP;
                 ui.add(
@@ -2639,14 +2639,14 @@ fn add_step_row(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRe
         add_wait_menu(ui, draft);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = ADD_ROW_GAP;
-            if !draft.sequence.is_empty() && theme::secondary_button(ui, USE_DEFAULT).clicked() {
+            if !draft.sequence.is_empty() && crate::kit::controls::row_button(ui, USE_DEFAULT).clicked() {
                 // The empty string, not the default's own spelling: an empty
                 // stored value IS the default, and rendering it would turn an
                 // item that inherits into one that pins.
                 draft.sequence = String::new();
             }
             let caption = if draft.revealing { HIDE } else { REVEAL };
-            if theme::secondary_button(ui, caption).clicked() {
+            if crate::kit::controls::row_button(ui, caption).clicked() {
                 draft.revealing = !draft.revealing;
             }
         });
@@ -2716,7 +2716,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                     let add = ui
                         .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
-                            let add = theme::row_button(ui, ADD_LITERAL_BUTTON).clicked();
+                            let add = crate::kit::controls::row_button(ui, ADD_LITERAL_BUTTON).clicked();
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
@@ -2799,7 +2799,7 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                     let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
                     let typed = entered(&box_response, ui);
                     ui.add_enabled_ui(addable, |ui| {
-                        if theme::row_button(ui, ADD_WAIT_BUTTON).clicked() || (typed && addable) {
+                        if crate::kit::controls::row_button(ui, ADD_WAIT_BUTTON).clicked() || (typed && addable) {
                             if let Some(next) =
                                 detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
                             {
@@ -2900,7 +2900,7 @@ fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
     // [`LITERAL_BOX_WIDTH`] is one that cannot show what was typed into it.
     let field_row = LITERAL_BOX_WIDTH
         + theme::ROW_BUTTON_GAP
-        + theme::row_button_width(ui, ADD_LITERAL_BUTTON);
+        + crate::kit::controls::row_button_width(ui, ADD_LITERAL_BUTTON);
     // **Capped at the CARD, not at a number of my own.** "the rest of values
     // put in one line unless it becomes wider than Fill rule modal, then
     // transfer to next line and make the popup width dinamic to the width of
