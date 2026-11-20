@@ -315,7 +315,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
                 crate::kit::menu::MENU.frame(&palette).show(ui, |ui| {
                     ui.set_width(crate::kit::menu::MENU.content_width());
                     for step in ALL {
-                        let mut row = crate::kit::menu::Item::new(step.label()).icon(step.icon()).id(menu_row_id(step));
+                        let mut row = crate::kit::menu::Item::new(step.label()).icon(step.icon()).id(menu_row_id(step)).min_width(crate::kit::menu::MENU.content_width());
                         if step.secret() {
                             row = row.ink(palette.danger_ink);
                         }

@@ -28,7 +28,7 @@ use crate::theme;
 const EVERY_SCRIPT: [Fonts; 5] =
     [Fonts::Greek, Fonts::ChineseSimplified, Fonts::ChineseTraditional, Fonts::Japanese, Fonts::Korean];
 
-const MENU_WIDTH: f32 = 300.0;
+const MENU_WIDTH: f32 = 340.0;
 const MENU_MAX_HEIGHT: f32 = 360.0;
 
 fn open_id() -> egui::Id {
@@ -163,7 +163,8 @@ pub fn language_row(ui: &mut Ui, settings: &mut Settings, title: &str) {
 /// One option; whether it was clicked this frame. The kit's row, under this
 /// option's own id, with the language's English name as its hint.
 fn option_row(ui: &mut Ui, tag: Option<&str>, name: &str, english: &str, selected: bool) -> bool {
-    let mut row = kit_menu::Item::new(name).selected(selected).id(option_id(tag));
+    let mut row =
+        kit_menu::Item::new(name).selected(selected).id(option_id(tag)).min_width(kit_menu::MENU.at_least(MENU_WIDTH).content_width());
     if !english.is_empty() {
         row = row.hint(english);
     }

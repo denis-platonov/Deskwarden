@@ -287,11 +287,17 @@ pub struct Item<'a> {
     /// Ink for a row that is not danger but is not ordinary either (the add
     /// menu's secret steps are `#8c3c33`).
     pub ink: Option<Color32>,
+    /// At least this wide: for a menu a caller lays in a region of its own.
+    pub min_width: f32,
 }
 
 impl<'a> Item<'a> {
     pub fn new(label: &'a str) -> Self {
-        Item { label, icon: None, hint: None, selected: false, danger: false, enabled: true, id: None, ink: None }
+        Item { label, icon: None, hint: None, selected: false, danger: false, enabled: true, id: None, ink: None, min_width: 0.0 }
+    }
+    pub fn min_width(mut self, width: f32) -> Self {
+        self.min_width = width;
+        self
     }
     pub fn ink(mut self, ink: Color32) -> Self {
         self.ink = Some(ink);
@@ -352,7 +358,7 @@ fn paint_row(ui: &mut Ui, item: Item<'_>, trailing: Option<&str>) -> Response {
     let hint_width = hint.as_ref().map_or(0.0, |h| HINT_GAP + h.size().x);
     let wanted = ROW_PAD_X * 2.0 + lead + label.size().x + hint_width + tail;
     let sense = if item.enabled { Sense::click() } else { Sense::hover() };
-    let size = Vec2::new(row_width(ui, wanted), ROW_HEIGHT);
+    let size = Vec2::new(row_width(ui, wanted).max(item.min_width), ROW_HEIGHT);
     let (rect, response) = match item.id {
         Some(id) => {
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());

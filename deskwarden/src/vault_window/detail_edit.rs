@@ -11431,10 +11431,7 @@ fn folder_combo(
     // The cell's full width in the grid arm, which is what makes three
     // controls of three different natural widths read as a row.
     if let Some(index) = crate::kit::menu::select(ui, "edit-folder", ui.available_width(), crate::kit::menu::FIELD, current, &choices) {
-        draft.folder_id = match index.checked_sub(1) {
-            None => None,
-            Some(i) => Some(assignable[i].id.clone()),
-        };
+        draft.folder_id = index.checked_sub(1).map(|i| assignable[i].id.clone());
     }
 }
 
