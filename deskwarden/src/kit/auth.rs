@@ -33,8 +33,6 @@ pub const WORDMARK: &str = "Deskwarden";
 
 /// The sign-in form's width.
 pub const FORM_WIDTH: f32 = 420.0;
-/// The lock screen's password row.
-pub const LOCK_ROW_WIDTH: f32 = 440.0;
 /// A window narrower than this drops the brand half and gives the form the
 /// whole window (the design is drawn at 1280; the form needs 420 and a margin).
 pub const COMPACT_BELOW: f32 = 760.0;
@@ -45,23 +43,12 @@ pub const CAPTION_CELL: Vec2 = vec2(46.0, 34.0);
 pub const FORM_GAP: f32 = 18.0;
 /// Between a label and its field.
 pub const LABEL_GAP: f32 = 8.0;
-/// Between the stacked parts of the lock screen.
-pub const LOCK_GAP: f32 = 26.0;
 
-/// What the lock screen's Hello button says before and during a check.
+/// What the lock screen's Windows Hello button says.
 pub fn hello_label() -> &'static str {
     i18n::t("auth.hello_label")
 }
-pub fn hello_checking() -> &'static str {
-    i18n::t("auth.hello_checking")
-}
-/// The link from the Hello stage to the password stage, and back.
-pub fn use_password_label() -> &'static str {
-    i18n::t("auth.use_password")
-}
-pub fn lock_heading() -> &'static str {
-    i18n::t("auth.lock_heading")
-}
+/// The lock screen's title.
 pub fn lock_sub() -> &'static str {
     i18n::t("auth.lock_sub")
 }
@@ -229,18 +216,6 @@ pub fn error_line(ui: &mut Ui, text: &str) {
     ui.painter().galley(rect.min, g, p.error);
 }
 
-/// An error on the navy lock screen: red on navy does not read, so it sits on
-/// a white chip, still in `ERROR`.
-pub fn error_chip(ui: &mut Ui, text: &str, width: f32) {
-    let p = palette(ui.ctx());
-    let role = Role { size: 14.0, face: SEMIBOLD, tracking_em: 0.0 };
-    let g = galley(ui.ctx(), role, text, p.error, Some(width - 28.0), None);
-    let size = g.size() + vec2(28.0, 20.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(size.x.max(0.0), size.y), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(12), p.card);
-    ui.painter().galley(rect.min + vec2(14.0, 10.0), g, p.error);
-}
-
 /// A full-width button (the sign-in screen's Log in is the form's width).
 // Draw entry point: its arguments are the state it paints; a bundle would only move them.
 #[allow(clippy::too_many_arguments)]
@@ -268,6 +243,18 @@ pub fn wide_button(
 /// centred on the right half. Below [`COMPACT_BELOW`] the brand half is
 /// dropped. Returns what the caption buttons were asked.
 pub fn split(ui: &mut Ui, full: Rect, close: CloseControl, add_form: impl FnOnce(&mut Ui)) -> ChromeAction {
+    split_timed(ui, full, close, (0.08, 0.45), add_form)
+}
+
+/// The same shell for the lock screen (the design's `dw-up .3s`, no delay):
+/// the account is already known, so its column rises as soon as the window
+/// does.
+pub fn lock_split(ui: &mut Ui, full: Rect, close: CloseControl, add_form: impl FnOnce(&mut Ui)) -> ChromeAction {
+    split_timed(ui, full, close, (0.0, 0.3), add_form)
+}
+
+/// [`split`] with the form column's rise as `(delay, duration)` seconds.
+fn split_timed(ui: &mut Ui, full: Rect, close: CloseControl, (delay, duration): (f32, f32), add_form: impl FnOnce(&mut Ui)) -> ChromeAction {
     let ctx = ui.ctx().clone();
     let p = palette(&ctx);
     ui.painter().rect_filled(full, CornerRadius::ZERO, p.card);
@@ -286,7 +273,7 @@ pub fn split(ui: &mut Ui, full: Rect, close: CloseControl, add_form: impl FnOnce
     let before = remembered_height(&ctx, id, 0.0);
     let top = form_half.top() + ((form_half.height() - before) / 2.0).max(CAPTION_CELL.y);
     let rect = Rect::from_min_size(pos2(form_half.center().x - width / 2.0, top), vec2(width, form_half.bottom() - top));
-    let pose = rise(&ctx, "split-form", 0.08, 0.45);
+    let pose = rise(&ctx, "split-form", delay, duration);
     let height = column(ui, rect, pose, add_form);
     remembered_height(&ctx, id, height);
     action
@@ -330,98 +317,6 @@ fn brand_panel(ui: &mut Ui, rect: Rect) {
     painter.galley_with_override_text_color(sub_at, sub, tint(p.blue_edge));
 }
 
-// --------------------------------------------------------------- the lock
-
-/// The lock screen (spec C 5.3): navy, with a column centred in it. `add`
-/// lays out the column: [`lock_header`] and then the stage.
-pub fn lock_surface(ui: &mut Ui, full: Rect, close: CloseControl, add: impl FnOnce(&mut Ui)) -> ChromeAction {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    ui.painter().rect_filled(full, CornerRadius::ZERO, p.blue_deep);
-    let action = caption_buttons(ui, full, p.blue_edge, close);
-
-    let width = LOCK_ROW_WIDTH.min((full.width() - 48.0).max(0.0));
-    let id = egui::Id::new("kit-auth-lock-height");
-    let before = remembered_height(&ctx, id, 0.0);
-    let top = full.top() + ((full.height() - before) / 2.0).max(CAPTION_CELL.y);
-    let rect = Rect::from_min_size(pos2(full.center().x - width / 2.0, top), vec2(width, full.bottom() - top));
-    let pose = rise(&ctx, "lock", 0.0, 0.3);
-    let height = column(ui, rect, pose, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.spacing_mut().item_spacing.y = LOCK_GAP;
-            add(ui);
-        });
-    });
-    remembered_height(&ctx, id, height);
-    action
-}
-
-/// The lock screen's head: the white shield (64 by 75), the heading and the
-/// line under it, 8 apart.
-pub fn lock_header(ui: &mut Ui, heading: &str, sub: &str) {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    let (mark, _) = ui.allocate_exact_size(vec2(64.0, 75.0), Sense::hover());
-    theme::paint_mark_colours(ui.painter(), mark, theme::MARK_REVERSED);
-    let head_role = Role { size: 32.0, face: EXTRABOLD, tracking_em: -0.02 };
-    let sub_role = Role { size: 17.0, face: theme::REGULAR, tracking_em: 0.0 };
-    let head = galley(&ctx, head_role, heading, Color32::WHITE, Some(ui.available_width()), None);
-    let sub = galley(&ctx, sub_role, sub, p.blue_edge, Some(ui.available_width()), None);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), head.size().y + 8.0 + sub.size().y), Sense::hover());
-    let head_at = pos2(rect.center().x - head.size().x / 2.0, rect.top());
-    let sub_at = pos2(rect.center().x - sub.size().x / 2.0, rect.top() + head.size().y + 8.0);
-    ui.painter().galley(head_at, head, Color32::WHITE);
-    ui.painter().galley(sub_at, sub, p.blue_edge);
-}
-
-/// The Windows Hello button (62 high, white, navy type, a fingerprint). While
-/// `checking` it reads "Checking\u{2026}" and a white ring spreads from it.
-pub fn hello_button(ui: &mut Ui, label: &str, checking: bool) -> egui::Response {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    let role = Role { size: 17.0, face: BOLD, tracking_em: 0.0 };
-    let text = galley(&ctx, role, label, p.blue_deep, None, None);
-    let size = vec2(30.0 * 2.0 + 24.0 + 12.0 + text.size().x, 62.0);
-    let (slot, response) = ui.allocate_exact_size(size, Sense::click());
-    let lift = if response.hovered() && !checking { -2.0 } else { 0.0 };
-    let rect = slot.translate(vec2(0.0, lift));
-    let radius = CornerRadius::same(18);
-    if checking {
-        let (spread, alpha) = motion::pulse(ctx.input(|i| i.time), 22.0);
-        ui.painter().rect_stroke(
-            rect.expand(spread),
-            CornerRadius::same(18 + spread as u8),
-            Stroke::new(2.0, Color32::WHITE.gamma_multiply(alpha * 0.6)),
-            egui::StrokeKind::Outside,
-        );
-        ctx.request_repaint();
-    }
-    ui.painter().add(Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(46) }.as_shape(rect, radius));
-    ui.painter().rect_filled(rect, radius, Color32::WHITE);
-    let icon_rect = Rect::from_min_size(pos2(rect.left() + 30.0, rect.center().y - 12.0), Vec2::splat(24.0));
-    icon::stroke(ui.painter(), icon_rect, glyph::FINGERPRINT, 2.0, p.blue_deep);
-    ui.painter().galley(pos2(icon_rect.right() + 12.0, rect.center().y - text.size().y / 2.0), text, p.blue_deep);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// The text link under a lock stage (15, light blue, white on hover).
-pub fn lock_link(ui: &mut Ui, text: &str) -> egui::Response {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
-    let g = galley(&ctx, role, text, p.blue_edge, None, None);
-    let (rect, response) = ui.allocate_exact_size(g.size() + vec2(8.0, 6.0), Sense::click());
-    let colour = if response.hovered() { Color32::WHITE } else { p.blue_edge };
-    ui.painter().galley_with_override_text_color(rect.center() - g.size() / 2.0, g, colour);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// How wide [`lock_button`] draws `label`.
-pub fn lock_button_width(ctx: &egui::Context, label: &str) -> f32 {
-    let role = Role { size: 16.0, face: BOLD, tracking_em: 0.0 };
-    galley(ctx, role, label, Color32::WHITE, None, None).size().x + 48.0
-}
-
 /// A text link on the white half (14, blue, deeper blue on hover).
 pub fn link(ui: &mut Ui, text: &str) -> egui::Response {
     let ctx = ui.ctx().clone();
@@ -453,42 +348,6 @@ pub fn progress(ui: &mut Ui, width: f32, on_dark: bool) {
         ui.painter().rect_filled(rect, CornerRadius::same(2), fore);
     }
     ui.ctx().request_repaint();
-}
-
-/// A wrapped note on the navy lock screen, centred (the first-run notice).
-pub fn lock_note(ui: &mut Ui, text: &str, width: f32) {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    let role = Role { size: 14.0, face: theme::REGULAR, tracking_em: 0.0 };
-    let mut job = tokens::job(role, text, p.blue_edge);
-    job.wrap.max_width = width;
-    job.halign = egui::Align::Center;
-    let g = ctx.fonts_mut(|f| f.layout_job(job));
-    let (rect, _) = ui.allocate_exact_size(vec2(width, g.size().y), Sense::hover());
-    ui.painter().galley(pos2(rect.center().x, rect.top()), g, p.blue_edge);
-}
-
-/// The lock screen's Unlock button (58 high, bright blue).
-pub fn lock_button(ui: &mut Ui, label: &str) -> egui::Response {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    let role = Role { size: 16.0, face: BOLD, tracking_em: 0.0 };
-    let g = galley(&ctx, role, label, Color32::WHITE, None, None);
-    let (rect, response) = ui.allocate_exact_size(vec2(g.size().x + 48.0, 58.0), Sense::click());
-    let fill = if response.hovered() { p.blue_bright_hover } else { p.blue_bright };
-    ui.painter().rect_filled(rect, CornerRadius::same(16), fill);
-    ui.painter().galley_with_override_text_color(rect.center() - g.size() / 2.0, g, Color32::WHITE);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// A small line under the lock stage in a quieter blue (the server, Log out).
-pub fn lock_quiet(ui: &mut Ui, text: &str) {
-    let ctx = ui.ctx().clone();
-    let p = palette(&ctx);
-    let role = Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 };
-    let g = galley(&ctx, role, text, p.blue_soft, None, None);
-    let (rect, _) = ui.allocate_exact_size(g.size(), Sense::hover());
-    ui.painter().galley(rect.min, g, p.blue_soft);
 }
 
 // ------------------------------------------------- the sign-in gallery's parts
@@ -602,10 +461,30 @@ pub fn field_secret(
     width: f32,
     error: bool,
 ) -> egui::Response {
+    field_secret_sized(ui, id, value, revealed, placeholder, width, error, (50.0, 38.0))
+}
+
+/// The lock screen's master-password field: [`field_secret`] at 54 high with
+/// a 40 square eye.
+pub const LOCK_FIELD: (f32, f32) = (54.0, 40.0);
+
+/// [`field_secret`] with its `(height, eye)` chosen.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
+pub fn field_secret_sized(
+    ui: &mut Ui,
+    id: egui::Id,
+    value: &mut String,
+    revealed: &mut bool,
+    placeholder: &str,
+    width: f32,
+    error: bool,
+    (height, eye_side): (f32, f32),
+) -> egui::Response {
     let p = palette(ui.ctx());
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 50.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     field_box(ui, rect, 14, ui.memory(|m| m.has_focus(id)), error);
-    let eye = Rect::from_center_size(pos2(rect.right() - 6.0 - 19.0, rect.center().y), Vec2::splat(38.0));
+    let eye = Rect::from_center_size(pos2(rect.right() - 6.0 - eye_side / 2.0, rect.center().y), Vec2::splat(eye_side));
     let eye_response = ui.interact(eye, id.with("eye"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     if eye_response.hovered() {
         ui.painter().rect_filled(eye, CornerRadius::same(11), p.hover);
@@ -855,6 +734,107 @@ pub fn wait_panel(ui: &mut Ui, label: &str, value: &str) {
     ui.painter().galley(pos2(value_x, base - v.size().y), v, p.ink);
 }
 
+// ------------------------------------------------------------- the lock
+
+/// `clock`: the mark in front of the lock screen's no-activity line.
+const CLOCK: &str = "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 6v6l4 2";
+/// The account chip's status dot (the design's `#1f9d55`).
+const ONLINE_DOT: Color32 = Color32::from_rgb(0x1f, 0x9d, 0x55);
+/// The dot between the chip's two facts (the design's `#c4c0bc`).
+const CHIP_DOT: Color32 = Color32::from_rgb(0xc4, 0xc0, 0xbc);
+
+/// What the lock screen's account chip says.
+pub struct AccountChip<'a> {
+    /// The avatar's two letters.
+    pub initials: &'a str,
+    pub email: &'a str,
+    /// "Still logged in".
+    pub status: &'a str,
+    /// The server, as the web address it is reached at.
+    pub host: &'a str,
+    /// What hovering the server says (US cloud, EU cloud, your own server).
+    pub host_hint: &'a str,
+}
+
+/// A line of one row that gives way with an ellipsis rather than wrapping.
+fn one_line(ctx: &egui::Context, role: Role, text: &str, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = tokens::job(role, text, color);
+    job.wrap.max_width = width.max(8.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('\u{2026}');
+    ctx.fonts_mut(|f| f.layout_job(job))
+}
+
+/// The lock screen's account chip: the avatar with its green dot, the address
+/// over "Still logged in \u{b7} server", on a grey pill that is only as wide as
+/// it needs to be and never wider than the column.
+pub fn account_chip(ui: &mut Ui, chip: &AccountChip) {
+    let ctx = ui.ctx().clone();
+    let p = palette(&ctx);
+    let dark = ctx.global_style().visuals.dark_mode;
+    let avatar = 40.0;
+    let text_max = (ui.available_width() - 10.0 - avatar - 12.0 - 14.0).max(40.0);
+    let email = one_line(&ctx, Role { size: 15.0, face: BOLD, tracking_em: 0.0 }, chip.email, p.ink, text_max);
+    let line_role = Role { size: 13.0, face: SEMIBOLD, tracking_em: 0.0 };
+    let status = galley(&ctx, line_role, chip.status, p.done_ink, None, None);
+    let dot = galley(&ctx, line_role, "\u{b7}", if dark { p.text_ghost } else { CHIP_DOT }, None, None);
+    let globe = 13.0;
+    let before_host = status.size().x + 8.0 + dot.size().x + 8.0 + globe + 4.0;
+    let host = one_line(&ctx, line_role, chip.host, p.text_muted, text_max - before_host);
+    let line_w = before_host + host.size().x;
+    let text_w = email.size().x.max(line_w).min(text_max);
+    let (rect, _) = ui.allocate_exact_size(vec2(10.0 + avatar + 12.0 + text_w + 14.0, 60.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(16), p.window_bg);
+
+    let disc = Rect::from_center_size(pos2(rect.left() + 10.0 + avatar / 2.0, rect.center().y), Vec2::splat(avatar));
+    ui.painter().circle_filled(disc.center(), avatar / 2.0, p.blue);
+    let letters = galley(&ctx, Role { size: 14.0, face: EXTRABOLD, tracking_em: 0.0 }, chip.initials, Color32::WHITE, None, None);
+    ui.painter().galley_with_override_text_color(disc.center() - letters.size() / 2.0, letters, Color32::WHITE);
+    // 12 of green inside a 2 ring, its outer edge 1 past the disc's corner.
+    let at = pos2(disc.right() + 1.0 - 8.0, disc.bottom() + 1.0 - 8.0);
+    ui.painter().circle_filled(at, 8.0, p.window_bg);
+    ui.painter().circle_filled(at, 6.0, ONLINE_DOT);
+
+    let x = disc.right() + 12.0;
+    let block = email.size().y + 2.0 + status.size().y.max(host.size().y);
+    let top = rect.center().y - block / 2.0;
+    let second = top + email.size().y + 2.0;
+    let line_h = status.size().y.max(host.size().y);
+    ui.painter().galley(pos2(x, top), email, p.ink);
+    let mut cursor = x;
+    let middle = |h: f32| second + (line_h - h) / 2.0;
+    let status_w = status.size().x;
+    ui.painter().galley(pos2(cursor, middle(status.size().y)), status, p.done_ink);
+    cursor += status_w + 8.0;
+    let dot_w = dot.size().x;
+    ui.painter().galley(pos2(cursor, middle(dot.size().y)), dot, CHIP_DOT);
+    cursor += dot_w + 8.0;
+    let host_rect = Rect::from_min_size(pos2(cursor, second), vec2(globe + 4.0 + host.size().x, line_h));
+    icon::stroke(ui.painter(), Rect::from_center_size(pos2(cursor + globe / 2.0, second + line_h / 2.0), Vec2::splat(globe)), glyph::WEB, 2.2, p.text_muted);
+    ui.painter().galley(pos2(cursor + globe + 4.0, middle(host.size().y)), host, p.text_muted);
+    let over = ui.interact(host_rect, egui::Id::new("auth-lock-host"), Sense::hover());
+    crate::kit::tips::hint(ui, &over, chip.host_hint, &[]);
+}
+
+/// The line under the lock screen's title: the clock, `text`, and the `?`
+/// badge whose bubble says `tip`.
+pub fn lock_note_line(ui: &mut Ui, text: &str, tip: &str) {
+    let ctx = ui.ctx().clone();
+    let p = palette(&ctx);
+    let width = ui.available_width();
+    let role = Role { size: 16.0, face: theme::REGULAR, tracking_em: 0.0 };
+    let line = galley(&ctx, role, text, p.text_faint, Some((width - 17.0 - 8.0 - 8.0 - 18.0).max(60.0)), None);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (mark, _) = ui.allocate_exact_size(Vec2::splat(17.0), Sense::hover());
+        icon::stroke(ui.painter(), mark, CLOCK, 2.0, p.text_faint);
+        let (rect, _) = ui.allocate_exact_size(line.size(), Sense::hover());
+        ui.painter().galley(rect.min, line, p.text_faint);
+        crate::kit::tips::help_dot(ui, egui::Id::new("auth-lock-note-tip"), tip, 230.0, crate::kit::tips::Placement::Below);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,72 +925,77 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_surface_is_navy_with_the_shield_heading_and_line() {
+    fn the_account_chip_is_a_grey_pill_with_the_avatar_its_dot_and_two_lines() {
         let ctx = testing::ctx();
-        let mut painted = testing::Painted::default();
-        for i in 0..8 {
-            painted = testing::frame(&ctx, 1.0 + i as f64 * 0.2, WIDE, vec![], |ui| {
-                let full = ui.max_rect();
-                let _ = lock_surface(ui, full, CloseControl::Active, |ui| lock_header(ui, lock_heading(), lock_sub()));
-            });
-        }
-        assert!(painted.rects.iter().any(|r| r.fill == palette(&ctx).blue_deep && r.rect.size() == WIDE));
-        let heading = painted.text(lock_heading()).expect("the heading");
-        assert_eq!(heading.1, Color32::WHITE);
-        assert_eq!(painted.text(lock_sub()).expect("the line").1, palette(&ctx).blue_edge);
-        assert!((heading.2.center().x - 640.0).abs() < 1.0, "centred");
+        let p = palette(&ctx);
+        let mut size = Vec2::ZERO;
+        let painted = one(&ctx, 1.0, vec![], |ui| {
+            let before = ui.cursor().min;
+            account_chip(
+                ui,
+                &AccountChip {
+                    initials: "AN",
+                    email: "a.novak@ledgerline.com",
+                    status: "Still logged in",
+                    host: "bitwarden.eu",
+                    host_hint: "Bitwarden EU cloud",
+                },
+            );
+            size = ui.min_rect().size();
+            assert_eq!(ui.min_rect().min, before, "left aligned, not centred");
+        });
+        assert_eq!(size.y, 60.0);
+        assert!(size.x < 420.0, "only as wide as its text: {size:?}");
+        assert!(painted.rects.iter().any(|r| r.fill == p.window_bg && r.rect.height() == 60.0));
+        assert!(painted.circles.iter().any(|c| c.radius == 20.0 && c.fill == p.blue), "the 40 avatar");
+        assert!(painted.circles.iter().any(|c| c.radius == 6.0 && c.fill == ONLINE_DOT), "the 12 dot");
+        assert!(painted.circles.iter().any(|c| c.radius == 8.0 && c.fill == p.window_bg), "its 2 ring");
+        assert_eq!(painted.text("AN").expect("the initials").1, Color32::WHITE);
+        assert_eq!(painted.text("a.novak@ledgerline.com").expect("the address").1, p.ink);
+        assert_eq!(painted.text("Still logged in").expect("the status").1, p.done_ink);
+        assert_eq!(painted.text("bitwarden.eu").expect("the host").1, p.text_muted);
     }
 
     #[test]
-    fn the_hello_button_is_62_high_and_says_checking_while_it_checks() {
+    fn a_long_address_gives_way_inside_the_column() {
         let ctx = testing::ctx();
         let mut size = Vec2::ZERO;
-        let p = testing::frame(&ctx, 1.0, WIDE, vec![], |ui| {
-            size = hello_button(ui, hello_label(), false).rect.size();
+        one(&ctx, 1.0, vec![], |ui| {
+            account_chip(
+                ui,
+                &AccountChip {
+                    initials: "VE",
+                    email: "a.very.long.address.for.an.employee@a-subdomain.of.a-large-company.example.com",
+                    status: "Still logged in",
+                    host: "vault.a-large-company.example.com",
+                    host_hint: "Your company server",
+                },
+            );
+            size = ui.min_rect().size();
         });
-        assert_eq!(size.y, 62.0);
-        assert!(p.text(hello_label()).is_some());
-        let p = testing::frame(&ctx, 1.1, WIDE, vec![], |ui| {
-            hello_button(ui, hello_checking(), true);
-        });
-        assert!(p.text("Checking").is_some());
+        assert!(size.x <= 420.0, "{size:?}");
     }
 
     #[test]
-    fn the_lock_button_and_link_answer_clicks() {
+    fn the_lock_note_line_has_the_clock_the_words_and_the_badge() {
         let ctx = testing::ctx();
-        let mut button = Rect::NOTHING;
-        let mut link = Rect::NOTHING;
-        for t in 0..3 {
-            testing::frame(&ctx, t as f64, WIDE, vec![], |ui| {
-                button = lock_button(ui, "Unlock").rect;
-                link = lock_link(ui, use_password_label()).rect;
-            });
-        }
-        assert_eq!(button.height(), 58.0);
-        let mut clicked = (false, false);
-        testing::frame(&ctx, 3.0, WIDE, click_at(button.center()), |ui| {
-            clicked.0 = lock_button(ui, "Unlock").clicked();
-            lock_link(ui, use_password_label());
-        });
-        testing::frame(&ctx, 4.0, WIDE, vec![egui::Event::PointerGone], |ui| {
-            lock_button(ui, "Unlock");
-            lock_link(ui, use_password_label());
-        });
-        testing::frame(&ctx, 5.0, WIDE, click_at(link.center()), |ui| {
-            lock_button(ui, "Unlock");
-            clicked.1 = lock_link(ui, use_password_label()).clicked();
-        });
-        assert_eq!(clicked, (true, true));
+        let painted = one(&ctx, 1.0, vec![], |ui| lock_note_line(ui, "Locks after 15 minutes of no activity", "Change this"));
+        let text = painted.text("Locks after 15 minutes").expect("the words");
+        assert_eq!(text.1, palette(&ctx).text_faint);
+        assert!(painted.circles.iter().any(|c| c.radius == 9.0), "the 18 badge");
+        assert!(painted.text("?").is_some());
     }
 
     #[test]
-    fn an_error_on_navy_sits_on_a_white_chip_in_the_error_colour() {
+    fn the_lock_field_is_54_high_with_a_40_eye() {
         let ctx = testing::ctx();
-        let p = testing::frame(&ctx, 1.0, WIDE, vec![], |ui| error_chip(ui, "That master password is not right.", 440.0));
-        let text = p.text("master password").expect("the message");
-        assert_eq!(text.1, palette(&ctx).error);
-        assert!(p.rects.iter().any(|r| r.fill == palette(&ctx).card && r.rect.contains_rect(text.2)));
+        let mut value = String::new();
+        let mut revealed = false;
+        let mut height = 0.0;
+        one(&ctx, 1.0, vec![], |ui| {
+            height = field_secret_sized(ui, egui::Id::new("lf"), &mut value, &mut revealed, "x", 420.0, false, LOCK_FIELD).rect.height();
+        });
+        assert!(height <= 54.0);
     }
 
     // ---- the sign-in gallery's parts (slice 15a) ---------------------------
@@ -1150,7 +1135,7 @@ mod tests {
     fn every_new_glyph_parses() {
         let ctx = testing::ctx();
         one(&ctx, 1.0, vec![], |ui| {
-            for d in [ALERT_CIRCLE, PHONE_CODE, TRIANGLE_ALERT, DONE_TICK, LOCK_TILE] {
+            for d in [ALERT_CIRCLE, PHONE_CODE, TRIANGLE_ALERT, DONE_TICK, LOCK_TILE, CLOCK] {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
                 icon::stroke(ui.painter(), rect, d, 2.0, Color32::BLACK);
             }
