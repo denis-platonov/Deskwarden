@@ -8,7 +8,8 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationElement, IUIAutomationElementArray, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
     UIA_ClassNamePropertyId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId,
-    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_IsPasswordPropertyId,
+    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_IsOffscreenPropertyId,
+    UIA_IsPasswordPropertyId,
     UIA_NamePropertyId, UIA_ValuePatternId,
 };
 
@@ -179,7 +180,8 @@ pub fn fill_via_ui_automation(hwnd: isize, username: &str, password: &str) -> Re
     }
 }
 
-/// Whether the window `hwnd` contains **any** masked field.
+/// Whether the window `hwnd` shows a masked field **on screen** while the
+/// keyboard is in one of its text fields.
 ///
 /// The question the no-match overlay is built on: `fill_via_ui_automation`
 /// asks `CurrentIsPassword` of every Edit it found, but it only runs against a
@@ -226,6 +228,14 @@ pub fn window_has_password_field(hwnd: isize) -> Result<bool> {
         let is_password = automation
             .CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))?;
         let masked_edit = automation.CreateAndCondition(&is_edit, &is_password)?;
+        // **On screen, not merely in the tree.** An app that embeds a web
+        // view (Electron, WebView2) keeps every page it has open in its
+        // accessibility tree, including a sign-in page in a background tab
+        // or a collapsed pane. Counting those put the locked card over the
+        // Claude desktop app on every focus, with no sign-in form in sight.
+        let on_screen = automation
+            .CreatePropertyCondition(UIA_IsOffscreenPropertyId, &VARIANT::from(false))?;
+        let masked_edit = automation.CreateAndCondition(&masked_edit, &on_screen)?;
 
         // `FindFirst` answers a null element rather than an error when nothing
         // matches, which `windows-rs` surfaces as `Err`. So "not found" and
@@ -233,10 +243,24 @@ pub fn window_has_password_field(hwnd: isize) -> Result<bool> {
         // reading is the one that keeps today's behaviour: no hit means no
         // card. `Ok(false)` and `Err` are therefore both silence at the
         // disposition, and the distinction is kept only for the log.
-        match root.FindFirst(TreeScope_Descendants, &masked_edit) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+        if root.FindFirst(TreeScope_Descendants, &masked_edit).is_err() {
+            return Ok(false);
         }
+        // **And the keyboard is in a text field of this window.** A card
+        // opens for a sign-in the user is at, not for one that merely exists
+        // somewhere in a window they switched to for another reason (design
+        // D: the panel sits under the FOCUSED sign-in field). The focused
+        // element must belong to this window's process and be an Edit.
+        let Ok(focused) = automation.GetFocusedElement() else {
+            return Ok(false);
+        };
+        let same_process = matches!(
+            (focused.CurrentProcessId(), root.CurrentProcessId()),
+            (Ok(a), Ok(b)) if a == b
+        );
+        let in_text_field =
+            matches!(focused.CurrentControlType(), Ok(t) if t == UIA_EditControlTypeId);
+        Ok(same_process && in_text_field)
     }
 }
 
