@@ -1621,24 +1621,15 @@ pub struct LoginForm {
     /// The opt-in for Windows Hello quick unlock (see `hello::enroll`).
     pub enable_hello: bool,
     pub error: Option<String>,
-    /// Which stage of the lock screen is up (spec C 5.3). Only the Hello
-    /// stage can be skipped; with Hello off or unavailable the password stage
-    /// is the only one whatever this says.
-    pub lock_stage: LockStage,
+    /// The auto-lock period the lock screen tells the user about, in minutes;
+    /// `None` is auto-lock off. Read from the settings when the window is
+    /// built: this window is not told *why* the vault is locked, so it
+    /// describes the policy rather than claiming a cause.
+    pub auto_lock_minutes: Option<u64>,
     /// The sign-in worked and the window is about to give way to the next
     /// stage: the form column shows "You're in" until it does. Set by
     /// [`apply_auth_result`], never by anything the user does.
     pub signed_in: bool,
-}
-
-/// The lock screen's two stages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LockStage {
-    /// The Windows Hello button, and a link to the password.
-    #[default]
-    Hello,
-    /// The master-password row, and a link back to Hello.
-    Password,
 }
 
 /// **The backstop: no `LoginForm` is released to the allocator holding a
@@ -1887,16 +1878,9 @@ pub fn first_run_notice() -> &'static str {
     i18n::t("login.first_run_notice")
 }
 
-/// Paints [`FIRST_RUN_NOTICE`]. One definition, two call sites (with the Hello
-/// button, and standing alone when there is none), so the two cannot drift
-/// into saying different things. On the sign-in screen it is a blue-washed
-/// card; on the navy lock screen it is a centred note.
-fn draw_first_run_notice(ui: &mut egui::Ui, on_lock_screen: bool) {
-    if on_lock_screen {
-        let width = ui.available_width().min(crate::kit::auth::LOCK_ROW_WIDTH);
-        crate::kit::auth::lock_note(ui, first_run_notice(), width);
-        return;
-    }
+/// Paints [`FIRST_RUN_NOTICE`], a blue-washed card, above the form on both
+/// the sign-in and the lock screen.
+fn draw_first_run_notice(ui: &mut egui::Ui) {
     let p = crate::kit::tokens::palette(ui.ctx());
     egui::Frame::new()
         .fill(p.blue_wash)
@@ -1938,9 +1922,6 @@ fn server_tip() -> &'static str {
 /// The password fields' placeholders.
 fn password_placeholder() -> &'static str {
     i18n::t("login.password_placeholder")
-}
-fn lock_placeholder() -> &'static str {
-    i18n::t("login.lock_placeholder")
 }
 
 /// Draws the login/unlock body: the sign-in form for an account that is not
@@ -2212,7 +2193,7 @@ fn draw_sign_in_form(
     // also what stops the notice reappearing after the first sign-in within
     // one launch.
     if first_run && needs_setup {
-        draw_first_run_notice(ui, false);
+        draw_first_run_notice(ui);
         ui.add_space(FORM_GAP);
     }
 
@@ -2462,13 +2443,15 @@ fn log_in_label() -> &'static str {
     i18n::t("login.log_in")
 }
 
-/// The lock stage (spec C 5.3): the shield, the heading, then either the
-/// Windows Hello button or the master-password row, with Log out and the
-/// server under it.
+/// The lock stage (spec C 5.3), in the sign-in shell's form column: the
+/// account chip, the title and what the auto-lock does, the master-password
+/// field and its Unlock button, Windows Hello when it is available, and the
+/// way out.
 ///
-/// The Hello stage is shown only when Hello is available and enrolled and the
-/// user has not chosen the password; with Hello off, unavailable or gone
-/// (a failed open deletes the blob) the password stage is the only one.
+/// Hello is a button under Unlock, not a stage of its own: the password field
+/// is always there, so a failed or declined Hello leaves the way forward on
+/// screen. When Hello is available but not enrolled the same button offers to
+/// set it up, which needs the password typed first.
 fn draw_lock_stage(
     ui: &mut egui::Ui,
     account_email: Option<&str>,
@@ -2479,112 +2462,150 @@ fn draw_lock_stage(
     first_run: bool,
 ) -> Option<LoginAction> {
     use crate::kit::auth;
+    use crate::kit::controls::ButtonKind;
     use crate::kit::input;
     let mut action = None;
     let enrolled = hello.available && hello.enrolled;
-    let needs_setup = !hello.enrolled;
-    let hello_stage = enrolled && form.lock_stage == LockStage::Hello;
-    let width = ui.available_width().min(auth::LOCK_ROW_WIDTH);
+    let width = ui.available_width();
+    ui.spacing_mut().item_spacing.y = 0.0;
+    // The design stacks the lock screen's parts 20 apart.
+    let gap = 20.0;
 
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = auth::LOCK_GAP;
-        auth::lock_header(ui, auth::lock_heading(), auth::lock_sub());
-        if let Some(email) = account_email {
-            auth::lock_quiet(ui, email);
-        }
-        if first_run && needs_setup {
-            draw_first_run_notice(ui, true);
-        }
+    if first_run && !hello.enrolled {
+        draw_first_run_notice(ui);
+        ui.add_space(gap);
+    }
+    if let Some(email) = account_email {
+        auth::account_chip(
+            ui,
+            &auth::AccountChip {
+                initials: &theme::initials(email),
+                email,
+                status: still_logged_in(),
+                host: server_host,
+                host_hint: host_hint(server_host),
+            },
+        );
+        ui.add_space(gap);
+    }
+    auth::stage_title(ui, auth::lock_sub());
+    ui.add_space(6.0);
+    let after = match form.auto_lock_minutes {
+        Some(minutes) => i18n::tn("auth.lock_after", minutes, &[]),
+        None => i18n::t("auth.lock_auto_off").to_string(),
+    };
+    auth::lock_note_line(ui, &after, i18n::t("auth.lock_tip"));
+    ui.add_space(gap);
 
-        if hello_stage {
-            let label = if auth_in_progress { auth::hello_checking() } else { auth::hello_label() };
-            // Ignored while a check is under way: a second click would start a
-            // second `bw unlock` over the first.
-            let pressed = auth::hello_button(ui, label, auth_in_progress).clicked();
-            if !auth_in_progress
-                && (pressed || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)))
-            {
+    auth::label_dim(ui, master_password_label(), auth_in_progress);
+    ui.add_space(auth::FIELD_LABEL_GAP);
+    if auth_in_progress {
+        input::secret_disabled(ui, width, input::BoxLook { height: auth::LOCK_FIELD.0, radius: 14, font_px: 16.0 });
+    } else {
+        auth::field_secret_sized(
+            ui,
+            egui::Id::new("auth-lock-password"),
+            &mut form.password,
+            &mut form.reveal_password,
+            i18n::t("auth.password_placeholder"),
+            width,
+            form.error.is_some(),
+            auth::LOCK_FIELD,
+        );
+    }
+    if let Some(err) = &form.error {
+        ui.add_space(auth::FIELD_LABEL_GAP);
+        auth::field_error(ui, err);
+    }
+    ui.add_space(gap);
+
+    // While the password is with the server the button reads "Checking" over
+    // a bar. The press is ignored then, not greyed: a second one would start
+    // a second `bw unlock` over the first. There is no ENTER chip inside it
+    // (the owner's rule for a screen's only primary button); the key is named
+    // in its tooltip.
+    let label = if auth_in_progress { checking_label() } else { unlock_label() };
+    let unlock = auth::submit_button(ui, label, auth_in_progress, width);
+    crate::kit::tips::hint(ui, &unlock, unlock_label(), &["Enter"]);
+    if (unlock.clicked() && !auth_in_progress)
+        || (!auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+    {
+        action = Some(LoginAction::Submit);
+    }
+
+    if hello.available {
+        ui.add_space(gap);
+        let label = if enrolled { auth::hello_label() } else { hello_setup_link() };
+        let pressed = ui
+            .add_enabled_ui(!auth_in_progress, |ui| {
+                auth::wide_button(
+                    ui,
+                    ButtonKind::Outline,
+                    52.0,
+                    14,
+                    16.0,
+                    label,
+                    Some(crate::kit::icon::glyph::FINGERPRINT),
+                    width,
+                )
+            })
+            .inner
+            .clicked();
+        if !auth_in_progress && (pressed || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H))) {
+            if enrolled {
                 action = Some(LoginAction::HelloUnlock);
-            }
-            if !auth_in_progress && auth::lock_link(ui, auth::use_password_label()).clicked() {
-                form.lock_stage = LockStage::Password;
-            }
-        } else {
-            let unlock_width = auth::lock_button_width(ui.ctx(), unlock_label());
-            let field_width = (width - 10.0 - unlock_width).max(120.0);
-            let mut unlock = false;
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, input::LOCK.height),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    if auth_in_progress {
-                        input::secret_disabled(ui, field_width, input::LOCK);
-                    } else {
-                        input::secret(
-                            ui,
-                            egui::Id::new("auth-lock-password"),
-                            &mut form.password,
-                            &mut form.reveal_password,
-                            lock_placeholder(),
-                            field_width,
-                            input::LOCK,
-                        );
-                    }
-                    let button = ui
-                        .add_enabled_ui(!auth_in_progress, |ui| auth::lock_button(ui, unlock_label()))
-                        .inner;
-                    unlock = button.clicked();
-                },
-            );
-            if auth_in_progress {
-                auth::progress(ui, 220.0, true);
-            }
-            if unlock || (!auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+            } else if form.password.is_empty() {
+                // With the password typed one click unlocks AND enrols.
+                form.error = Some(hello_setup_needs_password().to_string());
+            } else {
+                form.enable_hello = true;
                 action = Some(LoginAction::Submit);
             }
-            // The way to the other stage: Hello when it is enrolled, or the
-            // opt-in that seals the typed password for it when it is not --
-            // with the password typed, one click unlocks AND enrols.
-            if hello.available && !auth_in_progress {
-                if enrolled {
-                    if auth::lock_link(ui, auth::hello_label()).clicked() {
-                        form.lock_stage = LockStage::Hello;
-                    }
-                } else {
-                    let clicked = auth::lock_link(ui, hello_setup_link()).clicked()
-                        || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
-                    if clicked {
-                        if form.password.is_empty() {
-                            form.error = Some(hello_setup_needs_password().to_string());
-                        } else {
-                            form.enable_hello = true;
-                            action = Some(LoginAction::Submit);
-                        }
-                    }
-                }
-            }
         }
+    }
 
-        if let Some(err) = &form.error {
-            auth::error_chip(ui, err, width);
-        }
-
-        // The foot: which server this vault is on, and the way out.
-        auth::lock_quiet(ui, server_host);
-        if auth::lock_link(ui, log_out_label()).clicked() {
-            action = Some(LoginAction::LogOut);
-        }
-    });
+    ui.add_space(gap);
+    if auth::link_big(ui, not_you_label()).clicked() {
+        action = Some(LoginAction::LogOut);
+    }
     action
 }
 
-/// The lock screen's Unlock button and the way out under it.
+/// The chip's "Still logged in".
+fn still_logged_in() -> &'static str {
+    i18n::t("auth.still_logged_in")
+}
+
+/// What hovering the server on the chip says: Bitwarden's own clouds by name,
+/// anything else is the company's.
+fn host_hint(host: &str) -> &'static str {
+    match host {
+        "bitwarden.com" => i18n::t("auth.host_us"),
+        "bitwarden.eu" => i18n::t("auth.host_eu"),
+        _ => i18n::t("auth.host_own"),
+    }
+}
+
+/// The auto-lock period in whole minutes, or `None` with auto-lock off, as
+/// the settings on disk say it. Anything unreadable is the defaults, which is
+/// what [`crate::settings::Settings::load`] answers.
+fn auto_lock_minutes_now() -> Option<u64> {
+    let settings = crate::settings::default_path().as_deref().map(crate::settings::Settings::load)?;
+    match settings.auto_lock() {
+        crate::settings::AutoLock::After(period) => Some(period.as_secs() / 60),
+        crate::settings::AutoLock::Never => None,
+    }
+}
+
+/// The lock screen's Unlock button, the field's label and the way out.
 fn unlock_label() -> &'static str {
     i18n::t("login.unlock")
 }
-fn log_out_label() -> &'static str {
-    i18n::t("login.log_out")
+fn master_password_label() -> &'static str {
+    i18n::t("login.master_password_label")
+}
+fn not_you_label() -> &'static str {
+    i18n::t("auth.not_you")
 }
 
 /// Runs a `bw login`/`bw unlock` on a one-shot background thread and reports
@@ -3432,6 +3453,7 @@ pub fn build_login_frame(
     let mut account_email = details.user_email;
     let host = server_host(details.server_url.as_deref());
     let mut form = LoginForm::default();
+    form.auto_lock_minutes = auto_lock_minutes_now();
     // The dropdown starts on whatever server the CLI is already pointed at,
     // so re-login on a self-hosted setup doesn't silently flip to the cloud.
     let (choice, url) = ServerChoice::from_configured(details.server_url.as_deref());
@@ -4336,7 +4358,7 @@ pub fn build_login_frame(
         let caption = if signed_out {
             crate::kit::auth::split(ui, full, CloseControl::Active, &mut body)
         } else {
-            crate::kit::auth::lock_surface(ui, full, CloseControl::Active, &mut body)
+            crate::kit::auth::lock_split(ui, full, CloseControl::Active, &mut body)
         };
         crate::kit::auth::apply_caption(ui.ctx(), caption);
     };
@@ -6423,7 +6445,7 @@ mod first_run_notice_tests {
                     let _ = if status == BwStatus::Unauthenticated {
                         crate::kit::auth::split(ui, full, CloseControl::Active, &mut body)
                     } else {
-                        crate::kit::auth::lock_surface(ui, full, CloseControl::Active, &mut body)
+                        crate::kit::auth::lock_split(ui, full, CloseControl::Active, &mut body)
                     };
                 },
             );
@@ -6525,62 +6547,85 @@ mod first_run_notice_tests {
     }
 
     #[test]
-    fn the_lock_screen_opens_on_the_hello_stage_and_hello_unlocks() {
+    fn the_lock_screen_is_the_design_with_the_password_and_hello_together() {
         let ctx = styled_context();
         let mut form = LoginForm::default();
+        form.auto_lock_minutes = Some(15);
         let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, None);
         for wanted in [
-            "Welcome back",
             "Your vault is locked",
             "a.novak@ledgerline.com",
+            "Still logged in",
+            "bitwarden.com",
+            "Locks after 15 minutes of no activity",
+            "Master password",
+            "Unlock",
             "Unlock with Windows Hello",
-            "Use master password instead",
-            "Log out",
+            "Not you? Log out",
         ] {
             assert!(has(&painted, wanted), "{wanted:?} is missing; painted {painted:?}");
         }
-        assert!(!has(&painted, "Unlock"), "no password row on the Hello stage");
+        assert!(has(&painted, "AN"), "the avatar's initials");
+        assert!(!has(&painted, "Enter"), "no ENTER chip on the screen's only primary button");
+        assert!(at(&painted, "Your vault is locked").left() > 640.0, "in the form column");
         let button = at(&painted, "Unlock with Windows Hello").center();
         let (_, action) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(button));
         assert_eq!(action, Some(LoginAction::HelloUnlock));
     }
 
     #[test]
-    fn the_hello_stage_says_checking_while_the_check_runs_and_cannot_be_clicked_again() {
-        let ctx = styled_context();
-        let mut form = LoginForm::default();
-        let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, None);
-        assert!(has(&painted, auth_checking()), "painted {painted:?}");
-        let (_, action) =
-            screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, Some(at(&painted, auth_checking()).center()));
-        assert!(action.is_none());
-    }
-
-    fn auth_checking() -> &'static str {
-        crate::kit::auth::hello_checking()
-    }
-
-    #[test]
-    fn the_link_moves_between_the_two_lock_stages() {
+    fn the_unlock_button_submits_and_says_checking_while_the_check_runs() {
         let ctx = styled_context();
         let mut form = LoginForm::default();
         let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, None);
-        let link = at(&painted, "Use master password instead").center();
-        let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(link));
-        assert_eq!(form.lock_stage, LockStage::Password);
-        // One more frame to show the new stage.
-        let (painted2, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, None);
-        let _ = painted;
-        assert!(has(&painted2, "Unlock"), "the password row has its Unlock button");
-        assert!(has(&painted2, "Master password") || painted2.iter().any(|(t, _)| t.is_empty()));
-        assert!(has(&painted2, "Unlock with Windows Hello"), "the link back to Hello");
-        let back = at(&painted2, "Unlock with Windows Hello").center();
-        let _ = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(back));
-        assert_eq!(form.lock_stage, LockStage::Hello);
+        let unlock = at(&painted, "Unlock").center();
+        let (_, action) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(unlock));
+        assert_eq!(action, Some(LoginAction::Submit));
+        let (busy, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, None);
+        assert!(has(&busy, checking_label()), "painted {busy:?}");
+        let (_, action) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, Some(at(&busy, checking_label()).center()));
+        assert!(action.is_none(), "no second unlock over the first");
+        let (_, action) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, Some(at(&busy, "Not you? Log out").center() - egui::vec2(0.0, 130.0)));
+        assert!(action.is_none(), "nothing else starts one either");
     }
 
     #[test]
-    fn with_hello_off_the_lock_screen_is_only_the_password_stage() {
+    fn the_lock_line_tells_the_policy_and_says_so_when_auto_lock_is_off() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        form.auto_lock_minutes = Some(1);
+        let (painted, _) = screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, None);
+        assert!(has(&painted, "Locks after 1 minute of no activity"), "{painted:?}");
+        form.auto_lock_minutes = None;
+        let (painted, _) = screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, None);
+        assert!(has(&painted, "Auto-lock is off"), "{painted:?}");
+    }
+
+    #[test]
+    fn hello_that_is_available_but_not_enrolled_offers_its_setup_and_wants_the_password_first() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let (painted, _) = screen(&ctx, BwStatus::Locked, NOT_ENROLLED, &mut form, false, None);
+        let setup = at(&painted, hello_setup_link()).center();
+        let (_, action) = screen(&ctx, BwStatus::Locked, NOT_ENROLLED, &mut form, false, Some(setup));
+        assert!(action.is_none());
+        assert_eq!(form.error.as_deref(), Some(hello_setup_needs_password()));
+        form.error = None;
+        form.password = "pw".to_string();
+        let (_, action) = screen(&ctx, BwStatus::Locked, NOT_ENROLLED, &mut form, false, Some(setup));
+        assert_eq!(action, Some(LoginAction::Submit));
+        assert!(form.enable_hello);
+    }
+
+    #[test]
+    fn the_chip_names_the_server_and_hovering_it_says_whose() {
+        assert_eq!(host_hint("bitwarden.com"), "Bitwarden US cloud");
+        assert_eq!(host_hint("bitwarden.eu"), "Bitwarden EU cloud");
+        assert_eq!(host_hint("vault.ledgerline.eu"), "Your company server");
+    }
+
+    #[test]
+    fn with_hello_off_the_lock_screen_has_no_hello_button_and_shows_the_error_under_the_field() {
         let ctx = styled_context();
         let mut form = LoginForm::default();
         form.error = Some("That master password is not right.".to_string());
@@ -6589,8 +6634,7 @@ mod first_run_notice_tests {
         assert!(has(&painted, "Unlock"));
         assert!(has(&painted, "That master password is not right."));
         assert!(!painted.iter().any(|(t, _)| t.contains("Windows Hello")), "{painted:?}");
-        assert!(!has(&painted, "Use master password instead"));
-        let logout = at(&painted, "Log out").center();
+        let logout = at(&painted, "Not you? Log out").center();
         let (_, action) =
             screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, Some(logout));
         assert_eq!(action, Some(LoginAction::LogOut));
@@ -11587,7 +11631,7 @@ pub(crate) mod password_lifetime_tests {
             reveal_password: false,
             enable_hello: false,
             error: Some(probe_password()),
-            lock_stage: LockStage::default(),
+            auto_lock_minutes: None,
             signed_in: false,
         }
     }
@@ -12163,8 +12207,8 @@ pub(crate) mod password_lifetime_tests {
             reveal_password: _,
             enable_hello: _,
             error: _,
-            // Not a String: the lock screen's stage holds no secret.
-            lock_stage: _,
+            // Not a String: a number of minutes.
+            auto_lock_minutes: _,
             // Not a String either: one flag.
             signed_in: _,
         } = &form;

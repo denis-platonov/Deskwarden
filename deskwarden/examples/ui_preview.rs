@@ -2736,6 +2736,8 @@ impl Preview {
                 HelloState { available: true, enrolled: true },
             )
         };
+        // The lock screen says what the auto-lock does; the shipped default.
+        self.form.auto_lock_minutes = Some(15);
         if signin && auth_in_progress {
             self.form.email = "a.novak@ledgerline.com".to_string();
         }
@@ -2783,10 +2785,11 @@ impl Preview {
                 self.form.signed_in = true;
             }
             LoginVariant::UnlockPassword => {
-                self.form.lock_stage = login_ui::LockStage::Password;
+                // Typed, and shown as dots.
+                self.form.password = "correct horse battery".to_string();
             }
             LoginVariant::UnlockPasswordError => {
-                self.form.lock_stage = login_ui::LockStage::Password;
+                self.form.password = "correct horse".to_string();
                 self.form.error = Some("That master password is not right.".to_string());
             }
             LoginVariant::Plain => {}
@@ -2816,7 +2819,7 @@ impl Preview {
         let caption = if signin {
             deskwarden::kit::auth::split(root, full, login_ui::CloseControl::Active, &mut body)
         } else {
-            deskwarden::kit::auth::lock_surface(root, full, login_ui::CloseControl::Active, &mut body)
+            deskwarden::kit::auth::lock_split(root, full, login_ui::CloseControl::Active, &mut body)
         };
         deskwarden::kit::auth::apply_caption(ctx, caption);
         self.login_variant = LoginVariant::Plain;
