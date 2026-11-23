@@ -70,6 +70,21 @@
 //! 200 % display is a few MB and the steady cost is the system's copy of the
 //! surface. Every GDI object created here is deleted before returning.
 //!
+//! # The main windows: [`attach_shadow`]
+//!
+//! The frameless main windows (sign-in/unlock, spinner, Preferences, vault)
+//! paint their own content on a GL surface and cut their own antialiased 18 px
+//! corners out of its alpha, so the shell under them is [`Look::ShadowOnly`]:
+//! the same blurred shadow, with the window's footprint carved out of it by the
+//! same curve and left fully transparent. Everything above applies except the
+//! card-only parts (no fill, no hairline, no `DWMWCP_DONOTROUND` here -- the
+//! window already asked -- and no stair-stepped region over the silhouette).
+//! The shell is hidden while the window is maximized, fullscreen, minimized or
+//! cloaked ([`resync`] is how `window_host`'s cloak reaches it, since DWM
+//! announces a cloak to nobody), and DWM's own square shadow is removed with a
+//! window region rather than with non-client rendering, which brings back a dark
+//! top line; see [`attach_shadow`].
+//!
 //! # Classification
 //!
 //! This module **does create a window**, and says so. It is not a surface: it
@@ -85,17 +100,19 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_NCRENDERING_POLICY,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_CLOAKED,
+    DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DWM_CLOAKED_APP,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateRoundRectRgn, DeleteDC, DeleteObject, GetDC,
     GetDeviceCaps, ReleaseDC, SelectObject, SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, LOGPIXELSX,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, GetMonitorInfoW, LOGPIXELSX,
+    HRGN, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowDisplayAffinity,
-    GetWindowLongPtrW, GetWindowRect, IsWindowVisible, RegisterClassW, SetWindowDisplayAffinity,
+    GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible, IsZoomed, RegisterClassW, SetWindowDisplayAffinity,
     SetWindowLongPtrW, SetWindowPos, UpdateLayeredWindow, GWLP_WNDPROC, GWL_EXSTYLE,
     HTTRANSPARENT, MA_NOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, ULW_ALPHA, WINDOW_DISPLAY_AFFINITY, WINDOW_EX_STYLE, WM_DESTROY,
@@ -230,11 +247,31 @@ pub fn blur(grid: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
+/// What a shell paints in the card's own footprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look {
+    /// The card's colour and hairline in an antialiased rounded rectangle, over
+    /// the shadow: the bare-Win32 cards, which paint nothing of their own
+    /// along the curve.
+    Card([u8; 3]),
+    /// **Only the shadow**: the footprint is fully transparent (alpha 0) and
+    /// the shadow is cut out of it by the same antialiased curve. The main
+    /// windows paint their own content and edge on the GL surface and cut their
+    /// own corners out of its alpha; the shell under them contributes nothing
+    /// but the soft shadow round that silhouette.
+    ShadowOnly,
+}
+
 /// Fills `out` (`shell_w` x `shell_h`, premultiplied `0xAARRGGBB`) with the
 /// shell for a `card_w` x `card_h` card: the card's `fill` in an antialiased
 /// rounded rectangle, over a blurred shadow. `out.len()` must be
 /// `shell_w * shell_h` (the sizes [`shell_size`] answers). Pure.
 pub fn render_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i32, fill: [u8; 3]) {
+    render_look_into(out, card_w, card_h, scale_pct, Look::Card(fill));
+}
+
+/// [`render_into`] for either [`Look`]. Pure.
+pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i32, look: Look) {
     let m = margins(scale_pct);
     let (sw, sh) = shell_size(card_w, card_h, scale_pct);
     let (sw_u, sh_u) = (sw.max(0) as usize, sh.max(0) as usize);
@@ -285,6 +322,19 @@ pub fn render_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i32, fi
             // `c` is the card's whole footprint; `inner` the part of it that
             // is the card's colour rather than the hairline round it.
             let c = coverage(d);
+            if let Look::ShadowOnly = look {
+                // Premultiplied shadow, with the footprint carved out of it.
+                let a = shadow_a * (1.0 - c);
+                let channel = |shadow: u8| -> u32 {
+                    (shadow as f32 * a).round().clamp(0.0, 255.0) as u32
+                };
+                out[y * sw_u + x] = ((a * 255.0).round().clamp(0.0, 255.0) as u32) << 24
+                    | channel(SHADOW_RGB[0]) << 16
+                    | channel(SHADOW_RGB[1]) << 8
+                    | channel(SHADOW_RGB[2]);
+                continue;
+            }
+            let Look::Card(fill) = look else { continue };
             let inner = coverage(d + border).min(c);
             // Premultiplied "card (fill + hairline) over shadow".
             let a = c + shadow_a * (1.0 - c);
@@ -328,7 +378,7 @@ struct Entry {
     /// The card's size the shell and region were last cut for.
     size: (i32, i32),
     scale_pct: i32,
-    fill: [u8; 3],
+    look: Look,
     /// The capture exclusion last mirrored onto the shell.
     affinity: u32,
 }
@@ -427,7 +477,7 @@ fn create_shell(topmost: bool) -> Option<HWND> {
 /// Paints the shell for `card_w` x `card_h` and places it at `at` (its own
 /// top-left, device pixels) with `UpdateLayeredWindow`. Every GDI object made
 /// here is gone before it returns. `false` if any step was refused.
-fn paint_shell(shell: HWND, at: POINT, card_w: i32, card_h: i32, scale_pct: i32, fill: [u8; 3]) -> bool {
+fn paint_shell(shell: HWND, at: POINT, card_w: i32, card_h: i32, scale_pct: i32, look: Look) -> bool {
     let (sw, sh) = shell_size(card_w, card_h, scale_pct);
     if sw <= 0 || sh <= 0 {
         return false;
@@ -453,7 +503,7 @@ fn paint_shell(shell: HWND, at: POINT, card_w: i32, card_h: i32, scale_pct: i32,
         if let Ok(dib) = dib {
             if !bits.is_null() && !mem.is_invalid() {
                 let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (sw * sh) as usize);
-                render_into(pixels, card_w, card_h, scale_pct, fill);
+                render_look_into(pixels, card_w, card_h, scale_pct, look);
                 let old = SelectObject(mem, dib);
                 let blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
@@ -503,6 +553,34 @@ fn cut_region(card: HWND, w: i32, h: i32, scale_pct: i32) {
     }
 }
 
+/// The region that makes DWM stop drawing its own square shadow round a
+/// [`Look::ShadowOnly`] window: the whole window as a round rectangle with
+/// HALF the window's corner radius, so it cuts nothing the window's own
+/// 18 px corner cut (done in the GL surface's alpha) has not already made
+/// transparent. Measured: any non-rectangular region does it; the bare
+/// rectangle does not.
+fn shadow_region_diameter(scale_pct: i32) -> i32 {
+    (dev(RADIUS as f32 / 2.0, scale_pct).round() as i32).max(1) * 2
+}
+
+fn cut_shadow_region(window: HWND, w: i32, h: i32, scale_pct: i32) {
+    unsafe {
+        let d = shadow_region_diameter(scale_pct);
+        let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
+        // As `cut_region`: the system owns it on success, a refusal frees it.
+        if SetWindowRgn(window, region, true) == 0 {
+            let _ = DeleteObject(region);
+        }
+    }
+}
+
+/// Gives the window back its rectangular region.
+fn clear_region(window: HWND) {
+    unsafe {
+        SetWindowRgn(window, HRGN::default(), true);
+    }
+}
+
 /// Mirrors the card's `SetWindowDisplayAffinity` onto the shell, so a card
 /// excluded from capture does not leave its shadow behind in a recording.
 fn mirror_affinity(entry: &mut Entry) {
@@ -532,20 +610,36 @@ fn sync(card: HWND, visible: Option<bool>) {
     if w <= 0 || h <= 0 {
         return;
     }
-    let show = visible.unwrap_or_else(|| unsafe { IsWindowVisible(card).as_bool() });
+    let mut show = visible.unwrap_or_else(|| unsafe { IsWindowVisible(card).as_bool() });
+    let shadow_only = entry.look == Look::ShadowOnly;
+    if shadow_only && show && !shadow_wanted(card, &rc) {
+        // A maximized, fullscreen, minimized or cloaked window has no shadow.
+        show = false;
+    }
     let scale_pct = screen_scale_pct();
     let m = margins(scale_pct);
     let at = POINT { x: rc.left - m.left, y: rc.top - m.top };
 
+    if shadow_only && !show && entry.size != (0, 0) {
+        // Maximized, fullscreen, minimized, cloaked or hidden: the window is
+        // square again, and DWM's own treatment of it (none, at the screen's
+        // edge) is the right one.
+        clear_region(card);
+        entry.size = (0, 0);
+    }
     let resized = (w, h) != entry.size || scale_pct != entry.scale_pct;
     if resized {
         // Only worth painting for a card that is about to be seen; a hidden
         // card's next show repaints.
         if show {
-            if paint_shell(shell, at, w, h, scale_pct, entry.fill) {
+            if paint_shell(shell, at, w, h, scale_pct, entry.look) {
                 entry.size = (w, h);
                 entry.scale_pct = scale_pct;
-                cut_region(card, w, h, scale_pct);
+                if shadow_only {
+                    cut_shadow_region(card, w, h, scale_pct);
+                } else {
+                    cut_region(card, w, h, scale_pct);
+                }
             }
         } else {
             entry.size = (0, 0);
@@ -559,6 +653,43 @@ fn sync(card: HWND, visible: Option<bool>) {
         // `card` as the insert-after window puts the shell directly BELOW it.
         let _ = SetWindowPos(shell, card, at.x, at.y, 0, 0, flags);
     }
+}
+
+/// Whether a [`Look::ShadowOnly`] window has a shadow right now: not maximized,
+/// not minimized, not covering its whole monitor (borderless fullscreen), and
+/// not cloaked by this app (`window_host::Reveal` cloaks a window it has shown
+/// but not yet presented, and a shadow standing alone on the desktop for that
+/// moment would be the very flash the cloak exists to prevent).
+fn shadow_wanted(card: HWND, rc: &RECT) -> bool {
+    unsafe {
+        if IsZoomed(card).as_bool() || IsIconic(card).as_bool() {
+            return false;
+        }
+        let monitor = MonitorFromWindow(card, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let m = info.rcMonitor;
+            if rc.left <= m.left && rc.top <= m.top && rc.right >= m.right && rc.bottom >= m.bottom {
+                return false;
+            }
+        }
+        let mut cloaked = 0u32;
+        let read = DwmGetWindowAttribute(
+            card,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        !(read.is_ok() && cloaked & DWM_CLOAKED_APP != 0)
+    }
+}
+
+/// Re-reads a [`Look::ShadowOnly`] window's state and shows or hides its
+/// shadow to match. For the one change `WM_WINDOWPOSCHANGED` does not announce:
+/// `window_host` cloaking or uncloaking the window. `hwnd` is the raw handle;
+/// a window without a shell is left alone.
+pub fn resync(hwnd: isize) {
+    sync(hwnd_of(hwnd), None);
 }
 
 unsafe extern "system" fn card_proc(
@@ -626,7 +757,7 @@ pub fn attach(card: HWND, fill: Color32) {
             original,
             size: (0, 0),
             scale_pct: screen_scale_pct(),
-            fill: [fill.r(), fill.g(), fill.b()],
+            look: Look::Card([fill.r(), fill.g(), fill.b()]),
             affinity: 0,
         });
         // Windows stops rounding the card (the shell draws the corners) and
@@ -652,6 +783,54 @@ pub fn attach(card: HWND, fill: Color32) {
         if GetWindowRect(card, &mut rc).is_ok() {
             cut_region(card, rc.right - rc.left, rc.bottom - rc.top, screen_scale_pct());
         }
+    }
+}
+
+/// Gives a frameless, transparent main window the soft rounded shadow of the
+/// design, and takes away DWM's own square one. Call it on the thread that owns
+/// the window (the subclass is run by that thread's message loop), once the
+/// window exists; calling it again is a no-op. `login_ui::round_window_corners`
+/// is the caller, from the UI closure on winit's event-loop thread.
+///
+/// Unlike [`attach`] this changes nothing about the window's silhouette: the
+/// window cuts its own 18 px corners out of its alpha (`window_host::CornerMask`)
+/// and asked DWM for no rounding of its own. The shell under it is
+/// [`Look::ShadowOnly`] and hides itself while the window is maximized,
+/// fullscreen, minimized or cloaked.
+///
+/// **DWM's own shadow is removed with a window region, not with
+/// `DWMNCRP_DISABLED`.** Switching non-client rendering off does remove it, and
+/// measured on the real window it brings back an opaque dark 1 px line along the
+/// top edge (`login_ui::round_window_corners` records the history). A round-rect
+/// region ([`shadow_region_diameter`], half the window's own radius, so it cuts
+/// nothing visible) makes DWM draw no shadow and leaves the top row alone. The
+/// region is dropped whenever the shell is hidden, so a maximized window is
+/// the plain rectangle it was.
+pub fn attach_shadow(window: HWND) {
+    unsafe {
+        if entry_of(window).is_some() {
+            return;
+        }
+        let topmost = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+        let Some(shell) = create_shell(topmost) else { return };
+        let original = GetWindowLongPtrW(window, GWLP_WNDPROC);
+        if original == 0 {
+            let _ = DestroyWindow(shell);
+            return;
+        }
+        store(Entry {
+            card: window.0 as isize,
+            shell: shell.0 as isize,
+            original,
+            size: (0, 0),
+            scale_pct: screen_scale_pct(),
+            look: Look::ShadowOnly,
+            affinity: 0,
+        });
+        SetWindowLongPtrW(window, GWLP_WNDPROC, card_proc as *const () as isize);
+        // The window may already be on screen (cloaked or not): place the
+        // shadow now rather than waiting for the next move.
+        sync(window, None);
     }
 }
 
@@ -848,6 +1027,67 @@ mod tests {
         assert!(grid[40 * w + 40] > grid[40 * w + 47], "the blur is not peaked at the centre");
     }
 
+    // ---- the shadow-only look (the main windows) ---------------------------
+
+    fn shadow_only(card_w: i32, card_h: i32, scale_pct: i32) -> (Vec<u32>, i32, i32) {
+        let (sw, sh) = shell_size(card_w, card_h, scale_pct);
+        let mut out = vec![0u32; (sw * sh) as usize];
+        render_look_into(&mut out, card_w, card_h, scale_pct, Look::ShadowOnly);
+        (out, sw, sh)
+    }
+
+    #[test]
+    fn the_shadow_only_look_leaves_the_footprint_transparent() {
+        let (buf, w, _) = shadow_only(300, 200, 100);
+        let m = margins(100);
+        for (x, y) in [(150, 100), (18, 18), (40, 180), (280, 20), (150, 1), (1, 100)] {
+            assert_eq!(px(&buf, w, m.left + x, m.top + y), 0, "({x},{y}) inside the window is not transparent");
+        }
+    }
+
+    #[test]
+    fn the_shadow_only_look_follows_the_rounded_silhouette_not_a_square() {
+        let (buf, w, _) = shadow_only(300, 200, 100);
+        let m = margins(100);
+        // The footprint's own corner pixel lies outside the 18 px curve, so
+        // the shadow shows there; stepping out along the bottom-right
+        // diagonal it only ever fades.
+        let corner = alpha(px(&buf, w, m.left + 299, m.top + 199));
+        assert!(corner > 0, "no shadow in the cut corner");
+        let mut last = corner;
+        for k in 1..40 {
+            let a = alpha(px(&buf, w, m.left + 299 + k, m.top + 199 + k));
+            assert!(a <= last, "the shadow gets darker moving away from the corner: {a} > {last}");
+            last = a;
+        }
+        // Beside the window the shadow is darker than the same distance out
+        // beyond its corner, which is what a rounded shadow does and a square
+        // outline does not.
+        let beside = alpha(px(&buf, w, m.left + 150, m.top + 199 + 3));
+        let beyond = alpha(px(&buf, w, m.left + 299 + 3, m.top + 199 + 3));
+        assert!(beyond < beside, "{beyond} vs {beside}");
+        assert!(buf.iter().all(|p| (p >> 24) <= 255 * 21 / 100 + 1), "darker than the shadow's peak");
+    }
+
+    #[test]
+    fn the_shadow_only_look_is_premultiplied() {
+        let (buf, ..) = shadow_only(200, 120, 100);
+        for p in buf {
+            let a = p >> 24;
+            for shift in [16, 8, 0] {
+                assert!((p >> shift) & 0xff <= a, "channel exceeds alpha in {p:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_region_that_removes_dwms_square_shadow_never_cuts_the_silhouette() {
+        // Half the window's radius at 100 % and 200 %.
+        assert_eq!(shadow_region_diameter(100), 18);
+        assert_eq!(shadow_region_diameter(200), 36);
+        assert!(shadow_region_diameter(100) / 2 < RADIUS);
+    }
+
     // ---- source pins: the glue ---------------------------------------------
 
     fn production() -> String {
@@ -910,6 +1150,40 @@ mod tests {
         ] {
             assert!(code.contains(needle), "the shell glue lost `{needle}`");
         }
+    }
+
+    #[test]
+    fn the_main_windows_get_a_shadow_only_shell_with_dwms_own_removed_by_a_region() {
+        let code = production();
+        let body = code
+            .split("pub fn attach_shadow(")
+            .nth(1)
+            .expect("`attach_shadow` is gone")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("Look::ShadowOnly"));
+        // Non-client rendering stays on: switching it off brings back DWM's
+        // opaque 1 px top line (measured). The region removes the shadow.
+        assert!(!body.contains("DWMNCRP_DISABLED"), "`attach_shadow` turned non-client rendering off");
+        assert!(code.contains("fn cut_shadow_region") && code.contains("fn clear_region"));
+        assert!(code.contains("shadow_wanted(card, &rc)"), "the shell no longer hides for maximized/fullscreen");
+        for needle in ["IsZoomed(", "IsIconic(", "DWMWA_CLOAKED"] {
+            assert!(code.contains(needle), "`shadow_wanted` lost {needle}");
+        }
+    }
+
+    #[test]
+    fn the_cloak_reaches_the_shadow() {
+        let host = include_str!("window_host.rs").replace("\r\n", "\n");
+        let cloak = host
+            .split("fn set_cloak(hwnd: isize")
+            .nth(1)
+            .expect("`set_cloak` is gone")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(cloak.contains("crate::card_shell::resync(hwnd)"));
     }
 
     #[test]

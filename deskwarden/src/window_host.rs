@@ -58,9 +58,14 @@
 //! The windows used to ask DWM for `DWMWCP_ROUND`, a fixed ~8 px. They now
 //! ask for `DWMWCP_DONOTROUND`, are transparent, and [`CornerMask`] cuts the
 //! design's 18 px (`theme::WINDOW_RADIUS`) out of the framebuffer's alpha with
-//! a one-pixel antialiased ramp. **There is no shadow**: a transparent window
-//! has none on Windows 11, and `DwmExtendFrameIntoClientArea` did not bring it
-//! back; see `login_ui::round_window_corners`.
+//! a one-pixel antialiased ramp. **The shadow is `card_shell`'s**: DWM's own is
+//! square, and outlines the cut corners over a light background, so
+//! `login_ui::round_window_corners` removes it (with a window region -- not
+//! with `DWMNCRP_DISABLED`, which brings back a dark 1 px top line) and
+//! `card_shell::attach_shadow` puts a click-through layered window under the
+//! window that paints only a soft shadow shaped to the 18 px silhouette. It is
+//! hidden while the window is maximized or fullscreen, when the corners are
+//! square too.
 //!
 //! # 2. The white box that blinked, and `Reveal`
 //!
@@ -842,6 +847,9 @@ fn set_cloak(hwnd: isize, title: &str, on: bool) -> bool {
     };
     match result {
         Ok(()) => {
+            // The window's shadow (`card_shell::attach_shadow`) follows the
+            // cloak: DWM announces it to nobody.
+            crate::card_shell::resync(hwnd);
             log::info!(
                 "window host: {title:?} ({hwnd:#x}) is {} (DWMWA_CLOAK accepted); {}",
                 if on { "cloaked" } else { "uncloaked" },
