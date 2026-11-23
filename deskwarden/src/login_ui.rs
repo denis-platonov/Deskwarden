@@ -1275,11 +1275,27 @@ pub fn draw_window_chrome_with_extra(
 /// every window makes to get its corners right. Resolved by title because
 /// eframe never exposes the HWND.
 ///
-/// **No DWM shadow.** A transparent window has none on Windows 11 here:
-/// `DwmExtendFrameIntoClientArea` with 1 px and with -1 margins were both
-/// tried on the real window over a dark backdrop and neither brought it back
-/// (measured: the pixels next to the window were untouched). The window's own
-/// 1 px border is what defines its edge.
+/// **DWM's square shadow, and what replaced it.** A transparent window keeps
+/// DWM's drop shadow on Windows 11, drawn round its square RECTANGLE -- over a
+/// light background it outlines the square corners the window has cut away.
+/// Measured live (Windows 11 build 26300, over a plain white backdrop), what
+/// does and does not remove it:
+///
+/// * `DWMWA_NCRENDERING_POLICY = DWMNCRP_DISABLED` removes the shadow **and
+///   brings the opaque dark 1 px top line back**, whatever the margins (-1, 0
+///   and 1 were all tried, with and without `DWMWA_BORDER_COLOR`, with and
+///   without `WS_THICKFRAME`). So non-client rendering stays ON here, unlike on
+///   the cards.
+/// * A window region that is a round rectangle makes DWM draw no shadow at all,
+///   and the top line is not there. [`crate::card_shell::attach_shadow`] sets
+///   one (and drops it while the window is maximized or fullscreen). Its radius
+///   is half the window's, so it never cuts a pixel the 18 px corner cut has not
+///   already made transparent: the visible edge stays the antialiased one the
+///   GL surface draws.
+///
+/// The shadow the user sees is `card_shell`'s: a click-through layered window
+/// under this one, painted with the same blur as the cards' and shaped to the
+/// 18 px silhouette.
 ///
 /// **Scoped to this process**, through
 /// [`crate::foreground::own_window_titled`]. It used to ask
@@ -1336,6 +1352,8 @@ pub fn round_window_corners(window_title: &str) {
         // `undecorated_shadow` uses; it did not bring a shadow back here.
         let margins = MARGINS { cxLeftWidth: 1, cxRightWidth: 1, cyTopHeight: 1, cyBottomHeight: 1 };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        // The soft rounded shadow, in place of DWM's square one.
+        crate::card_shell::attach_shadow(hwnd);
     }
 }
 
@@ -4644,6 +4662,16 @@ mod round_window_corners_stays_inside_this_process {
             body.contains("DWMWA_BORDER_COLOR") && body.contains("DwmExtendFrameIntoClientArea"),
             "`round_window_corners` no longer removes DWM's 1 px square border and top line, \
              which show as a ghost frame around the transparent corners"
+        );
+        assert!(
+            body.contains("crate::card_shell::attach_shadow("),
+            "`round_window_corners` no longer hands the window its rounded shadow, so DWM's \
+             square one is the only shadow left round the cut corners"
+        );
+        assert!(
+            !body.contains("DWMWA_NCRENDERING_POLICY"),
+            "`round_window_corners` turns non-client rendering off, which brings back DWM's \
+             opaque 1 px line along the top edge (measured)"
         );
         assert_eq!(crate::theme::WINDOW_RADIUS, 18, "the design's window radius is 18");
 
