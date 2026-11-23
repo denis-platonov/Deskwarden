@@ -301,11 +301,13 @@ fn brand_panel(ui: &mut Ui, rect: Rect) {
     let foot_at = pos2(inner.left(), inner.bottom() - foot.size().y);
     ui.painter().galley(foot_at, foot, p.blue_soft);
 
-    // Middle: centred between the two, headline 48 over a 30ch line of 18.
+    // Middle: centred between the two, headline 48 over a line of 18 that
+    // wraps at the headline's own width, so the two read as one block.
     let head_role = Role { size: 48.0, face: EXTRABOLD, tracking_em: -0.035 };
     let sub_role = Role { size: 18.0, face: theme::REGULAR, tracking_em: 0.0 };
     let head = galley(&ctx, head_role, headline(), Color32::WHITE, Some(inner.width()), Some(48.0 * 1.04));
-    let sub = galley(&ctx, sub_role, brand_sub(), p.blue_edge, Some(30.0 * 18.0 * 0.5), Some(18.0 * 1.5));
+    let sub_width = head.size().x.min(inner.width());
+    let sub = galley(&ctx, sub_role, brand_sub(), p.blue_edge, Some(sub_width), Some(18.0 * 1.5));
     let block = head.size().y + 18.0 + sub.size().y;
     let top = (mark.bottom() + foot_at.y) / 2.0 - block / 2.0;
     let pose = rise(&ctx, "split-brand", 0.0, 0.5);
