@@ -3691,6 +3691,10 @@ pub fn build_frame_with_search(
         // same reason its message is computed before it: the three `Option`s
         // the band reads are borrowed for the length of the call.
         let mut dismiss_move_error = false;
+        // Whether the record in the pane is absent from the rows this very
+        // call drew, decided inside the list's closure from `shown` -- the
+        // one place the visible list is computed. See where it is read.
+        let mut selection_gone = false;
         // **The item list is not drawn on the Sends screen.** Sends are not
         // `VaultItem`s and must not be forced through a pane that filters a
         // list of them; the Sends rows are drawn in the central panel below
@@ -3899,6 +3903,15 @@ pub fn build_frame_with_search(
                         }
                         ItemListAction::None => {}
                     }
+                    // After the list has taken this frame's click and typing,
+                    // so the verdict is about the selection the user is now
+                    // looking at. An unfetched Trash/Archive reads as empty.
+                    selection_gone = selection_left_the_list(
+                        selected_id.as_deref(),
+                        shown.unwrap_or(&[]),
+                        &filter,
+                        &search,
+                    );
                 });
 
             // **The list's own right-hand divider, painted just OUTSIDE it.**
@@ -4067,6 +4080,29 @@ pub fn build_frame_with_search(
                     }
                 }
             }
+        }
+
+        // **A selection the list no longer shows closes the pane.** Whatever
+        // narrowed the list this frame -- a sidebar row, a folder, an account
+        // switch, the search box -- the record in the pane must still be one
+        // of the rows beside it; "Favorites 0" with a card from another
+        // folder open is the defect this is. Decided HERE, once, from the
+        // same `matches_filter` the list draws with, so no click handler has
+        // to remember it. Cleared exactly the way the delete's close is:
+        // `detail_dismissed` so a sync does not reopen the first item.
+        //
+        // Only from the read pane. An Edit, Create or sequence-builder draft
+        // may hold unsaved work and closing the pane would drop it silently;
+        // those leave the selection alone, as a click on another row does not
+        // guard them either. Not on the Sends or Password health screens,
+        // whose rows are not this list's.
+        if !show_sends
+            && !on_health
+            && matches!(mode, DetailMode::Read)
+            && selection_gone
+        {
+            selected_id = None;
+            detail_dismissed = true;
         }
 
         // `draw_item_list` above is the only place `selected_id` can change
@@ -11082,6 +11118,22 @@ fn list_unless_unfetched<'a>(
         sidebar::FilterSource::Trash => trash,
         sidebar::FilterSource::Archive => archive,
     }
+}
+
+/// Whether the selected record is absent from the list the sidebar scope and
+/// the search box currently produce. `None` selected is never "left": there
+/// is nothing to close.
+fn selection_left_the_list(
+    selected: Option<&str>,
+    list: &[VaultItem],
+    filter: &sidebar::SidebarFilter,
+    search: &str,
+) -> bool {
+    let Some(id) = selected else { return false };
+    let search_lower = search.to_lowercase();
+    !list
+        .iter()
+        .any(|item| item.id == id && item_list::matches_filter(item, filter, &search_lower))
 }
 
 /// [`list_unless_unfetched`] for the callers that only need something to
@@ -29279,8 +29331,9 @@ mod preferences_modal_wiring_tests {
             // 70 with `edit_trash_wiring` (v2 editor, Move to trash); 71 with
             // `new_item_chooser_wiring`; 72 with `palette_wiring`; 73 with
             // `slice5_review_guards`; 72 again when the Ctrl+K palette and
-            // `palette_wiring` were dropped.
-            modules, 72,
+            // `palette_wiring` were dropped; 73 with
+            // `selection_follows_the_list_tests`.
+            modules, 73,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -42345,5 +42398,88 @@ mod slice5_review_guards {
         assert!(draft.discard_prompt, "and its confirmation raised");
         let mut clean = DetailMode::Read;
         assert!(!asks_to_discard(&mut clean));
+    }
+}
+
+#[cfg(test)]
+mod selection_follows_the_list_tests {
+    use super::*;
+    use crate::vault_bridge::VaultItem;
+
+    fn card(id: &str, name: &str, folder: Option<&str>, favorite: bool) -> VaultItem {
+        VaultItem {
+            id: id.into(),
+            name: name.into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(3),
+            folder_id: folder.map(str::to_string),
+            favorite,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn vault() -> Vec<VaultItem> {
+        vec![
+            card("napps", "Napps (Brex)", Some("f-napps"), false),
+            card("star", "Starred", None, true),
+        ]
+    }
+
+    #[test]
+    fn switching_to_a_scope_without_it_drops_the_selection() {
+        let items = vault();
+        assert!(selection_left_the_list(Some("napps"), &items, &sidebar::SidebarFilter::Favorites, ""));
+        assert!(selection_left_the_list(Some("napps"), &items, &sidebar::SidebarFilter::Folder("other".into()), ""));
+        assert!(selection_left_the_list(Some("napps"), &[], &sidebar::SidebarFilter::Trash, ""));
+    }
+
+    #[test]
+    fn a_scope_that_still_holds_the_item_keeps_it() {
+        let items = vault();
+        for filter in [
+            sidebar::SidebarFilter::All,
+            sidebar::SidebarFilter::Cards,
+            sidebar::SidebarFilter::Folder("f-napps".into()),
+        ] {
+            assert!(!selection_left_the_list(Some("napps"), &items, &filter, ""), "{filter:?}");
+        }
+        // A re-sync that still carries the item (even with new contents) keeps it.
+        let mut resynced = vault();
+        resynced[0].name = "Napps (Brex) renamed".into();
+        assert!(!selection_left_the_list(Some("napps"), &resynced, &sidebar::SidebarFilter::All, ""));
+    }
+
+    #[test]
+    fn a_search_that_filters_it_out_drops_it_and_one_that_matches_keeps_it() {
+        let items = vault();
+        assert!(selection_left_the_list(Some("napps"), &items, &sidebar::SidebarFilter::All, "zzz"));
+        assert!(!selection_left_the_list(Some("napps"), &items, &sidebar::SidebarFilter::All, "BREX"));
+    }
+
+    #[test]
+    fn nothing_selected_and_an_item_that_vanished() {
+        let items = vault();
+        assert!(!selection_left_the_list(None, &items, &sidebar::SidebarFilter::Favorites, ""));
+        assert!(selection_left_the_list(Some("gone"), &items, &sidebar::SidebarFilter::All, ""));
+    }
+
+    /// The frame's call must be gated on the read pane (an open Edit or
+    /// Create draft may hold unsaved work), skip the Sends/health screens, and
+    /// set `detail_dismissed` so a sync does not reopen the first item.
+    #[test]
+    fn the_frame_closes_only_from_the_read_pane_and_marks_it_dismissed() {
+        let source = include_str!("mod.rs");
+        let call = concat!("&& selection_", "gone");
+        let at = source.find(call).expect("the frame no longer checks the selection against the list");
+        let before = &source[at - 200..at];
+        assert!(before.contains(concat!("matches!(mode, DetailMode::", "Read)")), "an open draft could be closed silently");
+        assert!(before.contains(concat!("!show_", "sends")) && before.contains(concat!("!on_", "health")));
+        let after = &source[at..at + 800];
+        assert!(after.contains("selected_id = None;") && after.contains("detail_dismissed = true;"));
     }
 }
