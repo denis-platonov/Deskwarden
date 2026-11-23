@@ -110,6 +110,8 @@ pub mod loading_ui;
 /// Civil dates, and the one place a stored UTC instant becomes the wall clock
 /// the user is reading. Store UTC, display local, never print "UTC".
 pub mod local_time;
+/// Why the vault is locked, for the lock screen's line under its title.
+pub mod lock_reason;
 pub mod logging;
 /// Design 3b: the locked-vault card, in bare Win32.
 pub mod locked_card;

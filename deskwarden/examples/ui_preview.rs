@@ -2738,6 +2738,8 @@ impl Preview {
         };
         // The lock screen says what the auto-lock does; the shipped default.
         self.form.auto_lock_minutes = Some(15);
+        // ...and why this lock happened: the idle timer, the design's own line.
+        self.form.lock_reason = Some(deskwarden::lock_reason::LockReason::Idle { minutes: 15 });
         if signin && auth_in_progress {
             self.form.email = "a.novak@ledgerline.com".to_string();
         }
