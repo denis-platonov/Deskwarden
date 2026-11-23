@@ -2186,6 +2186,12 @@ pub fn build_frame_with_search(
         // `Lock`.
         let lock_countdown = match idle_frame(auto_lock_now, last_activity.elapsed()) {
             IdleFrame::Lock => {
+                // Recorded where it is decided: the period that FIRED, which
+                // the setting may no longer say by the time the lock screen
+                // is drawn.
+                if let AutoLock::After(timeout) = auto_lock_now {
+                    crate::lock_reason::note(crate::lock_reason::LockReason::idle_after(timeout));
+                }
                 *locked_for_closure.borrow_mut() = true;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -2855,6 +2861,7 @@ pub fn build_frame_with_search(
             // caller's one lock recovery -- sign-in for the account that
             // was locked, and no switch anywhere else.
             Some(AccountAction::Lock) => {
+                crate::lock_reason::note(crate::lock_reason::LockReason::User);
                 *locked_for_closure.borrow_mut() = true;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -3057,6 +3064,7 @@ pub fn build_frame_with_search(
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
         }
         if ctrl_l {
+            crate::lock_reason::note(crate::lock_reason::LockReason::User);
             *locked_for_closure.borrow_mut() = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -9187,6 +9195,8 @@ pub fn run(
     // to keep its window in the daemon.
     initial_search: String,
 ) -> VaultWindowResult {
+    // A window that opens on an open vault is a vault with no lock to explain.
+    crate::lock_reason::forget_current();
     // **`build_frame_with_search`, not `build_frame`**, because this host has
     // hide hooks to hand in and is now also the one that can be asked to open
     // on a search.

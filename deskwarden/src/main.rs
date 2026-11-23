@@ -252,6 +252,9 @@ fn main() {
         deskwarden::app_profile::app_dirs().expect("could not resolve config directory");
     let config_dir = project_dirs.config_dir.clone();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");
+    // A vault locked by a previous run has no reason now: the lock screen says
+    // what the setting is until something locks it again.
+    deskwarden::lock_reason::forget(&deskwarden::lock_reason::path(&config_dir));
 
     // Downloaded installers go under the *cache* directory, not next to
     // `session.bin` and the log in the config directory: they are large,
@@ -8886,6 +8889,13 @@ fn run_vault_loop(
                     log::warn!(
                         "vault window write failed with an unauthorized session; re-authenticating"
                     );
+                    // A lock the window recorded itself keeps its own reason.
+                    if !result.locked {
+                        let _ = deskwarden::lock_reason::write(
+                            &deskwarden::lock_reason::path(deps.config_dir),
+                            deskwarden::lock_reason::LockReason::SessionExpired,
+                        );
+                    }
                 } else {
                     log::info!("vault window locked itself; re-authenticating");
                 }
@@ -9088,6 +9098,13 @@ fn lock_after_walking_away(
         return;
     }
     log::info!("Windows reported {away:?}; locking the vault rather than waiting out the idle timeout");
+    // The lock screen says which of the two it was; see `lock_reason`.
+    if let Err(e) = deskwarden::lock_reason::write(
+        &deskwarden::lock_reason::path(config_dir),
+        deskwarden::lock_reason::LockReason::from_away(away),
+    ) {
+        log::warn!("could not record why the vault locked ({e}); the lock screen will describe the policy");
+    }
     deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Lock);
     // **Closed first, and that ordering used to be the point.**
     // `resettle_session` below blocked on a master-password prompt which
@@ -9179,6 +9196,12 @@ fn lock_from_the_tray(
         return;
     }
     log::info!("the user locked the vault from the tray");
+    if let Err(e) = deskwarden::lock_reason::write(
+        &deskwarden::lock_reason::path(config_dir),
+        deskwarden::lock_reason::LockReason::User,
+    ) {
+        log::warn!("could not record why the vault locked ({e}); the lock screen will describe the policy");
+    }
     deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Lock);
     ui.close_because_the_user_walked_away(config_dir);
     let SessionEstate {
@@ -9310,7 +9333,7 @@ fn unlock_from_the_locked_card(
         active_account,
         ..
     } = est;
-    resettle_session(
+    let outcome = resettle_session(
         cache,
         engine,
         child,
@@ -9335,7 +9358,12 @@ fn unlock_from_the_locked_card(
             );
             authenticate_by_unlock_prompt(store, dir, ask)
         },
-    )
+    );
+    // Unlocked, so there is no lock left to explain.
+    if !est.token.is_empty() {
+        deskwarden::lock_reason::forget(&deskwarden::lock_reason::path(config_dir));
+    }
+    outcome
 }
 
 /// Whether the fill the user asked for may be resumed.

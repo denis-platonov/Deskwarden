@@ -1623,9 +1623,12 @@ pub struct LoginForm {
     pub error: Option<String>,
     /// The auto-lock period the lock screen tells the user about, in minutes;
     /// `None` is auto-lock off. Read from the settings when the window is
-    /// built: this window is not told *why* the vault is locked, so it
-    /// describes the policy rather than claiming a cause.
+    /// built; it is what the line says when no cause was recorded.
     pub auto_lock_minutes: Option<u64>,
+    /// Why the vault is locked, as the lock's source recorded it
+    /// ([`crate::lock_reason`]); `None` is a lock nobody recorded and the line
+    /// falls back to the policy above.
+    pub lock_reason: Option<crate::lock_reason::LockReason>,
     /// The sign-in worked and the window is about to give way to the next
     /// stage: the form column shows "You're in" until it does. Set by
     /// [`apply_auth_result`], never by anything the user does.
@@ -2490,10 +2493,7 @@ fn draw_lock_stage(
     }
     auth::stage_title(ui, auth::lock_sub());
     ui.add_space(6.0);
-    let after = match form.auto_lock_minutes {
-        Some(minutes) => i18n::tn("auth.lock_after", minutes, &[]),
-        None => i18n::t("auth.lock_auto_off").to_string(),
-    };
+    let after = crate::lock_reason::line(form.lock_reason, form.auto_lock_minutes);
     auth::lock_note_line(ui, &after, i18n::t("auth.lock_tip"));
     ui.add_space(gap);
 
@@ -3454,6 +3454,7 @@ pub fn build_login_frame(
     let host = server_host(details.server_url.as_deref());
     let mut form = LoginForm::default();
     form.auto_lock_minutes = auto_lock_minutes_now();
+    form.lock_reason = crate::lock_reason::current();
     // The dropdown starts on whatever server the CLI is already pointed at,
     // so re-login on a self-hosted setup doesn't silently flip to the cloud.
     let (choice, url) = ServerChoice::from_configured(details.server_url.as_deref());
@@ -3707,6 +3708,8 @@ pub fn build_login_frame(
                     if let AuthOutcome::Succeeded(session_token) =
                         apply_auth_result(result, &mut form)
                     {
+                        // Unlocked: there is no lock left to explain.
+                        crate::lock_reason::forget_current();
                         // **Beside the token, in the same arm, and only
                         // here.** This is the moment the app learns whose
                         // account this is without asking a `bw status`: the
@@ -6599,6 +6602,28 @@ mod first_run_notice_tests {
         form.auto_lock_minutes = None;
         let (painted, _) = screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, None);
         assert!(has(&painted, "Auto-lock is off"), "{painted:?}");
+    }
+
+    #[test]
+    fn the_lock_line_says_why_the_vault_is_locked_and_not_what_the_setting_is() {
+        use crate::lock_reason::LockReason;
+        let ctx = styled_context();
+        for (reason, wanted) in [
+            (LockReason::Idle { minutes: 7 }, "Locked after 7 minutes of no activity"),
+            (LockReason::Idle { minutes: 1 }, "Locked after 1 minute of no activity"),
+            (LockReason::User, "You locked the vault"),
+            (LockReason::WindowsLocked, "Locked when Windows was locked"),
+            (LockReason::Sleep, "Locked when the PC went to sleep"),
+            (LockReason::SessionExpired, "Locked because your session ended"),
+        ] {
+            let mut form = LoginForm::default();
+            // A setting that disagrees with the cause, which is the whole point.
+            form.auto_lock_minutes = Some(15);
+            form.lock_reason = Some(reason);
+            let (painted, _) = screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, None);
+            assert!(has(&painted, wanted), "{reason:?} should read {wanted:?}; painted {painted:?}");
+            assert!(!has(&painted, "Locks after 15 minutes of no activity"), "{painted:?}");
+        }
     }
 
     #[test]
@@ -11632,6 +11657,7 @@ pub(crate) mod password_lifetime_tests {
             enable_hello: false,
             error: Some(probe_password()),
             auto_lock_minutes: None,
+            lock_reason: None,
             signed_in: false,
         }
     }
@@ -12209,6 +12235,8 @@ pub(crate) mod password_lifetime_tests {
             error: _,
             // Not a String: a number of minutes.
             auto_lock_minutes: _,
+            // Not a String: a small enum.
+            lock_reason: _,
             // Not a String either: one flag.
             signed_in: _,
         } = &form;
