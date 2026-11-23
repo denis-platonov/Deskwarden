@@ -5296,7 +5296,10 @@ const CARD_JSON: &str = r#"{
     "expMonth": "11",
     "expYear": "2029",
     "code": "417"
-  }
+  },
+  "fields": [
+    { "name": "deskwarden:bank-domain", "value": "brex.com", "type": 0 }
+  ]
 }"#;
 
 /// The item list's rows: one card per network, plus the two login shapes.

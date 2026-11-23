@@ -626,9 +626,19 @@ pub fn icon_authority_for(item: &crate::vault_bridge::VaultItem) -> Option<Strin
 /// Duplicates are dropped, keeping the first place a domain earned. Every
 /// other kind answers [`icon_authority_for`]'s one authority, or nothing.
 pub fn icon_authorities_for(item: &crate::vault_bridge::VaultItem) -> Vec<String> {
-    let crate::vault_bridge::ItemKind::Login = crate::vault_bridge::ItemKind::of(item) else {
-        return icon_authority_for(item).into_iter().collect();
-    };
+    match crate::vault_bridge::ItemKind::of(item) {
+        crate::vault_bridge::ItemKind::Login => {}
+        // A card's bank is a login's host (the picker offers those), and that
+        // host's parents stand in for it as they do for the login itself.
+        crate::vault_bridge::ItemKind::Card => {
+            let mut out: Vec<String> = icon_authority_for(item).into_iter().collect();
+            if let Some(first) = out.first().cloned() {
+                out.extend(parent_domains(&first));
+            }
+            return out;
+        }
+        _ => return icon_authority_for(item).into_iter().collect(),
+    }
     let mut out: Vec<String> = Vec::new();
     let websites = item
         .login

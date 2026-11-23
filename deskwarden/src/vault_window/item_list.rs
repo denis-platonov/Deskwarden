@@ -2191,19 +2191,35 @@ fn list_header(ui: &mut egui::Ui, title: &str, count: usize) -> Option<ItemListA
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let count = tokens::job(tokens::BODY, &count.to_string(), p.text_ghost);
-                    let count_width = ui.fonts_mut(|f| f.layout_job(count.clone()).size().x);
+                    let count_galley = ui.fonts_mut(|f| f.layout_job(count));
+                    let count_width = count_galley.size().x;
                     let room = (ui.available_width() - count_width - 10.0).max(1.0);
                     let mut title_job = tokens::job(tokens::LIST_HEADER, title, p.ink);
                     title_job.wrap = egui::text::TextWrapping::truncate_at_width(room);
-                    ui.label(title_job);
-                    // Nudged down to the title's baseline: the two sizes share
-                    // a bottom edge, not a baseline, in egui's boxes.
-                    ui.add_space(0.0);
-                    ui.label(count);
+                    let title_galley = ui.fonts_mut(|f| f.layout_job(title_job));
+                    // Spec 3.1: baseline aligned. The two boxes share a bottom
+                    // edge, and the smaller type's baseline sits nearer to it,
+                    // so the count is raised by the difference.
+                    let raise = (baseline_below(&title_galley) - baseline_below(&count_galley)).max(0.0);
+                    ui.label(title_galley);
+                    let (slot, _) = ui.allocate_exact_size(
+                        egui::vec2(count_width, count_galley.size().y + raise),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().galley(slot.min, count_galley, p.text_ghost);
                 });
             });
         });
     chosen
+}
+
+/// How far the first line's baseline sits above the bottom of its galley.
+fn baseline_below(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|placed| placed.row.glyphs.first().map(|g| galley.size().y - (placed.pos.y + g.pos.y)))
+        .unwrap_or(0.0)
 }
 
 /// The compact `+` beside the list's title (slice 3, decision 1).
@@ -2370,6 +2386,11 @@ pub(crate) fn row_look(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> 
     let net = card_net(item);
     if let Some(bank) = item_bank(item) {
         return kit::avatar::Look::Brand { mark: Mark::Bank(bank), chip: net };
+    }
+    // A bank without a bundled mark is still the card's logo when its own
+    // icon has loaded: it beats the network tile, which stays as the chip.
+    if let (Some(texture), Some(_)) = (icon, crate::favicon::icon_domain_for(item).filter(|_| card_net(item).is_some())) {
+        return kit::avatar::Look::BankIcon { texture: texture.clone(), chip: net };
     }
     if let Some(net) = net {
         return kit::avatar::Look::Brand { mark: Mark::Net(net), chip: None };
@@ -4781,6 +4802,25 @@ mod row_tile_tests {
         assert_eq!(item_bank(&with_site(login("Chase Business", "me"), "https://secure.chase.com/login")), Some(Bank::Chase));
         assert_eq!(item_bank(&with_site(login("Other", "me"), "https://example.com")), None);
         assert_eq!(item_bank(&card_branded("Bare", "Visa")), None);
+    }
+
+    /// The owner's "Napps (Brex)" card: a bank with no bundled mark, whose
+    /// favicon is cached. It used to fall to the black network tile because
+    /// the network was tried before the favicon.
+    #[test]
+    fn a_banks_own_icon_beats_the_network_tile_and_keeps_the_network_as_a_chip() {
+        use crate::kit::avatar::Look;
+        let card = crate::vault_bridge::with_custom_field(&card_branded("Napps", "Mastercard"), crate::favicon::BANK_DOMAIN_FIELD, "dashboard.brex.com");
+        let ctx = crate::kit::testing::ctx();
+        let texture = ctx.load_texture("brex", egui::ColorImage::filled([4, 4], egui::Color32::RED), Default::default());
+        match row_look(&card, Some(&texture)) {
+            Look::BankIcon { chip, .. } => assert_eq!(chip, Some(Net::Mastercard)),
+            _ => panic!("the bank's icon lost to the network tile"),
+        }
+        // Until the icon has loaded the network tile stands in.
+        assert!(matches!(row_look(&card, None), Look::Brand { mark: Mark::Net(Net::Mastercard), .. }));
+        // The card with no bank never wears an icon over its network.
+        assert!(matches!(row_look(&card_branded("Plain", "Mastercard"), Some(&texture)), Look::Brand { .. }));
     }
 
     #[test]
@@ -7909,6 +7949,10 @@ mod v2_list_tests {
         let (_, count_ink, count) = p.texts.iter().find(|(t, _, _)| t == "3").expect("the count");
         assert_eq!(*count_ink, P.text_ghost);
         assert!(count.left() > title.right(), "the count sits after the title");
+        // Spec 3.1 "baseline aligned": the painted rects are the glyphs' own
+        // bounds, and neither "Work" nor "3" has a descender, so their bottoms
+        // are their baselines.
+        assert!((title.bottom() - count.bottom()).abs() < 0.6, "the count sits off the title's baseline: {title:?} vs {count:?}");
         assert!(title.left() >= 24.0 - 0.5 && title.top() >= 24.0 - 6.0, "the header's 24pt padding: {title:?}");
 
         // The titles themselves, one per scope (spec 3.1's map, and the

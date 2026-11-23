@@ -16,6 +16,10 @@ pub enum Look {
     Initials { text: String, bg: Color32, fg: Color32 },
     /// A site's favicon, on white.
     Favicon(TextureHandle),
+    /// A card's bank, drawn from its own favicon because the bank has no
+    /// bundled mark: the icon on white with the card's network as the same
+    /// small chip a bundled bank tile wears.
+    BankIcon { texture: TextureHandle, chip: Option<Net> },
     /// A network's or bank's tile (design 1e): its mark in white on its colour,
     /// or its short label when it has no bundled mark. A bank's tile carries
     /// the card's network as a small chip over its bottom-right corner.
@@ -72,6 +76,12 @@ pub fn paint(painter: &Painter, rect: Rect, look: &Look, radius: u8) {
                 RectShape::filled(image, CornerRadius::ZERO, Color32::WHITE)
                     .with_texture(texture.id(), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))),
             );
+        }
+        Look::BankIcon { texture, chip } => {
+            paint(painter, rect, &Look::Favicon(texture.clone()), radius);
+            if let Some(net) = chip {
+                paint_chip(painter, rect, *net);
+            }
         }
         Look::Brand { mark, chip } => {
             painter.add(RectShape::filled(rect, corner, mark.colour()));

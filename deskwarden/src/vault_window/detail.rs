@@ -3816,7 +3816,7 @@ pub fn draw_detail_read(
         DetailBody::Card => {
             match card_pane_fields(item) {
                 Some(fields) => {
-                    card_hero(ui, &fields, super::item_list::card_network(item), super::item_list::card_net(item), reveal, &mut action);
+                    card_hero(ui, &fields, super::item_list::card_network(item), super::item_list::card_net(item), reveal, &mut action, icon, vault);
                     ui.add_space(CARD_GAP);
                     card_field_card(ui, &fields, super::item_list::card_network(item), reveal, &mut action, vault);
                 }
@@ -7325,10 +7325,12 @@ fn gradient_rounded_rect(rect: egui::Rect, radius: f32, b: egui::Color32, ink: e
 }
 
 /// Spec 3.3's card hero: the card's face, 440x258 at radius 22 in its
-/// network's colour, with the chip, the number and its eye, and the holder,
+/// network's colour, with the number and its eye, and the holder,
 /// expiry and code with the code's own eye. Design 1e adds the bank's mark at
 /// the top left and the network's mark at the bottom right, and the face's
 /// colour is the bank's, else the network's, else the navy.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 fn card_hero(
     ui: &mut egui::Ui,
     fields: &CardFields,
@@ -7336,9 +7338,12 @@ fn card_hero(
     net: Option<crate::kit::logos::Net>,
     reveal: &mut RevealState,
     action: &mut DetailAction,
+    // The bank's favicon, if the window's icon cache has loaded one, and the
+    // vault's items that name the bank through [`bank_name`].
+    icon: Option<&egui::TextureHandle>,
+    vault: &[VaultItem],
 ) {
     use crate::kit::{self, tokens};
-    let _ = action;
     let p = tokens::palette(ui.ctx());
     let width = ui.available_width().min(440.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, width * 258.0 / 440.0), egui::Sense::hover());
@@ -7372,22 +7377,26 @@ fn card_hero(
         2.0,
         egui::Color32::from_white_alpha(191),
     );
-    // The bank's mark, top left (image 62 x 24, else its name at 18/900).
-    if let Some(bank) = bank {
-        use crate::kit::logos::{paint_aligned, Label, Mark};
-        paint_aligned(
-            ui.painter(),
-            egui::pos2(inner.left(), inner.top() + 12.0 * k),
-            egui::Align::Min,
-            egui::vec2(62.0 * k, 24.0 * k),
-            18.0 * k,
-            Mark::Bank(bank),
-            Label::Long,
-        );
+    // The bank, top left: its logo in a small white tile and its name, which
+    // ellipsizes before it reaches the contactless icon. No bank, nothing.
+    if let Some(domain) = fields.bank.as_deref() {
+        let name = bank_name(domain, vault);
+        let tile = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.top()), egui::Vec2::splat(30.0 * k));
+        let look = match (icon, crate::kit::logos::Bank::for_domain(domain)) {
+            (Some(texture), _) => kit::avatar::Look::Favicon(texture.clone()),
+            (None, Some(bank)) => kit::avatar::Look::Brand { mark: crate::kit::logos::Mark::Bank(bank), chip: None },
+            (None, None) => {
+                let (bg, fg) = kit::avatar::initials_colours(&name);
+                kit::avatar::Look::Initials { text: super::item_list::initials(&name), bg, fg }
+            }
+        };
+        kit::avatar::paint(ui.painter(), tile, &look, 8);
+        let room = (inner.right() - 22.0 * k - 12.0 * k) - (tile.right() + 10.0 * k);
+        let mut job = tokens::job(tokens::Role { size: 17.0 * k, face: theme::EXTRABOLD, tracking_em: 0.0 }, &name, white);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(room.max(24.0 * k));
+        let g = ctx.fonts_mut(|f| f.layout_job(job));
+        ui.painter().galley(egui::pos2(tile.right() + 10.0 * k, tile.center().y - g.size().y / 2.0), g, white);
     }
-    // The chip.
-    let chip = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.top() + (28.0 + 18.0) * k), egui::vec2(46.0 * k, 34.0 * k));
-    ui.painter().rect(chip, CornerRadius::same(7), egui::Color32::from_rgb(0xde, 0xbb, 0x57), Stroke::new(1.0, egui::Color32::from_black_alpha(31)), egui::StrokeKind::Inside);
     // The number, with its eye.
     let number = fields.number.as_deref().unwrap_or("");
     let shown = if reveal.card_number {
@@ -7403,8 +7412,23 @@ fn card_hero(
         let scaled = tokens::Role { size: (mono.size * number_room / digits.size().x).floor(), ..mono };
         digits = galley(scaled, &shown, white);
     }
-    let digits_at = egui::pos2(inner.left(), chip.bottom() + 18.0 * k);
+    // With no chip the number sits centred between the top row and the
+    // bottom row.
+    let bottom_h = tokens::font_height(&ctx, tokens::Role { size: 16.0 * k, face: theme::BOLD, tracking_em: 0.0 })
+        + tokens::font_height(&ctx, tokens::Role { size: 11.0 * k, face: theme::BOLD, tracking_em: 0.12 })
+        + 2.0;
+    let top_end = inner.top() + 30.0 * k;
+    let bottom_start = inner.bottom() - bottom_h;
     let digits_size = digits.size();
+    let digits_at = egui::pos2(inner.left(), (top_end + bottom_start) / 2.0 - digits_size.y / 2.0);
+    let number_rect = egui::Rect::from_min_size(digits_at, digits_size);
+    if !number.is_empty() {
+        let r = ui.interact(number_rect.expand(4.0 * k), ui.id().with("hero-number"), egui::Sense::click());
+        if hero_copy_affordance(ui, &r, number_rect, 6.0 * k, CopyShortcut::CardNumber) {
+            *action = DetailAction::CopyCardNumber;
+            note_copied(ui.ctx(), number_label());
+        }
+    }
     ui.painter().galley(digits_at, digits, white);
     let eye = egui::Rect::from_center_size(egui::pos2(digits_at.x + digits_size.x + (12.0 + 16.0) * k, digits_at.y + digits_size.y / 2.0), egui::Vec2::splat(32.0 * k));
     if !number.is_empty() {
@@ -7457,8 +7481,28 @@ fn card_hero(
         };
         let w = l.size().x.max(v.size().x);
         let value_w = v.size().x;
+        let value_at = egui::pos2(x, label_y + label_h + 2.0);
+        // Each value copies what its row under the hero copies.
+        let copy = if label == hero_holder() {
+            fields.cardholder.as_ref().map(|h| (DetailAction::CopyValue(h.clone()), CopyShortcut::Cardholder, cardholder_label()))
+        } else if label == hero_expires() {
+            fields.expiry.as_ref().map(|_| (DetailAction::CopyValue(fields.expiry.clone().unwrap_or_default()), CopyShortcut::CardExpiry, expiry_label()))
+        } else if !code.is_empty() {
+            Some((DetailAction::CopyCardCode, CopyShortcut::CardCode, code_label()))
+        } else {
+            None
+        };
+        if let Some((on_copy, hint, name)) = copy {
+            let value_rect = egui::Rect::from_min_size(value_at, v.size());
+            let id = ui.id().with(("hero-copy", name));
+            let r = ui.interact(value_rect.expand(4.0 * k), id, egui::Sense::click());
+            if hero_copy_affordance(ui, &r, value_rect, 5.0 * k, hint) {
+                *action = on_copy;
+                note_copied(ui.ctx(), name);
+            }
+        }
         ui.painter().galley(egui::pos2(x, label_y), l, faint);
-        ui.painter().galley(egui::pos2(x, label_y + label_h + 2.0), v, white);
+        ui.painter().galley(value_at, v, white);
         if label == hero_code() && !code.is_empty() {
             let at = egui::Rect::from_center_size(egui::pos2(x + value_w + (8.0 + 12.0) * k, label_y + label_h + 2.0 + value_h / 2.0), egui::Vec2::splat(24.0 * k));
             let response = ui.interact(at, ui.id().with("hero-code-eye"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -7495,6 +7539,19 @@ fn card_hero(
         }
     }
     let _ = p;
+}
+
+/// What a hero value does under the pointer: the pointing hand, a faint
+/// plate behind it, and the copy rows' tooltip. Returns whether it was
+/// clicked. The plate is painted before the text so it sits behind it.
+fn hero_copy_affordance(ui: &egui::Ui, response: &egui::Response, around: egui::Rect, pad: f32, hint: CopyShortcut) -> bool {
+    if !response.hovered() {
+        return response.clicked();
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    ui.painter().rect_filled(around.expand(pad), CornerRadius::same(8), egui::Color32::from_white_alpha(30));
+    response.clone().on_hover_text(copy_row_tooltip(Some(hint)));
+    response.clicked()
 }
 
 /// Spec 3.3's field card under the hero: Name on card; Card number (its own
@@ -18518,6 +18575,80 @@ mod tests {
             let _ = pane.click(&item, &TotpState::NoSecret, eye);
             let shown = pane.idle(&item, &TotpState::NoSecret);
             assert!(shown.painted("4242 4242 4242 4242"), "{:?}", shown.strings());
+        }
+
+        /// The topmost of the painted runs reading `text`: the hero's, above
+        /// the field card's own copy of the same value.
+        fn hero_run(f: &Frame, text: &str) -> egui::Rect {
+            f.texts
+                .iter()
+                .filter(|(t, _)| t == text)
+                .map(|(_, r)| *r)
+                .min_by(|a, b| a.top().total_cmp(&b.top()))
+                .unwrap_or_else(|| panic!("no {text:?} in {:?}", f.strings()))
+        }
+
+        /// A pane that has already drawn `item` once, so a click lands.
+        fn warmed(item: &VaultItem) -> Pane {
+            let mut pane = Pane::new();
+            let _ = pane.idle(item, &TotpState::NoSecret);
+            pane
+        }
+
+        /// Owner request: the face's number, holder, expiry and code copy what
+        /// the rows under it copy -- the real number and code even masked --
+        /// and the eyes still only reveal.
+        #[test]
+        fn the_heros_values_copy_what_their_rows_copy_and_the_eyes_do_not() {
+            let item = a_full_card();
+            let mask = "\u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} 4242";
+            let f = Pane::new().idle(&item, &TotpState::NoSecret);
+            let number = hero_run(&f, mask);
+            let holder = hero_run(&f, "John Doe").center();
+            let expiry = hero_run(&f, "04/23").center();
+            let code = hero_run(&f, "\u{2022}\u{2022}\u{2022}").center();
+            assert_eq!(warmed(&item).click(&item, &TotpState::NoSecret, number.center()).action, DetailAction::CopyCardNumber);
+            assert_eq!(
+                warmed(&item).click(&item, &TotpState::NoSecret, holder).action,
+                DetailAction::CopyValue("John Doe".into())
+            );
+            assert_eq!(
+                warmed(&item).click(&item, &TotpState::NoSecret, expiry).action,
+                DetailAction::CopyValue("04/23".into())
+            );
+            assert_eq!(warmed(&item).click(&item, &TotpState::NoSecret, code).action, DetailAction::CopyCardCode);
+            // The eye beside the number reveals it and copies nothing.
+            let eye = egui::pos2(number.right() + 12.0 + 16.0, number.center().y);
+            let mut pane = warmed(&item);
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, eye).action, DetailAction::None, "the eye copied");
+            assert!(pane.idle(&item, &TotpState::NoSecret).painted(REVEALED_NUMBER));
+        }
+
+        /// Owner request: a card with a bank wears the bank's name on its face,
+        /// top left; one without looks as before.
+        #[test]
+        fn the_heros_bank_is_named_top_left_and_absent_without_one() {
+            let with = napps_brex();
+            let f = Pane::new().in_vault(vec![bank_login_for_hero()]).idle(&with, &TotpState::NoSecret);
+            // The name is drawn twice: on the face, and on the Bank row.
+            let name = hero_run(&f, "Brex (Napps)");
+            let holder = hero_run(&f, "Denis Platonov");
+            assert!(name.bottom() < holder.top(), "the bank sits above the rest of the face: {name:?} {holder:?}");
+            assert!((name.left() - holder.left()).abs() < 80.0, "top left: {name:?} {holder:?}");
+            let mut plain = a_full_card();
+            plain.fields.clear();
+            let f = Pane::new().idle(&plain, &TotpState::NoSecret);
+            assert!(!f.painted("Brex (Napps)") && !f.painted("Brex"), "{:?}", f.strings());
+        }
+
+        fn bank_login_for_hero() -> VaultItem {
+            let mut login = a_login();
+            login.name = "Brex (Napps)".to_string();
+            login.login.as_mut().expect("a login").uris = vec![crate::vault_bridge::UriEntry {
+                uri: Some("https://brex.com/login".to_string()),
+                other: serde_json::Map::new(),
+            }];
+            login
         }
 
         #[test]
