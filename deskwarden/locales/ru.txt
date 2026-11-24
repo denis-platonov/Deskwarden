@@ -723,7 +723,6 @@ sidebar.no_folder = Без папки
 sidebar.organisation = Организация
 sidebar.collection = Коллекция
 sidebar.section_vault = Хранилище
-sidebar.section_tools = Инструменты
 sidebar.section_folders = Папки
 sidebar.eyebrow_waiting = ОЖИДАЕТ
 sidebar.eyebrow_opened = ОТКРЫТА

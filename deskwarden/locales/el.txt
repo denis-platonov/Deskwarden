@@ -681,7 +681,6 @@ sidebar.no_folder = Χωρίς φάκελο
 sidebar.organisation = Οργανισμός
 sidebar.collection = Συλλογή
 sidebar.section_vault = Θησαυροφυλάκιο
-sidebar.section_tools = Εργαλεία
 sidebar.section_folders = Φάκελοι
 sidebar.eyebrow_waiting = ΣΕ ΑΝΑΜΟΝΗ
 sidebar.eyebrow_opened = ΑΝΟΙΧΤΑ

@@ -664,7 +664,6 @@ sidebar.no_folder = フォルダーなし
 sidebar.organisation = 組織
 sidebar.collection = コレクション
 sidebar.section_vault = 保管庫
-sidebar.section_tools = ツール
 sidebar.section_folders = フォルダー
 sidebar.eyebrow_waiting = 待機中
 sidebar.eyebrow_opened = 開封済み

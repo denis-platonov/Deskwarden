@@ -706,7 +706,6 @@ sidebar.no_folder = Geen map
 sidebar.organisation = Organisatie
 sidebar.collection = Collectie
 sidebar.section_vault = Kluis
-sidebar.section_tools = Hulpmiddelen
 sidebar.section_folders = Mappen
 sidebar.eyebrow_waiting = WACHTEND
 sidebar.eyebrow_opened = GEOPEND

@@ -479,9 +479,6 @@ pub enum SidebarAction {
     CreateFolder(String),
     /// The pinned Lock row: whatever `Ctrl+L` does.
     Lock,
-    /// The TOOLS section's Settings row: opens the preferences the titlebar
-    /// gear used to.
-    OpenSettings,
     /// A click on a folder row's edit-pencil icon -- the folder id.
     /// `vault_window::mod` opens the "Edit folder" modal in response (see
     /// `folder_modal`), which is where rename and delete actually happen.
@@ -1241,11 +1238,6 @@ pub fn draw_sidebar(
                 }
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                section_label(ui, crate::i18n::t("sidebar.section_tools"), false);
-                if tools_rows(ui, lists, &mut screens) {
-                    action = SidebarAction::OpenSettings;
-                }
-
                 section_label(ui, crate::i18n::t("sidebar.section_folders"), false);
                 ui.spacing_mut().item_spacing.y = ROW_GAP;
                 // What is being dragged over this window right now, if
@@ -1716,64 +1708,68 @@ fn draw_organisations(
     ui.spacing_mut().item_spacing.y = 0.0;
 }
 
-/// The TOOLS section: Shared (the Sent screen), Password health, Settings.
-/// Returns whether Settings was clicked.
-///
-/// **Shared and Password health are screens, not cuts of the vault**: Sends
-/// are not `VaultItem`s, and password reuse is a property of a PAIR of items,
-/// which no per-item `scope_contains` can answer. So they are flags in
-/// [`Screens`] rather than [`SidebarFilter`] variants, and [`Screens::select`]
-/// is the only way in.
-/// Slice 6: the TOOLS row for the Generator screen.
+/// Slice 6: the label of the Generator row of the gear menu.
 pub fn generator_row_label() -> &'static str {
     crate::i18n::t("sidebar.generator")
 }
 
-fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_>) -> bool {
+/// What the top bar's gear menu holds -- the rows the rail's TOOLS section
+/// used to: Shared (the Sent screen), Password health, Generator, Settings.
+/// Hung off the gear button (`anchor`); returns whether Settings was clicked.
+///
+/// **Shared, Password health and Generator are screens, not cuts of the
+/// vault**: Sends are not `VaultItem`s, and password reuse is a property of a
+/// PAIR of items, which no per-item `scope_contains` can answer. So they are
+/// flags in [`Screens`] rather than [`SidebarFilter`] variants, and
+/// [`Screens::select`] is the only way in. The screen in force carries the
+/// menu's selected look, as its rail row carried the selection wash.
+pub fn tools_menu(anchor: &egui::Response, lists: VaultLists<'_>, screens: &mut Screens<'_>) -> bool {
+    crate::kit::menu::menu(anchor, |ui| tools_rows(ui, lists, screens)).is_some_and(|shown| shown.inner)
+}
+
+/// The gear menu's rows, drawn into whatever menu surface `ui` is -- the
+/// popover [`tools_menu`] opens, or the one `ui_preview` holds open.
+pub fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_>) -> bool {
     use crate::kit::icon::glyph;
-    ui.spacing_mut().item_spacing.y = ROW_GAP;
+    use crate::kit::menu::{item, Item};
+    // Sends and person shares in one count (spec 6.10). Unknown Sends
+    // with no shares stay unknown; unknown Sends with shares count the
+    // shares -- a PARTIAL count, knowingly, over an en dash that would
+    // hide shares the window does know about.
+    let shared = match (lists.sends.map(|c| c.all), lists.shared_records) {
+        (Some(sends), shares) => Some(sends + shares),
+        (None, 0) => None,
+        (None, shares) => Some(shares),
+    };
+    let shared = badge_text(shared);
+    // Distinct items with a finding: always known, so never an en dash.
+    let findings = badge_text(Some(lists.health_findings));
+    let mut settings = false;
+    if item(
+        ui,
+        Item::new(sends_row_label()).icon(glyph::SHARED).hint(&shared).selected(screens.sharing_is(SendScope::All)),
+    )
+    .clicked()
     {
-        let width = ui.available_width();
-        let on = screens.sharing_is(SendScope::All);
-        // Sends and person shares in one count (spec 6.10). Unknown Sends
-        // with no shares stay unknown; unknown Sends with shares count the
-        // shares -- a PARTIAL count, knowingly, over an en dash that would
-        // hide shares the window does know about.
-        let count = match (lists.sends.map(|c| c.all), lists.shared_records) {
-            (Some(sends), shares) => Some(sends + shares),
-            (None, 0) => None,
-            (None, shares) => Some(shares),
-        };
-        let count = badge_text(count);
-        if sidebar_row(ui, glyph::SHARED, sends_row_label(), Some(&count), on, width, 0.0, ROW_HEIGHT)
-            .clicked()
-        {
-            screens.select_sharing(SendScope::All);
-        }
+        screens.select_sharing(SendScope::All);
     }
+    if item(
+        ui,
+        Item::new(crate::vault_window::password_health::health_row_label())
+            .icon(glyph::HEALTH)
+            .hint(&findings)
+            .selected(screens.is(Screen::Health)),
+    )
+    .clicked()
     {
-        // Distinct items with a finding: always known, so never an en dash.
-        let width = ui.available_width();
-        let on = screens.is(Screen::Health);
-        let label = crate::vault_window::password_health::health_row_label();
-        let count = badge_text(Some(lists.health_findings));
-        if sidebar_row(ui, glyph::HEALTH, label, Some(&count), on, width, 0.0, ROW_HEIGHT).clicked() {
-            screens.select(Screen::Health);
-        }
+        screens.select(Screen::Health);
     }
-    {
-        // Slice 6: the Generator screen.
-        let width = ui.available_width();
-        let on = screens.is(Screen::Generator);
-        if sidebar_row(ui, glyph::GEN, generator_row_label(), None, on, width, 0.0, ROW_HEIGHT).clicked() {
-            screens.select(Screen::Generator);
-        }
+    if item(ui, Item::new(generator_row_label()).icon(glyph::GEN).selected(screens.is(Screen::Generator))).clicked() {
+        screens.select(Screen::Generator);
     }
-    let width = ui.available_width();
-    let settings_on = screens.is(Screen::Settings);
-    let settings = sidebar_row(ui, glyph::SETTINGS, settings_row_label(), None, settings_on, width, 0.0, ROW_HEIGHT)
-        .clicked();
-    ui.spacing_mut().item_spacing.y = 0.0;
+    if item(ui, Item::new(settings_row_label()).icon(glyph::SETTINGS).selected(screens.is(Screen::Settings))).clicked() {
+        settings = true;
+    }
     settings
 }
 
@@ -3430,9 +3426,140 @@ mod tests {
         ]
     }
 
+    /// The four screen flags the gear menu can set, in and out.
+    #[derive(Default, Clone, Copy)]
+    pub(super) struct GearFlags {
+        pub(super) sends: bool,
+        pub(super) health: bool,
+        pub(super) generator: bool,
+        pub(super) settings: bool,
+    }
+
+    pub(super) struct GearRun {
+        /// Every painted string while the menu is open (before any press).
+        pub(super) painted: Vec<(String, egui::Rect)>,
+        pub(super) flags: GearFlags,
+        pub(super) asked_settings: bool,
+    }
+
+    /// The gear menu, driven like a user: click its anchor, let it paint, and
+    /// -- with `press` -- click the row labelled so.
+    pub(super) fn gear_menu(lists: VaultLists<'_>, start: GearFlags, press: Option<&str>) -> GearRun {
+        let ctx = egui::Context::default();
+        let base = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(base(vec![]), |_ui| {});
+        theme::apply(&ctx);
+        let mut flags = start;
+        let mut scope = SendScope::All;
+        let mut asked = false;
+        let anchor_rect = egui::Rect::from_min_size(egui::pos2(300.0, 20.0), egui::vec2(38.0, 38.0));
+        let mut run = |events: Vec<egui::Event>| {
+            let out = ctx.run_ui(base(events), |ui| {
+                let anchor = ui.interact(anchor_rect, egui::Id::new("test-gear"), egui::Sense::click());
+                if tools_menu(
+                    &anchor,
+                    lists,
+                    &mut Screens {
+                        sends: &mut flags.sends,
+                        health: &mut flags.health,
+                        received: &mut false,
+                        generator: &mut flags.generator,
+                        settings: &mut flags.settings,
+                        scope: &mut scope,
+                    },
+                ) {
+                    asked = true;
+                }
+            });
+            let mut rects = Vec::new();
+            for clipped in &out.shapes {
+                collect_labelled_rects(&clipped.shape, &mut rects);
+            }
+            rects
+        };
+        let press_at = |pos: egui::Pos2| {
+            (
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            )
+        };
+        let _ = run(vec![]);
+        let (down, up) = press_at(anchor_rect.center());
+        let _ = run(down);
+        let _ = run(up);
+        let _ = run(vec![]);
+        let painted = run(vec![]);
+        if let Some(label) = press {
+            let pos = painted
+                .iter()
+                .find(|(t, _)| t == label)
+                .map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("the open gear menu painted no {label:?}: {painted:?}"));
+            let (down, up) = press_at(pos);
+            let _ = run(down);
+            let _ = run(up);
+            let _ = run(vec![]);
+        }
+        GearRun { painted, flags, asked_settings: asked }
+    }
+
+    /// What the menu paints before its anchor is clicked: nothing.
+    pub(super) fn gear_menu_closed(lists: VaultLists<'_>) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw(), |_ui| {});
+        theme::apply(&ctx);
+        let mut scope = SendScope::All;
+        let (mut s, mut h, mut g, mut st) = (false, false, false, false);
+        let out = ctx.run_ui(raw(), |ui| {
+            let anchor = ui.interact(
+                egui::Rect::from_min_size(egui::pos2(300.0, 20.0), egui::vec2(38.0, 38.0)),
+                egui::Id::new("test-gear"),
+                egui::Sense::click(),
+            );
+            let _ = tools_menu(
+                &anchor,
+                lists,
+                &mut Screens {
+                    sends: &mut s,
+                    health: &mut h,
+                    received: &mut false,
+                    generator: &mut g,
+                    settings: &mut st,
+                    scope: &mut scope,
+                },
+            );
+        });
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            collect_labelled_rects(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
     /// The one painted string sitting on the same row as `label` but not the
     /// label itself -- i.e. that row's right-aligned count badge.
-    fn badge_beside(painted: &[(String, egui::Rect)], label: &str) -> String {
+    pub(super) fn badge_beside(painted: &[(String, egui::Rect)], label: &str) -> String {
         let row_y = painted
             .iter()
             .find(|(text, _)| text == label)
@@ -3693,35 +3820,33 @@ mod tests {
         let folders = one_real_folder_and_the_virtual_bucket();
 
         // Not fetched, or fetched and failed -- both `None`, both an en dash.
-        let (unknown, _, _) =
-            painted_sidebar_lists("Locks in 11:42", VaultLists::live_only(&live), &folders);
+        let unknown = gear_menu(VaultLists::live_only(&live), GearFlags::default(), None).painted;
         assert_eq!(badge_beside(&unknown, SENDS_ROW_LABEL), UNKNOWN_COUNT);
 
         // Answered, and empty. `0` is a claim, and here it is one this app
         // has: the CLI said so.
-        let (none_published, _, _) = painted_sidebar_lists(
-            "Locks in 11:42",
+        let none_published = gear_menu(
             VaultLists { sends: Some(SendCounts::default()), ..VaultLists::live_only(&live) },
-            &folders,
-        );
+            GearFlags::default(),
+            None,
+        )
+        .painted;
         assert_eq!(badge_beside(&none_published, SENDS_ROW_LABEL), "0");
 
         // Answered, with three. And it is not the live vault's count leaking
         // through: the live list here has five items.
-        let (three, _, _) = painted_sidebar_lists(
-            "Locks in 11:42",
-            VaultLists {
-                sends: Some(SendCounts::over([
-                    crate::send::SendState::Waiting,
-                    crate::send::SendState::Used,
-                    crate::send::SendState::Revoked,
-                ])),
-                ..VaultLists::live_only(&live)
-            },
-            &folders,
-        );
+        let lists = VaultLists {
+            sends: Some(SendCounts::over([
+                crate::send::SendState::Waiting,
+                crate::send::SendState::Used,
+                crate::send::SendState::Revoked,
+            ])),
+            ..VaultLists::live_only(&live)
+        };
+        let three = gear_menu(lists, GearFlags::default(), None).painted;
         assert_eq!(badge_beside(&three, SENDS_ROW_LABEL), "3");
-        assert_eq!(badge_beside(&three, "All items"), "5");
+        let (rail, _, _) = painted_sidebar_lists("Locks in 11:42", lists, &folders);
+        assert_eq!(badge_beside(&rail, "All items"), "5");
     }
 
     /// The row is in the rail, once, and pressing it selects the Sends screen
@@ -3731,29 +3856,32 @@ mod tests {
     /// sidebar is culled entirely by egui and comes back as nothing, so
     /// reading geometry before counting would read the rows that survived.
     #[test]
-    fn the_sends_row_is_in_the_rail_once_and_is_the_only_thing_it_selects() {
+    fn the_sends_row_is_in_the_gear_menu_once_and_is_the_only_thing_it_selects() {
         let live = three_unfiled_and_two_filed();
         let folders = one_real_folder_and_the_virtual_bucket();
-        let (painted, _, _) =
+        // Not in the rail any more: the gear menu in the top bar holds it.
+        let (rail, _, _) =
             painted_sidebar_lists("Locks in 11:42", VaultLists::live_only(&live), &folders);
+        assert!(
+            !rail.iter().any(|(t, _)| t == SENDS_ROW_LABEL),
+            "the Sends row is still in the rail: {rail:?}"
+        );
+        let menu = gear_menu(VaultLists::live_only(&live), GearFlags::default(), None).painted;
         assert_eq!(
-            painted.iter().filter(|(t, _)| t == SENDS_ROW_LABEL).count(),
+            menu.iter().filter(|(t, _)| t == SENDS_ROW_LABEL).count(),
             1,
-            "the Sends row is not in the rail exactly once: {painted:?}"
+            "the Sends row is not in the gear menu exactly once: {menu:?}"
         );
 
-        // Press it, and the item filter is untouched: Sends is not a cut of
-        // the item list and selecting it must not pretend to be one.
-        let (filter, sends) =
-            press_row(
-                SENDS_ROW_LABEL,
-                SidebarFilter::Logins,
-                false,
-                VaultLists::live_only(&live),
-                &folders,
-            );
-        assert!(sends, "the Sends row did not select the Sends screen");
-        assert_eq!(filter, SidebarFilter::Logins, "the Sends row changed the item filter");
+        // Press it, and the Sends screen is the only thing that changed: Sends
+        // is not a cut of the item list and selecting it must not pretend to
+        // be one (the item filter is not even an input of the menu).
+        let run = gear_menu(VaultLists::live_only(&live), GearFlags::default(), Some(SENDS_ROW_LABEL));
+        assert!(run.flags.sends, "the Sends row did not select the Sends screen");
+        assert!(
+            !run.flags.health && !run.flags.generator && !run.flags.settings && !run.asked_settings,
+            "the Sends row selected more than the Sends screen"
+        );
 
         // ...and pressing any item row leaves the Sends screen. This is the
         // invariant `draw_sidebar` exists to keep, and without it the window
@@ -4049,29 +4177,22 @@ mod tests {
         let health_label = crate::vault_window::password_health::health_row_label();
 
         // Password health selects itself and nothing else.
-        let (filter, sends, health) =
-            press_row_screens(
-                health_label,
-                SidebarFilter::Logins,
-                false,
-                false,
-                VaultLists::live_only(&live),
-                &folders,
-            );
-        assert!(health, "the Password health row did not select its screen");
-        assert!(!sends, "selecting Password health left the Sends screen up as well");
-        assert_eq!(filter, SidebarFilter::Logins, "it changed the item filter");
+        let run = gear_menu(VaultLists::live_only(&live), GearFlags::default(), Some(health_label));
+        assert!(run.flags.health, "the Password health row did not select its screen");
+        assert!(!run.flags.sends, "selecting Password health left the Sends screen up as well");
 
         // At most one: pressing Sends while Password health is up clears it.
-        let (_, sends, health) = press_row_screens(
-            SENDS_ROW_LABEL,
-            SidebarFilter::Logins,
-            false,
-            true,
+        let run = gear_menu(
             VaultLists::live_only(&live),
-            &folders,
+            GearFlags { health: true, ..GearFlags::default() },
+            Some(SENDS_ROW_LABEL),
         );
-        assert!(sends && !health, "both screens were live at once (sends={sends}, health={health})");
+        assert!(
+            run.flags.sends && !run.flags.health,
+            "both screens were live at once (sends={}, health={})",
+            run.flags.sends,
+            run.flags.health
+        );
 
         // ...and any item row clears them. A FOLDER row, specifically: it is
         // the loop the two rows now sit directly beneath, and it is a separate
@@ -5091,10 +5212,11 @@ mod tests {
     fn the_sharing_rows_count_person_shares_and_received_records() {
         let lists = VaultLists { shared_records: 3, received_records: 2, invitation_waiting: true, ..VaultLists::live_only(&[]) };
         let (painted, _bounds) = scrolled_rail(lists, &[], -6000.0);
+        let menu = gear_menu(lists, GearFlags::default(), None).painted;
         let near = |label: &str| painted.iter().find(|(t, _)| t == label).map(|(_, r)| *r).expect(label);
-        let sent = near(SENDS_ROW_LABEL);
+        let sent = menu.iter().find(|(t, _)| t == SENDS_ROW_LABEL).map(|(_, r)| *r).expect("Shared in the gear menu");
         let received = near(received_row_label());
-        assert!(painted.iter().any(|(t, r)| t == "3" && (r.center().y - sent.center().y).abs() < 2.0), "Shared does not count 3: {painted:?}");
+        assert!(menu.iter().any(|(t, r)| t == "3" && (r.center().y - sent.center().y).abs() < 2.0), "Shared does not count 3: {menu:?}");
         assert!(painted.iter().any(|(t, r)| t == "2" && (r.center().y - received.center().y).abs() < 2.0), "Shared with me does not count 2: {painted:?}");
     }
 
@@ -5102,14 +5224,14 @@ mod tests {
     /// `0` -- and known Sends add to the shares.
     #[test]
     fn sent_is_unknown_only_while_both_halves_are() {
-        let (unknown, _) = scrolled_rail(VaultLists::live_only(&[]), &[], -6000.0);
+        let unknown = gear_menu(VaultLists::live_only(&[]), GearFlags::default(), None).painted;
         assert_eq!(badge_beside(&unknown, SENDS_ROW_LABEL), UNKNOWN_COUNT);
         let both = VaultLists {
             sends: Some(SendCounts::over([crate::send::SendState::Waiting, crate::send::SendState::Used])),
             shared_records: 3,
             ..VaultLists::live_only(&[])
         };
-        let (painted, _) = scrolled_rail(both, &[], -6000.0);
+        let painted = gear_menu(both, GearFlags::default(), None).painted;
         assert_eq!(badge_beside(&painted, SENDS_ROW_LABEL), "5");
     }
 
@@ -5153,6 +5275,7 @@ mod tests {
 /// pinned Lock row.
 #[cfg(test)]
 mod v2_rail_tests {
+    use super::tests::{badge_beside, gear_menu, gear_menu_closed, GearFlags};
     use super::*;
     use crate::kit::testing::{self, Painted};
     use crate::kit::tokens::{set_sidebar_style, SidebarStyle};
@@ -5313,20 +5436,65 @@ mod v2_rail_tests {
         assert!(rail.painted.text("Identities").is_some());
     }
 
+    /// The rail has no TOOLS section: FOLDERS follows VAULT directly, and the
+    /// four tools live in the top bar's gear menu instead.
     #[test]
-    fn the_tools_section_holds_shared_password_health_and_settings() {
+    fn the_rail_has_no_tools_section_and_folders_follow_the_vault() {
         let ctx = testing::ctx();
         let rail = Fixture::new(vec![folder("f1", "Engineering")]).frame(&ctx, 0.0, vec![], "Locks in 11:42");
         let order = row_order(&rail.painted);
         let at = |t: &str| order.iter().position(|x| x == t).unwrap_or_else(|| panic!("{t} missing: {order:?}"));
-        assert!(at("Trash") < at("TOOLS"));
-        assert!(at("TOOLS") < at(SENDS_ROW_LABEL));
-        assert!(at(SENDS_ROW_LABEL) < at(crate::vault_window::password_health::health_row_label()));
-        assert!(at(crate::vault_window::password_health::health_row_label()) < at(SETTINGS_ROW_LABEL));
-        assert!(at(SETTINGS_ROW_LABEL) < at("FOLDERS"));
+        for gone in [
+            "TOOLS",
+            SENDS_ROW_LABEL,
+            crate::vault_window::password_health::health_row_label(),
+            generator_row_label(),
+            SETTINGS_ROW_LABEL,
+        ] {
+            assert!(!order.iter().any(|t| t == gone), "{gone:?} is still in the rail: {order:?}");
+        }
+        assert!(at("Trash") < at("FOLDERS"));
         assert!(at("FOLDERS") < at("Engineering"));
         assert!(at("Engineering") < at(received_row_label()));
         assert!(at(received_row_label()) < at(new_folder_label()));
+    }
+
+    /// The gear menu holds the four tools in the TOOLS section's old order,
+    /// each with its glyph's row look, and the counts the rail rows had.
+    #[test]
+    fn the_gear_menu_holds_shared_password_health_generator_and_settings_in_order() {
+        let menu = gear_menu(VaultLists::live_only(&[]), GearFlags::default(), None).painted;
+        let order: Vec<&str> = {
+            let mut rows: Vec<_> = menu.iter().map(|(t, r)| (r.top(), t.as_str())).collect();
+            rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+            rows.into_iter().map(|(_, t)| t).collect()
+        };
+        let at = |t: &str| order.iter().position(|x| *x == t).unwrap_or_else(|| panic!("{t} missing: {order:?}"));
+        assert!(at(SENDS_ROW_LABEL) < at(crate::vault_window::password_health::health_row_label()));
+        assert!(at(crate::vault_window::password_health::health_row_label()) < at(generator_row_label()));
+        assert!(at(generator_row_label()) < at(SETTINGS_ROW_LABEL));
+        // Password health's count is never an en dash: always known.
+        assert_eq!(badge_beside(&menu, crate::vault_window::password_health::health_row_label()), "0");
+        // Closed, the menu paints nothing.
+        let closed = gear_menu_closed(VaultLists::live_only(&[]));
+        assert!(closed.is_empty(), "the menu is painted while closed: {closed:?}");
+    }
+
+    /// Generator and Settings do what their rail rows did.
+    #[test]
+    fn the_gear_menus_generator_and_settings_rows_do_what_their_rail_rows_did() {
+        let generator = gear_menu(VaultLists::live_only(&[]), GearFlags::default(), Some(generator_row_label()));
+        assert!(generator.flags.generator && !generator.flags.sends && !generator.asked_settings);
+        let settings = gear_menu(VaultLists::live_only(&[]), GearFlags::default(), Some(SETTINGS_ROW_LABEL));
+        assert!(settings.asked_settings, "Settings did not ask for the preferences");
+        assert!(!settings.flags.sends && !settings.flags.health && !settings.flags.generator);
+        // Selecting Generator while Sends is up leaves only Generator.
+        let swapped = gear_menu(
+            VaultLists::live_only(&[]),
+            GearFlags { sends: true, ..GearFlags::default() },
+            Some(generator_row_label()),
+        );
+        assert!(swapped.flags.generator && !swapped.flags.sends);
     }
 
     #[test]
@@ -5368,12 +5536,6 @@ mod v2_rail_tests {
     fn clicking_lock_returns_lock() {
         let ctx = testing::ctx();
         assert_eq!(click_text(&mut Fixture::new(vec![]), &ctx, lock_row_label()), SidebarAction::Lock);
-    }
-
-    #[test]
-    fn clicking_settings_opens_settings() {
-        let ctx = testing::ctx();
-        assert_eq!(click_text(&mut Fixture::new(vec![]), &ctx, SETTINGS_ROW_LABEL), SidebarAction::OpenSettings);
     }
 
     fn typed(text: &str) -> Vec<egui::Event> {

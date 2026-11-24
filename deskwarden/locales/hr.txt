@@ -702,7 +702,6 @@ sidebar.no_folder = Bez mape
 sidebar.organisation = Organizacija
 sidebar.collection = Zbirka
 sidebar.section_vault = Trezor
-sidebar.section_tools = Alati
 sidebar.section_folders = Mape
 sidebar.eyebrow_waiting = ČEKA
 sidebar.eyebrow_opened = OTVORENO

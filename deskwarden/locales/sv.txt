@@ -685,7 +685,6 @@ sidebar.no_folder = Ingen mapp
 sidebar.organisation = Organisation
 sidebar.collection = Samling
 sidebar.section_vault = Valv
-sidebar.section_tools = Verktyg
 sidebar.section_folders = Mappar
 sidebar.eyebrow_waiting = VÄNTAR
 sidebar.eyebrow_opened = ÖPPNAD

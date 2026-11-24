@@ -659,7 +659,6 @@ sidebar.no_folder = Không có thư mục
 sidebar.organisation = Tổ chức
 sidebar.collection = Bộ sưu tập
 sidebar.section_vault = Kho
-sidebar.section_tools = Công cụ
 sidebar.section_folders = Thư mục
 sidebar.eyebrow_waiting = ĐANG CHỜ
 sidebar.eyebrow_opened = ĐÃ MỞ

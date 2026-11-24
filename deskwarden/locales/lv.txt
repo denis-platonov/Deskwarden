@@ -706,7 +706,6 @@ sidebar.no_folder = Nav mapes
 sidebar.organisation = Organizācija
 sidebar.collection = Kolekcija
 sidebar.section_vault = Glabātuve
-sidebar.section_tools = Rīki
 sidebar.section_folders = Mapes
 sidebar.eyebrow_waiting = GAIDA
 sidebar.eyebrow_opened = ATVĒRTS

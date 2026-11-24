@@ -706,7 +706,6 @@ sidebar.no_folder = Be aplanko
 sidebar.organisation = Organizacija
 sidebar.collection = Kolekcija
 sidebar.section_vault = Saugykla
-sidebar.section_tools = Įrankiai
 sidebar.section_folders = Aplankai
 sidebar.eyebrow_waiting = LAUKIA
 sidebar.eyebrow_opened = ATIDARYTA

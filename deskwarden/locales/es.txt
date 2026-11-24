@@ -727,7 +727,6 @@ sidebar.no_folder = Sin carpeta
 sidebar.organisation = Organización
 sidebar.collection = Colección
 sidebar.section_vault = Caja fuerte
-sidebar.section_tools = Herramientas
 sidebar.section_folders = Carpetas
 sidebar.eyebrow_waiting = EN ESPERA
 sidebar.eyebrow_opened = ABIERTO

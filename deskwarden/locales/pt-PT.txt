@@ -727,7 +727,6 @@ sidebar.no_folder = Sem pasta
 sidebar.organisation = Organização
 sidebar.collection = Coleção
 sidebar.section_vault = Cofre
-sidebar.section_tools = Ferramentas
 sidebar.section_folders = Pastas
 sidebar.eyebrow_waiting = AGUARDANDO
 sidebar.eyebrow_opened = ABERTO

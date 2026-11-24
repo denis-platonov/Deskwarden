@@ -664,7 +664,6 @@ sidebar.no_folder = 폴더 없음
 sidebar.organisation = 조직
 sidebar.collection = 컬렉션
 sidebar.section_vault = 보관함
-sidebar.section_tools = 도구
 sidebar.section_folders = 폴더
 sidebar.eyebrow_waiting = 대기 중
 sidebar.eyebrow_opened = 열림
