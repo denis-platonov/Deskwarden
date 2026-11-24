@@ -23,6 +23,11 @@ const SEARCH: egui::Vec2 = egui::vec2(460.0, 46.0);
 const SEARCH_MIN_WIDTH: f32 = 120.0;
 /// The account avatar's diameter.
 pub const AVATAR: f32 = 38.0;
+/// The Settings gear's square, drawn like the 38 icon buttons of the spec
+/// (radius 11) so it stands level with the avatar beside it.
+pub const GEAR: f32 = 38.0;
+/// Between the gear and the avatar: close enough to read as a pair.
+const GEAR_GAP: f32 = 8.0;
 /// One caption button (design 1a: 46 by 34, flush to the top-right).
 pub const CAPTION: egui::Vec2 = egui::vec2(46.0, 34.0);
 /// The search field's placeholder (design 1a, verbatim).
@@ -121,6 +126,11 @@ pub enum TopBarAction {
 /// ("Search 12 logins") until slice 3 gives the list a header that carries
 /// the count, after which it is [`SEARCH_PLACEHOLDER`].
 ///
+/// `gear_on` paints the Settings gear selected (one of the screens its menu
+/// holds is up). The gear's [`egui::Response`] is left in `gear` for the
+/// caller to hang the menu off: the menu's counts are only known further down
+/// the frame, and a popup needs nothing but its anchor.
+///
 /// `controls_only` is the splash's case: while the vault loads the splash
 /// covers the bar, so only the caption buttons and the drag area answer --
 /// nothing hidden under it may start a sync, take the keyboard or open the
@@ -135,6 +145,8 @@ pub fn draw(
     maximized: bool,
     controls_only: bool,
     avatar: impl FnOnce(&mut Ui),
+    gear_on: bool,
+    gear: &mut Option<egui::Response>,
 ) -> TopBarAction {
     let p = palette(ui.ctx());
     let mut child = ui.new_child(UiBuilder::new().max_rect(bar).id_salt("vault-top-bar"));
@@ -171,7 +183,13 @@ pub fn draw(
     );
     ui.scope_builder(UiBuilder::new().max_rect(avatar_rect), avatar);
 
-    let pill_rect = pill_rect(ui, pill, avatar_rect.left() - GAP, bar.center().y);
+    let gear_rect = Rect::from_center_size(
+        pos2(avatar_rect.left() - GEAR_GAP - GEAR / 2.0, bar.center().y),
+        egui::Vec2::splat(GEAR),
+    );
+    *gear = Some(gear_button(ui, gear_rect, gear_on));
+
+    let pill_rect = pill_rect(ui, pill, gear_rect.left() - GAP, bar.center().y);
     if sync_pill(ui, pill_rect, pill).clicked() {
         action = TopBarAction::Sync;
     }
@@ -202,6 +220,31 @@ pub fn draw(
         }
     }
     action
+}
+
+/// The id of the Settings gear, for tests and the preview to find it.
+pub fn gear_id() -> egui::Id {
+    egui::Id::new("vault-top-bar-gear")
+}
+
+/// The Settings gear: a 38 square, radius 11, grey on hover, the blue wash
+/// and ink while one of its menu's screens is the current one.
+fn gear_button(ui: &mut Ui, rect: Rect, on: bool) -> egui::Response {
+    let p = palette(ui.ctx());
+    let response = ui.interact(rect, gear_id(), Sense::click());
+    let (bg, ink) = if on {
+        (Some(p.blue_wash), p.blue_deep)
+    } else if response.hovered() {
+        (Some(p.hover), p.text_icon)
+    } else {
+        (None, p.text_icon)
+    };
+    if let Some(bg) = bg {
+        ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
+    }
+    icon::stroke(ui.painter(), Rect::from_center_size(rect.center(), egui::Vec2::splat(20.0)), icon::glyph::SETTINGS, 2.0, ink);
+    tips::hint(ui, &response, crate::vault_window::sidebar::settings_row_label(), &[]);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn pill_role() -> Role {
@@ -377,9 +420,10 @@ mod tests {
         let mut text = search.to_owned();
         let mut action = TopBarAction::None;
         let painted = testing::frame(ctx, time, size, events, |ui| {
+            let mut gear = None;
             action = draw(ui, bar, &mut text, search_placeholder(), pill, false, controls_only, |ui| {
                 ui.allocate_exact_size(egui::Vec2::splat(AVATAR), egui::Sense::click());
-            });
+            }, false, &mut gear);
         });
         Run { painted, action, search: text }
     }
@@ -461,6 +505,56 @@ mod tests {
         let pill = first.painted.text("Synced").unwrap().2.center();
         let clicked = run(&ctx, 0.1, SCREEN, BAR, &green(), "", testing::click_at(pill));
         assert_eq!(clicked.action, TopBarAction::Sync);
+    }
+
+    /// One frame of the bar with the gear's state in hand: what it painted,
+    /// and the gear's own response.
+    fn run_gear(ctx: &egui::Context, time: f64, on: bool, events: Vec<egui::Event>) -> (Painted, Option<egui::Response>) {
+        let mut text = String::new();
+        let mut gear = None;
+        let painted = testing::frame(ctx, time, SCREEN, events, |ui| {
+            draw(ui, BAR, &mut text, search_placeholder(), &green(), false, false, |ui| {
+                ui.allocate_exact_size(egui::Vec2::splat(AVATAR), egui::Sense::click());
+            }, on, &mut gear);
+        });
+        (painted, gear)
+    }
+
+    #[test]
+    fn the_settings_gear_is_a_38_square_right_beside_the_avatar_and_clicks() {
+        let ctx = testing::ctx();
+        let (_, gear) = run_gear(&ctx, 0.0, false, vec![]);
+        let gear = gear.expect("the bar hands back the gear").rect;
+        let avatar_left = BAR.right() - CAPTION.x * 3.0 - GAP - AVATAR;
+        assert_eq!(gear.size(), vec2(GEAR, GEAR));
+        assert_eq!(gear.right(), avatar_left - 8.0, "{gear:?} is not 8 left of the avatar at {avatar_left}");
+        assert_eq!(gear.center().y, BAR.center().y);
+        // Left of the avatar, right of the pill.
+        let (painted, _) = run_gear(&ctx, 0.1, false, vec![]);
+        let pill = painted.text("Synced").unwrap().2;
+        assert!(pill.right() < gear.left(), "the pill {pill:?} runs into the gear {gear:?}");
+        let (_, clicked) = run_gear(&ctx, 0.2, false, testing::click_at(gear.center()));
+        assert!(clicked.unwrap().clicked(), "the gear did not answer a click");
+        // A tooltip names it.
+        let (hovered, _) = run_gear(&ctx, 0.3, false, testing::hover_at(gear.center()));
+        let (hovered, _) = {
+            let _ = hovered;
+            run_gear(&ctx, 0.6, false, testing::hover_at(gear.center()))
+        };
+        assert!(hovered.text(crate::vault_window::sidebar::settings_row_label()).is_some(), "no Settings tooltip");
+    }
+
+    #[test]
+    fn the_gear_is_lit_while_one_of_its_screens_is_up_and_grey_on_hover() {
+        let ctx = testing::ctx();
+        let (resting, gear) = run_gear(&ctx, 0.0, false, vec![]);
+        let rect = gear.unwrap().rect;
+        assert!(!rect_filled(&resting, P.blue_wash).contains(&rect), "lit while nothing is up");
+        assert!(!rect_filled(&resting, P.hover).contains(&rect), "grey at rest");
+        let (hovered, _) = run_gear(&ctx, 0.1, false, testing::hover_at(rect.center()));
+        assert!(rect_filled(&hovered, P.hover).contains(&rect), "not grey on hover");
+        let (on, _) = run_gear(&ctx, 0.2, true, vec![]);
+        assert!(rect_filled(&on, P.blue_wash).contains(&rect), "not lit while a screen is up");
     }
 
     fn caption(bar: Rect, nth_from_right: usize) -> Rect {

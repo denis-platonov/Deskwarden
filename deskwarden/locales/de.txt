@@ -706,7 +706,6 @@ sidebar.no_folder = Kein Ordner
 sidebar.organisation = Organisation
 sidebar.collection = Sammlung
 sidebar.section_vault = Tresor
-sidebar.section_tools = Werkzeuge
 sidebar.section_folders = Ordner
 sidebar.eyebrow_waiting = WARTET
 sidebar.eyebrow_opened = GEÖFFNET

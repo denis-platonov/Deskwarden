@@ -12568,7 +12568,16 @@ mod frame_promptness {
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
         if scenario.press_sends {
-            let pos = locate_label(&output, super::super::sidebar::SENDS_ROW_LABEL, "the sidebar");
+            // The Sends screen is the gear menu's first row: two clicks, the
+            // gear and then the row, exactly as it is for a user.
+            let gear = ctx
+                .read_response(crate::vault_window::top_bar::gear_id())
+                .map(|r| r.rect.center())
+                .unwrap_or_else(|| panic!("the top bar drew no Settings gear to open the menu with"));
+            click(&ctx, &mut *frame_fn, gear);
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+            let pos = locate_label(&output, super::super::sidebar::SENDS_ROW_LABEL, "the gear menu");
             click(&ctx, &mut *frame_fn, pos);
             // Two more settled frames, so what is read below is the Sends
             // screen at rest rather than the frame the click landed on: the
@@ -12642,10 +12651,17 @@ mod frame_promptness {
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
         if scenario.press_prefs {
-            // The v2 rail's Settings row, which replaced the titlebar gear:
-            // found by its label like every other control here. Its click is
-            // answered on the next frame (a shell request), hence the extra
-            // frame below.
+            // The top bar's gear menu's Settings row: the gear first, then the
+            // row, found by its label like every other control here. Its
+            // click is answered on the next frame (a shell request), hence
+            // the extra frame below.
+            let gear = ctx
+                .read_response(crate::vault_window::top_bar::gear_id())
+                .map(|r| r.rect.center())
+                .unwrap_or_else(|| panic!("the top bar drew no Settings gear to open the menu with"));
+            click(&ctx, &mut *frame_fn, gear);
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
             let label = crate::vault_window::sidebar::SETTINGS_ROW_LABEL;
             let rect = labels_of(&output)
                 .into_iter()
@@ -12653,7 +12669,7 @@ mod frame_promptness {
                 .map(|(_, rect)| rect)
                 .unwrap_or_else(|| {
                     panic!(
-                        "the rail painted no {label:?} row to press, so this scenario cannot \
+                        "the gear menu painted no {label:?} row to press, so this scenario cannot \
                          open the preferences modal at all. What was painted: {:?}",
                         labels_of(&output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
                     )

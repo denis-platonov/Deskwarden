@@ -680,6 +680,9 @@ enum Surface {
     VaultShellNavy,
     /// The same, with the light rail.
     VaultShellLight,
+    /// The shell with the top bar's Settings gear menu held open (Shared,
+    /// Password health, Generator, Settings).
+    VaultShellGearMenu,
     /// The launch splash over the whole window (design 1a).
     VaultSplash,
     /// The v2 shell with a card selected: the card hero and its field rows.
@@ -1035,6 +1038,7 @@ const ALL: &[Surface] = &[
     Surface::CardLogos,
     Surface::VaultShellNavy,
     Surface::VaultShellLight,
+    Surface::VaultShellGearMenu,
     Surface::VaultSplash,
     Surface::VaultShellCard,
     Surface::VaultShellOffline,
@@ -1199,6 +1203,7 @@ impl Surface {
             Surface::CardLogos => "card_logos",
             Surface::VaultShellNavy => "vault_shell_navy",
             Surface::VaultShellLight => "vault_shell_light",
+            Surface::VaultShellGearMenu => "vault_shell_gear_menu",
             Surface::VaultSplash => "vault_splash",
             Surface::VaultShellCard => "vault_shell_card",
             Surface::VaultShellOffline => "vault_shell_offline",
@@ -1466,6 +1471,7 @@ impl Surface {
             Surface::CardLogos => egui::vec2(1000.0, 520.0),
             Surface::VaultShellNavy
             | Surface::VaultShellLight
+            | Surface::VaultShellGearMenu
             | Surface::VaultSplash
             | Surface::VaultShellCard
             | Surface::VaultShellOffline
@@ -1687,6 +1693,7 @@ fn main() -> eframe::Result {
         vec![
             Surface::VaultShellNavy,
             Surface::VaultShellLight,
+            Surface::VaultShellGearMenu,
             Surface::VaultSplash,
             Surface::VaultShellCard,
             Surface::VaultShellOffline,
@@ -1906,6 +1913,7 @@ fn main() -> eframe::Result {
                 rail_health: false,
                 rail_received: false,
                 rail_scope: sidebar::SendScope::All,
+                gear_menu_open: false,
                 list_offline: false,
                 // 5b's own picked row: the Used Send whose link is dead and
                 // whose views are spent. Picked because it is the ONE row
@@ -2037,6 +2045,8 @@ struct Preview {
     /// this shot has to be able to put any of them in any state.
     rail_received: bool,
     rail_scope: sidebar::SendScope,
+    /// Whether the shell holds the top bar's gear menu open this frame.
+    gear_menu_open: bool,
     /// Whether the shell's list draws the offline banner.
     list_offline: bool,
     /// Which row each Sends shot has picked.
@@ -2330,6 +2340,10 @@ impl eframe::App for Preview {
             }
             Surface::VaultShellLight => {
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Light, DetailShot::Login, false)
+            }
+            Surface::VaultShellGearMenu => {
+                self.gear_menu_open = true;
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false)
             }
             Surface::VaultShellCard => {
                 // The list's own first card is the row shown selected.
@@ -3727,6 +3741,7 @@ impl Preview {
         };
         let mut search = String::new();
         let placeholder = item_list::search_hint(Some(self.fixtures.list.len()), &SidebarFilter::All);
+        let mut gear = None;
         let _ = top_bar::draw(root, bar, &mut search, &placeholder, &pill, false, false, |ui| {
             let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(top_bar::AVATAR), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), top_bar::AVATAR / 2.0, theme::INK);
@@ -3737,7 +3752,28 @@ impl Preview {
                 egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())),
                 egui::Color32::WHITE,
             );
-        });
+        }, false, &mut gear);
+        if std::mem::take(&mut self.gear_menu_open) {
+            if let Some(gear) = gear {
+                // Held open the way the real menu is drawn, under the gear.
+                let at = gear.rect.left_bottom() + egui::vec2(0.0, deskwarden::kit::menu::ANCHOR_GAP);
+                let lists = sidebar::VaultLists { health_findings: 4, ..sidebar::VaultLists::live_only(&self.fixtures.list) };
+                deskwarden::kit::menu::show_at(root.ctx(), egui::Id::new("preview-gear-menu"), at, |ui| {
+                    sidebar::tools_rows(
+                        ui,
+                        lists,
+                        &mut sidebar::Screens {
+                            sends: &mut false,
+                            health: &mut true,
+                            received: &mut false,
+                            generator: &mut false,
+                            settings: &mut false,
+                            scope: &mut sidebar::SendScope::All,
+                        },
+                    )
+                });
+            }
+        }
         {
             let fixtures = &self.fixtures;
             let (selected, sends, health, received, scope) = (

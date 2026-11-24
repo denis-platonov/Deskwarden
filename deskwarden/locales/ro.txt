@@ -701,7 +701,6 @@ sidebar.no_folder = Fără dosar
 sidebar.organisation = Organizație
 sidebar.collection = Colecție
 sidebar.section_vault = Seif
-sidebar.section_tools = Instrumente
 sidebar.section_folders = Dosare
 sidebar.eyebrow_waiting = ÎN AȘTEPTARE
 sidebar.eyebrow_opened = DESCHIS

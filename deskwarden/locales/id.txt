@@ -659,7 +659,6 @@ sidebar.no_folder = Tanpa folder
 sidebar.organisation = Organisasi
 sidebar.collection = Koleksi
 sidebar.section_vault = Brankas
-sidebar.section_tools = Alat
 sidebar.section_folders = Folder
 sidebar.eyebrow_waiting = MENUNGGU
 sidebar.eyebrow_opened = DIBUKA

@@ -664,7 +664,6 @@ sidebar.no_folder = 无文件夹
 sidebar.organisation = 组织
 sidebar.collection = 集合
 sidebar.section_vault = 密码库
-sidebar.section_tools = 工具
 sidebar.section_folders = 文件夹
 sidebar.eyebrow_waiting = 等待中
 sidebar.eyebrow_opened = 已打开

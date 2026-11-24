@@ -727,7 +727,6 @@ sidebar.no_folder = Aucun dossier
 sidebar.organisation = Organisation
 sidebar.collection = Collection
 sidebar.section_vault = Coffre
-sidebar.section_tools = Outils
 sidebar.section_folders = Dossiers
 sidebar.eyebrow_waiting = EN ATTENTE
 sidebar.eyebrow_opened = OUVERT

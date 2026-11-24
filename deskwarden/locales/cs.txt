@@ -702,7 +702,6 @@ sidebar.no_folder = Bez složky
 sidebar.organisation = Organizace
 sidebar.collection = Sbírka
 sidebar.section_vault = Trezor
-sidebar.section_tools = Nástroje
 sidebar.section_folders = Složky
 sidebar.eyebrow_waiting = ČEKÁ
 sidebar.eyebrow_opened = OTEVŘENO

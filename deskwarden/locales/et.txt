@@ -685,7 +685,6 @@ sidebar.no_folder = Kaustata
 sidebar.organisation = Organisatsioon
 sidebar.collection = Kogumik
 sidebar.section_vault = Hoidla
-sidebar.section_tools = Tööriistad
 sidebar.section_folders = Kaustad
 sidebar.eyebrow_waiting = OOTEL
 sidebar.eyebrow_opened = AVATUD

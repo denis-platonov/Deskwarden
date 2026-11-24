@@ -681,7 +681,6 @@ sidebar.no_folder = Klasör yok
 sidebar.organisation = Kuruluş
 sidebar.collection = Koleksiyon
 sidebar.section_vault = Kasa
-sidebar.section_tools = Araçlar
 sidebar.section_folders = Klasörler
 sidebar.eyebrow_waiting = BEKLİYOR
 sidebar.eyebrow_opened = AÇILDI

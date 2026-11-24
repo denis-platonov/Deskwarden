@@ -723,7 +723,6 @@ sidebar.no_folder = Без теки
 sidebar.organisation = Організація
 sidebar.collection = Колекція
 sidebar.section_vault = Сховище
-sidebar.section_tools = Інструменти
 sidebar.section_folders = Теки
 sidebar.eyebrow_waiting = ОЧІКУЄ
 sidebar.eyebrow_opened = ВІДКРИТО

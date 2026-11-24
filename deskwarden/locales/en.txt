@@ -737,7 +737,6 @@ sidebar.no_folder = No folder
 sidebar.organisation = Organisation
 sidebar.collection = Collection
 sidebar.section_vault = Vault
-sidebar.section_tools = Tools
 sidebar.section_folders = Folders
 sidebar.eyebrow_waiting = WAITING
 sidebar.eyebrow_opened = OPENED

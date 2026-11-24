@@ -723,7 +723,6 @@ sidebar.no_folder = Bez folderu
 sidebar.organisation = Organizacja
 sidebar.collection = Kolekcja
 sidebar.section_vault = Sejf
-sidebar.section_tools = Narzędzia
 sidebar.section_folders = Foldery
 sidebar.eyebrow_waiting = OCZEKUJE
 sidebar.eyebrow_opened = OTWARTE

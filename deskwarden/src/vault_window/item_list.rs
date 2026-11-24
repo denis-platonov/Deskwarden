@@ -7314,6 +7314,8 @@ mod keyboard_selection_tests {
                     false,
                     false,
                     |_| {},
+                    false,
+                    &mut None,
                 );
                 draw_item_list(
                     ui,

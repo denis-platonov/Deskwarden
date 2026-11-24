@@ -681,7 +681,6 @@ sidebar.no_folder = Без папка
 sidebar.organisation = Организация
 sidebar.collection = Колекция
 sidebar.section_vault = Трезор
-sidebar.section_tools = Инструменти
 sidebar.section_folders = Папки
 sidebar.eyebrow_waiting = ЧАКА
 sidebar.eyebrow_opened = ОТВОРЕНА

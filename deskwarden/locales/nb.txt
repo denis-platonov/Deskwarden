@@ -711,7 +711,6 @@ sidebar.no_folder = Ingen mappe
 sidebar.organisation = Organisasjon
 sidebar.collection = Samling
 sidebar.section_vault = Hvelv
-sidebar.section_tools = Verktøy
 sidebar.section_folders = Mapper
 sidebar.eyebrow_waiting = VENTER
 sidebar.eyebrow_opened = ÅPNET

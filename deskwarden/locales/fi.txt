@@ -685,7 +685,6 @@ sidebar.no_folder = Ei kansiota
 sidebar.organisation = Organisaatio
 sidebar.collection = Kokoelma
 sidebar.section_vault = Holvi
-sidebar.section_tools = Työkalut
 sidebar.section_folders = Kansiot
 sidebar.eyebrow_waiting = ODOTTAA
 sidebar.eyebrow_opened = AVATTU

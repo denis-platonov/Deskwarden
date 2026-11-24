@@ -701,7 +701,6 @@ sidebar.no_folder = Sense carpeta
 sidebar.organisation = Organització
 sidebar.collection = Col·lecció
 sidebar.section_vault = Caixa forta
-sidebar.section_tools = Eines
 sidebar.section_folders = Carpetes
 sidebar.eyebrow_waiting = EN ESPERA
 sidebar.eyebrow_opened = OBERT

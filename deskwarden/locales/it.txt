@@ -727,7 +727,6 @@ sidebar.no_folder = Nessuna cartella
 sidebar.organisation = Organizzazione
 sidebar.collection = Raccolta
 sidebar.section_vault = Cassaforte
-sidebar.section_tools = Strumenti
 sidebar.section_folders = Cartelle
 sidebar.eyebrow_waiting = IN ATTESA
 sidebar.eyebrow_opened = APERTO

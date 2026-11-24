@@ -702,7 +702,6 @@ sidebar.no_folder = Без фасцикле
 sidebar.organisation = Организација
 sidebar.collection = Колекција
 sidebar.section_vault = Сеф
-sidebar.section_tools = Алатке
 sidebar.section_folders = Фасцикле
 sidebar.eyebrow_waiting = НА ЧЕКАЊУ
 sidebar.eyebrow_opened = ОТВОРЕНО

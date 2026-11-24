@@ -685,7 +685,6 @@ sidebar.no_folder = Ingen mappe
 sidebar.organisation = Organisation
 sidebar.collection = Samling
 sidebar.section_vault = Boks
-sidebar.section_tools = Værktøjer
 sidebar.section_folders = Mapper
 sidebar.eyebrow_waiting = VENTER
 sidebar.eyebrow_opened = ÅBNET

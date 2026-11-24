@@ -681,7 +681,6 @@ sidebar.no_folder = Nincs mappa
 sidebar.organisation = Szervezet
 sidebar.collection = Gyűjtemény
 sidebar.section_vault = Széf
-sidebar.section_tools = Eszközök
 sidebar.section_folders = Mappák
 sidebar.eyebrow_waiting = VÁRAKOZIK
 sidebar.eyebrow_opened = MEGNYITVA

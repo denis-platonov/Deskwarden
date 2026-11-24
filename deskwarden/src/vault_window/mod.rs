@@ -2826,6 +2826,9 @@ pub fn build_frame_with_search(
             },
             &filter,
         );
+        // The gear's anchor, drawn by the top bar; its menu is hung off it
+        // further down, beside the rail, where the counts it shows are known.
+        let mut gear_anchor: Option<egui::Response> = None;
         let bar_action = top_bar::draw(
             ui,
             bar_rect,
@@ -2844,7 +2847,11 @@ pub fn build_frame_with_search(
                 server_url.as_deref(),
                 icon_base_known,
             );
-        });
+        },
+        // Lit while one of the gear menu's screens is the one up.
+        sends_selected || health_selected || generator_selected || settings_selected,
+        &mut gear_anchor,
+        );
         match &account_action {
             // The gear's two-step dance, for the same reason and one more:
             // `main` cannot tear this account's backend down and bring the
@@ -3536,6 +3543,26 @@ pub fn build_frame_with_search(
                     received_records: received_share_rows.len(),
                     invitation_waiting: !waiting_from.is_empty(),
                 };
+                // The top bar's gear menu: the rail's old TOOLS rows. Applied
+                // before the rail is drawn, so the rail already shows the
+                // screen it opened.
+                if let Some(anchor) = &gear_anchor {
+                    let opens_settings = sidebar::tools_menu(
+                        anchor,
+                        lists,
+                        &mut sidebar::Screens {
+                            sends: &mut sends_selected,
+                            health: &mut health_selected,
+                            received: &mut received_selected,
+                            generator: &mut generator_selected,
+                            settings: &mut settings_selected,
+                            scope: &mut send_scope,
+                        },
+                    );
+                    if opens_settings {
+                        sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings);
+                    }
+                }
                 match draw_sidebar(
                     ui,
                     lists,
@@ -3571,9 +3598,6 @@ pub fn build_frame_with_search(
                         sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::NewItem)
                     }
                     SidebarAction::Lock => sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::Lock),
-                    SidebarAction::OpenSettings => {
-                        sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings)
-                    }
                     // Opens the "Edit folder" modal (drawn once, after all
                     // three panels, further down) seeded with this folder's
                     // current name. Rename and delete both happen there.
@@ -33990,7 +34014,8 @@ mod send_delete_wiring {
         // previous frame, so the chrome is measured properly only from the
         // second one on.
         let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
-        let mut output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let mut output: egui::FullOutput;
 
         let labels = |output: &egui::FullOutput| {
             let mut out = Vec::new();
@@ -34112,7 +34137,13 @@ mod send_delete_wiring {
         );
 
         // 1. The Sends screen, reached the only way there is.
-        let sends_at = locate(&output, sidebar::SENDS_ROW_LABEL);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = click(&ctx, &mut frame_fn, gear_at);
+        let sends_at = locate(&gear_menu, sidebar::SENDS_ROW_LABEL);
         output = click(&ctx, &mut frame_fn, sends_at);
 
         // Positive control on the harness: the fetch answered and the row a
@@ -34182,7 +34213,13 @@ mod send_delete_wiring {
 
         // Back to Sends to carry on, with a control that the round trip
         // really did land on the Sends screen again.
-        let sends_again = locate(&back, sidebar::SENDS_ROW_LABEL);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = click(&ctx, &mut frame_fn, gear_at);
+        let sends_again = locate(&gear_menu, sidebar::SENDS_ROW_LABEL);
         output = click(&ctx, &mut frame_fn, sends_again);
         assert!(
             find(&output, FRAME_SEND_NAME).is_some(),
@@ -34330,8 +34367,14 @@ mod send_delete_wiring {
         let _ = ctx.run_ui(egui::RawInput { events: vec![escape], ..input() }, |ui| frame_fn(ui));
         let closed = ctx.run_ui(input(), |ui| frame_fn(ui));
         let vault_at = locate(&closed, "All items");
-        let away = click(&ctx, &mut frame_fn, vault_at);
-        let sends_at = locate(&away, sidebar::SENDS_ROW_LABEL);
+        let _ = click(&ctx, &mut frame_fn, vault_at);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = click(&ctx, &mut frame_fn, gear_at);
+        let sends_at = locate(&gear_menu, sidebar::SENDS_ROW_LABEL);
         let failed = click(&ctx, &mut frame_fn, sends_at);
         assert!(
             find(&failed, FRAME_SEND_NAME).is_none(),
@@ -34363,8 +34406,14 @@ mod send_delete_wiring {
         let vault_at = locate(&settled, "All items");
         let on_vault = click(&ctx, &mut frame_fn, vault_at);
         let item_at = locate(&on_vault, FRAME_ITEM_NAME);
-        let selected = click(&ctx, &mut frame_fn, item_at);
-        let sends_at = locate(&selected, sidebar::SENDS_ROW_LABEL);
+        let _ = click(&ctx, &mut frame_fn, item_at);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = click(&ctx, &mut frame_fn, gear_at);
+        let sends_at = locate(&gear_menu, sidebar::SENDS_ROW_LABEL);
         let back_on_sends = click(&ctx, &mut frame_fn, sends_at);
         let delete_at = locate(&back_on_sends, send_ui::revoke_label());
         let armed_with_selection = click(&ctx, &mut frame_fn, delete_at);
@@ -34469,7 +34518,7 @@ mod send_delete_wiring {
         crate::theme::apply(&ctx);
         let _ = ctx.run_ui(input(), |_ui| {});
         let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
-        let output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
 
         let labels = |output: &egui::FullOutput| {
             let mut out = Vec::new();
@@ -34520,7 +34569,13 @@ mod send_delete_wiring {
         };
 
         // The Sends screen, over a vault with nothing in it.
-        let sends_at = locate(&output, sidebar::SENDS_ROW_LABEL);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = click(&ctx, &mut frame_fn, gear_at);
+        let sends_at = locate(&gear_menu, sidebar::SENDS_ROW_LABEL);
         let on_sends = click(&ctx, &mut frame_fn, sends_at);
         assert!(
             find(&on_sends, FRAME_SEND_NAME).is_some(),
@@ -36157,7 +36212,13 @@ mod send_delete_wiring {
              string again, so finding it below no longer proves the PANE painted -- it is \
              satisfied by the rail row alone."
         );
-        let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = matrix_click(&ctx, &mut frame_fn, gear_at);
+        let sends_at = matrix_locate(state, &gear_menu, sidebar::SENDS_ROW_LABEL);
         output = matrix_click(&ctx, &mut frame_fn, sends_at);
 
         // 1. **THE SCREEN IS THERE.** The pane paints its list column's own
@@ -36232,8 +36293,14 @@ mod send_delete_wiring {
         // thread answers.)
         if matches!(state, ReachableState::FetchInFlight) {
             let vault_at = matrix_locate(state, &output, "All items");
-            let away = matrix_click(&ctx, &mut frame_fn, vault_at);
-            let sends_at = matrix_locate(state, &away, sidebar::SENDS_ROW_LABEL);
+            let _ = matrix_click(&ctx, &mut frame_fn, vault_at);
+            // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+            let gear_at = ctx
+                .read_response(crate::vault_window::top_bar::gear_id())
+                .map(|r| r.rect.center())
+                .expect("the top bar drew no Settings gear to open the menu with");
+            let gear_menu = matrix_click(&ctx, &mut frame_fn, gear_at);
+            let sends_at = matrix_locate(state, &gear_menu, sidebar::SENDS_ROW_LABEL);
             let _ = matrix_click(&ctx, &mut frame_fn, sends_at);
             FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
             let (stale_tx, stale_generation) = FRAME_LIST_TX
@@ -36290,8 +36357,14 @@ mod send_delete_wiring {
         FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
         let output = matrix_close_the_modal(&ctx, &mut frame_fn, output);
         let vault_at = matrix_locate(state, &output, "All items");
-        let away = matrix_click(&ctx, &mut frame_fn, vault_at);
-        let sends_at = matrix_locate(state, &away, sidebar::SENDS_ROW_LABEL);
+        let _ = matrix_click(&ctx, &mut frame_fn, vault_at);
+        // The Sends screen is the top bar gear menu's first row: the gear, then the row.
+        let gear_at = ctx
+            .read_response(crate::vault_window::top_bar::gear_id())
+            .map(|r| r.rect.center())
+            .expect("the top bar drew no Settings gear to open the menu with");
+        let gear_menu = matrix_click(&ctx, &mut frame_fn, gear_at);
+        let sends_at = matrix_locate(state, &gear_menu, sidebar::SENDS_ROW_LABEL);
         let failed = matrix_click(&ctx, &mut frame_fn, sends_at);
         assert!(
             matrix_find(&failed, send_ui::failed_headline()).is_some(),
