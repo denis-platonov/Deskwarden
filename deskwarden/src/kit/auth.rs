@@ -833,7 +833,8 @@ pub fn lock_note_line(ui: &mut Ui, text: &str, tip: &str) {
         icon::stroke(ui.painter(), mark, CLOCK, 2.0, p.text_faint);
         let (rect, _) = ui.allocate_exact_size(line.size(), Sense::hover());
         ui.painter().galley(rect.min, line, p.text_faint);
-        crate::kit::tips::help_dot(ui, egui::Id::new("auth-lock-note-tip"), tip, 230.0, crate::kit::tips::Placement::Below);
+        let tip_width = crate::kit::tips::fit_width(&ctx, tip, 380.0);
+        crate::kit::tips::help_dot(ui, egui::Id::new("auth-lock-note-tip"), tip, tip_width, crate::kit::tips::Placement::Below);
     });
 }
 

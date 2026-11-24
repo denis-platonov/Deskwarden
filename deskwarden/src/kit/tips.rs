@@ -71,6 +71,15 @@ fn pinned(ctx: &egui::Context, id: egui::Id) -> bool {
     ctx.data(|d| d.get_temp::<bool>(id.with("help-pinned"))).unwrap_or(false)
 }
 
+/// The bubble width that fits `text` on one line, capped at `cap`: for a
+/// short tip that should not break ("Change this in Settings -> Security").
+/// A longer translation still wraps at the cap.
+pub fn fit_width(ctx: &egui::Context, text: &str, cap: f32) -> f32 {
+    let job = tokens::job(TOOLTIP, text, Color32::WHITE);
+    let one_line = ctx.fonts_mut(|f| f.layout_job(job)).size().x;
+    (one_line.ceil() + 26.0 + 1.0).min(cap)
+}
+
 /// The 18 px `?` dot. Hovering it shows `text` in a `width`-wide bubble on
 /// the `placement` side.
 pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32, placement: Placement) -> Response {
@@ -198,6 +207,18 @@ mod tests {
 
     fn target(x: f32, y: f32) -> Rect {
         Rect::from_min_size(pos2(x, y), Vec2::new(40.0, 40.0))
+    }
+
+    #[test]
+    fn a_fitted_bubble_keeps_a_short_tip_on_one_line_and_still_caps_a_long_one() {
+        let c = ctx();
+        let tip = crate::i18n::t("auth.lock_tip");
+        let width = fit_width(&c, tip, 380.0);
+        assert!(width < 380.0, "the English lock tip should fit well under the cap, got {width}");
+        let mut job = tokens::job(TOOLTIP, tip, Color32::WHITE);
+        job.wrap.max_width = width - 26.0;
+        assert_eq!(c.fonts_mut(|f| f.layout_job(job)).rows.len(), 1, "the tip breaks inside its fitted bubble");
+        assert_eq!(fit_width(&c, &"word ".repeat(80), 380.0), 380.0);
     }
 
     #[test]
