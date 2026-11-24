@@ -116,7 +116,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, UpdateLayeredWindow, GWLP_WNDPROC, GWL_EXSTYLE,
     HTTRANSPARENT, MA_NOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, ULW_ALPHA, WINDOW_DISPLAY_AFFINITY, WINDOW_EX_STYLE, WM_DESTROY,
-    WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SHOWWINDOW, WM_WINDOWPOSCHANGED,
+    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
+    WM_SHOWWINDOW, WM_WINDOWPOSCHANGED,
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -315,10 +316,17 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
     // ---- compose: the card over the shadow ---------------------------------
     for y in 0..sh_u {
         for x in 0..sw_u {
-            let shadow_a = (sample(x, y) * PEAK_ALPHA).clamp(0.0, 1.0);
             let cx = x as f32 + 0.5 - m.left as f32;
             let cy = y as f32 + 0.5 - m.top as f32;
             let d = rounded_rect_sdf(cx, cy, card_w as f32, card_h as f32, radius);
+            if d < -1.0 && matches!(look, Look::ShadowOnly) {
+                // Deep inside the footprint, which a shadow-only shell leaves
+                // fully transparent: nearly every pixel of a main window's
+                // shell, so it skips the shadow sample.
+                out[y * sw_u + x] = 0;
+                continue;
+            }
+            let shadow_a = (sample(x, y) * PEAK_ALPHA).clamp(0.0, 1.0);
             // `c` is the card's whole footprint; `inner` the part of it that
             // is the card's colour rather than the hairline round it.
             let c = coverage(d);
@@ -381,6 +389,11 @@ struct Entry {
     look: Look,
     /// The capture exclusion last mirrored onto the shell.
     affinity: u32,
+    /// Inside the user's move/resize drag (`WM_ENTERSIZEMOVE` ..
+    /// `WM_EXITSIZEMOVE`). A [`Look::ShadowOnly`] shadow sits the drag out:
+    /// re-rendering a window-sized blurred bitmap on every mouse move made
+    /// resizing crawl. It is painted once, when the drag ends.
+    sizing: bool,
 }
 
 /// Every card with a shell. A `Vec`, not a single slot: two cards can be alive
@@ -574,6 +587,18 @@ fn cut_shadow_region(window: HWND, w: i32, h: i32, scale_pct: i32) {
     }
 }
 
+/// [`cut_shadow_region`] without asking for a repaint: during a resize drag
+/// the window repaints itself for the new size anyway.
+fn cut_shadow_region_quietly(window: HWND, w: i32, h: i32, scale_pct: i32) {
+    unsafe {
+        let d = shadow_region_diameter(scale_pct);
+        let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
+        if SetWindowRgn(window, region, false) == 0 {
+            let _ = DeleteObject(region);
+        }
+    }
+}
+
 /// Gives the window back its rectangular region.
 fn clear_region(window: HWND) {
     unsafe {
@@ -619,6 +644,21 @@ fn sync(card: HWND, visible: Option<bool>) {
     let scale_pct = screen_scale_pct();
     let m = margins(scale_pct);
     let at = POINT { x: rc.left - m.left, y: rc.top - m.top };
+
+    if shadow_only && entry.sizing && (w, h) != entry.size {
+        // Mid-resize (a move-only drag keeps its size and its shadow): no
+        // shadow, and the region kept in step without a forced repaint.
+        // `size` is zeroed so the drag's end paints afresh.
+        if show {
+            cut_shadow_region_quietly(card, w, h, scale_pct);
+        }
+        entry.size = (0, 0);
+        store(entry);
+        unsafe {
+            let _ = SetWindowPos(shell, card, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE | SWP_HIDEWINDOW);
+        }
+        return;
+    }
 
     if shadow_only && !show && entry.size != (0, 0) {
         // Maximized, fullscreen, minimized, cloaked or hidden: the window is
@@ -714,6 +754,13 @@ unsafe extern "system" fn card_proc(
     match msg {
         WM_WINDOWPOSCHANGED => sync(card, None),
         WM_SHOWWINDOW => sync(card, Some(wparam.0 != 0)),
+        WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => {
+            if let Some(mut e) = entry_of(card) {
+                e.sizing = msg == WM_ENTERSIZEMOVE;
+                store(e);
+            }
+            sync(card, None);
+        }
         WM_PAINT => {
             if let Some(mut e) = entry_of(card) {
                 mirror_affinity(&mut e);
@@ -759,6 +806,7 @@ pub fn attach(card: HWND, fill: Color32) {
             scale_pct: screen_scale_pct(),
             look: Look::Card([fill.r(), fill.g(), fill.b()]),
             affinity: 0,
+            sizing: false,
         });
         // Windows stops rounding the card (the shell draws the corners) and
         // stops drawing its own shadow (the shell draws that too).
@@ -826,6 +874,7 @@ pub fn attach_shadow(window: HWND) {
             scale_pct: screen_scale_pct(),
             look: Look::ShadowOnly,
             affinity: 0,
+            sizing: false,
         });
         SetWindowLongPtrW(window, GWLP_WNDPROC, card_proc as *const () as isize);
         // The window may already be on screen (cloaked or not): place the
@@ -1101,6 +1150,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_resize_drag_does_not_repaint_the_shadow_on_every_step() {
+        let code = production();
+        assert!(code.contains("WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE =>"), "the shell no longer knows when a drag starts and ends");
+        let at = code.find("entry.sizing && (w, h) != entry.size").expect("a resize no longer skips the shadow repaint");
+        let branch = &code[at..at + code[at..].find("return;").expect("the branch ends")];
+        assert!(!branch.contains("paint_shell("), "the shadow is painted mid-drag again");
+        assert!(branch.contains("cut_shadow_region_quietly("), "the region no longer follows the drag");
+    }
+
+    #[test]
+    fn a_shadow_only_shell_spends_nothing_inside_the_footprint() {
+        let (card_w, card_h, scale_pct) = (1280, 820, 100);
+        let (sw, sh) = shell_size(card_w, card_h, scale_pct);
+        let mut out = vec![0xFFFF_FFFFu32; (sw * sh) as usize];
+        let started = std::time::Instant::now();
+        render_look_into(&mut out, card_w, card_h, scale_pct, Look::ShadowOnly);
+        let m = margins(scale_pct);
+        let centre = ((m.top + card_h / 2) * sw + m.left + card_w / 2) as usize;
+        assert_eq!(out[centre], 0, "the footprint is transparent");
+        // Measured, not a benchmark: it bounds the one paint a drag's end
+        // costs, generously enough for a debug build on a busy machine.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[test]

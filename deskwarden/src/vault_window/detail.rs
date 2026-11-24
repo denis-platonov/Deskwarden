@@ -7324,6 +7324,55 @@ fn gradient_rounded_rect(rect: egui::Rect, radius: f32, b: egui::Color32, ink: e
     mesh
 }
 
+/// The outline of a circle intersected with a rounded rectangle, as one
+/// convex polygon (both shapes are convex, so their intersection is): the
+/// circle's boundary where it lies inside the rectangle, plus the
+/// rectangle's boundary where it lies inside the circle, in angular order
+/// round a point inside both. Empty when they do not meet. Pure.
+fn circle_within_rounded_rect(centre: egui::Pos2, r: f32, rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
+    let radius = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let half = rect.size() / 2.0 - egui::vec2(radius, radius);
+    let sdf = |p: egui::Pos2| {
+        let q = (p - rect.center()).abs() - half;
+        q.max(egui::Vec2::ZERO).length() + q.x.max(q.y).min(0.0) - radius
+    };
+    let mut points = Vec::new();
+    for i in 0..160 {
+        let a = i as f32 / 160.0 * std::f32::consts::TAU;
+        let p = centre + r * egui::vec2(a.cos(), a.sin());
+        if sdf(p) <= 0.0 {
+            points.push(p);
+        }
+    }
+    // The rectangle's boundary: four straight edges and four quarter arcs.
+    let (l, t, rt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let mut boundary = Vec::new();
+    for (cx, cy, from) in [(rt - radius, t + radius, -90.0f32), (rt - radius, b - radius, 0.0), (l + radius, b - radius, 90.0), (l + radius, t + radius, 180.0)] {
+        for s in 0..=12 {
+            let a = (from + s as f32 * 7.5).to_radians();
+            boundary.push(egui::pos2(cx + radius * a.cos(), cy + radius * a.sin()));
+        }
+    }
+    let edges = boundary.clone();
+    for (i, p) in edges.iter().enumerate() {
+        let q = edges[(i + 1) % edges.len()];
+        for s in 1..24 {
+            boundary.push(*p + (q - *p) * (s as f32 / 24.0));
+        }
+    }
+    points.extend(boundary.into_iter().filter(|p| p.distance(centre) <= r));
+    if points.len() < 3 {
+        return Vec::new();
+    }
+    let mid = points.iter().fold(egui::Vec2::ZERO, |sum, p| sum + p.to_vec2()) / points.len() as f32;
+    let mid = mid.to_pos2();
+    points.sort_by(|a, b| {
+        let (aa, ab) = ((a.y - mid.y).atan2(a.x - mid.x), (b.y - mid.y).atan2(b.x - mid.x));
+        aa.total_cmp(&ab)
+    });
+    points
+}
+
 /// Spec 3.3's card hero: the card's face, 440x258 at radius 22 in its
 /// network's colour, with the number and its eye, and the holder,
 /// expiry and code with the code's own eye. Design 1e adds the bank's mark at
@@ -7360,10 +7409,17 @@ fn card_hero(
             .as_shape(rect, CornerRadius::same(22)),
     );
     ui.painter().add(gradient_rounded_rect(rect, 22.0, b, egui::Color32::from_rgb(0x20, 0x1e, 0x1d)));
-    // The two circles, kept inside the face.
-    let painter = ui.painter().with_clip_rect(rect.shrink(6.0));
-    painter.circle_filled(egui::pos2(rect.right() + 70.0 - 120.0, rect.top() - 80.0 + 120.0), 120.0, egui::Color32::from_white_alpha(18));
-    painter.circle_filled(egui::pos2(rect.right() - 40.0 - 110.0, rect.bottom() + 120.0 - 110.0), 110.0, egui::Color32::from_white_alpha(13));
+    // The two circles, cut by the face's own rounded edge -- not by a rect
+    // inset from it, which left a flat, padded edge inside the card.
+    for (centre, r, alpha) in [
+        (egui::pos2(rect.right() - 50.0 * k, rect.top() + 40.0 * k), 120.0 * k, 18),
+        (egui::pos2(rect.right() - 150.0 * k, rect.bottom() + 10.0 * k), 110.0 * k, 13),
+    ] {
+        let outline = circle_within_rounded_rect(centre, r, rect, 22.0);
+        if outline.len() >= 3 {
+            ui.painter().add(egui::Shape::convex_polygon(outline, egui::Color32::from_white_alpha(alpha), egui::Stroke::NONE));
+        }
+    }
 
     let white = egui::Color32::WHITE;
     let inner = rect.shrink2(egui::vec2(26.0 * k, 22.0 * k));
@@ -18540,6 +18596,24 @@ mod tests {
             assert!(MASKED_PASSWORD.chars().all(|c| c == '\u{2022}'));
             let f = Pane::new().idle(&a_login(), &TotpState::NoSecret);
             assert!(f.painted(MASKED_PASSWORD), "whatever its length, the password shows 14 dots");
+        }
+
+        #[test]
+        fn the_hero_circles_reach_the_cards_own_edge_and_stay_inside_it() {
+            let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(440.0, 258.0));
+            let outline = super::circle_within_rounded_rect(egui::pos2(rect.right() - 50.0, rect.top() + 40.0), 120.0, rect, 22.0);
+            assert!(outline.len() > 20);
+            let right = outline.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+            let top = outline.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+            assert!((right - rect.right()).abs() < 0.5, "the circle stops {} px short of the right edge", rect.right() - right);
+            assert!((top - rect.top()).abs() < 0.5, "the circle stops {} px short of the top edge", top - rect.top());
+            for p in &outline {
+                assert!(rect.expand(0.01).contains(*p));
+                assert!(p.distance(egui::pos2(rect.right() - 50.0, rect.top() + 40.0)) <= 120.01);
+            }
+            // The rounded corner: nothing in the square's corner outside the curve.
+            assert!(outline.iter().all(|p| !(p.x > rect.right() - 2.0 && p.y < rect.top() + 2.0)));
+            assert!(super::circle_within_rounded_rect(egui::pos2(-500.0, -500.0), 10.0, rect, 22.0).is_empty());
         }
 
         #[test]

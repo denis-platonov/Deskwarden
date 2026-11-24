@@ -7153,12 +7153,12 @@ const TEXT_AREA_PAD_Y: f32 = 9.0;
 /// page. It is measured from the text this frame rather than fixed beforehand,
 /// because a note longer than a fixed box ran straight out of the bottom of it.
 pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Response {
-    text_area_shaped(ui, value, hint, rows, 0.0, FIELD_RADIUS)
+    text_area_shaped(ui, value, hint, rows, 0.0, FIELD_RADIUS, false)
 }
 
 /// Spec B 1.4 E's notes box: at least `min_height` tall, radius `radius`.
 pub fn text_area_v2(ui: &mut Ui, value: &mut String, hint: &str, min_height: f32, radius: u8) -> Response {
-    text_area_shaped(ui, value, hint, 4, min_height, radius)
+    text_area_shaped(ui, value, hint, 4, min_height, radius, true)
 }
 
 fn text_area_shaped(
@@ -7168,6 +7168,10 @@ fn text_area_shaped(
     rows: usize,
     min_height: f32,
     radius: u8,
+    // The v2 editor's look (spec B 0.6, `kit::input`): a 1pt border inside
+    // the box that turns blue with the keyboard, and no focus halo. The
+    // halo is v1's, and its 8 px corners never matched a 14 px box.
+    v2: bool,
 ) -> Response {
     let bg = ui.painter().add(egui::Shape::Noop);
     let row_height = text_area_row(ui);
@@ -7197,17 +7201,13 @@ fn text_area_shaped(
         ),
     );
     ui.advance_cursor_after_rect(outer);
-    let border = field_border(ui, outer, response.has_focus());
-    ui.painter().set(
-        bg,
-        egui::epaint::RectShape::new(
-            outer,
-            CornerRadius::same(radius),
-            CARD,
-            border,
-            StrokeKind::Middle,
-        ),
-    );
+    let (border, fill, kind) = if v2 {
+        let p = crate::kit::tokens::palette(ui.ctx());
+        (Stroke::new(1.0, if response.has_focus() { p.blue } else { p.border }), p.card, StrokeKind::Inside)
+    } else {
+        (field_border(ui, outer, response.has_focus()), CARD, StrokeKind::Middle)
+    };
+    ui.painter().set(bg, egui::epaint::RectShape::new(outer, CornerRadius::same(radius), fill, border, kind));
     response
 }
 
