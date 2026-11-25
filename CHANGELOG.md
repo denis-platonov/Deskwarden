@@ -15,6 +15,17 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 1.0.1 - 2026-11-25
+
+> A security release: nothing in the app changed, only a library it is
+> built from.
+
+### Security
+
+- url moves to 2.5.9 (RUSTSEC-2026-0592): `Url::origin()` could overflow the
+  stack on a URL with many nested `blob:` prefixes. Deskwarden never calls
+  it, but the old version no longer gets fixes.
+
 ## 1.0.0 - 2026-11-25
 
 > Deskwarden 1.0 is the v2 design, built end to end. Every screen is new;
