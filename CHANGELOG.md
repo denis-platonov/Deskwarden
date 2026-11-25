@@ -15,6 +15,48 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 1.0.0 - 2026-11-25
+
+> Deskwarden 1.0 is the v2 design, built end to end. Every screen is new;
+> nothing 0.15 did was dropped, and it stays fully compatible with official
+> Bitwarden servers and clients.
+
+### A new look, everywhere
+
+- One window: a navy (or light) sidebar with Vault, Favorites, the item
+  kinds and your folders; a top bar with search (`Ctrl K`), the sync state
+  and your account; Tools and Settings under the gear beside the avatar.
+- Rounded corners with a soft shadow on every window, and light, dark or
+  system theme with a text-size setting.
+- The item list and the detail pane are redesigned: field cards with reveal
+  and copy, a ring round one-time codes, a card face that shows the bank and
+  network and copies its number, name, expiry or code on click.
+- The edit view, the new-item chooser, Share and Send, adding a two-factor
+  code and every small dialog are rebuilt in the same style.
+
+### New
+
+- **Settings as a screen**, twelve pages, with a `?` tip on every row that
+  needs explaining. New: open at sign-in, start in the tray, keep running on
+  close, lock on sleep or screen lock, hide passwords while the screen is
+  shared, autofill panel options, notifications, devices (sign one or all
+  others out), account and language.
+- **Password health**: weak, reused, old and breached passwords in one place.
+- **Import** from Bitwarden JSON or CSV, 1Password, Keeper, LastPass,
+  Chrome/Edge or any CSV, with duplicate detection.
+- **The generator** is its own screen, with a PIN mode and remembered defaults.
+- **The autofill panel** opens under the focused field, with key hints, and
+  the tray popup has search, recent items and quick copy.
+- **Bank and card-network logos**, with the bank named from the login it is
+  linked to.
+- **35 languages**, following your Windows display language on first start.
+- The lock screen says why the vault locked, and after how long.
+
+### Sign-in
+
+The sign-in, unlock, two-factor and signed-out screens share one split-screen
+shell with the server choice, and keep every error state 0.15 had.
+
 ## 0.15.30 - 2026-11-16
 
 > A security release: nothing in the app changed, only the libraries it is

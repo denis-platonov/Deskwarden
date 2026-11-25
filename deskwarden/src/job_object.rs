@@ -3232,7 +3232,19 @@ mod tests {
             // appeared, and `[build-dependencies]` still reads exactly
             // `winresource = "0.1"`. Same FNV-1a/64 implementation, first run against
             // the v1 pair (31047, 0x2ca1_25c6_7fa6_fee0), which it reproduced.
-            (31314, 0xf99c_5ac7_7f8b_c192_u64),
+            //
+            // **31308 bytes, new hash: the 1.0.0 release, and nothing else.**
+            // `version = "0.15.31-dev"` became `"1.0.0"`, 6 bytes shorter: the
+            // v2 redesign on `v1` is cut as 1.0.0. The commit after this one puts a
+            // `-dev` suffix back.
+            //
+            // No dependency was added, removed, re-pointed or re-featured, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table appeared, no
+            // path or fork appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. Same FNV-1a/64 implementation, first run against
+            // the PREVIOUS pinned pair (31314, 0xf99c_5ac7_7f8b_c192), which it
+            // reproduced.
+            (31308, 0xc49b_4ed3_01a8_77e5_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
