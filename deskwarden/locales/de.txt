@@ -2008,6 +2008,7 @@ autofill.err_dangling = die Auto-Type-Sequenz hat einen {what}-Modifikator ohne 
 autofill.err_untypable = die Auto-Type-Sequenz drückt {{{key}}}, was keinen Tastencode hat
 autofill.err_too_long = die Auto-Type-Sequenz würde {seconds} s dauern, über dem Limit von {limit} s
 autofill.err_stopped = Fenster {hwnd} ist nicht mehr im Vordergrund (nach {index} von {total} Schritten). Es wurde nichts weiter getippt.
+autofill.err_stopped_by = Fenster {hwnd} ist nicht mehr im Vordergrund, sondern {other} (nach {index} von {total} Schritten). Es wurde nichts weiter getippt.
 autofill.err_not_foreground = Tippen abgelehnt: Zielfenster {hwnd} ist nicht im Vordergrund (im Vordergrund ist {current}) nach {attempts} Versuchen
 autofill.what_username = einen Benutzernamen
 autofill.what_password = ein Passwort

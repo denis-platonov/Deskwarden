@@ -2008,6 +2008,7 @@ autofill.err_dangling = de auto-typereeks heeft een {what}-modificator zonder to
 autofill.err_untypable = de auto-typereeks drukt op {{{key}}}, die geen toetscode heeft
 autofill.err_too_long = de auto-typereeks zou {seconds}s duren, meer dan de limiet van {limit}s
 autofill.err_stopped = venster {hwnd} staat niet meer vooraan (na {index} van {total} stappen). Er is niets meer getypt.
+autofill.err_stopped_by = venster {hwnd} staat niet meer vooraan; {other} staat vooraan (na {index} van {total} stappen). Er is niets meer getypt.
 autofill.err_not_foreground = typen geweigerd: doelvenster {hwnd} staat niet op de voorgrond (op de voorgrond is {current}) na {attempts} pogingen
 autofill.what_username = een gebruikersnaam
 autofill.what_password = een wachtwoord

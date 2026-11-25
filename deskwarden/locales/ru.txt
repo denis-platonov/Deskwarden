@@ -2106,6 +2106,7 @@ autofill.err_dangling = в последовательности автоввод
 autofill.err_untypable = последовательность автоввода нажимает {{{key}}}, у которой нет кода клавиши
 autofill.err_too_long = последовательность автоввода заняла бы {seconds} с, что больше лимита в {limit} с
 autofill.err_stopped = окно {hwnd} больше не на переднем плане (после {index} из {total} шагов). Дальше ничего не вводилось.
+autofill.err_stopped_by = окно {hwnd} больше не на переднем плане; на переднем плане {other} (после {index} из {total} шагов). Дальше ничего не вводилось.
 autofill.err_not_foreground = ввод отклонён: целевое окно {hwnd} не на переднем плане (на переднем плане {current}) после попыток: {attempts}
 autofill.what_username = имя пользователя
 autofill.what_password = пароль

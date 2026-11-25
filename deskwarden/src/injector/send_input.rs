@@ -174,9 +174,47 @@ impl crate::injector::sequence::Keyboard for RealKeyboard {
     /// of the thing this check exists to prevent. Mid-sequence the only honest
     /// question is "is it still there", and the only honest answer to "no" is
     /// to stop.
+    ///
+    /// **The same app counts, and a moment of nothing in front is waited
+    /// out.** An app's own pop-up -- Chromium's autocomplete list under a
+    /// field it has just been typed into, for one -- can take the foreground
+    /// from the app's main window for a moment, and Windows reports no
+    /// foreground window at all part way through an activation change. Either
+    /// stopped a fill half way into apps the user never touched (mabl, after
+    /// the username and the Tab). So a window owned by the same top-level
+    /// window or run by the same process still holds the foreground -- the
+    /// app the user chose is still the one receiving the keys -- and anything
+    /// else is re-checked for [`SETTLE`] before the run is abandoned. Nothing is
+    /// typed while another app is in front: the wait is before the step.
     fn holds_foreground(&self, hwnd: isize) -> bool {
+        let deadline = std::time::Instant::now() + SETTLE;
+        loop {
+            let current = unsafe { GetForegroundWindow() }.0 as isize;
+            if may_type_into(hwnd, current) {
+                return true;
+            }
+            if current != 0 && same_app(hwnd, current) {
+                log::info!(
+                    "auto-type: {} is in front of {}, which is the same app, so typing goes on",
+                    describe_window(current),
+                    describe_window(hwnd)
+                );
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn describe(&self, hwnd: isize) -> String {
+        describe_window(hwnd)
+    }
+
+    fn in_front_instead(&self, hwnd: isize) -> Option<String> {
         let current = unsafe { GetForegroundWindow() }.0 as isize;
-        may_type_into(hwnd, current)
+        (current != 0 && current != hwnd).then(|| describe_window(current))
     }
 
     fn type_text(&self, text: &str, rate: Duration) -> Result<(), String> {
@@ -226,6 +264,50 @@ impl crate::injector::sequence::Keyboard for RealKeyboard {
     }
 }
 
+/// How long a run waits for the foreground to come back to the target before
+/// it gives up: long enough for an activation change or a closing pop-up,
+/// short enough that a user who really switched away sees the run stop.
+const SETTLE: Duration = Duration::from_millis(500);
+
+/// Whether `other` belongs to the same app as `target`: the same top-level
+/// owner (an owned pop-up), or the same process.
+fn same_app(target: isize, other: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindowThreadProcessId, GA_ROOTOWNER};
+    let (t, o) = (HWND(target as *mut core::ffi::c_void), HWND(other as *mut core::ffi::c_void));
+    unsafe {
+        let (rt, ro) = (GetAncestor(t, GA_ROOTOWNER), GetAncestor(o, GA_ROOTOWNER));
+        if !rt.is_invalid() && rt == ro {
+            return true;
+        }
+        let (mut pt, mut po) = (0u32, 0u32);
+        GetWindowThreadProcessId(t, Some(&mut pt));
+        GetWindowThreadProcessId(o, Some(&mut po));
+        pt != 0 && pt == po
+    }
+}
+
+/// A window as a person would name it: its title and program, the title
+/// alone or the program alone when one is missing, and its number only when
+/// both are.
+pub(crate) fn describe_window(hwnd: isize) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let title = crate::window_watch::window_title(hwnd);
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut core::ffi::c_void), Some(&mut pid)) };
+    let exe = crate::window_watch::process_name_for_pid(pid);
+    name_window(hwnd, title.trim(), exe.as_deref())
+}
+
+/// [`describe_window`]'s wording, apart from the Win32 reads. Pure.
+fn name_window(hwnd: isize, title: &str, exe: Option<&str>) -> String {
+    match (title.is_empty(), exe) {
+        (false, Some(exe)) => format!("\u{201c}{title}\u{201d} ({exe})"),
+        (false, None) => format!("\u{201c}{title}\u{201d}"),
+        (true, Some(exe)) => exe.to_string(),
+        (true, None) => hwnd.to_string(),
+    }
+}
+
 /// The virtual keys held for `mods`, in the order they are pressed. Released
 /// in the reverse order, which is what a real keyboard does and what
 /// applications watching for chords expect.
@@ -268,5 +350,18 @@ mod modifier_tests {
         assert_eq!(modifier_keys(ModSet { shift: true, ..Default::default() }), vec![VK_SHIFT.0]);
         assert_eq!(modifier_keys(ModSet { ctrl: true, ..Default::default() }), vec![VK_CONTROL.0]);
         assert_eq!(modifier_keys(ModSet { alt: true, ..Default::default() }), vec![VK_MENU.0]);
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::name_window;
+
+    #[test]
+    fn a_window_is_named_by_its_title_and_program_and_by_its_number_only_as_a_last_resort() {
+        assert_eq!(name_window(7, "mabl", Some("mabl.exe")), "\u{201c}mabl\u{201d} (mabl.exe)");
+        assert_eq!(name_window(7, "mabl", None), "\u{201c}mabl\u{201d}");
+        assert_eq!(name_window(7, "", Some("mabl.exe")), "mabl.exe");
+        assert_eq!(name_window(7, "", None), "7");
     }
 }

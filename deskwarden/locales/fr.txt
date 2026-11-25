@@ -2070,6 +2070,7 @@ autofill.err_dangling = la séquence de saisie automatique a un modificateur {wh
 autofill.err_untypable = la séquence de saisie automatique appuie sur {{{key}}}, qui n'a pas de code de touche
 autofill.err_too_long = la séquence de saisie automatique prendrait {seconds} s, au-delà de la limite de {limit} s
 autofill.err_stopped = la fenêtre {hwnd} n'est plus au premier plan (après {index} étapes sur {total}). Rien d'autre n'a été saisi.
+autofill.err_stopped_by = la fenêtre {hwnd} n'est plus au premier plan ; {other} l’est (après {index} étapes sur {total}). Rien d'autre n'a été saisi.
 autofill.err_not_foreground = saisie refusée : la fenêtre cible {hwnd} n'est pas au premier plan (le premier plan est {current}) après {attempts} tentatives
 autofill.what_username = un identifiant
 autofill.what_password = un mot de passe

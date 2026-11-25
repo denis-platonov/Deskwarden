@@ -1924,6 +1924,7 @@ autofill.err_dangling = 自动输入序列中有一个{what}修饰键，其后�
 autofill.err_untypable = 自动输入序列按下了 {{{key}}}，它没有键码
 autofill.err_too_long = 自动输入序列需要 {seconds} 秒，超过了 {limit} 秒的限制
 autofill.err_stopped = 窗口 {hwnd} 已不在最前面（在 {total} 个步骤中的第 {index} 步之后）。没有再输入任何内容。
+autofill.err_stopped_by = 窗口 {hwnd} 已不在最前面，现在最前面的是 {other}（在 {total} 个步骤中的第 {index} 步之后）。没有再输入任何内容。
 autofill.err_not_foreground = 拒绝输入：目标窗口 {hwnd} 不在最前面（最前面的是 {current}），已尝试 {attempts} 次
 autofill.what_username = 用户名
 autofill.what_password = 密码

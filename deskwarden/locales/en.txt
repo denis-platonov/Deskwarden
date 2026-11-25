@@ -2039,6 +2039,7 @@ autofill.err_dangling = the auto-type sequence has a {what} modifier with no key
 autofill.err_untypable = the auto-type sequence presses {{{key}}}, which has no key code
 autofill.err_too_long = the auto-type sequence would take {seconds}s, over the {limit}s limit
 autofill.err_stopped = window {hwnd} is no longer in front (after {index} of {total} steps). Nothing further was typed.
+autofill.err_stopped_by = window {hwnd} is no longer in front; {other} is (after {index} of {total} steps). Nothing further was typed.
 autofill.err_not_foreground = refusing to type: target window {hwnd} is not foreground (foreground is {current}) after {attempts} attempts
 autofill.what_username = a username
 autofill.what_password = a password

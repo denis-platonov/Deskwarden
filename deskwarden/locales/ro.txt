@@ -2043,6 +2043,7 @@ autofill.err_dangling = secvența de tastare automată are un modificator {what}
 autofill.err_untypable = secvența de tastare automată apasă {{{key}}}, care nu are cod de tastă
 autofill.err_too_long = secvența de tastare automată ar dura {seconds}s, peste limita de {limit}s
 autofill.err_stopped = fereastra {hwnd} nu mai este în față (după {index} din {total} pași). Nu s-a mai tastat nimic.
+autofill.err_stopped_by = fereastra {hwnd} nu mai este în față; în față este {other} (după {index} din {total} pași). Nu s-a mai tastat nimic.
 autofill.err_not_foreground = refuz să tastez: fereastra țintă {hwnd} nu este în prim-plan (în prim-plan este {current}) după {attempts} încercări
 autofill.what_username = un nume de utilizator
 autofill.what_password = o parolă

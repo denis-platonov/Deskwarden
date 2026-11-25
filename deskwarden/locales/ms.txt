@@ -1919,6 +1919,7 @@ autofill.err_dangling = jujukan taip automatik mempunyai pengubah suai {what} ta
 autofill.err_untypable = jujukan taip automatik menekan {{{key}}}, yang tiada kod kekunci
 autofill.err_too_long = jujukan taip automatik akan mengambil masa {seconds}s, melebihi had {limit}s
 autofill.err_stopped = tetingkap {hwnd} tidak lagi berada di hadapan (selepas {index} daripada {total} langkah). Tiada apa-apa lagi ditaip.
+autofill.err_stopped_by = tetingkap {hwnd} tidak lagi berada di hadapan; {other} yang berada di hadapan (selepas {index} daripada {total} langkah). Tiada apa-apa lagi ditaip.
 autofill.err_not_foreground = enggan menaip: tetingkap sasaran {hwnd} bukan latar depan (latar depan ialah {current}) selepas {attempts} percubaan
 autofill.what_username = nama pengguna
 autofill.what_password = kata laluan

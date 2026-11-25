@@ -2070,6 +2070,7 @@ autofill.err_dangling = la secuencia de escritura automática tiene un modificad
 autofill.err_untypable = la secuencia de escritura automática pulsa {{{key}}}, que no tiene código de tecla
 autofill.err_too_long = la secuencia de escritura automática tardaría {seconds} s, por encima del límite de {limit} s
 autofill.err_stopped = la ventana {hwnd} ya no está en primer plano (tras {index} de {total} pasos). No se escribió nada más.
+autofill.err_stopped_by = la ventana {hwnd} ya no está en primer plano; ahora lo está {other} (tras {index} de {total} pasos). No se escribió nada más.
 autofill.err_not_foreground = se rechaza escribir: la ventana de destino {hwnd} no está en primer plano (lo está {current}) tras {attempts} intentos
 autofill.what_username = un usuario
 autofill.what_password = una contraseña

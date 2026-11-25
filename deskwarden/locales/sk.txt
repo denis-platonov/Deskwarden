@@ -2044,6 +2044,7 @@ autofill.err_dangling = sekvencia automatického písania má modifikátor {what
 autofill.err_untypable = sekvencia automatického písania stláča {{{key}}}, ktorá nemá kód klávesu
 autofill.err_too_long = sekvencia automatického písania by trvala {seconds} s, nad limitom {limit} s
 autofill.err_stopped = okno {hwnd} už nie je v popredí (po {index} z {total} krokoch). Ďalej sa nič nepísalo.
+autofill.err_stopped_by = okno {hwnd} už nie je v popredí; v popredí je {other} (po {index} z {total} krokoch). Ďalej sa nič nepísalo.
 autofill.err_not_foreground = písanie odmietnuté: cieľové okno {hwnd} nie je v popredí (v popredí je {current}) po pokusoch: {attempts}
 autofill.what_username = používateľské meno
 autofill.what_password = heslo

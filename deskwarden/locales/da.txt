@@ -1986,6 +1986,7 @@ autofill.err_dangling = autoskrivningssekvensen har en {what}-modifikator uden n
 autofill.err_untypable = autoskrivningssekvensen trykker {{{key}}}, som ikke har nogen tastekode
 autofill.err_too_long = autoskrivningssekvensen ville tage {seconds} s, over grænsen på {limit} s
 autofill.err_stopped = vindue {hwnd} er ikke længere forrest (efter {index} af {total} trin). Intet mere blev skrevet.
+autofill.err_stopped_by = vindue {hwnd} er ikke længere forrest; {other} er forrest (efter {index} af {total} trin). Intet mere blev skrevet.
 autofill.err_not_foreground = nægter at skrive: målvinduet {hwnd} er ikke forrest (forrest er {current}) efter {attempts} forsøg
 autofill.what_username = et brugernavn
 autofill.what_password = en adgangskode

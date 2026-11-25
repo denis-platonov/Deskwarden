@@ -1986,6 +1986,7 @@ autofill.err_dangling = automaatsisestuse jadas on {what} muutja, mille järel p
 autofill.err_untypable = automaatsisestuse jada vajutab {{{key}}}, millel pole klahvikoodi
 autofill.err_too_long = automaatsisestuse jada võtaks {seconds} s, mis ületab piiri {limit} s
 autofill.err_stopped = aken {hwnd} pole enam esiplaanil (pärast {index} / {total} sammu). Rohkem midagi ei sisestatud.
+autofill.err_stopped_by = aken {hwnd} pole enam esiplaanil; esiplaanil on {other} (pärast {index} / {total} sammu). Rohkem midagi ei sisestatud.
 autofill.err_not_foreground = keeldun sisestamast: sihtaken {hwnd} pole esiplaanil (esiplaanil on {current}) pärast {attempts} katset
 autofill.what_username = kasutajanime
 autofill.what_password = parooli

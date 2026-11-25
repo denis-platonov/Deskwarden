@@ -1919,6 +1919,7 @@ autofill.err_dangling = urutan ketik otomatis memiliki pengubah {what} tanpa tom
 autofill.err_untypable = urutan ketik otomatis menekan {{{key}}}, yang tidak memiliki kode tombol
 autofill.err_too_long = urutan ketik otomatis akan memakan {seconds} detik, melebihi batas {limit} detik
 autofill.err_stopped = jendela {hwnd} tidak lagi di depan (setelah {index} dari {total} langkah). Tidak ada lagi yang diketik.
+autofill.err_stopped_by = jendela {hwnd} tidak lagi di depan; {other} yang di depan (setelah {index} dari {total} langkah). Tidak ada lagi yang diketik.
 autofill.err_not_foreground = menolak mengetik: jendela target {hwnd} bukan yang di depan (yang di depan adalah {current}) setelah {attempts} percobaan
 autofill.what_username = nama pengguna
 autofill.what_password = kata sandi

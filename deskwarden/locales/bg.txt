@@ -1982,6 +1982,7 @@ autofill.err_dangling = последователността за автомат
 autofill.err_untypable = последователността за автоматично въвеждане натиска {{{key}}}, който няма код на клавиш
 autofill.err_too_long = последователността за автоматично въвеждане би отнела {seconds} с, над ограничението от {limit} с
 autofill.err_stopped = прозорец {hwnd} вече не е отпред (след {index} от {total} стъпки). Нищо повече не е въведено.
+autofill.err_stopped_by = прозорец {hwnd} вече не е отпред; отпред е {other} (след {index} от {total} стъпки). Нищо повече не е въведено.
 autofill.err_not_foreground = въвеждането е отказано: целевият прозорец {hwnd} не е отпред (отпред е {current}) след {attempts} опита
 autofill.what_username = потребителско име
 autofill.what_password = парола

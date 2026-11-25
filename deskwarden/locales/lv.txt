@@ -2048,6 +2048,7 @@ autofill.err_dangling = automātiskās ievades secībai ir {what} modifikators, 
 autofill.err_untypable = automātiskās ievades secība nospiež {{{key}}}, kam nav taustiņa koda
 autofill.err_too_long = automātiskās ievades secība aizņemtu {seconds} s, pārsniedzot {limit} s ierobežojumu
 autofill.err_stopped = logs {hwnd} vairs nav priekšplānā (pēc {index} no {total} soļiem). Vairs nekas netika ievadīts.
+autofill.err_stopped_by = logs {hwnd} vairs nav priekšplānā; priekšplānā ir {other} (pēc {index} no {total} soļiem). Vairs nekas netika ievadīts.
 autofill.err_not_foreground = atsakos ievadīt: mērķa logs {hwnd} nav priekšplānā (priekšplānā ir {current}) pēc {attempts} mēģinājumiem
 autofill.what_username = lietotājvārdu
 autofill.what_password = paroli

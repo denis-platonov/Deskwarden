@@ -2044,6 +2044,7 @@ autofill.err_dangling = slijed automatskog upisa ima modifikator {what} bez tipk
 autofill.err_untypable = slijed automatskog upisa pritišće {{{key}}}, što nema kôd tipke
 autofill.err_too_long = slijed automatskog upisa trajao bi {seconds} s, preko ograničenja od {limit} s
 autofill.err_stopped = prozor {hwnd} više nije u prvom planu (nakon {index} od {total} koraka). Ništa dalje nije upisano.
+autofill.err_stopped_by = prozor {hwnd} više nije u prvom planu; u prvom planu je {other} (nakon {index} od {total} koraka). Ništa dalje nije upisano.
 autofill.err_not_foreground = odbijam upisivati: ciljni prozor {hwnd} nije u prvom planu (u prvom planu je {current}) nakon {attempts} pokušaja
 autofill.what_username = korisničko ime
 autofill.what_password = lozinku

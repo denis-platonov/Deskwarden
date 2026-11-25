@@ -2070,6 +2070,7 @@ autofill.err_dangling = a sequência de digitação automática tem um modificad
 autofill.err_untypable = a sequência de digitação automática pressiona {{{key}}}, que não tem código de tecla
 autofill.err_too_long = a sequência de digitação automática levaria {seconds} s, acima do limite de {limit} s
 autofill.err_stopped = a janela {hwnd} não está mais em primeiro plano (após {index} de {total} etapas). Nada mais foi digitado.
+autofill.err_stopped_by = a janela {hwnd} não está mais em primeiro plano; agora está {other} (após {index} de {total} etapas). Nada mais foi digitado.
 autofill.err_not_foreground = recusando digitar: a janela de destino {hwnd} não está em primeiro plano (o primeiro plano é {current}) após {attempts} tentativas
 autofill.what_username = um nome de usuário
 autofill.what_password = uma senha

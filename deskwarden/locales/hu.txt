@@ -1982,6 +1982,7 @@ autofill.err_dangling = az automatikus gépelési sorozatban van egy {what} mód
 autofill.err_untypable = az automatikus gépelési sorozat ezt nyomja le: {{{key}}}, amelynek nincs billentyűkódja
 autofill.err_too_long = az automatikus gépelési sorozat {seconds} mp-ig tartana, a {limit} mp-es korlát felett
 autofill.err_stopped = a(z) {hwnd} ablak már nincs előtérben ({index}/{total} lépés után). Több semmi sem lett beírva.
+autofill.err_stopped_by = a; előtérben most: {other}(z) {hwnd} ablak már nincs előtérben ({index}/{total} lépés után). Több semmi sem lett beírva.
 autofill.err_not_foreground = a beírás megtagadva: a(z) {hwnd} célablak nem előtérben van (az előtérben: {current}), {attempts} próbálkozás után
 autofill.what_username = felhasználónév
 autofill.what_password = jelszó

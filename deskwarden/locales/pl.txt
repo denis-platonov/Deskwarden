@@ -2106,6 +2106,7 @@ autofill.err_dangling = sekwencja autowpisywania ma modyfikator {what} bez klawi
 autofill.err_untypable = sekwencja autowpisywania naciska {{{key}}}, który nie ma kodu klawisza
 autofill.err_too_long = sekwencja autowpisywania trwałaby {seconds} s, ponad limit {limit} s
 autofill.err_stopped = okno {hwnd} nie jest już na wierzchu (po {index} z {total} kroków). Dalej niczego nie wpisano.
+autofill.err_stopped_by = okno {hwnd} nie jest już na wierzchu; na wierzchu jest {other} (po {index} z {total} kroków). Dalej niczego nie wpisano.
 autofill.err_not_foreground = wpisywanie odrzucone: okno docelowe {hwnd} nie jest na wierzchu (na wierzchu jest {current}) po próbach: {attempts}
 autofill.what_username = nazwa użytkownika
 autofill.what_password = hasło

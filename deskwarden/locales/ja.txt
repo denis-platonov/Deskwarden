@@ -1924,6 +1924,7 @@ autofill.err_dangling = 自動入力シーケンスに{what}の修飾キーが�
 autofill.err_untypable = 自動入力シーケンスが {{{key}}} を押しますが、キーコードがありません
 autofill.err_too_long = 自動入力シーケンスに {seconds} 秒かかり、{limit} 秒の上限を超えます
 autofill.err_stopped = ウィンドウ {hwnd} は前面にありません（{total} 手順中 {index} 手順の後）。それ以上は入力されませんでした。
+autofill.err_stopped_by = ウィンドウ {hwnd} は前面にありません。前面にあるのは {other} です（{total} 手順中 {index} 手順の後）。それ以上は入力されませんでした。
 autofill.err_not_foreground = 入力を拒否しました：対象のウィンドウ {hwnd} が前面にありません（前面は {current}）。{attempts} 回試行しました
 autofill.what_username = ユーザー名
 autofill.what_password = パスワード

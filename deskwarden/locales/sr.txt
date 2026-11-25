@@ -2044,6 +2044,7 @@ autofill.err_dangling = секвенца аутоматског уноса им�
 autofill.err_untypable = секвенца аутоматског уноса притиска {{{key}}}, који нема кôд тастера
 autofill.err_too_long = секвенци аутоматског уноса би требало {seconds} с, преко ограничења од {limit} с
 autofill.err_stopped = прозор {hwnd} више није у првом плану (после {index} од {total} корака). Даље ништа није унето.
+autofill.err_stopped_by = прозор {hwnd} више није у првом плану; у првом плану је {other} (после {index} од {total} корака). Даље ништа није унето.
 autofill.err_not_foreground = унос је одбијен: циљни прозор {hwnd} није у првом плану (у првом плану је {current}) после покушаја: {attempts}
 autofill.what_username = корисничко име
 autofill.what_password = лозинка

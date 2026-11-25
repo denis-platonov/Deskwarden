@@ -1982,6 +1982,7 @@ autofill.err_dangling = otomatik yazma dizisinde, ardından tuş gelmeyen bir {w
 autofill.err_untypable = otomatik yazma dizisi {{{key}}} tuşuna basıyor ve bunun tuş kodu yok
 autofill.err_too_long = otomatik yazma dizisi {seconds} sn sürerdi; sınır {limit} sn
 autofill.err_stopped = {hwnd} penceresi artık önde değil ({total} adımın {index}. adımından sonra). Daha fazla bir şey yazılmadı.
+autofill.err_stopped_by = {hwnd} penceresi artık önde değil; önde olan: {other} ({total} adımın {index}. adımından sonra). Daha fazla bir şey yazılmadı.
 autofill.err_not_foreground = yazma reddedildi: hedef pencere {hwnd}, {attempts} denemeden sonra ön planda değil (ön plandaki {current})
 autofill.what_username = bir kullanıcı adı
 autofill.what_password = bir parola

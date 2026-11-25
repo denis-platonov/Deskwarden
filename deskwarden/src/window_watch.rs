@@ -324,7 +324,7 @@ pub fn observe_foreground_event(
 /// `window_list::enum_proc` reads titles the same way, but *drops* untitled
 /// windows because an untitled row is nothing a user could click; here an
 /// untitled window is an ordinary case that simply cannot be matched by title.
-fn window_title(hwnd: isize) -> String {
+pub(crate) fn window_title(hwnd: isize) -> String {
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     unsafe {
         let len = GetWindowTextLengthW(hwnd);

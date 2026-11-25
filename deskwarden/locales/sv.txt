@@ -1986,6 +1986,7 @@ autofill.err_dangling = autoskrivningssekvensen har en {what}-modifierare utan t
 autofill.err_untypable = autoskrivningssekvensen trycker på {{{key}}}, som saknar tangentkod
 autofill.err_too_long = autoskrivningssekvensen skulle ta {seconds} s, över gränsen på {limit} s
 autofill.err_stopped = fönster {hwnd} ligger inte längre överst (efter {index} av {total} steg). Inget mer skrevs.
+autofill.err_stopped_by = fönster {hwnd} ligger inte längre överst; {other} ligger överst (efter {index} av {total} steg). Inget mer skrevs.
 autofill.err_not_foreground = vägrar skriva: målfönstret {hwnd} är inte i förgrunden (förgrunden är {current}) efter {attempts} försök
 autofill.what_username = ett användarnamn
 autofill.what_password = ett lösenord

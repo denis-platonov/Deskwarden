@@ -1924,6 +1924,7 @@ autofill.err_dangling = 자동 입력 시퀀스에 {what} 보조 키가 있지�
 autofill.err_untypable = 자동 입력 시퀀스가 {{{key}}}을(를) 누르지만 키 코드가 없습니다
 autofill.err_too_long = 자동 입력 시퀀스가 {seconds}초 걸려 {limit}초 제한을 넘습니다
 autofill.err_stopped = 창 {hwnd}이(가) 더 이상 맨 앞에 없습니다({total}단계 중 {index}단계 이후). 더 이상 입력하지 않았습니다.
+autofill.err_stopped_by = 창 {hwnd}이 — 맨 앞에는 {other}이(가) 있습니다(가) 더 이상 맨 앞에 없습니다({total}단계 중 {index}단계 이후). 더 이상 입력하지 않았습니다.
 autofill.err_not_foreground = 입력을 거부합니다: 대상 창 {hwnd}이(가) 맨 앞에 있지 않습니다(맨 앞은 {current}). {attempts}회 시도 후
 autofill.what_username = 사용자 이름
 autofill.what_password = 비밀번호

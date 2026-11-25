@@ -2048,6 +2048,7 @@ autofill.err_dangling = automatinio įvedimo sekoje yra modifikatorius {what}, p
 autofill.err_untypable = automatinio įvedimo seka paspaudžia {{{key}}}, kuris neturi klavišo kodo
 autofill.err_too_long = automatinio įvedimo seka užtruktų {seconds} s, viršydama {limit} s ribą
 autofill.err_stopped = langas {hwnd} nebėra priekyje (po {index} iš {total} žingsnių). Daugiau niekas nebuvo įvesta.
+autofill.err_stopped_by = langas {hwnd} nebėra priekyje; priekyje yra {other} (po {index} iš {total} žingsnių). Daugiau niekas nebuvo įvesta.
 autofill.err_not_foreground = atsisakoma įvesti: tikslinis langas {hwnd} nėra priekyje (priekyje yra {current}) po {attempts} bandymų
 autofill.what_username = naudotojo vardas
 autofill.what_password = slaptažodis

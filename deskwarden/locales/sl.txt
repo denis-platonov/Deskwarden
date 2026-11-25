@@ -2106,6 +2106,7 @@ autofill.err_dangling = zaporedje samodejnega tipkanja ima preklopno tipko {what
 autofill.err_untypable = zaporedje samodejnega tipkanja pritisne {{{key}}}, ki nima kode tipke
 autofill.err_too_long = zaporedje samodejnega tipkanja bi trajalo {seconds} s, kar presega omejitev {limit} s
 autofill.err_stopped = okno {hwnd} ni več v ospredju (po {index} od {total} korakov). Nič več ni bilo vtipkano.
+autofill.err_stopped_by = okno {hwnd} ni več v ospredju; v ospredju je {other} (po {index} od {total} korakov). Nič več ni bilo vtipkano.
 autofill.err_not_foreground = tipkanje zavrnjeno: ciljno okno {hwnd} ni v ospredju (v ospredju je {current}) po {attempts} poskusih
 autofill.what_username = uporabniško ime
 autofill.what_password = geslo

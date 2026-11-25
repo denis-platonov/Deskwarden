@@ -2012,6 +2012,7 @@ autofill.err_dangling = autoskrivingssekvensen har en {what}-modifikator uten ta
 autofill.err_untypable = autoskrivingssekvensen trykker {{{key}}}, som ikke har noen tastekode
 autofill.err_too_long = autoskrivingssekvensen ville tatt {seconds} s, over grensen på {limit} s
 autofill.err_stopped = vindu {hwnd} er ikke lenger foran (etter {index} av {total} trinn). Ingenting mer ble skrevet.
+autofill.err_stopped_by = vindu {hwnd} er ikke lenger foran; {other} er foran (etter {index} av {total} trinn). Ingenting mer ble skrevet.
 autofill.err_not_foreground = nekter å skrive: målvinduet {hwnd} er ikke i forgrunnen (forgrunnen er {current}) etter {attempts} forsøk
 autofill.what_username = et brukernavn
 autofill.what_password = et passord

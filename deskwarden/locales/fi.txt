@@ -1986,6 +1986,7 @@ autofill.err_dangling = kirjoitussarjassa on {what}-muunnin, jonka perässä ei 
 autofill.err_untypable = kirjoitussarja painaa {{{key}}}, jolla ei ole näppäinkoodia
 autofill.err_too_long = kirjoitussarja kestäisi {seconds} s, yli {limit} s rajan
 autofill.err_stopped = ikkuna {hwnd} ei ole enää edessä ({index} / {total} vaiheen jälkeen). Mitään ei kirjoitettu enempää.
+autofill.err_stopped_by = ikkuna {hwnd} ei ole enää edessä; edessä on {other} ({index} / {total} vaiheen jälkeen). Mitään ei kirjoitettu enempää.
 autofill.err_not_foreground = kirjoitus evätty: kohdeikkuna {hwnd} ei ole etualalla (etualalla on {current}) {attempts} yrityksen jälkeen
 autofill.what_username = käyttäjätunnus
 autofill.what_password = salasana

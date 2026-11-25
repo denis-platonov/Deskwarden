@@ -851,6 +851,16 @@ pub trait Keyboard {
     fn type_text(&self, text: &str, rate: Duration) -> Result<(), String>;
     fn press_key(&self, key: &'static KeyDef, mods: ModSet) -> Result<(), String>;
     fn wait(&self, how_long: Duration);
+    /// What to call `hwnd` in a message a person reads: its title and
+    /// program. The number is all a test double has to give.
+    fn describe(&self, hwnd: isize) -> String {
+        hwnd.to_string()
+    }
+    /// The window in front now, described, when it is not `hwnd` -- so a
+    /// stopped run can say what took over.
+    fn in_front_instead(&self, _hwnd: isize) -> Option<String> {
+        None
+    }
 }
 
 /// How [`run`]'s abandoned-run message begins, and the one thing that tells it
@@ -870,10 +880,17 @@ pub fn run<K: Keyboard>(kb: &K, hwnd: isize, plan: &Plan) -> Result<(), String> 
     let total = plan.len();
     for (index, step) in plan.steps().iter().enumerate() {
         if !kb.holds_foreground(hwnd) {
-            return Err(format!(
-                "{STOPPED_PREFIX} window {hwnd} is no longer in front (after {index} of \
-                 {total} steps). Nothing further was typed."
-            ));
+            let window = kb.describe(hwnd);
+            return Err(match kb.in_front_instead(hwnd) {
+                Some(other) => format!(
+                    "{STOPPED_PREFIX} window {window} is no longer in front; {other} is (after \
+                     {index} of {total} steps). Nothing further was typed."
+                ),
+                None => format!(
+                    "{STOPPED_PREFIX} window {window} is no longer in front (after {index} of \
+                     {total} steps). Nothing further was typed."
+                ),
+            });
         }
         match step {
             Step::Text { text, rate } => kb.type_text(text, *rate)?,
@@ -2104,6 +2121,35 @@ pub(crate) mod run_tests {
         fn wait(&self, how_long: Duration) {
             self.emitted.borrow_mut().push(Emitted::Waited(how_long));
         }
+    }
+
+    /// A stopped run names the window it was typing into and the one that
+    /// took over, as the keyboard describes them -- not a bare handle.
+    #[test]
+    fn a_stopped_run_names_both_windows() {
+        struct Taken;
+        impl Keyboard for Taken {
+            fn holds_foreground(&self, _hwnd: isize) -> bool {
+                false
+            }
+            fn type_text(&self, _text: &str, _rate: Duration) -> Result<(), String> {
+                Ok(())
+            }
+            fn press_key(&self, _key: &'static KeyDef, _mods: ModSet) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait(&self, _how_long: Duration) {}
+            fn describe(&self, _hwnd: isize) -> String {
+                "\u{201c}mabl\u{201d} (mabl.exe)".into()
+            }
+            fn in_front_instead(&self, _hwnd: isize) -> Option<String> {
+                Some("\u{201c}Slack\u{201d} (slack.exe)".into())
+            }
+        }
+        let err = run(&Taken, 7, &ms365()).unwrap_err();
+        assert!(err.contains("window \u{201c}mabl\u{201d} (mabl.exe) is no longer in front"), "{err}");
+        assert!(err.contains("\u{201c}Slack\u{201d} (slack.exe) is (after 0 of"), "{err}");
+        assert!(!err.contains(" 7 "), "no bare handle: {err}");
     }
 
     fn ms365() -> Plan {

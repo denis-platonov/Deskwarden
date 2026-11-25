@@ -2043,6 +2043,7 @@ autofill.err_dangling = la seqüència d'escriptura automàtica té un modificad
 autofill.err_untypable = la seqüència d'escriptura automàtica prem {{{key}}}, que no té codi de tecla
 autofill.err_too_long = la seqüència d'escriptura automàtica trigaria {seconds} s, per sobre del límit de {limit} s
 autofill.err_stopped = la finestra {hwnd} ja no és al primer pla (després de {index} de {total} passos). No s'ha escrit res més.
+autofill.err_stopped_by = la finestra {hwnd} ja no és al primer pla; ara hi és {other} (després de {index} de {total} passos). No s'ha escrit res més.
 autofill.err_not_foreground = es refusa escriure: la finestra de destinació {hwnd} no és al primer pla (el primer pla és {current}) després de {attempts} intents
 autofill.what_username = un nom d'usuari
 autofill.what_password = una contrasenya

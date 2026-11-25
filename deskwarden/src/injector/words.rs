@@ -19,6 +19,7 @@ const TEMPLATED: &[&str] = &[
     "autofill.err_dangling",
     "autofill.err_untypable",
     "autofill.err_too_long",
+    "autofill.err_stopped_by",
     "autofill.err_stopped",
     "autofill.err_not_foreground",
 ];
@@ -81,6 +82,8 @@ mod tests {
         assert_eq!(localize(typing).as_deref(), Some(typing));
         let stopped = "window 7 is no longer in front (after 2 of 5 steps). Nothing further was typed.";
         assert_eq!(localize(stopped).as_deref(), Some(stopped));
+        let taken = "window \u{201c}mabl\u{201d} (mabl.exe) is no longer in front; \u{201c}Slack\u{201d} (slack.exe) is (after 2 of 5 steps). Nothing further was typed.";
+        assert_eq!(localize(taken).as_deref(), Some(taken), "the sentence naming what took over is worded too");
         assert_eq!(localize("something this file does not know"), None);
     }
 

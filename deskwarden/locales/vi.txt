@@ -1919,6 +1919,7 @@ autofill.err_dangling = trình tự tự động gõ có phím bổ trợ {what}
 autofill.err_untypable = trình tự tự động gõ bấm {{{key}}}, không có mã phím
 autofill.err_too_long = trình tự tự động gõ sẽ mất {seconds} giây, vượt giới hạn {limit} giây
 autofill.err_stopped = cửa sổ {hwnd} không còn ở phía trước (sau {index} trên {total} bước). Không gõ thêm gì nữa.
+autofill.err_stopped_by = cửa sổ {hwnd} không còn ở phía trước; {other} đang ở phía trước (sau {index} trên {total} bước). Không gõ thêm gì nữa.
 autofill.err_not_foreground = từ chối gõ: cửa sổ đích {hwnd} không ở phía trước (cửa sổ phía trước là {current}) sau {attempts} lần thử
 autofill.what_username = tên người dùng
 autofill.what_password = mật khẩu
