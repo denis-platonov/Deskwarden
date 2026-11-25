@@ -165,12 +165,49 @@ pub const FULLY_TRANSPARENT: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 struct TransparentlyCleared<U> {
     ui_fun: U,
     corners: CornerMask,
+    slow: SlowFrames,
+}
+
+/// **A frame whose UI pass alone took longer than [`SlowFrames::LIMIT`] goes
+/// in the log**, with the window's size -- at most once a second, so a
+/// resize drag that is slow on every step writes one line a second, not one
+/// a step. The UI pass is the part this crate's own code decides; the GPU
+/// and the swap are not in it.
+#[derive(Default)]
+struct SlowFrames {
+    last_logged: Option<std::time::Instant>,
+    /// Slow frames since the last line, counted into the next one.
+    unlogged: u32,
+}
+
+impl SlowFrames {
+    const LIMIT: std::time::Duration = std::time::Duration::from_millis(40);
+
+    fn note(&mut self, took: std::time::Duration, size: egui::Vec2) {
+        if took < Self::LIMIT {
+            return;
+        }
+        self.unlogged += 1;
+        let now = std::time::Instant::now();
+        if self.last_logged.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        log::info!(
+            "slow frame: the UI pass took {took:.1?} at {:.0}x{:.0} ({} slow frame(s) since the last line)",
+            size.x,
+            size.y,
+            self.unlogged
+        );
+        self.last_logged = Some(now);
+        self.unlogged = 0;
+    }
 }
 
 impl<U: FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static> eframe::App
     for TransparentlyCleared<U>
 {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
         // **The window's own opacity, on every frame and before anything the
         // closure does.** With a transparent clear an unpainted pixel is a
         // see-through one, so every window through here -- not only the two
@@ -180,6 +217,7 @@ impl<U: FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static> eframe::App
         // **Last, so that it lands on top of everything**: the cut that makes
         // the outer corners round. See [`CornerMask`].
         self.corners.paint(ui.ctx());
+        self.slow.note(started.elapsed(), ui.ctx().content_rect().size());
     }
 
     /// **Transparent, so that a window's opacity is the window's own doing.**
@@ -223,7 +261,7 @@ pub fn run_ui_native(
     eframe::run_native(
         app_name,
         native_options,
-        Box::new(|_cc| Ok(Box::new(TransparentlyCleared { ui_fun, corners: CornerMask::new() }))),
+        Box::new(|_cc| Ok(Box::new(TransparentlyCleared { ui_fun, corners: CornerMask::new(), slow: SlowFrames::default() }))),
     )
 }
 
@@ -891,10 +929,22 @@ mod tests {
     /// there. Nothing here can prove the two combine correctly on a real GL
     /// config; that needs a desktop.
     #[test]
+    fn a_slow_frame_is_counted_and_a_fast_one_is_not() {
+        let mut slow = SlowFrames::default();
+        slow.note(std::time::Duration::from_millis(5), egui::vec2(800.0, 600.0));
+        assert!(slow.last_logged.is_none() && slow.unlogged == 0, "a fast frame is not news");
+        slow.note(std::time::Duration::from_millis(90), egui::vec2(800.0, 600.0));
+        assert!(slow.last_logged.is_some() && slow.unlogged == 0, "the first slow frame is logged at once");
+        slow.note(std::time::Duration::from_millis(90), egui::vec2(800.0, 600.0));
+        assert_eq!(slow.unlogged, 1, "a second inside the same second waits for the next line");
+    }
+
+    #[test]
     fn the_clear_colour_is_fully_transparent() {
         let app = TransparentlyCleared {
             ui_fun: |_: &mut egui::Ui, _: &mut eframe::Frame| {},
             corners: CornerMask::new(),
+            slow: SlowFrames::default(),
         };
         let cleared = eframe::App::clear_color(&app, &egui::Visuals::light());
         assert_eq!(

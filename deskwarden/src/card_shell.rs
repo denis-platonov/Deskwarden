@@ -116,7 +116,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, UpdateLayeredWindow, GWLP_WNDPROC, GWL_EXSTYLE,
     HTTRANSPARENT, MA_NOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, ULW_ALPHA, WINDOW_DISPLAY_AFFINITY, WINDOW_EX_STYLE, WM_DESTROY,
-    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_MOUSEACTIVATE, WM_SIZING, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
     WM_SHOWWINDOW, WM_WINDOWPOSCHANGED,
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
@@ -394,6 +394,12 @@ struct Entry {
     /// re-rendering a window-sized blurred bitmap on every mouse move made
     /// resizing crawl. It is painted once, when the drag ends.
     sizing: bool,
+    /// A [`Look::ShadowOnly`] window made opaque for a resize drag: set at the
+    /// drag's first `WM_SIZING`, cleared at `WM_EXITSIZEMOVE`. A transparent
+    /// window's not-yet-painted strip is see-through, which showed the windows
+    /// behind it all along the dragged edge; an opaque one shows its own
+    /// background there. See [`set_per_pixel_alpha`].
+    opaque: bool,
 }
 
 /// Every card with a shell. A `Vec`, not a single slot: two cards can be alive
@@ -589,12 +595,58 @@ fn cut_shadow_region(window: HWND, w: i32, h: i32, scale_pct: i32) {
 
 /// [`cut_shadow_region`] without asking for a repaint: during a resize drag
 /// the window repaints itself for the new size anyway.
-fn cut_shadow_region_quietly(window: HWND, w: i32, h: i32, scale_pct: i32) {
+fn cut_shadow_region_quietly(window: HWND, w: i32, h: i32, d: i32) {
     unsafe {
-        let d = shadow_region_diameter(scale_pct);
         let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
         if SetWindowRgn(window, region, false) == 0 {
             let _ = DeleteObject(region);
+        }
+    }
+}
+
+/// The region a window wears while it is opaque for a resize drag: its whole
+/// corner radius, because with per-pixel alpha off the GL surface's own
+/// antialiased corner cut paints black rather than see-through.
+fn full_region_diameter(scale_pct: i32) -> i32 {
+    (dev(RADIUS as f32, scale_pct).round() as i32).max(1) * 2
+}
+
+/// **Per-pixel alpha off (`opaque`) or back on, for a transparent GL window.**
+///
+/// `winit` makes a `with_transparent(true)` window see-through with
+/// `DwmEnableBlurBehindWindow` over an empty region; this is that call, and
+/// its undoing. While it is off, DWM shows the window as opaque, so the strip
+/// a resize drag exposes before the next frame reaches it is the window's own
+/// background instead of whatever lies behind the window.
+fn set_per_pixel_alpha(window: HWND, on: bool) {
+    use windows::Win32::Graphics::Dwm::{DwmEnableBlurBehindWindow, DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND};
+    use windows::Win32::Graphics::Gdi::CreateRectRgn;
+    unsafe {
+        let region = CreateRectRgn(0, 0, -1, -1);
+        let bb = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+            fEnable: on.into(),
+            hRgnBlur: region,
+            fTransitionOnMaximized: false.into(),
+        };
+        let _ = DwmEnableBlurBehindWindow(window, &bb);
+        let _ = DeleteObject(region);
+    }
+}
+
+/// Fills the window's client area with the app's window background -- what an
+/// opaque window shows in the strip a resize drag uncovers.
+fn fill_with_window_background(window: HWND, dc: windows::Win32::Graphics::Gdi::HDC) {
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, FillRect};
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    let bg = crate::theme::WINDOW_BG;
+    let colour = COLORREF(u32::from(bg.r()) | (u32::from(bg.g()) << 8) | (u32::from(bg.b()) << 16));
+    unsafe {
+        let mut rect = RECT::default();
+        if GetClientRect(window, &mut rect).is_ok() {
+            let brush = CreateSolidBrush(colour);
+            FillRect(dc, &rect, brush);
+            let _ = DeleteObject(brush);
         }
     }
 }
@@ -650,7 +702,11 @@ fn sync(card: HWND, visible: Option<bool>) {
         // shadow, and the region kept in step without a forced repaint.
         // `size` is zeroed so the drag's end paints afresh.
         if show {
-            cut_shadow_region_quietly(card, w, h, scale_pct);
+            // Opaque for the drag (see [`Entry::opaque`]): the region is the
+            // corner, at the window's full radius, since the GL alpha cut no
+            // longer shows through.
+            let d = if entry.opaque { full_region_diameter(scale_pct) } else { shadow_region_diameter(scale_pct) };
+            cut_shadow_region_quietly(card, w, h, d);
         }
         entry.size = (0, 0);
         store(entry);
@@ -746,6 +802,19 @@ unsafe extern "system" fn card_proc(
         // for the frame the card is already gone.
         let _ = DestroyWindow(hwnd_of(entry.shell));
     }
+    // An opaque window mid-drag paints the strip the drag uncovers in its own
+    // background, before the next frame reaches it. See [`Entry::opaque`].
+    if msg == WM_ERASEBKGND && entry.opaque {
+        fill_with_window_background(card, windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _));
+        return LRESULT(1);
+    }
+    // The drag's first resize step: opaque, and the corner cut by the region.
+    if msg == WM_SIZING && entry.sizing && !entry.opaque && matches!(entry.look, Look::ShadowOnly) {
+        let mut e = entry;
+        e.opaque = true;
+        store(e);
+        set_per_pixel_alpha(card, false);
+    }
     let original = std::mem::transmute::<
         isize,
         Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>,
@@ -757,7 +826,13 @@ unsafe extern "system" fn card_proc(
         WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => {
             if let Some(mut e) = entry_of(card) {
                 e.sizing = msg == WM_ENTERSIZEMOVE;
+                let was_opaque = std::mem::take(&mut e.opaque);
                 store(e);
+                if was_opaque {
+                    // Back to see-through corners; `sync` below re-cuts the
+                    // half-radius region and repaints the shadow.
+                    set_per_pixel_alpha(card, true);
+                }
             }
             sync(card, None);
         }
@@ -807,6 +882,7 @@ pub fn attach(card: HWND, fill: Color32) {
             look: Look::Card([fill.r(), fill.g(), fill.b()]),
             affinity: 0,
             sizing: false,
+            opaque: false,
         });
         // Windows stops rounding the card (the shell draws the corners) and
         // stops drawing its own shadow (the shell draws that too).
@@ -875,6 +951,7 @@ pub fn attach_shadow(window: HWND) {
             look: Look::ShadowOnly,
             affinity: 0,
             sizing: false,
+            opaque: false,
         });
         SetWindowLongPtrW(window, GWLP_WNDPROC, card_proc as *const () as isize);
         // The window may already be on screen (cloaked or not): place the

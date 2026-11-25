@@ -37,7 +37,9 @@ struct Shape {
 }
 
 const SINGLE: Shape = Shape { pad: [16.0, 20.0, 16.0, 20.0], button: 42.0, radius: 12 };
-const PAIRED: Shape = Shape { pad: [16.0, 12.0, 16.0, 20.0], button: 38.0, radius: 11 };
+/// The same buttons and right padding as [`SINGLE`]: a pair's right-hand copy
+/// and eye sit in the column the full-width rows above and below put theirs in.
+const PAIRED: Shape = Shape { pad: [16.0, 20.0, 16.0, 20.0], button: 42.0, radius: 12 };
 /// Between the text column and the buttons.
 const GAP: f32 = 14.0;
 /// Between the label and the value.
@@ -208,8 +210,25 @@ mod tests {
         let (_, _, expires) = p.text("Expires").unwrap();
         let (_, _, code) = p.text("Security code").unwrap();
         assert!(expires.center().x < SCREEN.x / 2.0 && code.center().x > SCREEN.x / 2.0 - 10.0);
-        assert_eq!(a.copy_rect.size(), vec2(38.0, 38.0));
+        assert_eq!(a.copy_rect.size(), vec2(42.0, 42.0));
         assert!(b.eye_rect.is_some() && a.eye_rect.is_none());
         assert!(p.rects.iter().any(|r| r.fill == P.row_rule && r.rect.width() <= 1.0), "no rule between the cells");
+    }
+
+    #[test]
+    fn a_pairs_right_buttons_line_up_with_a_single_rows_buttons() {
+        let ctx = testing::ctx();
+        let (mut one, mut two) = (None, None);
+        testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            one = Some(single(ui, "Number", "4111", 0.06, Some(false)));
+            two = Some(pair(
+                ui,
+                Cell { label: "Expires", value: "08 / 29", tracking_em: 0.0, secret: None },
+                Cell { label: "Security code", value: "•••", tracking_em: 0.12, secret: Some(false) },
+            ));
+        });
+        let (one, (_, b)) = (one.unwrap(), two.unwrap());
+        assert_eq!(one.copy_rect.center().x, b.copy_rect.center().x, "copy buttons in one column");
+        assert_eq!(one.eye_rect.unwrap().center().x, b.eye_rect.unwrap().center().x, "eyes in one column");
     }
 }

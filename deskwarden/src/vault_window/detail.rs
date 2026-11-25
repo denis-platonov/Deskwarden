@@ -7294,11 +7294,25 @@ fn hero_colour(b: egui::Color32, ink: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(mix(b.r(), ink.r()), mix(b.g(), ink.g()), mix(b.b(), ink.b()))
 }
 
+/// The face of a card with neither a known bank nor a known network: the navy
+/// sidebar's own `bg`.
+const HERO_NAVY: egui::Color32 = egui::Color32::from_rgb(0x14, 0x30, 0x7a);
+
+/// Points per quarter-circle corner. Eight left a radius-22 corner visibly
+/// faceted at 150%; this many keeps every segment under a pixel and a half.
+const HERO_CORNER_STEPS: usize = 24;
+
 /// A rounded rect as a triangle fan whose every vertex takes the hero's
 /// gradient at its place on the diagonal: egui fills shapes with one colour.
-fn gradient_rounded_rect(rect: egui::Rect, radius: f32, b: egui::Color32, ink: egui::Color32) -> egui::Mesh {
+///
+/// **Anti-aliased by hand.** A raw mesh gets none of the tessellator's
+/// feathering, so its edge is a hard stair-step. Around the opaque outline
+/// sits a second ring `feather` (one physical pixel) further out, in the same
+/// colours at zero alpha, and the strip between them fades the edge.
+fn gradient_rounded_rect(rect: egui::Rect, radius: f32, b: egui::Color32, ink: egui::Color32, feather: f32) -> egui::Mesh {
     let mut mesh = egui::Mesh::default();
     let at = |p: egui::Pos2| ((p.x - rect.left()) + (p.y - rect.top())) / (rect.width() + rect.height());
+    // Each outline point with its outward normal.
     let mut outline = Vec::new();
     let corners = [
         (egui::pos2(rect.right() - radius, rect.top() + radius), -90.0_f32),
@@ -7307,19 +7321,31 @@ fn gradient_rounded_rect(rect: egui::Rect, radius: f32, b: egui::Color32, ink: e
         (egui::pos2(rect.left() + radius, rect.top() + radius), 180.0),
     ];
     for (centre, start) in corners {
-        for k in 0..=8 {
-            let a = (start + 90.0 * k as f32 / 8.0).to_radians();
-            outline.push(centre + radius * egui::vec2(a.cos(), a.sin()));
+        for k in 0..=HERO_CORNER_STEPS {
+            let a = (start + 90.0 * k as f32 / HERO_CORNER_STEPS as f32).to_radians();
+            let normal = egui::vec2(a.cos(), a.sin());
+            outline.push((centre + (radius - feather / 2.0) * normal, normal));
         }
     }
     let c = rect.center();
     mesh.colored_vertex(c, hero_colour(b, ink, at(c)));
-    for p in &outline {
+    for (p, _) in &outline {
         mesh.colored_vertex(*p, hero_colour(b, ink, at(*p)));
     }
     let n = outline.len() as u32;
     for k in 0..n {
         mesh.add_triangle(0, 1 + k, 1 + (k + 1) % n);
+    }
+    // The feather ring: vertices 1 + n .. 1 + 2n, each beside its opaque twin.
+    for (p, normal) in &outline {
+        let out = *p + *normal * feather;
+        mesh.colored_vertex(out, hero_colour(b, ink, at(out)).gamma_multiply(0.0));
+    }
+    for k in 0..n {
+        let (i0, i1) = (1 + k, 1 + (k + 1) % n);
+        let (o0, o1) = (i0 + n, i1 + n);
+        mesh.add_triangle(i0, o0, o1);
+        mesh.add_triangle(i0, o1, i1);
     }
     mesh
 }
@@ -7399,16 +7425,14 @@ fn card_hero(
     // The design draws the face at 440; a narrower pane gets the same face
     // at its own size, everything on it scaled by `k`.
     let k = width / 440.0;
-    let bank = fields.bank.as_deref().and_then(crate::kit::logos::Bank::for_domain);
-    let b = bank
-        .map(|bank| bank.colour())
-        .or_else(|| net.map(|n| n.colour()))
-        .unwrap_or(egui::Color32::from_rgb(0x14, 0x30, 0x7a));
     ui.painter().add(
         egui::Shadow { offset: [0, 18], blur: 40, spread: 0, color: egui::Color32::from_rgba_unmultiplied(20, 26, 48, 71) }
             .as_shape(rect, CornerRadius::same(22)),
     );
-    ui.painter().add(gradient_rounded_rect(rect, 22.0, b, egui::Color32::from_rgb(0x20, 0x1e, 0x1d)));
+    let bank = fields.bank.as_deref().and_then(crate::kit::logos::Bank::for_domain);
+    let b = bank.map(|bank| bank.colour()).or_else(|| net.map(|n| n.colour())).unwrap_or(HERO_NAVY);
+    let feather = 1.0 / ui.ctx().pixels_per_point();
+    ui.painter().add(gradient_rounded_rect(rect, 22.0, b, egui::Color32::from_rgb(0x20, 0x1e, 0x1d), feather));
     // The two circles, cut by the face's own rounded edge -- not by a rect
     // inset from it, which left a flat, padded edge inside the card.
     for (centre, r, alpha) in [
@@ -7480,7 +7504,7 @@ fn card_hero(
     let number_rect = egui::Rect::from_min_size(digits_at, digits_size);
     if !number.is_empty() {
         let r = ui.interact(number_rect.expand(4.0 * k), ui.id().with("hero-number"), egui::Sense::click());
-        if hero_copy_affordance(ui, &r, number_rect, 6.0 * k, CopyShortcut::CardNumber) {
+        if hero_copy_affordance(ui, &r, ink_centred(number_rect, &digits), 6.0 * k, CopyShortcut::CardNumber) {
             *action = DetailAction::CopyCardNumber;
             note_copied(ui.ctx(), number_label());
         }
@@ -7552,7 +7576,7 @@ fn card_hero(
             let value_rect = egui::Rect::from_min_size(value_at, v.size());
             let id = ui.id().with(("hero-copy", name));
             let r = ui.interact(value_rect.expand(4.0 * k), id, egui::Sense::click());
-            if hero_copy_affordance(ui, &r, value_rect, 5.0 * k, hint) {
+            if hero_copy_affordance(ui, &r, ink_centred(value_rect, &v), 5.0 * k, hint) {
                 *action = on_copy;
                 note_copied(ui.ctx(), name);
             }
@@ -7595,6 +7619,26 @@ fn card_hero(
         }
     }
     let _ = p;
+}
+
+/// The box a hero plate goes around: the galley's own width, but its height
+/// centred on the ink the glyphs actually paint. A font's line box keeps room
+/// above the digits for accents and ascenders, so a plate centred on it sits
+/// high and the digits look dropped inside it.
+fn ink_centred(text_rect: egui::Rect, galley: &egui::Galley) -> egui::Rect {
+    let ink = galley
+        .rows
+        .iter()
+        .map(|placed| placed.row.visuals.mesh_bounds.translate(placed.pos.to_vec2()))
+        .filter(|r| r.is_positive())
+        .reduce(|a, b| a.union(b));
+    match ink {
+        Some(ink) => {
+            let centre_y = text_rect.top() + ink.center().y;
+            egui::Rect::from_center_size(egui::pos2(text_rect.center().x, centre_y), text_rect.size())
+        }
+        None => text_rect,
+    }
 }
 
 /// What a hero value does under the pointer: the pointing hand, a faint
@@ -18596,6 +18640,33 @@ mod tests {
             assert!(MASKED_PASSWORD.chars().all(|c| c == '\u{2022}'));
             let f = Pane::new().idle(&a_login(), &TotpState::NoSecret);
             assert!(f.painted(MASKED_PASSWORD), "whatever its length, the password shows 14 dots");
+        }
+
+        #[test]
+        fn the_card_face_has_a_soft_edge_and_fine_corners() {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(440.0, 258.0));
+            let mesh = gradient_rounded_rect(rect, 22.0, HERO_NAVY, HERO_NAVY, 0.5);
+            let clear = mesh.vertices.iter().filter(|v| v.color.a() == 0).count();
+            let solid = mesh.vertices.iter().filter(|v| v.color.a() == 255).count();
+            assert_eq!(clear, solid - 1, "every outline point has a transparent twin outside it (the centre has none)");
+            assert!(clear >= 4 * 20, "corners drawn with too few points: {clear}");
+            for v in &mesh.vertices {
+                assert!(rect.expand(0.26).contains(v.pos), "{:?} strays past the face", v.pos);
+            }
+        }
+
+        #[test]
+        fn a_hero_plate_is_centred_on_the_glyphs_not_the_line_box() {
+            let ctx = crate::kit::testing::ctx();
+            let galley = ctx.fonts_mut(|f| {
+                f.layout_no_wrap("\u{2022}\u{2022}\u{2022}\u{2022} 6075".into(), egui::FontId::monospace(20.0), egui::Color32::WHITE)
+            });
+            let at = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), galley.size());
+            let plate = ink_centred(at, &galley);
+            let ink = galley.rows[0].row.visuals.mesh_bounds.translate(egui::vec2(10.0, 10.0) + galley.rows[0].pos.to_vec2());
+            assert!((plate.center().y - ink.center().y).abs() < 0.01, "plate {plate:?} vs ink {ink:?}");
+            assert_eq!(plate.size(), at.size());
+            assert_eq!(plate.center().x, at.center().x);
         }
 
         #[test]
