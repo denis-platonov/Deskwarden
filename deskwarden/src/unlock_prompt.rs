@@ -515,6 +515,15 @@ const CARD_PAD: i32 = 16;
 /// A top-level window that grew by 22px the moment a password was rejected
 /// would move its own buttons out from under the pointer at exactly the moment
 /// the user is about to click one again, so the room is reserved instead.
+/// Where the password `EDIT` sits inside the field box the parent paints:
+/// 10 in from each side, and 20 high, centred, so it stops as far above the
+/// box's bottom border as it starts below its top. It ran to the box's bottom
+/// edge before, and painted over the bottom of the blue focus border.
+pub fn password_child(field: Box2) -> Box2 {
+    const TEXT_H: i32 = 20;
+    Box2 { x: field.x + 10, y: field.y + (field.h - TEXT_H) / 2, w: field.w - 20, h: TEXT_H }
+}
+
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
@@ -881,7 +890,7 @@ mod win32 {
             w!("EDIT"),
             "",
             WS_TABSTOP.0 | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32,
-            inset(l.field, 10, (l.field.h - 20) / 2, 10, 0),
+            super::password_child(l.field),
             ID_PASSWORD,
             fonts.field,
         )?;
@@ -2241,6 +2250,18 @@ mod tests {
                 l.window.h
             );
         }
+    }
+
+    /// The password box sits inside the field's 1 px border on every side,
+    /// so the focus border is drawn whole -- the box once ran to the field's
+    /// bottom edge and covered the bottom of it.
+    #[test]
+    fn the_password_box_stays_inside_the_fields_border() {
+        let l = layout();
+        let edit = password_child(l.field);
+        assert!(edit.x > l.field.x && edit.right() < l.field.right(), "{edit:?} in {:?}", l.field);
+        assert!(edit.y > l.field.y && edit.bottom() < l.field.bottom(), "{edit:?} in {:?}", l.field);
+        assert_eq!(edit.y - l.field.y, l.field.bottom() - edit.bottom(), "centred top to bottom");
     }
 
     /// The card really contains the controls it is drawn around.
