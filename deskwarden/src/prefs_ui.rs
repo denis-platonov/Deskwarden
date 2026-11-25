@@ -2397,14 +2397,35 @@ fn row_text(ui: &mut Ui, label: &str, description: &str) {
 fn row_text_ink(ui: &mut Ui, label: &str, description: &str, tip: &str, ghost: bool) {
     let p = palette(ui.ctx());
     let (ink, sub_ink) = if ghost { (p.text_ghost, p.text_ghost) } else { (p.ink, p.text_label) };
+    // **Centred on the ink, not on the line boxes.** A galley keeps its spare
+    // room under the glyphs -- the font's descent, and for the sub the whole
+    // of its 20 px line height's leading -- so text centred by its boxes sits
+    // visibly high in the row. What is centred is the title's cap top down to
+    // the last line's baseline.
+    let title = ui.fonts_mut(|f| f.layout_job(tokens::job(ROW_TITLE, label, ink)));
+    let top_slack = ink_top(&title);
+    let sub = (!description.is_empty()).then(|| {
+        let width = ui.available_width();
+        ui.fonts_mut(|f| {
+            let mut job = sub_job(description, sub_ink);
+            job.wrap.max_width = width;
+            f.layout_job(job)
+        })
+    });
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
         if description.is_empty() {
             // **Most rows have no sub in the design**, and a lone title sits
             // level with its control rather than at the row's top edge.
-            let title_h = ui.fonts_mut(|f| f.layout_job(tokens::job(ROW_TITLE, label, ink))).size().y;
-            ui.add_space(((CONTROL_MIN_HEIGHT - title_h) / 2.0).max(0.0));
+            let cap = last_baseline(&title) - top_slack;
+            ui.add_space(((CONTROL_MIN_HEIGHT - cap) / 2.0 - top_slack).max(0.0));
         }
+        // With a sub: the text moves down by half the difference between the
+        // room under the last baseline and the room over the cap top, and the
+        // sub's box gives the same back at its foot, so the row keeps its
+        // height.
+        let shift = sub.as_ref().map_or(0.0, |sub| ((sub.size().y - last_baseline(sub) - top_slack) / 2.0).max(0.0));
+        ui.add_space(shift);
         if tip.is_empty() {
             ui.label(tokens::job(ROW_TITLE, label, ink));
         } else {
@@ -2420,10 +2441,39 @@ fn row_text_ink(ui: &mut Ui, label: &str, description: &str, tip: &str, ghost: b
                 );
             });
         }
-        if !description.is_empty() {
-            ui.label(sub_job(description, sub_ink));
+        if let Some(sub) = sub {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(sub.size().x, (sub.size().y - shift).max(0.0)), egui::Sense::hover());
+            ui.painter().galley(rect.min, sub, sub_ink);
         }
     });
+}
+
+/// The nudge that centres a one-line galley's cap-top-to-baseline span on its
+/// box's centre, rather than its line box (which keeps its spare room under
+/// the glyphs).
+fn text_centring(galley: &egui::Galley) -> Vec2 {
+    let ink_mid = (ink_top(galley) + last_baseline(galley)) / 2.0;
+    Vec2::new(0.0, galley.size().y / 2.0 - ink_mid)
+}
+
+/// How far below a galley's top its ink starts: the room a font keeps over
+/// its capitals. Zero for a galley with nothing painted.
+fn ink_top(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .map(|placed| placed.row.visuals.mesh_bounds)
+        .filter(|r| r.is_positive())
+        .map_or(0.0, |r| r.top().max(0.0))
+}
+
+/// Where a galley's last line sits on its baseline, from the galley's top.
+fn last_baseline(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .last()
+        .and_then(|placed| placed.row.glyphs.first().map(|g| placed.pos.y + g.pos.y))
+        .unwrap_or_else(|| galley.size().y)
 }
 
 /// Keeps the tip after the row titled `label` open, for `ui_preview`'s
@@ -4680,7 +4730,11 @@ fn chord_button(ui: &mut Ui, capturing: bool, bound: Option<crate::hotkey::Chord
     let p = palette(ui.ctx());
     let keys = chord_keys(capturing, bound);
     let role = tokens::Role { size: 14.0, face: theme::BOLD, tracking_em: 0.0 };
-    let ink = if capturing { p.blue_deep } else { p.ink };
+    let ink = match (capturing, bound) {
+        (true, _) => p.blue_deep,
+        (false, Some(_)) => p.ink,
+        (false, None) => p.text_label,
+    };
     let galleys: Vec<_> = keys.iter().map(|k| ui.fonts_mut(|f| f.layout_job(tokens::job(role, k, ink)))).collect();
     // Spec C 2.7: chips at least 32 wide and exactly 32 high, 6 apart, inside
     // a well with 6 of padding and a 2 px border (blue while recording).
@@ -4704,15 +4758,21 @@ fn chord_button(ui: &mut Ui, capturing: bool, bound: Option<crate::hotkey::Chord
     let top = rect.min.y + 2.0 + 6.0;
     for (galley, w) in galleys.into_iter().zip(chip_w) {
         let chip = Rect::from_min_size(Pos2::new(x, top), Vec2::new(w, 32.0));
-        if !capturing {
-            painter.rect_filled(chip, CornerRadius::same(9), p.hover);
-            painter.rect_filled(
-                Rect::from_min_max(Pos2::new(chip.min.x + 3.0, chip.max.y - 2.0), Pos2::new(chip.max.x - 3.0, chip.max.y)),
-                CornerRadius::ZERO,
-                p.kbd_border,
-            );
+        let keycap = !capturing && bound.is_some();
+        // The text is centred on the face; a keycap's face is the chip less
+        // its 2 px edge.
+        let face = if keycap { chip.with_max_y(chip.max.y - 2.0) } else { chip };
+        if keycap {
+            // A key: its edge is the same rounded shape a step lower, so the
+            // edge follows the corners instead of being a bar under the chip.
+            painter.rect_filled(chip, CornerRadius::same(9), p.kbd_border);
+            painter.rect_filled(face, CornerRadius::same(9), p.hover);
+        } else if !capturing {
+            // **"Not set" is not a key**, so it is not drawn as one: a plain
+            // outline, its word in the label grey.
+            painter.rect_stroke(chip, CornerRadius::same(9), Stroke::new(1.0, p.border), StrokeKind::Inside);
         }
-        painter.galley(chip.center() - galley.size() / 2.0 - Vec2::new(0.0, 1.0), galley, ink);
+        painter.galley(face.center() - galley.size() / 2.0 + text_centring(&galley), galley, ink);
         x += w + 6.0;
     }
     response.clicked()
@@ -14503,4 +14563,50 @@ mod modal_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod row_centring_tests {
+    use super::*;
+    use crate::kit::testing;
+
+    const SCREEN: Vec2 = Vec2::new(700.0, 300.0);
+
+    /// The row's text is centred on its ink: the room over the title's cap
+    /// top equals the room under the sub's baseline, to a pixel.
+    #[test]
+    fn a_row_with_a_sub_has_as_much_room_under_its_text_as_over_it() {
+        let ctx = testing::ctx();
+        let mut row_rect = Rect::NOTHING;
+        let painted = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let before = ui.cursor().min.y;
+            control_row_tip(ui, "Default sign-in steps", "Username, Tab, password", "", false, 80.0, |_| {});
+            row_rect = Rect::from_min_max(Pos2::new(0.0, before), Pos2::new(SCREEN.x, ui.cursor().min.y));
+        });
+        let title = painted.text("Default sign-in steps").expect("the title").2;
+        let sub = painted.text("Username, Tab").expect("the sub").2;
+        let ink = palette(&ctx).ink;
+        let sub_g = ctx.fonts_mut(|f| f.layout_job(sub_job("Username, Tab, password", ink)));
+        // `texts` records each text's INK rect, so the title's top is its cap
+        // top already and the sub's galley starts `ink_top` above its ink.
+        let above = title.top() - row_rect.top();
+        let below = row_rect.bottom() - (sub.top() - ink_top(&sub_g) + last_baseline(&sub_g));
+        assert!((above - below).abs() <= 1.0, "{above} over the cap top, {below} under the baseline");
+    }
+
+    /// "Not set" is an outline with its word in the label grey -- not a grey
+    /// keycap, which is what a real key in the chord is drawn as.
+    #[test]
+    fn an_unset_shortcut_is_an_outline_not_a_key() {
+        let ctx = testing::ctx();
+        let p = palette(&ctx);
+        let painted = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            chord_button(ui, false, None);
+        });
+        let (_, colour, _) = painted.text(shortcut_not_set()).expect("the word");
+        assert_eq!(*colour, p.text_label);
+        assert!(!painted.rects.iter().any(|r| r.fill == p.hover || r.fill == p.kbd_border), "no keycap under Not set");
+        assert!(painted.rects.iter().any(|r| r.stroke.color == p.border), "an outline round it");
+    }
 }
