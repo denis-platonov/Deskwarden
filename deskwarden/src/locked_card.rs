@@ -441,7 +441,7 @@ mod win32 {
         DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
         LOGPIXELSX, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, PeekMessageW,
@@ -1065,7 +1065,7 @@ mod win32 {
                         // The status pill: the design's pale blue wash.
                         Role::Pill => panel_draw::draw_pill(
                             mem,
-                            dev(run.at),
+                            fitted_pill(mem, fonts.pill, dev(run.at), &run.text),
                             &run.text,
                             fonts.pill,
                             crate::theme::BLUE_WASH,
@@ -1099,7 +1099,6 @@ mod win32 {
             let _ = GetClientRect(control, &mut rc);
 
             let hovered = HOVERED.load(Ordering::SeqCst) == ID_UNLOCK as isize;
-            let focused = GetFocus() == control;
 
             let mem = CreateCompatibleDC(hdc);
             let bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
@@ -1122,50 +1121,24 @@ mod win32 {
                     .unwrap_or_default();
                 // The design's deep blue, hovering to brand blue.
                 let skin = panel_draw::skin(PanelButton::Deep, hovered);
-                let l = super::layout();
                 let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                 // The card's ONLY button: Enter plainly presses it, so it
                 // carries no `ENTER` chip (the owner's call; the chip is kept
                 // for cards with a choice of buttons).
                 let hint: Option<(&str, windows::Win32::Graphics::Gdi::HFONT)> = None;
-                if focused {
-                    // **The ring is given LOGICAL size, from `layout`.** `rounded`
-                    // scales what it is handed, and `rc` came back from
-                    // `GetClientRect` in device pixels already.
-                    rounded(
-                        mem,
-                        Box2 { x: 0, y: 0, w: l.unlock.w, h: l.unlock.h },
-                        panel_draw::TALL_BUTTON_RADIUS + 1,
-                        crate::theme::FOCUS_RING,
-                    );
-                    let inner = RECT {
-                        left: whole.left + 2,
-                        top: whole.top + 2,
-                        right: whole.right - 2,
-                        bottom: whole.bottom - 2,
-                    };
-                    draw_button_with_shortcut(
-                        mem,
-                        inner,
-                        &label,
-                        fonts.button,
-                        skin,
-                        scale(panel_draw::TALL_BUTTON_RADIUS),
-                        hint,
-                        dpi,
-                    );
-                } else {
-                    draw_button_with_shortcut(
-                        mem,
-                        whole,
-                        &label,
-                        fonts.button,
-                        skin,
-                        scale(panel_draw::TALL_BUTTON_RADIUS),
-                        hint,
-                        dpi,
-                    );
-                }
+                // **No focus ring.** It is the card's only control and it always
+                // holds the focus, so a ring would be a permanent second border
+                // around the button -- which the design (D 1.6) does not have.
+                draw_button_with_shortcut(
+                    mem,
+                    whole,
+                    &label,
+                    fonts.button,
+                    skin,
+                    scale(panel_draw::TALL_BUTTON_RADIUS),
+                    hint,
+                    dpi,
+                );
             }
             drop(guard);
 
@@ -1175,6 +1148,18 @@ mod win32 {
             let _ = DeleteDC(mem);
             let _ = EndPaint(control, &ps);
         }
+    }
+
+    /// The pill's device rect, **as wide as its word and the design's 10 px
+    /// padding** (D 1.6: `pad 4x10`), right-aligned in the layout's box and
+    /// never wider than it. The box is the room a translation may take; a
+    /// fixed-width pill left "Locked" floating in a blue lozenge.
+    fn fitted_pill(hdc: HDC, font: HFONT, room: RECT, word: &str) -> RECT {
+        let chars: Vec<u16> = word.encode_utf16().collect();
+        let text_w = crate::win32_draw::text_width_utf16(hdc, font, &chars);
+        let w = panel_draw::pill_width(text_w, DPI_PERCENT.load(Ordering::SeqCst))
+            .min(room.right - room.left);
+        RECT { left: room.right - w, ..room }
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
@@ -1201,21 +1186,6 @@ mod win32 {
             FillRect(hdc, &rc, brush);
             let _ = DeleteObject(brush);
         }
-    }
-
-    fn rounded(hdc: HDC, at: Box2, radius: i32, fill_colour: eframe::egui::Color32) {
-        crate::win32_draw::aa_round_rect(
-            hdc,
-            RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()),
-            },
-            scale(radius),
-            rgb(fill_colour),
-            None,
-        );
     }
 
     /// One run of text, left-aligned, vertically centred, and **truncated with
