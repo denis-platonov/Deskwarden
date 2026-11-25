@@ -3244,7 +3244,14 @@ mod tests {
             // `winresource = "0.1"`. Same FNV-1a/64 implementation, first run against
             // the PREVIOUS pinned pair (31314, 0xf99c_5ac7_7f8b_c192), which it
             // reproduced.
-            (31308, 0xc49b_4ed3_01a8_77e5_u64),
+            //
+            // **31312 bytes, new hash: back to a `-dev` suffix after the 1.0.0
+            // release.** `version = "1.0.0"` became `"1.0.1-dev"`, 4 bytes longer,
+            // so a working-tree build stops claiming to BE the release. No
+            // dependency or table moved. Same FNV-1a/64 implementation, first run
+            // against the PREVIOUS pinned pair (31308, 0xc49b_4ed3_01a8_77e5), which it
+            // reproduced.
+            (31312, 0x0490_bf37_a6dd_382c_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
