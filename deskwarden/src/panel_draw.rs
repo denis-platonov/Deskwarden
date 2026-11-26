@@ -738,7 +738,14 @@ pub enum PanelButton {
     Outline,
     /// The Locked card's `#14307a`, hover `#1b3fa0`.
     Deep,
+    /// The design's danger button (spec section 1, `R.bt` with `danger`): an
+    /// outline button with `#b42318` text and a `#f0cfca` edge, hover
+    /// `#fdf3f2`. For the answer that deletes something.
+    Danger,
 }
+
+/// The edge of the [`PanelButton::Danger`] button (`#f0cfca`).
+pub const DANGER_EDGE_SOFT: Color32 = Color32::from_rgb(0xf0, 0xcf, 0xca);
 
 /// The [`ButtonSkin`] for `kind`, hovered or not.
 pub fn skin(kind: PanelButton, hovered: bool) -> ButtonSkin {
@@ -746,12 +753,23 @@ pub fn skin(kind: PanelButton, hovered: bool) -> ButtonSkin {
         PanelButton::Primary => ButtonSkin::panel_primary(),
         PanelButton::Outline => ButtonSkin::panel_outline(),
         PanelButton::Deep => ButtonSkin::panel_deep(),
+        PanelButton::Danger => {
+            // The outline skin with the danger ink and edge; its hover fill is
+            // set below, because `ButtonSkin`'s own is the outline's grey.
+            let mut skin = ButtonSkin::panel_outline();
+            skin.text = rgb(crate::theme::ERROR);
+            skin.border = Some(rgb(DANGER_EDGE_SOFT));
+            skin
+        }
     };
-    if hovered {
-        base.hovered()
-    } else {
-        base
+    if !hovered {
+        return base;
     }
+    let mut skin = base.hovered();
+    if kind == PanelButton::Danger {
+        skin.fill = rgb(crate::theme::DANGER_WASH);
+    }
+    skin
 }
 
 // ---------------------------------------------------------------------------
