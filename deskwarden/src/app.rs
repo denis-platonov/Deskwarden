@@ -2814,7 +2814,7 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: crate::prompt_card::show_prompt_card,
     show_recall: show_recall_card,
-    show_locked: crate::locked_card::show_locked_card,
+    show_locked: crate::unlock_prompt::for_locked_window,
     show_save_login: save_login_card::show_save_login_card,
     show_generate: crate::generate_prompt::show_generate_prompt,
 };
@@ -5692,7 +5692,7 @@ mod prompt_wiring_tests {
     /// for this one to be swapped with. What is left to pin is that 3b's field
     /// names the real function plainly, because `FnPresenter`'s forwarding
     /// test cannot see the struct literal it does not build.
-    const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "crate::locked_card::show_locked_card,");
+    const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "crate::unlock_prompt::for_locked_window,");
     /// `handle_match` asks [`super::match_disposition`] the question, and asks
     /// it about the value it was HANDED. `match_disposition(true)` -- the
     /// preference read out of the path, the prompt back on for everyone who
@@ -5799,10 +5799,10 @@ mod prompt_wiring_tests {
         let mutated = concat!("    show: ", "|_label, m, p, c| crate::prompt_card::show_prompt_card(\"\", m, p, c),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
 
-        let planted = concat!("    show_locked: ", "crate::locked_card::show_locked_card,");
+        let planted = concat!("    show_locked: ", "crate::unlock_prompt::for_locked_window,");
         assert_eq!(occurrences(planted, REAL_SHOW_LOCKED), 1, "planted: {planted}");
         let wrapped =
-            concat!("    show_locked: ", "|_label, p| crate::locked_card::show_locked_card(\"\", p),");
+            concat!("    show_locked: ", "|_label, p| crate::unlock_prompt::for_locked_window(\"\", p),");
         assert_eq!(occurrences(wrapped, REAL_SHOW_LOCKED), 0, "planted: {wrapped}");
 
         let planted = concat!("match match_disposition", "(prompt_on_match) {");

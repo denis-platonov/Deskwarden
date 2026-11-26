@@ -322,7 +322,60 @@ pub fn ask(data_dir: Option<std::path::PathBuf>) -> Outcome {
     set_profile_dir(data_dir);
     let outcome = run_with(&REAL);
     set_profile_dir(None);
+    forget_locked_window();
     outcome
+}
+
+/// **The locked card, answered with this prompt.** Design 1b's Locked panel
+/// is the card a user gets over a locked vault, and the card is where the
+/// password goes: there is no second window between pressing Ctrl+Alt+B and
+/// typing. So the presenter's `show_locked` lands here, records which app the
+/// prompt is for and where its field is, and answers `Unlock` at once -- which
+/// `run`'s loop turns into [`ask`], inside the one resettle sequence it has.
+/// [`ask`] then opens beside that field, naming that app.
+pub fn for_locked_window(
+    app_name: &str,
+    anchor: Option<(f32, f32)>,
+) -> crate::locked_card::LockedAnswer {
+    if let Ok(mut slot) = LOCKED_WINDOW.lock() {
+        *slot = Some((app_name.to_string(), anchor, std::time::Instant::now()));
+    }
+    crate::locked_card::LockedAnswer::Unlock
+}
+
+/// What [`for_locked_window`] recorded, for the [`ask`] that follows it.
+///
+/// **Only a fresh one.** The tray's own Unlock also opens this prompt, and a
+/// record that outlived the ask it was for (a resettle that never reached its
+/// closure) must not put another app's name on that one.
+static LOCKED_WINDOW: std::sync::Mutex<Option<LockedWindowRecord>> = std::sync::Mutex::new(None);
+
+/// The app's name, where its field is, and when that was recorded.
+type LockedWindowRecord = (String, Option<(f32, f32)>, std::time::Instant);
+
+fn locked_window() -> Option<(String, Option<(f32, f32)>)> {
+    let slot = LOCKED_WINDOW.lock().ok()?;
+    let (name, anchor, at) = slot.as_ref()?;
+    (at.elapsed() < std::time::Duration::from_secs(30)).then(|| (name.clone(), *anchor))
+}
+
+fn forget_locked_window() {
+    if let Ok(mut slot) = LOCKED_WINDOW.lock() {
+        *slot = None;
+    }
+}
+
+/// The card's two lines: the state, and what unlocking is for. With the app
+/// the card was raised over, the second names it; without one (the tray's
+/// Unlock) it says what an unlock gives back.
+pub fn prompt_text(app_name: Option<&str>) -> (String, String) {
+    match app_name {
+        Some(name) => crate::locked_card::locked_text(name),
+        None => (
+            crate::i18n::t("locked_card.title").to_string(),
+            crate::i18n::t("unlock_prompt.subtitle").to_string(),
+        ),
+    }
 }
 
 /// The profile directory the next [`ask`] runs `bw` against.
@@ -438,20 +491,24 @@ fn run_bw_unlock(password: &str) -> Result<String, String> {
 // agree with a first, which is this codebase's standing defect shape.
 // ---------------------------------------------------------------------------
 
-/// The card's width, and so the window's. `login_ui::LOGIN_CARD_WIDTH`.
-pub const WIDTH: i32 = 470;
+/// The card's width: design 1b's Locked panel, 410 -- the same card as every
+/// other panel the daemon puts beside a field.
+pub const WIDTH: i32 = crate::panel_draw::CARD_W;
 
-/// Content inset. `login_ui::CARD_MARGIN_X`.
-const MARGIN_X: i32 = 26;
-/// `login_ui::CARD_MARGIN_TOP`.
-const MARGIN_TOP: i32 = 24;
+/// D 1.6: `pad 18`, `gap 14`, and the title block's `gap 4`.
+const PAD: i32 = crate::panel_draw::PAD;
+const GAP: i32 = crate::panel_draw::BLOCK_GAP;
+const TITLE_GAP: i32 = 4;
+const TITLE_H: i32 = 26;
+const BODY_H: i32 = 22;
 
-/// The brand lockup's box. `login_ui::LOCKUP_MARK_SIZE` is 38x44 -- the mark's
-/// 24:28 artboard at 44 tall -- and the lockup is as tall as its mark.
-const LOCKUP_H: i32 = 44;
-const MARK_W: i32 = 38;
-/// `login_ui::LOCKUP_GAP_X`.
-const LOCKUP_GAP_X: i32 = 13;
+/// The password box: the panels' own control height and radius (46, r13).
+const FIELD_H: i32 = crate::panel_draw::BUTTON_H;
+const FIELD_RADIUS: i32 = crate::panel_draw::BUTTON_RADIUS;
+/// The Locked panel's tall button (D 1.6: `h54, r15`).
+const BUTTON_H: i32 = crate::panel_draw::TALL_BUTTON_H;
+/// The room the `Locked` pill may take; it is drawn as wide as its word.
+const PILL_ROOM: i32 = 120;
 
 /// One rectangle of the prompt, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,120 +530,61 @@ impl Box2 {
 
 /// Every rectangle the prompt paints, computed once.
 ///
-/// Pure arithmetic with no Win32 in it, so the height discipline below can be
-/// asserted without a window -- the same split the spike's `layout` subcommand
-/// used, and the same one `overlay_ui`'s height tests rest on. A control whose
-/// bottom edge fell past the window's would simply be invisible: this window
-/// does not scroll and cannot be resized.
+/// Pure arithmetic with no Win32 in it, so the height discipline can be
+/// asserted without a window. A control whose bottom edge fell past the
+/// window's would simply be invisible: this window does not scroll and cannot
+/// be resized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
     pub mark: Box2,
     pub wordmark: Box2,
-    pub tagline: Box2,
-    pub title: Box2,
-    pub subtitle: Box2,
-    pub card: Box2,
-    pub label: Box2,
-    pub field: Box2,
-    pub unlock: Box2,
-    pub cancel: Box2,
-    pub progress: Box2,
-    pub error: Box2,
+    pub pill: Box2,
     pub close_glyph: Box2,
+    pub title: Box2,
+    /// The body line -- and, after a refused attempt, the error in its place,
+    /// so the card never grows or reserves an empty row for one.
+    pub subtitle: Box2,
+    pub field: Box2,
+    pub progress: Box2,
+    pub unlock: Box2,
 }
 
-/// Field height. `theme::FIELD_HEIGHT`.
-const FIELD_H: i32 = 38;
-/// Button height. `theme::BUTTON_HEIGHT`.
-const BUTTON_H: i32 = 32;
-/// `login_ui::LABEL_GAP`.
-const LABEL_GAP: i32 = 7;
-/// `login_ui::GROUP_GAP`.
-const GROUP_GAP: i32 = 22;
-/// The card's own inner padding: design 3h's `Margin::same(16)`.
-const CARD_PAD: i32 = 16;
-
-/// The prompt's geometry.
-///
-/// **The window's height is fixed and includes the error line's row whether
-/// or not there is an error.** The egui card reflows when its error appears,
-/// which is right for a card inside a window that is already the right size.
-/// A top-level window that grew by 22px the moment a password was rejected
-/// would move its own buttons out from under the pointer at exactly the moment
-/// the user is about to click one again, so the room is reserved instead.
 /// Where the password `EDIT` sits inside the field box the parent paints:
-/// 10 in from each side, and 20 high, centred, so it stops as far above the
-/// box's bottom border as it starts below its top. It ran to the box's bottom
-/// edge before, and painted over the bottom of the blue focus border.
+/// 14 in from each side, and 20 high, centred, so it stops as far above the
+/// box's bottom border as it starts below its top and never paints over the
+/// focus border.
 pub fn password_child(field: Box2) -> Box2 {
     const TEXT_H: i32 = 20;
-    Box2 { x: field.x + 10, y: field.y + (field.h - TEXT_H) / 2, w: field.w - 20, h: TEXT_H }
+    Box2 { x: field.x + 14, y: field.y + (field.h - TEXT_H) / 2, w: field.w - 28, h: TEXT_H }
 }
 
+/// The prompt's geometry: design 1b's Locked panel, with the password box
+/// between its two lines and its button.
 pub fn layout() -> Layout {
-    let content_w = WIDTH - 2 * MARGIN_X;
+    let content_w = WIDTH - 2 * PAD;
 
-    let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: MARK_W, h: LOCKUP_H };
-    // The design's 25px wordmark on a `line-height: 1` box, with the 10px
-    // tagline 2px under it, the pair centred against the mark.
-    let text_x = mark.right() + LOCKUP_GAP_X;
-    let wordmark = Box2 { x: text_x, y: MARGIN_TOP + 6, w: content_w - MARK_W - LOCKUP_GAP_X, h: 25 };
-    let tagline = Box2 { x: text_x, y: wordmark.bottom() + 2, w: wordmark.w, h: 12 };
-
-    // `draw_login_window`: 14px under the lockup, then the heading pair.
-    let title = Box2 { x: MARGIN_X, y: mark.bottom() + 14, w: content_w, h: 25 };
-    let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: 18 };
-
-    let card_y = subtitle.bottom() + 14;
-    let card_inner_x = MARGIN_X + CARD_PAD;
-    let card_inner_w = content_w - 2 * CARD_PAD;
-
-    let label = Box2 { x: card_inner_x, y: card_y + CARD_PAD, w: card_inner_w, h: 16 };
-    let field = Box2 { x: card_inner_x, y: label.bottom() + LABEL_GAP, w: card_inner_w, h: FIELD_H };
-    let unlock = Box2 { x: card_inner_x, y: field.bottom() + GROUP_GAP, w: 124, h: BUTTON_H };
-    let cancel = Box2 { x: unlock.right() + 10, y: unlock.y, w: 88, h: BUTTON_H };
-    // The 3px track beside the button, `theme::BAR_HEIGHT` on
-    // `login_ui::AUTH_BAR_WIDTH`, vertically centred on the button row.
-    let progress = Box2 {
-        x: cancel.right() + 12,
-        y: unlock.y + (BUTTON_H - 3) / 2,
-        w: card_inner_x + card_inner_w - (cancel.right() + 12),
-        h: 3,
-    };
-    let card = Box2 {
-        x: MARGIN_X,
-        y: card_y,
-        w: content_w,
-        h: unlock.bottom() + CARD_PAD - card_y,
+    let lockup = crate::panel_draw::lockup();
+    let mark = Box2 { x: PAD, y: PAD, w: lockup.mark_w, h: lockup.mark_h };
+    let wordmark = Box2 { x: mark.right() + lockup.gap, y: PAD, w: lockup.word_w, h: lockup.mark_h };
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 { x: WIDTH - PAD - close, y: mark.y + (mark.h - close) / 2, w: close, h: close };
+    let pill = Box2 {
+        x: close_glyph.x - crate::panel_draw::BUTTON_GAP - PILL_ROOM,
+        y: mark.y + (mark.h - crate::panel_draw::PILL_H) / 2,
+        w: PILL_ROOM,
+        h: crate::panel_draw::PILL_H,
     };
 
-    // 6px under the card, which is `draw_login_window`'s own gap before its
-    // error label.
-    let error = Box2 { x: MARGIN_X, y: card.bottom() + 6, w: content_w, h: 17 };
-    // The bottom margin is deliberately smaller than the top. The top has to
-    // clear the brand lockup's optical weight; the bottom is closing a
-    // reserved row that is empty most of the time, and matching the top there
-    // leaves a band of nothing under the card that reads as a layout mistake.
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: error.bottom() + 16 };
-    let close_glyph = Box2 { x: WIDTH - 16 - 24, y: 14, w: 24, h: 24 };
+    let title = Box2 { x: PAD, y: mark.bottom() + GAP, w: content_w, h: TITLE_H };
+    let subtitle = Box2 { x: PAD, y: title.bottom() + TITLE_GAP, w: content_w, h: BODY_H };
+    let field = Box2 { x: PAD, y: subtitle.bottom() + GAP, w: content_w, h: FIELD_H };
+    // The 3px track in the gap under the box, inset past its corners.
+    let progress = Box2 { x: PAD + FIELD_RADIUS, y: field.bottom() + (GAP - 3) / 2, w: content_w - 2 * FIELD_RADIUS, h: 3 };
+    let unlock = Box2 { x: PAD, y: field.bottom() + GAP, w: content_w, h: BUTTON_H };
+    let window = Box2 { x: 0, y: 0, w: WIDTH, h: unlock.bottom() + PAD };
 
-    Layout {
-        window,
-        mark,
-        wordmark,
-        tagline,
-        title,
-        subtitle,
-        card,
-        label,
-        field,
-        unlock,
-        cancel,
-        progress,
-        error,
-        close_glyph,
-    }
+    Layout { window, mark, wordmark, pill, close_glyph, title, subtitle, field, progress, unlock }
 }
 
 // ---------------------------------------------------------------------------
@@ -665,7 +663,7 @@ mod win32 {
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
-        CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        CLEARTYPE_QUALITY, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID,
         SRCCOPY, TRANSPARENT,
     };
@@ -675,7 +673,7 @@ mod win32 {
         GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
         PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-        TranslateMessage, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
+        TranslateMessage, BN_CLICKED, BS_DEFPUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
         ES_AUTOHSCROLL, ES_PASSWORD, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE,
         SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
         WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONDOWN,
@@ -685,8 +683,7 @@ mod win32 {
 
     const ID_PASSWORD: usize = 101;
     const ID_UNLOCK: usize = 102;
-    const ID_CANCEL: usize = 103;
-
+    
     const CLASS_NAME: PCWSTR = w!("DeskwardenUnlockPrompt");
 
     /// The window's DPI as a percentage of 96, sampled once per open.
@@ -760,43 +757,35 @@ mod win32 {
     /// Every face the prompt paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
+        /// "Deskwarden" beside the mark, 15/800.
         wordmark: HFONT,
-        tagline: HFONT,
+        /// The `Locked` pill's word, 12/700.
+        pill: HFONT,
+        /// The title, 19/800, and the line under it, 15.
         title: HFONT,
         subtitle: HFONT,
-        label: HFONT,
+        /// What is typed, and the placeholder, 16.
         field: HFONT,
+        /// The *Unlock* button, 16/700.
         button: HFONT,
-        error: HFONT,
     }
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, EXTRABOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR};
             Fonts {
-                wordmark: font(EXTRABOLD, 25),
-                tagline: font(BOLD, 10),
-                title: font(BOLD, 19),
-                subtitle: font(REGULAR, 13),
-                label: font(REGULAR, 12),
-                field: font(REGULAR, 14),
-                button: font(SEMIBOLD, 13),
-                error: font(REGULAR, 12),
+                wordmark: font(EXTRABOLD, crate::panel_draw::WORD_PX),
+                pill: font(BOLD, crate::panel_draw::PILL_PX),
+                title: font(EXTRABOLD, crate::panel_draw::TITLE_PX),
+                subtitle: font(REGULAR, crate::panel_draw::BODY_PX),
+                field: font(REGULAR, 16),
+                button: font(BOLD, 16),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in [
-                    self.wordmark,
-                    self.tagline,
-                    self.title,
-                    self.subtitle,
-                    self.label,
-                    self.field,
-                    self.button,
-                    self.error,
-                ] {
+                for f in [self.wordmark, self.pill, self.title, self.subtitle, self.field, self.button] {
                     let _ = DeleteObject(f);
                 }
             }
@@ -814,7 +803,12 @@ mod win32 {
     /// over without losing the focus and keyboard behaviour that makes
     /// `IsDialogMessage` work.
     static UNLOCK_PROC: AtomicIsize = AtomicIsize::new(0);
-    static CANCEL_PROC: AtomicIsize = AtomicIsize::new(0);
+    /// The password `EDIT`'s original procedure: it is subclassed only to
+    /// paint the placeholder while it is empty.
+    static FIELD_PROC: AtomicIsize = AtomicIsize::new(0);
+    /// The app the card was raised over, for its second line. Empty for the
+    /// tray's Unlock.
+    static APP_NAME: Mutex<String> = Mutex::new(String::new());
     /// Which button the pointer is over, as a control id, or 0.
     static HOVERED: AtomicIsize = AtomicIsize::new(0);
 
@@ -847,11 +841,17 @@ mod win32 {
 
         let l = super::layout();
         let (w, h) = (scale(l.window.w), scale(l.window.h));
-        // Centred on the primary work area. Not on the foreground window: this
-        // prompt is answered by typing, and a password box that jumps around
-        // the desktop depending on which app happened to be in front is one
-        // the user has to hunt for.
-        let (x, y) = centred(w, h);
+        // Raised over a locked app, it opens where the locked card would have:
+        // beside the field the user was in. From the tray it has no field to
+        // stand beside, so it is centred on the work area.
+        let context = super::locked_window();
+        if let Ok(mut slot) = APP_NAME.lock() {
+            *slot = context.as_ref().map(|(name, _)| name.clone()).unwrap_or_default();
+        }
+        let (x, y) = match context.and_then(|(_, anchor)| anchor) {
+            Some(anchor) => crate::prompt_card::place(Some(anchor), work_area(), w, h),
+            None => centred(w, h),
+        };
 
         let window = unsafe {
             CreateWindowExW(
@@ -904,17 +904,11 @@ mod win32 {
             ID_UNLOCK,
             fonts.button,
         )?;
-        let cancel = child(
-            window,
-            w!("BUTTON"),
-            "&Cancel",
-            WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-            l.cancel,
-            ID_CANCEL,
-            fonts.button,
-        )?;
         subclass(unlock, &UNLOCK_PROC);
-        subclass(cancel, &CANCEL_PROC);
+        unsafe {
+            let previous = SetWindowLongPtrW(field, GWLP_WNDPROC, field_proc as *const () as isize);
+            FIELD_PROC.store(previous, Ordering::SeqCst);
+        }
 
         unsafe {
             let _ = ShowWindow(window, SW_SHOW);
@@ -1194,6 +1188,9 @@ mod win32 {
         if let Ok(mut line) = super::ERROR_LINE.lock() {
             line.clear();
         }
+        if let Ok(mut name) = APP_NAME.lock() {
+            name.clear();
+        }
     }
 
     // ---- plumbing ----------------------------------------------------------
@@ -1218,6 +1215,25 @@ mod win32 {
             y: b.y + top,
             w: b.w - left - right,
             h: b.h - top - bottom,
+        }
+    }
+
+    fn work_area() -> (i32, i32, i32, i32) {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+            };
+            let mut area = RECT::default();
+            let ok = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut area as *mut _ as *mut c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            if ok.is_err() || area.right <= area.left || area.bottom <= area.top {
+                return (0, 0, 1920, 1080);
+            }
+            (area.left, area.top, area.right, area.bottom)
         }
     }
 
@@ -1378,12 +1394,15 @@ mod win32 {
                 let id = (wparam.0 & 0xffff) as i32;
                 let notification = ((wparam.0 >> 16) & 0xffff) as u32;
                 // `IDOK` is what `IsDialogMessage` sends for Enter.
-                if id == ID_UNLOCK as i32 || id == IDOK.0 {
+                if (id == ID_UNLOCK as i32 && notification == BN_CLICKED) || id == IDOK.0 {
                     if !BUSY.load(Ordering::SeqCst) {
                         PENDING.store(PENDING_SUBMIT, Ordering::SeqCst);
                     }
-                } else if id == ID_CANCEL as i32 && notification == BN_CLICKED {
-                    PENDING.store(PENDING_CANCEL, Ordering::SeqCst);
+                } else if id == ID_PASSWORD as i32 && (notification == 0x0100 || notification == 0x0200) {
+                    // `EN_SETFOCUS` / `EN_KILLFOCUS`, which the `windows`
+                    // crate does not project under this crate's features.
+                    // The box's border follows the caret in and out.
+                    repaint(window);
                 }
                 LRESULT(0)
             }
@@ -1418,15 +1437,11 @@ mod win32 {
         lparam: LPARAM,
     ) -> LRESULT {
         let id = GetWindowLongPtrW(button, windows::Win32::UI::WindowsAndMessaging::GWLP_ID);
-        let original = if id == ID_UNLOCK as isize {
-            UNLOCK_PROC.load(Ordering::SeqCst)
-        } else {
-            CANCEL_PROC.load(Ordering::SeqCst)
-        };
+        let original = UNLOCK_PROC.load(Ordering::SeqCst);
         match msg {
             WM_ERASEBKGND => LRESULT(1),
             WM_PAINT => {
-                paint_button(button, id);
+                paint_button(button);
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
@@ -1494,8 +1509,8 @@ mod win32 {
             let _ = GetClientRect(window, &mut client);
             let (w, h) = (client.right, client.bottom);
 
-            // Double-buffered. A surface this dense repainted directly to the
-            // window flickers visibly on every keystroke.
+            // Double-buffered. A surface repainted directly to the window
+            // flickers visibly on every keystroke.
             let mem = CreateCompatibleDC(hdc);
             let bmp = CreateCompatibleBitmap(hdc, w, h);
             let old = SelectObject(mem, bmp);
@@ -1503,107 +1518,56 @@ mod win32 {
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
-            fill(mem, client, crate::theme::WINDOW_BG);
+            // The whole window is the card: design 1b's white panel.
+            fill(mem, client, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
             let l = super::layout();
-            paint_mark(mem, l.mark);
+            let busy = BUSY.load(Ordering::SeqCst);
 
             if let Some(fonts) = fonts {
-                // The wordmark, tracked in a little (-0.03em at 25px). GDI's
-                // tracking is a whole-pixel `SetTextCharacterExtra`, so this
-                // is the design's -0.75pt rounded to -1 -- an approximation,
-                // and named as one.
-                text(mem, fonts.wordmark, l.wordmark, "Deskwarden", crate::theme::INK, DT_LEFT, -1);
-                text(
+                crate::panel_draw::draw_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.wordmark);
+                let word = crate::locked_card::locked_pill();
+                crate::panel_draw::draw_pill(
                     mem,
-                    fonts.tagline,
-                    l.tagline,
-                    crate::i18n::t("unlock_prompt.tagline"),
-                    crate::theme::TEXT_FAINT,
-                    DT_LEFT,
-                    2,
+                    fitted_pill(mem, fonts.pill, dev(l.pill), word),
+                    word,
+                    fonts.pill,
+                    crate::theme::BLUE_WASH,
+                    crate::theme::BLUE_DEEP,
                 );
-                text(
-                    mem,
-                    fonts.title,
-                    l.title,
-                    crate::i18n::t("unlock_prompt.title"),
-                    crate::theme::INK,
-                    DT_LEFT,
-                    0,
-                );
-                text(
-                    mem,
-                    fonts.subtitle,
-                    l.subtitle,
-                    crate::i18n::t("unlock_prompt.subtitle"),
-                    crate::theme::TEXT_FAINT,
-                    DT_LEFT,
-                    0,
-                );
+
+                let name = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
+                let (title, body) = super::prompt_text((!name.is_empty()).then_some(name.as_str()));
+                text(mem, fonts.title, l.title, &title, crate::theme::INK, DT_LEFT | DT_END_ELLIPSIS, 0);
+                // A refused attempt says why in the body's place.
+                let line = super::error_line();
+                if line.is_empty() {
+                    text(mem, fonts.subtitle, l.subtitle, &body, crate::theme::TEXT_FAINT, DT_LEFT | DT_END_ELLIPSIS, 0);
+                } else {
+                    text(mem, fonts.subtitle, l.subtitle, &line, crate::theme::ERROR, DT_LEFT | DT_END_ELLIPSIS, 0);
+                }
             }
 
-            // The card.
-            rounded(
-                mem,
-                l.card,
-                10,
-                crate::theme::CARD,
-                Some((1, crate::theme::HAIRLINE)),
-            );
-
-            if let Some(fonts) = fonts {
-                text(
-                    mem,
-                    fonts.label,
-                    l.label,
-                    crate::i18n::t("unlock_prompt.label"),
-                    if BUSY.load(Ordering::SeqCst) {
-                        crate::theme::TEXT_GHOST
-                    } else {
-                        crate::theme::TEXT_MUTED
-                    },
-                    DT_LEFT,
-                    0,
-                );
-            }
-
-            // The field's box, and its focus halo. The `EDIT` itself is a
+            // The password box, and its focus halo. The `EDIT` itself is a
             // child sitting inside this.
             let focused = handle_of(GetFocus());
             let field_focused = GetDlgItem(window, ID_PASSWORD as i32)
                 .map(|f| handle_of(f) == focused)
                 .unwrap_or(false);
             if field_focused {
-                // `expand(2)` under a 3px stroke, which is design 3h's
-                // `box-shadow: 0 0 0 3px #dbe4f7` sitting flush against the
-                // border's outer edge.
-                rounded(
-                    mem,
-                    inset(l.field, -2, -2, -2, -2),
-                    9,
-                    crate::theme::FOCUS_RING,
-                    None,
-                );
+                rounded(mem, inset(l.field, -3, -3, -3, -3), super::FIELD_RADIUS + 3, crate::theme::FOCUS_RING, None);
             }
             rounded(
                 mem,
                 l.field,
-                8,
+                super::FIELD_RADIUS,
                 crate::theme::CARD,
                 Some((1, if field_focused { crate::theme::BLUE } else { crate::theme::BORDER_STRONG })),
             );
 
-            if BUSY.load(Ordering::SeqCst) {
+            if busy {
                 paint_progress(mem, l.progress);
-            }
-
-            let line = super::error_line();
-            if !line.is_empty() {
-                if let Some(fonts) = fonts {
-                    text(mem, fonts.error, l.error, &line, crate::theme::ERROR, DT_LEFT, 0);
-                }
             }
 
             paint_close_glyph(mem, l.close_glyph);
@@ -1617,70 +1581,57 @@ mod win32 {
         }
     }
 
-    fn paint_button(button: HWND, id: isize) {
-        use crate::win32_draw::{draw_button, ButtonSkin};
+    fn dev(b: Box2) -> RECT {
+        RECT { left: scale(b.x), top: scale(b.y), right: scale(b.right()), bottom: scale(b.bottom()) }
+    }
 
+    /// The pill's device rect, as wide as its word and the design's 10 px
+    /// padding, right-aligned in the layout's room for it.
+    fn fitted_pill(hdc: HDC, font: HFONT, room: RECT, word: &str) -> RECT {
+        let chars: Vec<u16> = word.encode_utf16().collect();
+        let text_w = crate::win32_draw::text_width_utf16(hdc, font, &chars);
+        let w = crate::panel_draw::pill_width(text_w, DPI_PERCENT.load(Ordering::SeqCst))
+            .min(room.right - room.left);
+        RECT { left: room.right - w, ..room }
+    }
+
+    /// The *Unlock* button: design 1b's deep-blue tall button.
+    fn paint_button(button: HWND) {
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(button, &mut ps);
             let mut rc = RECT::default();
             let _ = GetClientRect(button, &mut rc);
 
-            let primary = id == ID_UNLOCK as isize;
-            let hovered = HOVERED.load(Ordering::SeqCst) == id;
-            let disabled = primary && BUSY.load(Ordering::SeqCst);
+            let hovered = HOVERED.load(Ordering::SeqCst) == ID_UNLOCK as isize;
+            let busy = BUSY.load(Ordering::SeqCst);
             let focused = GetFocus() == button;
-
-            // `ButtonSkin::primary`/`secondary` are the two looks this app
-            // has; `hovered` and `disabled` are states layered on top of
-            // whichever one applies, not a third and fourth palette.
-            let skin = if primary {
-                let skin = ButtonSkin::primary();
-                if disabled {
-                    skin.disabled()
-                } else if hovered {
-                    skin.hovered()
-                } else {
-                    skin
-                }
-            } else {
-                let skin = ButtonSkin::secondary();
-                if hovered { skin.hovered() } else { skin }
-            };
+            let skin = crate::panel_draw::skin(crate::panel_draw::PanelButton::Deep, hovered && !busy);
+            let skin = if busy { skin.disabled() } else { skin };
 
             let mem = CreateCompatibleDC(hdc);
             let bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
             let old = SelectObject(mem, bmp);
-            // The button is drawn over the card it sits on, so its own
-            // "background" is the card's white -- otherwise the rounded
-            // corners show system grey through them.
+            // Drawn over the card it sits on, so the rounded corners show the
+            // card's white rather than system grey.
             fill(mem, rc, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
             let whole = RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom };
-            let radius = scale(7);
-            let label = if primary { crate::i18n::t("unlock_prompt.unlock") } else { crate::i18n::t("unlock_prompt.cancel") };
+            let radius = scale(crate::panel_draw::TALL_BUTTON_RADIUS);
+            let label = crate::i18n::t("unlock_prompt.unlock");
 
             let guard = FONTS.lock();
             let font = guard.as_ref().ok().and_then(|s| s.as_ref()).map(|fonts| fonts.button);
             if let Some(font) = font {
+                // A ring only when the keyboard has really moved here: the
+                // caret starts in the password box, so this is Tab's doing.
                 if focused {
-                    rounded(
-                        mem,
-                        Box2 { x: 0, y: 0, w: rc.right, h: rc.bottom },
-                        8,
-                        crate::theme::FOCUS_RING,
-                        None,
-                    );
-                    let inner = RECT {
-                        left: whole.left + 2,
-                        top: whole.top + 2,
-                        right: whole.right - 2,
-                        bottom: whole.bottom - 2,
-                    };
-                    draw_button(mem, inner, label, font, skin, radius);
+                    crate::win32_draw::aa_round_rect(mem, whole, radius + scale(1), rgb(crate::theme::FOCUS_RING), None);
+                    let inner = RECT { left: 2, top: 2, right: rc.right - 2, bottom: rc.bottom - 2 };
+                    crate::win32_draw::draw_button(mem, inner, label, font, skin, radius);
                 } else {
-                    draw_button(mem, whole, label, font, skin, radius);
+                    crate::win32_draw::draw_button(mem, whole, label, font, skin, radius);
                 }
             }
             drop(guard);
@@ -1693,24 +1644,48 @@ mod win32 {
         }
     }
 
-    /// The brand mark, from `theme`'s own geometry and fills.
-    ///
-    /// **The painter itself lives in [`crate::win32_draw::draw_mark`] now.**
-    /// This window's copy was the crate's only GDI shield, and the four cards
-    /// ported after it went without one rather than grow a second; it moved
-    /// there so all five draw the same mark. What stays here is the one thing
-    /// that is this window's own: turning its logical [`Box2`] into the device
-    /// rect the shared painter takes.
-    fn paint_mark(hdc: HDC, at: Box2) {
-        crate::win32_draw::draw_mark(
-            hdc,
-            RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()),
-            },
-        );
+    /// The password `EDIT`, subclassed for one thing: while it is empty it
+    /// shows its placeholder, painted over the control's own (empty) paint.
+    /// `EM_SETCUEBANNER` would do this, but only under comctl32 v6, which this
+    /// executable has no manifest for.
+    unsafe extern "system" fn field_proc(field: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        let original = FIELD_PROC.load(Ordering::SeqCst);
+        let result = if original == 0 {
+            DefWindowProcW(field, msg, wparam, lparam)
+        } else {
+            CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(original)),
+                field,
+                msg,
+                wparam,
+                lparam,
+            )
+        };
+        if msg == WM_PAINT && SendMessageW(field, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)).0 == 0 {
+            let guard = FONTS.lock();
+            if let Some(font) = guard.as_ref().ok().and_then(|s| s.as_ref()).map(|f| f.field) {
+                let dc = GetDC(field);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(field, &mut rc);
+                let old = SelectObject(dc, font);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, rgb(crate::theme::TEXT_GHOST));
+                // Past the caret's own column.
+                rc.left += scale(2);
+                crate::win32_draw::draw_text(
+                    dc,
+                    crate::i18n::t("unlock_prompt.label"),
+                    &mut rc,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                );
+                SelectObject(dc, old);
+                ReleaseDC(field, dc);
+            }
+        }
+        result
     }
 
     /// The 3px indeterminate track, `theme::paint_progress_bar`'s proportions
@@ -2217,22 +2192,18 @@ mod tests {
         let boxes = [
             ("mark", l.mark),
             ("wordmark", l.wordmark),
-            ("tagline", l.tagline),
+            ("pill", l.pill),
+            ("close_glyph", l.close_glyph),
             ("title", l.title),
             ("subtitle", l.subtitle),
-            ("card", l.card),
-            ("label", l.label),
             ("field", l.field),
-            ("unlock", l.unlock),
-            ("cancel", l.cancel),
             ("progress", l.progress),
-            ("error", l.error),
-            ("close_glyph", l.close_glyph),
+            ("unlock", l.unlock),
         ];
         // Positive control: the list is not empty and the window is not
         // degenerate, so the loop below is a real check rather than a vacuous
         // one over zero rows.
-        assert_eq!(boxes.len(), 13);
+        assert_eq!(boxes.len(), 9);
         assert!(l.window.w > 0 && l.window.h > 0, "{:?}", l.window);
 
         for (name, b) in boxes {
@@ -2264,49 +2235,52 @@ mod tests {
         assert_eq!(edit.y - l.field.y, l.field.bottom() - edit.bottom(), "centred top to bottom");
     }
 
-    /// The card really contains the controls it is drawn around.
-    ///
-    /// The card is painted as one rounded rectangle and the controls are
-    /// positioned independently, so nothing but arithmetic keeps the button
-    /// from hanging off the white panel it is supposed to sit on -- which is
-    /// exactly the class of defect a person spots in a second and no unit test
-    /// in this crate could see.
+    /// The card's blocks stack top to bottom without touching: header, the
+    /// two lines, the password box, then the button -- design 1b's Locked
+    /// panel with the box between its text and its button.
     #[test]
-    fn the_card_contains_the_controls_it_is_drawn_around() {
+    fn the_blocks_stack_in_the_designs_order() {
         let l = layout();
-        for (name, b) in [("label", l.label), ("field", l.field), ("unlock", l.unlock), ("cancel", l.cancel)] {
-            assert!(b.x >= l.card.x, "`{name}` starts left of the card");
-            assert!(b.right() <= l.card.right(), "`{name}` runs past the card's right edge");
-            assert!(b.y >= l.card.y, "`{name}` sits above the card");
-            assert!(
-                b.bottom() <= l.card.bottom(),
-                "`{name}` hangs off the bottom of the card ({} > {})",
-                b.bottom(),
-                l.card.bottom()
-            );
+        let order = [("header", l.mark), ("title", l.title), ("subtitle", l.subtitle), ("field", l.field), ("unlock", l.unlock)];
+        for pair in order.windows(2) {
+            let ((a, above), (b, below)) = (pair[0], pair[1]);
+            assert!(above.bottom() <= below.y, "`{a}` runs into `{b}`: {above:?} / {below:?}");
         }
-        // And the error line is OUTSIDE it, under the card, which is where
-        // design 3h puts it.
-        assert!(l.error.y >= l.card.bottom(), "the error line is inside the card");
+        // The bar runs in the gap under the box, never over the button.
+        assert!(l.progress.y >= l.field.bottom() && l.progress.bottom() <= l.unlock.y);
+        // The pill sits between the wordmark and the close glyph.
+        assert!(l.pill.x >= l.wordmark.right() && l.pill.right() <= l.close_glyph.x);
     }
 
-    /// The window is as wide as the login card, because it IS that card.
-    ///
-    /// Read off `login_ui`'s own value would be better still; that constant is
-    /// private, so this pins the number and says where it came from. A change
-    /// on either side is then a visible disagreement rather than a silent one.
+    /// The card is the panels' card: their width, padding, control heights.
     #[test]
-    fn the_prompt_is_the_width_of_the_login_card() {
-        assert_eq!(WIDTH, 470, "design 3h's LOGIN_CARD_WIDTH");
+    fn the_prompt_is_the_panels_card() {
+        assert_eq!(WIDTH, crate::panel_draw::CARD_W);
         assert_eq!(layout().window.w, WIDTH);
+        let l = layout();
+        assert_eq!(l.field.h, crate::panel_draw::BUTTON_H);
+        assert_eq!(l.unlock.h, crate::panel_draw::TALL_BUTTON_H);
+        assert_eq!(l.field.w, WIDTH - 2 * crate::panel_draw::PAD);
+        assert_eq!(l.unlock.w, l.field.w);
+        assert_eq!(l.window.bottom() - l.unlock.bottom(), crate::panel_draw::PAD);
     }
 
-    /// The measurements this surface borrows really are the app's, not
-    /// numbers that happen to look like them.
+    /// The locked path records the app and answers `Unlock` at once, the
+    /// record names that app on the prompt, and an ask clears it so the
+    /// tray's own Unlock never inherits another app's name.
     #[test]
-    fn the_field_and_button_heights_are_the_apps_own() {
-        assert_eq!(FIELD_H as f32, crate::theme::FIELD_HEIGHT);
-        assert_eq!(BUTTON_H as f32, crate::theme::BUTTON_HEIGHT);
+    fn the_locked_path_opens_this_prompt_for_its_app() {
+        assert_eq!(
+            for_locked_window("Ledgerline Desktop", Some((10.0, 20.0))),
+            crate::locked_card::LockedAnswer::Unlock
+        );
+        assert_eq!(locked_window(), Some(("Ledgerline Desktop".to_string(), Some((10.0, 20.0)))));
+        let (_, body) = prompt_text(Some("Ledgerline Desktop"));
+        assert!(body.contains("Ledgerline Desktop"), "{body}");
+        forget_locked_window();
+        assert_eq!(locked_window(), None);
+        let (_, tray_body) = prompt_text(None);
+        assert!(!tray_body.contains("Ledgerline"), "{tray_body}");
     }
 
     /// The title is unique, which is what keeps `foreground::pick`'s `find`

@@ -26,6 +26,10 @@ fn main() {
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
 
     let capturable = std::env::args().any(|arg| arg == "--capturable");
+    // `--app` opens it as the locked path does: beside a field, naming the app.
+    if std::env::args().any(|arg| arg == "--app") {
+        let _ = unlock_prompt::for_locked_window("Ledgerline Desktop", Some((320.0, 240.0)));
+    }
     let outcome = if std::env::args().any(|arg| arg == "--real") {
         eprintln!("running the REAL prompt: this will spawn `bw unlock`");
         unlock_prompt::ask(None)
