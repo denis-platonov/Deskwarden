@@ -12085,9 +12085,11 @@ mod tests {
             // 368 - 3 - 65 - 24 = 276 (206 selected); the search rows 285;
             // the footer buttons 180 less their chip lane; hints 202.
             b("picker.search_title", "Archivo-ExtraBold", 19, 368),
-            b("picker.empty_title", "Archivo-ExtraBold", 19, 368),
+            // The No-match card (D 1.5) is 410 wide with pad 18: 374; its two
+            // buttons are (374 - 8) / 2 = 183 less their 20 px of padding.
+            b("picker.nomatch_title", "Archivo-ExtraBold", 19, 374),
             b("picker.search_sub", "Archivo-Regular", 15, 368),
-            b("picker.empty_body", "Archivo-Regular", 15, 368),
+            b("picker.nomatch_body", "Archivo-Regular", 15, 374),
             b("picker.send_all", "Archivo-Bold", 16, 206),
             b("picker.send_sequence", "Archivo-Bold", 16, 206),
             b("picker.send_all_sub", "Archivo-Regular", 14, 206),
@@ -12100,8 +12102,8 @@ mod tests {
             b("picker.overflow_sub", "Archivo-Regular", 14, 285),
             b("picker.nothing_title", "Archivo-Bold", 16, 285),
             b("picker.nothing_sub", "Archivo-Regular", 14, 285),
-            b("picker.new_login", "Archivo-Bold", 15, 152),
-            b("picker.search_vault", "Archivo-Bold", 15, 340),
+            b("picker.save_new_login", "Archivo-Bold", 15, 163),
+            b("picker.search_vault", "Archivo-Bold", 15, 163),
             // generate_prompt: 410 - 36 = 374; see the painter for each cell.
             b("generate.new_password", "Archivo-ExtraBold", 19, 350),
             b("generate.suggested", "Archivo-Regular", 15, 286),
@@ -12223,7 +12225,7 @@ mod tests {
             "unlock_prompt.tagline", "picker.send_", "locked_card.body", "unlock_prompt.subtitle",
         ];
         PROSE.iter().any(|needle| key.contains(needle))
-            || matches!(key, "picker.overflow_title" | "picker.nothing_title" | "picker.search_sub" | "picker.empty_body")
+            || matches!(key, "picker.overflow_title" | "picker.nothing_title" | "picker.search_sub" | "picker.nomatch_body")
     }
 
     /// The `(top, bottom)` of the ink of every drawn glyph in a galley, one
