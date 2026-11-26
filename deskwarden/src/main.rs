@@ -15727,7 +15727,7 @@ mod tests {
     #[test]
     fn the_system_message_box_is_only_the_fallback_when_the_card_cannot_open() {
         let raw = include_str!("main.rs").replace("\r\n", "\n");
-        let production = raw.split(concat!("\n#[cfg(", "test)]\nmod tests {")).next().unwrap();
+        let production = raw.split(concat!("\n#[cfg(", "test)]\nmod ", "tests {")).next().unwrap();
         let code: String = production
             .lines()
             .map(|line| line.split("//").next().unwrap_or(""))
