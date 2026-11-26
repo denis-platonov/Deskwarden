@@ -8,8 +8,19 @@
 //! rejected as "not DW native modal": it was the one surface on the fill path
 //! that did not look like this app. This card replaces it, in the style of the
 //! account picker's "What should I type?" card: the DESKWARDEN lockup, a bold
-//! title, the refusal sentence, one *OK* button carrying its `ENTER` chip, and
-//! the ✕.
+//! title, the refusal sentence, one *OK* button, and the ✕.
+//!
+//! # One card for every message the app puts in front of the user
+//!
+//! The same card now also stands in for every stock `MessageBoxW` the app
+//! used to raise (`main.rs`'s `message_box`): an OK-only [`Notice::info`] with
+//! a caller-given title and body, and a two-button [`Notice::ask`] whose
+//! answer comes back as [`Outcome::Accepted`] / [`Outcome::Declined`]. The
+//! safe answer is always the negative one: Escape, the ✕ and the window going
+//! away all decline, and a card that defaults to *No* focuses the decline
+//! button so a stray Enter declines too. Only when the card cannot open
+//! ([`Outcome::Unavailable`]) does the caller fall back to the system box, so a
+//! startup failure is never silent.
 //!
 //! # Why bare Win32 and not egui
 //!
@@ -55,8 +66,13 @@ pub struct NoticeWindow(pub isize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     /// *OK*, Enter, Escape or the ✕. A notice has one answer, so every way of
-    /// giving it is the same event.
+    /// giving it is the same event. On an [`Notice::ask`] card it is the
+    /// negative answer: Escape and the ✕ decline.
     Dismiss,
+    /// The accept button of an ask card was pressed.
+    Accept,
+    /// The decline button of an ask card was pressed.
+    Decline,
     /// The window went away underneath the pump. Treated exactly as `Dismiss`.
     Closed,
 }
@@ -64,17 +80,66 @@ pub enum Event {
 /// How [`run_with`] finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
+    /// A notice (one button) was acknowledged.
     Dismissed,
+    /// An ask card was answered with its accept button.
+    Accepted,
+    /// An ask card was declined: its decline button, Escape, the ✕, or the
+    /// window going away.
+    Declined,
     /// The window could not be put on screen. Nothing was shown; the refusal
     /// is still in the log, where `show_refusal` wrote it first.
     Unavailable,
 }
 
+/// The second half of a confirm card: its two button labels and which one is
+/// the default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ask {
+    /// The primary button (left): "Remove", "Yes", "OK".
+    pub accept: String,
+    /// The outline button (right): "Cancel", "No".
+    pub decline: String,
+    /// The accept button is painted as the design's danger button, for an
+    /// answer that deletes something.
+    pub danger: bool,
+    /// Which button holds the focus when the card opens, and so which one a
+    /// bare Enter presses. `false` is the safe default: Enter declines.
+    pub default_accept: bool,
+}
+
 /// What one card says: a short title, and the refusal as a sentence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
-    pub title: &'static str,
+    /// Empty when the card needs none -- see [`Notice::info`].
+    pub title: String,
     pub body: String,
+    /// `None` for a notice with its one *OK*; `Some` for a confirm card.
+    pub ask: Option<Ask>,
+}
+
+impl Notice {
+    /// An OK-only card. A title that is only the app's name is dropped: the
+    /// header's wordmark already says it, and "Deskwarden" twice in three
+    /// lines is noise.
+    pub fn info(title: &str, body: &str) -> Self {
+        let title = title.trim();
+        let title = if title == crate::panel_draw::WORDMARK { "" } else { title };
+        Notice { title: title.to_string(), body: body.to_string(), ask: None }
+    }
+
+    /// A two-button card; see [`Ask`].
+    pub fn ask(title: &str, body: &str, ask: Ask) -> Self {
+        Notice { ask: Some(ask), ..Self::info(title, body) }
+    }
+
+    /// The card's shape, for [`layout`].
+    pub fn shape(&self) -> Shape {
+        Shape {
+            two_buttons: self.ask.is_some(),
+            title_lines: if self.title.is_empty() { 0 } else { 1 },
+        }
+    }
 }
 
 /// The Win32 half, as `fn` pointers so [`run_with`] can be driven without a
@@ -107,11 +172,13 @@ pub fn run_with(calls: &NoticeCalls, notice: &Notice) -> Outcome {
         );
     }
     // One `next`, not a loop: every `Event` it can return closes the card.
-    match (calls.next)(window) {
-        Event::Dismiss | Event::Closed => {
-            (calls.close)(window);
-            Outcome::Dismissed
-        }
+    let event = (calls.next)(window);
+    (calls.close)(window);
+    match (event, notice.ask.is_some()) {
+        (Event::Accept, true) => Outcome::Accepted,
+        // Every other way out of an ask card is the safe, negative answer.
+        (_, true) => Outcome::Declined,
+        (_, false) => Outcome::Dismissed,
     }
 }
 
@@ -164,12 +231,13 @@ pub fn notice_for(detail: &str) -> Notice {
         Some(rest) => (stopped_title(), rest.trim_start()),
         None => (nothing_typed_title(), detail),
     };
+    let title = title.to_string();
     let heading = format!("{}. ", crate::vault_window::preflight::refused_heading());
     let rest = rest.strip_prefix(heading.as_str()).unwrap_or(rest);
     // The refusal is written in English (it is a log line too); the card says
     // it in the language in force, or as it arrived if it is not one we know.
     let body = crate::injector::words::localize(rest).unwrap_or_else(|| rest.to_string());
-    Notice { title, body: sentence(&body) }
+    Notice { title, body: sentence(&body), ask: None }
 }
 
 /// `text`, trimmed, with a capital first letter and a closing full stop.
@@ -213,14 +281,36 @@ pub fn event_for_key(virtual_key: u16, held: bool) -> Option<Event> {
     }
 }
 
+/// **Which keys answer an ask card.** Escape is the negative answer. Enter
+/// presses whichever button holds the focus, so a card that opens with *No*
+/// focused (the default for everything destructive) is declined by a stray
+/// Return; with the focus on neither button Enter declines. A key already
+/// held answers nothing, for the reason [`event_for_key`] gives.
+pub fn event_for_ask_key(virtual_key: u16, held: bool, accept_focused: bool) -> Option<Event> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+    if held {
+        return None;
+    }
+    if virtual_key == VK_ESCAPE.0 {
+        Some(Event::Dismiss)
+    } else if virtual_key == VK_RETURN.0 {
+        Some(if accept_focused { Event::Accept } else { Event::Decline })
+    } else {
+        None
+    }
+}
+
 /// What kind of run a [`Painted`] is, which is what the painter reads to pick
 /// its font and its colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Title,
     Body,
-    /// The *OK* button's label. Painted by the control, with its chip.
+    /// The first button's label (*OK*, or an ask card's accept). Painted by
+    /// the control.
     Button,
+    /// An ask card's decline button's label. Painted by the control.
+    Decline,
 }
 
 /// One run of text the card paints, and where.
@@ -233,13 +323,21 @@ pub struct Painted {
 
 /// **Every word this card paints, with the box it is painted in** -- the one
 /// list the painter and the tests both read, as in `crate::locked_card`.
-pub fn painted(notice: &Notice, body_text_h: i32) -> Vec<Painted> {
-    let l = layout(body_text_h);
-    vec![
-        Painted { text: notice.title.to_string(), at: l.title, role: Role::Title },
-        Painted { text: notice.body.clone(), at: l.body_text, role: Role::Body },
-        Painted { text: ok_label().to_string(), at: l.ok, role: Role::Button },
-    ]
+pub fn painted(notice: &Notice, body_text_h: i32, shape: Shape) -> Vec<Painted> {
+    let l = layout(body_text_h, shape);
+    let mut runs = Vec::new();
+    if !notice.title.is_empty() {
+        runs.push(Painted { text: notice.title.clone(), at: l.title, role: Role::Title });
+    }
+    runs.push(Painted { text: notice.body.clone(), at: l.body_text, role: Role::Body });
+    match (&notice.ask, l.decline) {
+        (Some(ask), Some(decline)) => {
+            runs.push(Painted { text: ask.accept.clone(), at: l.accept, role: Role::Button });
+            runs.push(Painted { text: ask.decline.clone(), at: decline, role: Role::Decline });
+        }
+        _ => runs.push(Painted { text: ok_label().to_string(), at: l.accept, role: Role::Button }),
+    }
+    runs
 }
 
 /// Puts the notice on screen and returns when the user has dismissed it.
@@ -247,9 +345,15 @@ pub fn painted(notice: &Notice, body_text_h: i32) -> Vec<Painted> {
 /// **Blocks**, which is why its one production caller is the thread
 /// `crate::injector::sequence::show_refusal` spawns for it.
 pub fn show_notice(detail: &str) {
-    let notice = notice_for(detail);
+    let _ = show(&notice_for(detail));
+}
+
+/// **Shows any card and blocks until it is answered**, on the calling thread,
+/// behind any card already up. [`Outcome::Unavailable`] means nothing was
+/// shown and the caller must say it some other way.
+pub fn show(notice: &Notice) -> Outcome {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = run_with(&REAL, &notice);
+    run_with(&REAL, notice)
 }
 
 /// Held for as long as a card is on screen. See the module doc.
@@ -274,25 +378,38 @@ pub const WIDTH: i32 = crate::panel_draw::CARD_W;
 const MARGIN_X: i32 = crate::panel_draw::PAD;
 const MARGIN_TOP: i32 = crate::panel_draw::PAD;
 
-/// The body well's padding around its text.
-const BODY_PAD_X: i32 = 12;
-const BODY_PAD_Y: i32 = 10;
-
-/// One line of body text, at 100%, in the body's 13 px face.
+/// One line of body text, at 100%, in the body's 15 px face.
 pub const BODY_LINE_H: i32 = 20;
 
 /// The fewest lines the body is sized for, and the most. Every refusal this
-/// app writes fits in five; past eight the text is cut at a whole line
-/// rather than growing a window that cannot scroll off the screen.
+/// app writes fits in five, but the confirm cards carry whole paragraphs (the
+/// account removal's warning, the unrecognised CLI's explanation), and a
+/// destructive warning cut off at its last line would be worse than a tall
+/// card; past 24 lines the text is cut at a whole line rather than growing a
+/// window that cannot scroll off the screen.
 pub const MIN_BODY_LINES: i32 = 1;
-pub const MAX_BODY_LINES: i32 = 8;
+pub const MAX_BODY_LINES: i32 = 24;
 
 /// Button height: `crate::theme::BUTTON_HEIGHT`.
 const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
 
-/// The *OK* button's width: the word and its `ENTER` chip, with the padding a
-/// pill needs.
-const OK_W: i32 = 140;
+/// The title's row: 19/800 on a 25 px line, as `unlock_prompt`'s.
+const TITLE_H: i32 = 25;
+/// Between the title and the body (spec D 1.5: "Title block gap 4").
+const TITLE_GAP: i32 = 4;
+
+/// The most lines a title wraps to before it is cut with an ellipsis.
+pub const MAX_TITLE_LINES: i32 = 2;
+
+/// What a card has on it besides the header and the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    /// Two equal buttons (accept, decline) instead of one full-width *OK*.
+    pub two_buttons: bool,
+    /// How many lines the title takes: 0 for none, 1 usually, at most
+    /// [`MAX_TITLE_LINES`] for a title too long for one.
+    pub title_lines: i32,
+}
 
 /// Every rectangle the card paints, computed once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,16 +417,16 @@ pub struct Layout {
     pub window: Box2,
     pub mark: Box2,
     pub wordmark: Box2,
+    /// Zero-height when the card has no title.
     pub title: Box2,
     pub close_glyph: Box2,
-    pub header_rule: Box2,
-    /// The tinted well the refusal sits in.
-    pub body: Box2,
-    /// The refusal's own box inside the well, word-wrapped.
+    /// The body's own box, word-wrapped, straight on the card (the design has
+    /// no well behind it).
     pub body_text: Box2,
-    pub footer_rule: Box2,
-    pub footer: Box2,
-    pub ok: Box2,
+    /// The *OK*, or an ask card's accept button.
+    pub accept: Box2,
+    /// An ask card's decline button.
+    pub decline: Option<Box2>,
 }
 
 /// **How tall the body's text is, in logical pixels**, from what GDI measured
@@ -330,9 +447,11 @@ pub fn body_height(measured_device_h: i32, dpi_percent: i32) -> i32 {
 
 /// **The card's geometry, for a body `body_text_h` logical pixels tall.**
 ///
-/// The only thing about this card that varies is how long its sentence is, so
-/// that is the only argument; it is clamped exactly as [`body_height`] clamps.
-pub fn layout(body_text_h: i32) -> Layout {
+/// Spec D 1.5's anatomy, which is `unlock_prompt`'s: pad 18, gap 14, the
+/// lockup and the ✕ on the header row, the title (19/800) and the body (15)
+/// four apart, then the buttons (h46, gap 8) with `PAD` under them. Its height
+/// follows the body, which is clamped exactly as [`body_height`] clamps.
+pub fn layout(body_text_h: i32, shape: Shape) -> Layout {
     let body_text_h =
         body_text_h.clamp(MIN_BODY_LINES * BODY_LINE_H, MAX_BODY_LINES * BODY_LINE_H);
     let content_w = WIDTH - 2 * MARGIN_X;
@@ -348,47 +467,35 @@ pub fn layout(body_text_h: i32) -> Layout {
         w: close,
         h: close,
     };
-    let title = Box2 {
-        x: MARGIN_X,
-        y: mark.bottom() + crate::panel_draw::BLOCK_GAP,
-        w: content_w - 24,
-        h: 26,
-    };
-    let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
 
-    let body = Box2 {
-        x: MARGIN_X,
-        y: header_rule.bottom() + 12,
-        w: content_w,
-        h: body_text_h + 2 * BODY_PAD_Y,
+    let top = mark.bottom() + crate::panel_draw::BLOCK_GAP;
+    let (title, body_y) = if shape.title_lines > 0 {
+        let lines = shape.title_lines.min(MAX_TITLE_LINES);
+        let title = Box2 { x: MARGIN_X, y: top, w: content_w, h: TITLE_H * lines };
+        (title, title.bottom() + TITLE_GAP)
+    } else {
+        (Box2 { x: MARGIN_X, y: top, w: content_w, h: 0 }, top)
     };
-    let body_text = Box2 {
-        x: body.x + BODY_PAD_X,
-        y: body.y + BODY_PAD_Y,
-        w: body.w - 2 * BODY_PAD_X,
-        h: body_text_h,
+    let body_text = Box2 { x: MARGIN_X, y: body_y, w: content_w, h: body_text_h };
+
+    let buttons_y = body_text.bottom() + crate::panel_draw::BLOCK_GAP;
+    let (accept, decline) = if shape.two_buttons {
+        let gap = crate::panel_draw::BUTTON_GAP;
+        let first_w = (content_w - gap) / 2;
+        let first = Box2 { x: MARGIN_X, y: buttons_y, w: first_w, h: BUTTON_H };
+        let second = Box2 {
+            x: first.right() + gap,
+            y: buttons_y,
+            w: content_w - gap - first_w,
+            h: BUTTON_H,
+        };
+        (first, Some(second))
+    } else {
+        (Box2 { x: MARGIN_X, y: buttons_y, w: content_w, h: BUTTON_H }, None)
     };
+    let window = Box2 { x: 0, y: 0, w: WIDTH, h: accept.bottom() + MARGIN_TOP };
 
-    let footer_rule = Box2 { x: 0, y: body.bottom() + 12, w: WIDTH, h: 1 };
-    let ok = Box2 { x: WIDTH - MARGIN_X - OK_W, y: footer_rule.bottom() + 8, w: OK_W, h: BUTTON_H };
-    let height = ok.bottom() + 8;
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: height };
-    let footer =
-        Box2 { x: 0, y: footer_rule.bottom(), w: WIDTH, h: height - footer_rule.bottom() };
-
-    Layout {
-        window,
-        mark,
-        wordmark,
-        title,
-        close_glyph,
-        header_rule,
-        body,
-        body_text,
-        footer_rule,
-        footer,
-        ok,
-    }
+    Layout { window, mark, wordmark, title, close_glyph, body_text, accept, decline }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +582,7 @@ static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 static PENDING: std::sync::Mutex<Option<Event>> = std::sync::Mutex::new(None);
 
 /// What the card on screen says, and how tall its body was measured.
-static SHOWN: std::sync::Mutex<Option<(Notice, i32)>> = std::sync::Mutex::new(None);
+static SHOWN: std::sync::Mutex<Option<(Notice, i32, Shape)>> = std::sync::Mutex::new(None);
 
 /// # Every pixel is painted by hand, through `crate::win32_draw`
 ///
@@ -483,7 +590,7 @@ static SHOWN: std::sync::Mutex<Option<(Notice, i32)>> = std::sync::Mutex::new(No
 /// `BUTTON` child for focus, Space and Tab, with its painting handed to
 /// [`crate::win32_draw`] so this card cannot drift from the palette. GDI only.
 mod win32 {
-    use super::{Event, Notice, Painted, Role, GONE, NOTICE_CARD_TITLE, PENDING, SHOWN};
+    use super::{Event, Notice, Role, GONE, NOTICE_CARD_TITLE, PENDING, SHOWN};
     use crate::prompt_card::Box2;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -515,6 +622,8 @@ mod win32 {
     use crate::win32_draw::{draw_button_with_shortcut, draw_text, rgb};
 
     const ID_OK: usize = 101;
+    /// An ask card's decline button.
+    const ID_NO: usize = 102;
     const CLASS_NAME: PCWSTR = w!("DeskwardenAutofillNoticeCard");
 
     /// The system DPI as a percentage of 96, sampled once per open --
@@ -607,9 +716,9 @@ mod win32 {
         fn skin(&self, role: Role) -> (HFONT, eframe::egui::Color32, DRAW_TEXT_FORMAT) {
             let line = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
             match role {
-                Role::Title => (self.title, crate::theme::INK, line),
-                Role::Body => (self.body, crate::theme::CAUTION_INK, body_format()),
-                Role::Button => (self.button, crate::theme::INK, line),
+                Role::Title => (self.title, crate::theme::INK, title_format()),
+                Role::Body => (self.body, crate::theme::TEXT_FAINT, body_format()),
+                Role::Button | Role::Decline => (self.button, crate::theme::INK, line),
             }
         }
     }
@@ -621,6 +730,12 @@ mod win32 {
     /// `DT_NOPREFIX`: an `&` in a refusal is an ampersand, never a mnemonic.
     fn body_format() -> DRAW_TEXT_FORMAT {
         DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX
+    }
+
+    /// The title's flags: wrapped at word breaks, cut with an ellipsis only
+    /// past [`super::MAX_TITLE_LINES`].
+    fn title_format() -> DRAW_TEXT_FORMAT {
+        DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
     }
 
     static FONTS: Mutex<Option<Fonts>> = Mutex::new(None);
@@ -669,13 +784,23 @@ mod win32 {
         // **Sized to the sentence.** The body is measured with the face and
         // the flags it will be painted with, at the width it will be painted
         // into, and the window is laid out around that.
-        let measured = measure(&notice.body, body_font, scale(super::layout(0).body_text.w));
+        let content_w = scale(super::layout(0, notice.shape()).body_text.w);
+        let measured = measure(&notice.body, body_font, content_w, body_format());
         let body_h = super::body_height(measured, DPI_PERCENT.load(Ordering::SeqCst));
+        // The title wraps to a second line rather than being cut short.
+        let mut shape = notice.shape();
+        if shape.title_lines > 0 {
+            let title_font = FONTS.lock().ok()?.as_ref().map(|f| f.title)?;
+            let title_h = measure(&notice.title, title_font, content_w, title_format());
+            let line_h = scale(super::TITLE_H);
+            shape.title_lines = ((title_h + line_h - 1) / line_h.max(1))
+                .clamp(1, super::MAX_TITLE_LINES);
+        }
         if let Ok(mut slot) = SHOWN.lock() {
-            *slot = Some((notice.clone(), body_h));
+            *slot = Some((notice.clone(), body_h, shape));
         }
 
-        let l = super::layout(body_h);
+        let l = super::layout(body_h, shape);
         let (w, h) = (scale(l.window.w), scale(l.window.h));
         // Centred on the work area, slightly high -- where the account
         // picker's card opens, and where every OS prompt puts itself. The
@@ -718,10 +843,22 @@ mod win32 {
         else {
             return abandon(window);
         };
-        let Some(control) = child(window, l.ok, ID_OK, button_font) else {
+        let Some(accept) = child(window, l.accept, ID_OK, button_font) else {
             return abandon(window);
         };
-        subclass(control);
+        subclass(accept);
+        let mut focus = accept;
+        if let Some(decline_at) = l.decline {
+            let Some(decline) = child(window, decline_at, ID_NO, button_font) else {
+                return abandon(window);
+            };
+            subclass(decline);
+            // The safe default: a card that defaults to *No* opens with the
+            // decline button focused, so a stray Enter declines.
+            if !notice.ask.as_ref().is_some_and(|ask| ask.default_accept) {
+                focus = decline;
+            }
+        }
 
         unsafe {
             let _ = ShowWindow(window, SW_SHOW);
@@ -729,19 +866,19 @@ mod win32 {
             // topmost card the user clicks. Never asked for again: see the
             // module doc.
             let _ = SetForegroundWindow(window);
-            let _ = SetFocus(control);
+            let _ = SetFocus(focus);
         }
 
         Some(super::NoticeWindow(window.0 as isize))
     }
 
     /// The body's height in device pixels, as `DrawTextW` lays it out.
-    fn measure(body: &str, font: HFONT, width: i32) -> i32 {
+    fn measure(body: &str, font: HFONT, width: i32, format: DRAW_TEXT_FORMAT) -> i32 {
         unsafe {
             let dc = GetDC(None);
             let old = SelectObject(dc, font);
             let mut rc = RECT { left: 0, top: 0, right: width, bottom: 0 };
-            let height = draw_text(dc, body, &mut rc, body_format() | DT_CALCRECT);
+            let height = draw_text(dc, body, &mut rc, format | DT_CALCRECT);
             SelectObject(dc, old);
             ReleaseDC(None, dc);
             height.max(rc.bottom - rc.top)
@@ -781,6 +918,7 @@ mod win32 {
     /// [`super::event_for_key`] before `IsDialogMessageW` sees them.
     pub(super) fn next(window: super::NoticeWindow) -> Event {
         let top = hwnd(window.0);
+        let asking = shown().0.ask.is_some();
         loop {
             if GONE.load(Ordering::SeqCst) {
                 return Event::Closed;
@@ -799,7 +937,15 @@ mod win32 {
                     if msg.message == WM_KEYDOWN {
                         // Bit 30 of a key message: the key was down before.
                         let held = (msg.lParam.0 >> 30) & 1 == 1;
-                        if let Some(event) = super::event_for_key(msg.wParam.0 as u16, held) {
+                        let key = if asking {
+                            // Enter presses whichever button has the focus.
+                            let accept_focused = GetDlgItem(top, ID_OK as i32)
+                                .is_ok_and(|accept| GetFocus() == accept);
+                            super::event_for_ask_key(msg.wParam.0 as u16, held, accept_focused)
+                        } else {
+                            super::event_for_key(msg.wParam.0 as u16, held)
+                        };
+                        if let Some(event) = key {
                             return event;
                         }
                         if held {
@@ -1026,14 +1172,14 @@ mod win32 {
         }
     }
 
-    /// The runs the paint path draws, and the body height they were laid out
-    /// for.
-    fn shown() -> (Vec<Painted>, i32) {
+    /// The card on screen, and the body height it was laid out for.
+    fn shown() -> (Notice, i32, super::Shape) {
         let held = SHOWN.lock().ok().and_then(|slot| slot.clone());
-        let (notice, body_h) = held.unwrap_or_else(|| {
-            (Notice { title: super::nothing_typed_title(), body: String::new() }, 0)
-        });
-        (super::painted(&notice, body_h), body_h)
+        held.unwrap_or_else(|| {
+            let notice = Notice::info(super::nothing_typed_title(), "");
+            let shape = notice.shape();
+            (notice, 0, shape)
+        })
     }
 
     fn register_class() {
@@ -1130,8 +1276,10 @@ mod win32 {
             WM_MOUSEMOVE => {
                 if HOVERED.swap(0, Ordering::SeqCst) != 0 {
                     repaint(window);
-                    if let Ok(control) = GetDlgItem(window, ID_OK as i32) {
-                        repaint(control);
+                    for id in [ID_OK, ID_NO] {
+                        if let Ok(control) = GetDlgItem(window, id as i32) {
+                            repaint(control);
+                        }
                     }
                 }
                 LRESULT(0)
@@ -1139,8 +1287,13 @@ mod win32 {
             WM_COMMAND => {
                 let id = wparam.0 & 0xffff;
                 let notification = ((wparam.0 >> 16) & 0xffff) as u32;
-                if notification == BN_CLICKED && id == ID_OK {
-                    set_pending(Event::Dismiss);
+                if notification == BN_CLICKED {
+                    let asking = shown().0.ask.is_some();
+                    if id == ID_OK {
+                        set_pending(if asking { Event::Accept } else { Event::Dismiss });
+                    } else if id == ID_NO {
+                        set_pending(Event::Decline);
+                    }
                 }
                 LRESULT(0)
             }
@@ -1196,7 +1349,8 @@ mod win32 {
     /// The ✕'s rect in DEVICE pixels, read by the hit test and the click
     /// alike so the two can never disagree.
     fn close_glyph_rect() -> RECT {
-        let l = super::layout(shown().1);
+        let (_, body_h, shape) = shown();
+        let l = super::layout(body_h, shape);
         dev(l.close_glyph)
     }
 
@@ -1231,25 +1385,22 @@ mod win32 {
             let bmp = CreateCompatibleBitmap(hdc, w, h);
             let old = SelectObject(mem, bmp);
 
-            let (runs, body_h) = shown();
-            let l = super::layout(body_h);
+            let (notice, body_h, shape) = shown();
+            let runs = super::painted(&notice, body_h, shape);
+            let l = super::layout(body_h, shape);
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
-            // Design 1b's panels have no rules and no tinted footer; the layout
-            // keeps those slots as spacing and nothing is painted in them.
+            // Design 1b's panels have no rules, no tinted footer and no well
+            // behind the body: the words sit straight on the card.
             fill_rect(mem, client, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
-
-            // The well: the theme's caution wash and edge, which is what the
-            // message box's yellow triangle was saying.
-            rounded(mem, l.body, 12, crate::theme::CAUTION_WASH, crate::theme::CAUTION_EDGE);
 
             if let Some(fonts) = fonts {
                 crate::panel_draw::draw_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.brand);
                 for run in &runs {
-                    if run.role == Role::Button {
-                        // The control paints its own.
+                    if matches!(run.role, Role::Button | Role::Decline) {
+                        // The controls paint their own.
                         continue;
                     }
                     let (face, ink, format) = fonts.skin(run.role);
@@ -1268,7 +1419,8 @@ mod win32 {
         }
     }
 
-    /// The *OK* button, with its `ENTER` chip inside it.
+    /// One button: the *OK*, or an ask card's accept (primary, or the design's
+    /// danger skin) or decline (outline).
     fn paint_control(control: HWND) {
         unsafe {
             let mut ps = PAINTSTRUCT::default();
@@ -1276,7 +1428,9 @@ mod win32 {
             let mut rc = RECT::default();
             let _ = GetClientRect(control, &mut rc);
 
-            let hovered = HOVERED.load(Ordering::SeqCst) == ID_OK as isize;
+            let id = GetWindowLongPtrW(control, windows::Win32::UI::WindowsAndMessaging::GWLP_ID);
+            let is_decline = id == ID_NO as isize;
+            let hovered = HOVERED.load(Ordering::SeqCst) == id;
             let focused = GetFocus() == control;
 
             let mem = CreateCompatibleDC(hdc);
@@ -1292,23 +1446,34 @@ mod win32 {
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
-                let (runs, body_h) = shown();
-                let label = runs
+                let (notice, body_h, shape) = shown();
+                let wanted = if is_decline { Role::Decline } else { Role::Button };
+                let label = super::painted(&notice, body_h, shape)
                     .into_iter()
-                    .find(|r| r.role == Role::Button)
+                    .find(|r| r.role == wanted)
                     .map(|r| r.text)
                     .unwrap_or_default();
-                let skin = crate::panel_draw::skin(crate::panel_draw::PanelButton::Primary, hovered);
-                // The card's ONLY button: Enter plainly presses it, so it
-                // carries no `ENTER` chip (the owner's call; the chip is kept
-                // for cards with a choice of buttons).
+                let kind = if is_decline {
+                    crate::panel_draw::PanelButton::Outline
+                } else if notice.ask.as_ref().is_some_and(|ask| ask.danger) {
+                    crate::panel_draw::PanelButton::Danger
+                } else {
+                    crate::panel_draw::PanelButton::Primary
+                };
+                let skin = crate::panel_draw::skin(kind, hovered);
+                // No `ENTER` chip: Enter presses the focused button and the
+                // focus ring says which (the owner's call).
                 let hint: Option<(&str, windows::Win32::Graphics::Gdi::HFONT)> = None;
                 let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                 if focused {
                     // The ring in LOGICAL size, from `layout`: `rounded`
                     // scales what it is handed.
-                    let ok = super::layout(body_h).ok;
-                    let ring = Box2 { x: 0, y: 0, w: ok.w, h: ok.h };
+                    let l = super::layout(body_h, shape);
+                    let at = match (is_decline, l.decline) {
+                        (true, Some(decline)) => decline,
+                        _ => l.accept,
+                    };
+                    let ring = Box2 { x: 0, y: 0, w: at.w, h: at.h };
                     rounded(
                         mem,
                         ring,
@@ -1586,6 +1751,52 @@ mod tests {
         assert_eq!(CLOSED.load(Ordering::SeqCst), 0, "a window that never opened was closed");
     }
 
+    fn ask_card(default_accept: bool) -> Notice {
+        Notice::ask(
+            "Remove account",
+            "Sure?",
+            Ask { accept: "Yes".into(), decline: "No".into(), danger: false, default_accept },
+        )
+    }
+
+    /// **An ask card answers yes only to its accept button.** Every other way
+    /// out -- Escape or the ✕ (`Dismiss`), a decline, the window going away --
+    /// is the negative answer.
+    #[test]
+    fn an_ask_card_is_accepted_only_by_its_accept_button() {
+        let outcome = |next: fn(NoticeWindow) -> Event| {
+            run_with(&NoticeCalls { next, ..inert() }, &ask_card(false))
+        };
+        assert_eq!(outcome(|_| Event::Accept), Outcome::Accepted);
+        assert_eq!(outcome(|_| Event::Decline), Outcome::Declined);
+        assert_eq!(outcome(|_| Event::Dismiss), Outcome::Declined);
+        assert_eq!(outcome(|_| Event::Closed), Outcome::Declined);
+        // A one-button notice has no negative answer.
+        let notice = Notice::info("t", "b");
+        for event in [Event::Dismiss, Event::Closed, Event::Accept] {
+            static EVENT: std::sync::Mutex<Option<Event>> = std::sync::Mutex::new(None);
+            *EVENT.lock().unwrap() = Some(event);
+            let calls = NoticeCalls { next: |_| EVENT.lock().unwrap().unwrap(), ..inert() };
+            assert_eq!(run_with(&calls, &notice), Outcome::Dismissed);
+        }
+    }
+
+    /// Enter presses the focused button, Escape declines, a held key does
+    /// nothing -- so a card opened on *No* is declined by a stray Return.
+    #[test]
+    fn enter_presses_the_focused_button_and_escape_declines() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_ESCAPE, VK_RETURN, VK_TAB};
+        assert_eq!(event_for_ask_key(VK_RETURN.0, false, true), Some(Event::Accept));
+        assert_eq!(event_for_ask_key(VK_RETURN.0, false, false), Some(Event::Decline));
+        assert_eq!(event_for_ask_key(VK_ESCAPE.0, false, true), Some(Event::Dismiss));
+        assert_eq!(event_for_ask_key(VK_ESCAPE.0, false, false), Some(Event::Dismiss));
+        assert_eq!(event_for_ask_key(VK_RETURN.0, true, true), None);
+        assert_eq!(event_for_ask_key(VK_ESCAPE.0, true, false), None);
+        for other in [VK_TAB, VK_A] {
+            assert_eq!(event_for_ask_key(other.0, false, true), None);
+        }
+    }
+
     #[test]
     fn the_card_is_opened_with_the_notice_it_was_given() {
         static SEEN: std::sync::Mutex<Option<Notice>> = std::sync::Mutex::new(None);
@@ -1617,47 +1828,86 @@ mod tests {
         assert_eq!(body_height(10_000, 100), MAX_BODY_LINES * BODY_LINE_H);
     }
 
-    /// **Nothing the card lays out falls off it, at any body height.**
+    const SHAPES: [Shape; 5] = [
+        Shape { two_buttons: false, title_lines: 1 },
+        Shape { two_buttons: false, title_lines: 0 },
+        Shape { two_buttons: true, title_lines: 1 },
+        Shape { two_buttons: true, title_lines: 2 },
+        Shape { two_buttons: true, title_lines: 0 },
+    ];
+
+    /// **Nothing the card lays out falls off it, at any body height and in
+    /// every shape**, and it is the spec D 1.5 anatomy: pad 18, gap 14, title
+    /// and body 4 apart, h46 buttons 8 apart.
     #[test]
     fn nothing_the_card_lays_out_falls_off_it() {
-        let mut previous_height = 0;
-        for lines in MIN_BODY_LINES..=MAX_BODY_LINES {
-            let l = layout(lines * BODY_LINE_H);
-            assert_eq!((l.window.x, l.window.y, l.window.w), (0, 0, WIDTH));
-            assert!(l.window.h > previous_height, "a longer body did not grow the card");
-            previous_height = l.window.h;
+        for shape in SHAPES {
+            let mut previous_height = 0;
+            for lines in MIN_BODY_LINES..=MAX_BODY_LINES {
+                let l = layout(lines * BODY_LINE_H, shape);
+                assert_eq!((l.window.x, l.window.y, l.window.w), (0, 0, WIDTH));
+                assert!(l.window.h > previous_height, "a longer body did not grow the card");
+                previous_height = l.window.h;
 
-            assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
-            assert!(l.wordmark.right() <= l.close_glyph.x, "the wordmark runs under the ✕");
-            assert!(l.wordmark.bottom() <= l.title.y);
-            assert!(l.title.right() <= l.close_glyph.x);
-            assert!(l.close_glyph.right() <= WIDTH - MARGIN_X);
-            assert!(l.title.bottom() <= l.header_rule.y);
-            assert!(l.header_rule.bottom() <= l.body.y);
-            assert_eq!((l.body.x, l.body.right()), (MARGIN_X, WIDTH - MARGIN_X));
-            assert!(l.body_text.x > l.body.x && l.body_text.right() < l.body.right());
-            assert!(l.body_text.y > l.body.y && l.body_text.bottom() < l.body.bottom());
-            assert_eq!(l.body_text.h, lines * BODY_LINE_H);
-            assert!(l.body.bottom() <= l.footer_rule.y);
-            assert_eq!(l.footer.y, l.footer_rule.bottom());
-            assert_eq!(l.footer.bottom(), l.window.bottom());
-            assert!(l.ok.y >= l.footer.y);
-            assert_eq!(l.ok.right(), WIDTH - MARGIN_X, "OK is not on the footer's right margin");
-            assert_eq!(l.ok.bottom() + 8, l.window.bottom(), "the card is not sized to its footer");
+                assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
+                assert!(l.wordmark.right() <= l.close_glyph.x, "the wordmark runs under the ✕");
+                assert!(l.wordmark.bottom() <= l.title.y);
+                assert!(l.close_glyph.right() <= WIDTH - MARGIN_X);
+                assert_eq!((l.title.x, l.title.right()), (MARGIN_X, WIDTH - MARGIN_X));
+                assert_eq!(l.title.h, TITLE_H * shape.title_lines, "the title row does not follow the title");
+                assert!(l.title.bottom() <= l.body_text.y);
+                if shape.title_lines > 0 {
+                    assert_eq!(l.body_text.y, l.title.bottom() + 4, "title and body are not 4 apart");
+                }
+                assert_eq!((l.body_text.x, l.body_text.right()), (MARGIN_X, WIDTH - MARGIN_X));
+                assert_eq!(l.body_text.h, lines * BODY_LINE_H);
+                assert_eq!(l.accept.y, l.body_text.bottom() + 14, "the buttons are not a gap under the body");
+                assert_eq!(l.accept.h, BUTTON_H);
+                assert_eq!(l.accept.x, MARGIN_X);
+                assert_eq!(l.window.bottom(), l.accept.bottom() + MARGIN_X, "the card is not padded under its buttons");
+                match l.decline {
+                    Some(decline) => {
+                        assert!(shape.two_buttons);
+                        assert_eq!(decline.y, l.accept.y);
+                        assert_eq!(decline.h, BUTTON_H);
+                        assert_eq!(decline.x, l.accept.right() + 8, "the buttons are not 8 apart");
+                        assert_eq!(decline.right(), WIDTH - MARGIN_X);
+                        assert!((decline.w - l.accept.w).abs() <= 1, "the buttons are not equal");
+                    }
+                    None => {
+                        assert!(!shape.two_buttons);
+                        assert_eq!(l.accept.right(), WIDTH - MARGIN_X, "the OK is not full width");
+                    }
+                }
+            }
+            // Outside the range, the layout is the range's ends.
+            assert_eq!(layout(0, shape), layout(MIN_BODY_LINES * BODY_LINE_H, shape));
+            assert_eq!(layout(i32::MAX / 4, shape), layout(MAX_BODY_LINES * BODY_LINE_H, shape));
+            // And the measuring width `open` uses is the width painted into.
+            assert_eq!(
+                layout(0, shape).body_text.w,
+                layout(MAX_BODY_LINES * BODY_LINE_H, shape).body_text.w
+            );
         }
-        // Outside the range, the layout is the range's ends.
-        assert_eq!(layout(0), layout(MIN_BODY_LINES * BODY_LINE_H));
-        assert_eq!(layout(i32::MAX / 4), layout(MAX_BODY_LINES * BODY_LINE_H));
-        // And the measuring width `open` uses is the width painted into.
-        assert_eq!(layout(0).body_text.w, layout(MAX_BODY_LINES * BODY_LINE_H).body_text.w);
+    }
+
+    /// The card is the same shape as the reference `unlock_prompt` card where
+    /// the two share anatomy: its header, its margins, its gap.
+    #[test]
+    fn the_header_matches_the_reference_new_look_card() {
+        let l = layout(BODY_LINE_H, SHAPES[0]);
+        assert_eq!((l.mark.x, l.mark.y), (crate::panel_draw::PAD, crate::panel_draw::PAD));
+        assert_eq!(l.title.y, l.mark.bottom() + crate::panel_draw::BLOCK_GAP);
+        assert_eq!(l.accept.h, crate::panel_draw::BUTTON_H);
+        assert_eq!(WIDTH, crate::panel_draw::CARD_W);
     }
 
     #[test]
     fn every_word_this_card_paints_is_inside_its_window() {
         let notice = notice_for(PREFLIGHT);
         for lines in [MIN_BODY_LINES, 3, MAX_BODY_LINES] {
-            let l = layout(lines * BODY_LINE_H);
-            let runs = painted(&notice, lines * BODY_LINE_H);
+            let l = layout(lines * BODY_LINE_H, notice.shape());
+            let runs = painted(&notice, lines * BODY_LINE_H, notice.shape());
             let roles: Vec<Role> = runs.iter().map(|r| r.role).collect();
             assert_eq!(roles, vec![Role::Title, Role::Body, Role::Button]);
             for run in &runs {
@@ -1673,6 +1923,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An ask card paints both labels, in the roles the controls read; a title
+    /// that is only the app's name is not painted twice.
+    #[test]
+    fn an_ask_card_paints_both_labels_and_the_app_name_is_not_a_title() {
+        let ask = Ask {
+            accept: "Remove".into(),
+            decline: "Cancel".into(),
+            danger: true,
+            default_accept: false,
+        };
+        let notice = Notice::ask("Deskwarden: remove account", "Sure?", ask.clone());
+        let runs = painted(&notice, BODY_LINE_H, notice.shape());
+        let roles: Vec<Role> = runs.iter().map(|r| r.role).collect();
+        assert_eq!(roles, vec![Role::Title, Role::Body, Role::Button, Role::Decline]);
+        assert_eq!(runs[2].text, "Remove");
+        assert_eq!(runs[3].text, "Cancel");
+        let l = layout(BODY_LINE_H, notice.shape());
+        assert_eq!(runs[3].at, l.decline.expect("two buttons"));
+
+        let bare = Notice::ask("Deskwarden", "Sure?", ask);
+        assert_eq!(bare.title, "", "the wordmark already says Deskwarden");
+        assert!(!painted(&bare, BODY_LINE_H, bare.shape()).iter().any(|r| r.role == Role::Title));
+        assert_eq!(Notice::info("Deskwarden", "x").ask, None);
+        assert_eq!(Notice::info("Deskwarden: x", "x").title, "Deskwarden: x");
     }
 
     #[test]
@@ -1728,6 +2004,19 @@ mod tests {
         assert!(body.contains("SW_SHOWNOACTIVATE"));
         assert!(!body.contains("SetForegroundWindow("), "the done card asks for the foreground");
         assert!(!body.contains("SetFocus("), "the done card asks for the keyboard");
+    }
+
+    #[test]
+    fn the_danger_skin_is_the_designs_outline_danger_button() {
+        use crate::panel_draw::{skin, PanelButton};
+        use crate::win32_draw::rgb;
+        let rest = skin(PanelButton::Danger, false);
+        assert_eq!(rest.text, rgb(crate::theme::ERROR));
+        assert_eq!(rest.border, Some(rgb(crate::panel_draw::DANGER_EDGE_SOFT)));
+        assert_eq!(rest.fill, rgb(crate::theme::CARD));
+        assert_eq!(skin(PanelButton::Danger, true).fill, rgb(crate::theme::DANGER_WASH));
+        // The other skins are untouched by the addition.
+        assert_eq!(skin(PanelButton::Outline, true).fill, rgb(crate::theme::WINDOW_BG));
     }
 
     #[test]

@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 use tray_icon::menu::{MenuEvent, MenuId};
 use windows::core::HSTRING;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
+    GetForegroundWindow, MessageBoxW, IDNO, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO, MESSAGEBOX_RESULT,
     MESSAGEBOX_STYLE,
 };
@@ -4228,17 +4228,87 @@ fn unlock_asked_for(follow_up: &NoMatchFollowUp) -> bool {
     }
 }
 
-/// Shows a native message box.
+/// Puts a message in front of the user, on Deskwarden's own card
+/// (`notice_card`: header, title, body, the design's buttons), and blocks until
+/// it is answered. `MB_OK` styles get one *OK*; `MB_YESNO` styles get *Yes* /
+/// *No*, with *No* focused when the style says `MB_DEFBUTTON2`.
 ///
-/// The only user-visible channel that exists this early. Everything in this
-/// process is either a tray icon (not yet built at startup-check time) or an
-/// egui window (which needs an event loop this code hasn't reached), and the
-/// GUI subsystem means `eprintln!` goes nowhere at all -- so a plain
-/// `MessageBoxW` is the one mechanism that can actually put words in front of
-/// the user before anything else exists. `MB_SETFOREGROUND | MB_SYSTEMMODAL`
-/// because this fires during login-time autostart, when whatever the shell is
-/// doing would otherwise bury it.
+/// The one channel that exists this early: everything else in this process is
+/// either a tray icon (not yet built at startup-check time) or an egui window
+/// (which needs an event loop this code hasn't reached), and the GUI subsystem
+/// means `eprintln!` goes nowhere at all. The card is bare Win32 on the
+/// calling thread, so it can be raised before anything else exists, and it
+/// blocks like the box it replaced -- the callers that go on to
+/// `std::process::exit` rely on that.
 fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    message_box_asking(title, text, style, None)
+}
+
+/// [`message_box`] with the two answers' labels chosen by the caller (`Remove`
+/// / `Cancel` rather than `Yes` / `No`). `ask` only matters for `MB_YESNO`.
+fn message_box_asking(
+    title: &str,
+    text: &str,
+    style: MESSAGEBOX_STYLE,
+    ask: Option<deskwarden::notice_card::Ask>,
+) -> MESSAGEBOX_RESULT {
+    let notice = card_for_style(title, text, style, ask);
+    match message_box_answer(deskwarden::notice_card::show(&notice)) {
+        Some(answer) => answer,
+        // The card could not open (no window station, out of GDI handles...).
+        // A startup failure must never be silent, so the system box says it.
+        None => native_message_box(title, text, style),
+    }
+}
+
+/// **The card a `MessageBox` style asks for.** `MB_OK` is a notice with its one
+/// button; `MB_YESNO` is an ask card -- *Yes* / *No* unless the caller gave its
+/// own labels -- that opens on *No* when the style says `MB_DEFBUTTON2`, so a
+/// stray Return answers what the box's default did.
+fn card_for_style(
+    title: &str,
+    text: &str,
+    style: MESSAGEBOX_STYLE,
+    ask: Option<deskwarden::notice_card::Ask>,
+) -> deskwarden::notice_card::Notice {
+    use deskwarden::notice_card::{Ask, Notice};
+    if style.0 & 0xF != MB_YESNO.0 {
+        return Notice::info(title, text);
+    }
+    // `MB_DEFBUTTON1` is the absence of any default bit; the caller's own
+    // labels keep the default the style names.
+    let default_accept = style.0 & 0xF00 == 0;
+    let ask = match ask {
+        Some(ask) => Ask { default_accept, ..ask },
+        None => Ask {
+            accept: deskwarden::i18n::t("notice_card.yes").to_string(),
+            decline: deskwarden::i18n::t("notice_card.no").to_string(),
+            danger: false,
+            default_accept,
+        },
+    };
+    Notice::ask(title, text, ask)
+}
+
+/// What a card's [`Outcome`](deskwarden::notice_card::Outcome) answers, in the
+/// `MessageBox` vocabulary the callers already compare against. `None` is
+/// "nothing was shown".
+fn message_box_answer(outcome: deskwarden::notice_card::Outcome) -> Option<MESSAGEBOX_RESULT> {
+    use deskwarden::notice_card::Outcome;
+    match outcome {
+        Outcome::Dismissed => Some(IDOK),
+        Outcome::Accepted => Some(IDYES),
+        Outcome::Declined => Some(IDNO),
+        Outcome::Unavailable => None,
+    }
+}
+
+/// **The stock system box, reached only when the card could not open** (see
+/// [`message_box_asking`]): the last resort that keeps a startup failure from
+/// being silent. `MB_SETFOREGROUND | MB_SYSTEMMODAL` because this fires during
+/// login-time autostart, when whatever the shell is doing would otherwise bury
+/// it.
+fn native_message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     unsafe {
         MessageBoxW(
             None,
@@ -4785,10 +4855,18 @@ fn account_removal_warning(label: &str) -> String {
 /// is and for the same reason: this is the second most destructive thing this
 /// app does, and a stray Return should not be what does it.
 fn confirm_account_removal(label: &str) -> bool {
-    let answer = message_box(
+    let answer = message_box_asking(
         deskwarden::i18n::t("main.remove_account_title"),
         &account_removal_warning(label),
         MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2,
+        Some(deskwarden::notice_card::Ask {
+            accept: deskwarden::i18n::t("notice_card.remove").to_string(),
+            decline: deskwarden::i18n::t("notice_card.cancel").to_string(),
+            // The answer that deletes a profile is painted as the danger
+            // button, and the card opens on Cancel.
+            danger: true,
+            default_accept: false,
+        }),
     );
     if answer != IDYES {
         log::info!("the removal of {label} was cancelled; nothing has been deleted");
@@ -14950,7 +15028,19 @@ impl MissingCliEnv {
 /// file: this one costs the user a 37 MB transfer, so a stray Return must not
 /// be what starts it.
 fn ask_to_reinstall_the_cli(title: &str, body: &str) -> bool {
-    message_box(title, body, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES
+    // The body says "Press OK to reinstall it now, or Cancel", so the buttons
+    // say OK and Cancel.
+    message_box_asking(
+        title,
+        body,
+        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2,
+        Some(deskwarden::notice_card::Ask {
+            accept: deskwarden::i18n::t("notice_card.ok").to_string(),
+            decline: deskwarden::i18n::t("notice_card.cancel").to_string(),
+            danger: false,
+            default_accept: false,
+        }),
+    ) == IDYES
 }
 
 /// The outcome, said once.
@@ -15619,6 +15709,95 @@ fn stand_down_without_a_backend(e: &BackendStartError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- The message box is Deskwarden's own card ------------------------
+
+    /// **`MessageBoxW` is reached from one place: the fallback.** Every
+    /// `message_box` is a card; the system's box exists only so that a card
+    /// that cannot open (`Outcome::Unavailable`) never leaves a startup failure
+    /// silent.
+    #[test]
+    fn the_system_message_box_is_only_the_fallback_when_the_card_cannot_open() {
+        let raw = include_str!("main.rs").replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\nmod tests {")).next().unwrap();
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let call = concat!("MessageBox", "W(");
+        assert!(code.contains("fn native_message_box("), "control: the fallback is gone");
+        assert_eq!(code.matches(call).count(), 1, "the system box is called from more than one place");
+        let at = code.find(call).unwrap();
+        let fallback = code.find("fn native_message_box(").unwrap();
+        assert!(
+            at > fallback && !code[fallback..at].contains("\nfn "),
+            "the system box is not inside `native_message_box`"
+        );
+        // And `native_message_box` has exactly one caller: the arm taken when
+        // the card did not open.
+        assert_eq!(code.matches("native_message_box(").count(), 2, "definition plus one call");
+        let caller = code.find("None => native_message_box(title, text, style)").expect(
+            "control: the fallback is not the `Unavailable` arm of `message_box_asking`",
+        );
+        let routed = code.find("fn message_box_asking(").unwrap();
+        assert!(caller > routed && !code[routed..caller].contains("\nfn message_box_answer"));
+        // The import is the only other mention.
+        assert_eq!(code.matches(concat!("MessageBox", "W")).count(), 2);
+    }
+
+    /// A card's outcome is the answer the box would have given, and "nothing
+    /// shown" is the one case that reaches the system's box.
+    #[test]
+    fn a_cards_outcome_answers_as_the_message_box_did() {
+        use deskwarden::notice_card::Outcome;
+        assert_eq!(message_box_answer(Outcome::Dismissed), Some(IDOK));
+        assert_eq!(message_box_answer(Outcome::Accepted), Some(IDYES));
+        assert_eq!(message_box_answer(Outcome::Declined), Some(IDNO));
+        assert_eq!(message_box_answer(Outcome::Unavailable), None);
+    }
+
+    /// **The style picks the card, and a default of No survives the move.**
+    #[test]
+    fn a_message_box_style_picks_the_card_and_keeps_its_default_answer() {
+        let info = card_for_style("Deskwarden", "body", MB_ICONERROR | MB_OK, None);
+        assert_eq!(info.ask, None);
+        assert_eq!(info.body, "body");
+
+        let defaulted_no = card_for_style("t", "b", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2, None);
+        let ask = defaulted_no.ask.expect("a YESNO style is an ask card");
+        assert!(!ask.default_accept, "the default answer must stay No");
+        assert_eq!((ask.accept.as_str(), ask.decline.as_str()), ("Yes", "No"));
+        let defaulted_yes = card_for_style("t", "b", MB_ICONWARNING | MB_YESNO, None);
+        assert!(defaulted_yes.ask.unwrap().default_accept);
+
+        // A caller's own labels keep the style's default and nothing else.
+        let own = deskwarden::notice_card::Ask {
+            accept: "Remove".into(),
+            decline: "Cancel".into(),
+            danger: true,
+            default_accept: true,
+        };
+        let removal =
+            card_for_style("t", "b", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2, Some(own));
+        let ask = removal.ask.unwrap();
+        assert_eq!((ask.accept.as_str(), ask.decline.as_str(), ask.danger), ("Remove", "Cancel", true));
+        assert!(!ask.default_accept, "the removal must open on Cancel");
+    }
+
+    /// The two destructive/costly asks name their own buttons and the
+    /// removal is a danger button.
+    #[test]
+    fn the_removal_and_reinstall_asks_name_their_own_buttons() {
+        let raw = include_str!("main.rs").replace("\r\n", "\n");
+        let removal = raw.split("fn confirm_account_removal(").nth(1).unwrap();
+        let removal = removal.split("\n}\n").next().unwrap();
+        assert!(removal.contains("\"notice_card.remove\"") && removal.contains("danger: true"));
+        assert!(removal.contains("MB_DEFBUTTON2"));
+        let reinstall = raw.split("fn ask_to_reinstall_the_cli(").nth(1).unwrap();
+        let reinstall = reinstall.split("\n}\n").next().unwrap();
+        assert!(reinstall.contains("\"notice_card.ok\"") && reinstall.contains("MB_DEFBUTTON2"));
+    }
 
     // --- The vault service's per-request join-up ------------------------
     //
