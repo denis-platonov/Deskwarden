@@ -5330,9 +5330,15 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // is kept by the answer being used, not by the probe being skipped. (Had
     // the fix for the lying no-match card been to stay silent when locked,
     // this is the line that would have had to grow a `vault` arm.)
-    let field = match matched {
-        Matched::Yes(_) => HasPasswordField::Unknown,
-        Matched::No => field_probe.ask(event.hwnd),
+    // **A window coming to the front opens no card of its own any more**,
+    // on the owner's ruling: a card that rose on focus rose "without a
+    // reason" and rose again every time the window came back. Only
+    // `CTRL+ALT+B` opens one now. On a focus event the probe is not asked,
+    // so the field is `Unknown` -- which `disposition` already answers with
+    // silence on the automatic path, whatever the vault's state.
+    let field = match (matched, trigger) {
+        (Matched::No, deskwarden::app::Trigger::Hotkey) => field_probe.ask(event.hwnd),
+        _ => HasPasswordField::Unknown,
     };
 
     // The fourth input: whether the user pressed *Never for this app* on
@@ -5372,7 +5378,9 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
                     injector,
                     fill_stats,
                     item_id,
-                    prompt_on_match,
+                    // The matched card, too, waits to be asked: on focus the
+                    // match only arms the hotkey, which then fills it.
+                    prompt_on_match && trigger == deskwarden::app::Trigger::Hotkey,
                     event,
                     notifier,
                     reprompt,
@@ -33142,7 +33150,8 @@ mod tests {
                     &engine_with(&[]),
                     true,
                     deskwarden::app::VaultAvailability::Readable,
-                    deskwarden::app::Trigger::Foreground,
+                    // The chord: a focus event opens no card any more.
+                    deskwarden::app::Trigger::Hotkey,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &mut NoMatchEnv {
@@ -33359,7 +33368,8 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
-                deskwarden::app::Trigger::Foreground,
+                // The chord: a focus event opens no card any more.
+                deskwarden::app::Trigger::Hotkey,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -33468,7 +33478,8 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
-                deskwarden::app::Trigger::Foreground,
+                // The chord: a focus event opens no card any more.
+                deskwarden::app::Trigger::Hotkey,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -33542,7 +33553,8 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
-                deskwarden::app::Trigger::Foreground,
+                // The chord: a focus event opens no card any more.
+                deskwarden::app::Trigger::Hotkey,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -33598,7 +33610,8 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Locked,
-                deskwarden::app::Trigger::Foreground,
+                // The chord: a focus event opens no card any more.
+                deskwarden::app::Trigger::Hotkey,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -33633,6 +33646,58 @@ mod tests {
                  is a statement about an app that may very well have one -- which is the \
                  defect this state exists to correct"
             );
+        }
+
+        /// **A window coming to the front opens no card at all**, on the
+        /// owner's ruling: a card that rose on focus rose without a reason
+        /// and rose again every time the window came back. The same window
+        /// that gets 3a or 3b on `CTRL+ALT+B` -- unmatched, password field
+        /// found, prompt on -- gets nothing on focus, readable or locked, and
+        /// the probe is not even asked.
+        #[test]
+        fn a_focused_window_opens_no_card_in_either_vault_state() {
+            fn must_not_be_probed(_hwnd: isize) -> HasPasswordField {
+                panic!("a focus event asked the password-field probe; nothing reads its answer")
+            }
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            let _ = (take_no_match_shown(), take_locked_shown());
+            for (vault, hwnd) in [
+                (deskwarden::app::VaultAvailability::Readable, 0x9a1),
+                (deskwarden::app::VaultAvailability::Locked, 0x9a2),
+            ] {
+                let mut pending_hotkey_fill = None;
+                let mut last_dispatched_hwnd = None;
+                let follow_up = process_foreground_event(
+                    &window("AtlasLicence.exe", "Atlas Licence", hwnd),
+                    &cache,
+                    &recording_injector(&filled),
+                    &stats,
+                    &engine,
+                    true,
+                    vault,
+                    deskwarden::app::Trigger::Foreground,
+                    &mut pending_hotkey_fill,
+                    &mut last_dispatched_hwnd,
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: must_not_be_probed, show: record_no_match, show_locked: record_locked },
+                    &recorder(),
+                    &mut no_reprompt(),
+                );
+                assert_eq!(follow_up, NoMatchFollowUp::Nothing);
+                assert_eq!(
+                    last_dispatched_hwnd,
+                    Some(hwnd),
+                    "control: the event reached the decision rather than being discarded before it"
+                );
+                assert!(
+                    take_no_match_shown().is_empty() && take_locked_shown().is_empty(),
+                    "a card went up for a window that only came to the front ({vault:?})"
+                );
+                assert!(filled.seen().is_empty() && pending_hotkey_fill.is_none());
+            }
         }
 
         /// **And a locked vault does not turn the overlay into a popup.** The
@@ -34128,7 +34193,8 @@ mod tests {
                 // where that suppression is held.
                 true,
                 deskwarden::app::VaultAvailability::Locked,
-                deskwarden::app::Trigger::Foreground,
+                // The chord: a focus event opens no card any more.
+                deskwarden::app::Trigger::Hotkey,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv {
@@ -34309,7 +34375,8 @@ mod tests {
                 // where that suppression is held.
                 true,
                 deskwarden::app::VaultAvailability::Locked,
-                deskwarden::app::Trigger::Foreground,
+                // The chord: a focus event opens no card any more.
+                deskwarden::app::Trigger::Hotkey,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv {
