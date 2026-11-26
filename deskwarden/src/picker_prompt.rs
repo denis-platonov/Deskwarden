@@ -605,7 +605,7 @@ pub fn empty_rows() -> Vec<EmptyAction> {
 /// **It lived in `overlay_ui` until that module was deleted**; it is here now
 /// because this is the card that offers it.
 pub fn new_login_label() -> &'static str {
-    crate::i18n::t("picker.new_login")
+    crate::i18n::t("picker.save_new_login")
 }
 
 /// What the empty card's other row says, and **the only card that may NOT carry
@@ -626,10 +626,10 @@ pub fn search_vault_label() -> &'static str {
 /// exactly these two" is one string a test can find rather than one it
 /// re-spells. Re-typing them here would be the second spelling they were
 /// written to prevent.
-pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
+pub fn empty_label(action: EmptyAction) -> &'static str {
     match action {
-        EmptyAction::NewLogin => (new_login_label(), crate::i18n::t("picker.empty_new_login_sub")),
-        EmptyAction::SearchVault => (search_vault_label(), crate::i18n::t("picker.empty_search_sub")),
+        EmptyAction::NewLogin => new_login_label(),
+        EmptyAction::SearchVault => search_vault_label(),
     }
 }
 
@@ -646,10 +646,10 @@ pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
 /// a window title, either of which the user (or the app they ran) chooses. It
 /// is drawn into a fixed-width single-line run that clips, so no length of it
 /// can change the card's geometry; see [`layout`], whose height is a constant.
-pub fn empty_text(app_name: &str) -> (String, &'static str) {
+pub fn empty_text(_app_name: &str) -> (String, &'static str) {
     (
-        crate::i18n::tf("picker.empty_title", &[("app_name", app_name)]),
-        crate::i18n::t("picker.empty_body"),
+        crate::i18n::t("picker.nomatch_title").to_string(),
+        crate::i18n::t("picker.nomatch_body"),
     )
 }
 
@@ -723,6 +723,9 @@ pub const WIDTH: i32 = crate::panel_draw::LIST_W;
 
 /// Content inset, and the top margin.
 const MARGIN_X: i32 = 16;
+
+/// The gap between the `?` badge and the `x` beside it.
+const HEADER_BUTTON_GAP: i32 = 8;
 const MARGIN_TOP: i32 = crate::panel_draw::HEADER_PAD_TOP;
 
 /// One row. Tall enough for a name over a username, and for a square icon
@@ -758,15 +761,6 @@ pub const LIST_ROWS: usize = ROW_CAP + 1;
 /// [`the_cards_dimensions_are_the_themes`], so a redesign there cannot leave
 /// this card drawing a box of its own invented height.
 const SEARCH_H: i32 = 34;
-
-/// The gap between the subtitle and the field below it, which is the gap the
-/// card already has between its subtitle and its list.
-///
-/// **Once, not twice.** It used to sit above *and* below the search box,
-/// because the box and the list were two containers with a gap between them.
-/// They are one field now -- see [`Layout::field`] -- so there is one gap, the
-/// one above it.
-const SEARCH_GAP: i32 = 10;
 
 /// **The field's horizontal inner inset**, which is what keeps the search
 /// text off the border now that the text has no box of its own.
@@ -804,12 +798,11 @@ const FOCUS_RING_W: i32 = 2;
 /// slot the overflow notice holds here -- see [`search_overflow_label`].
 pub const SEARCH_CAP: usize = ROW_CAP;
 
-/// The gap between the header and the title under it, and the title block's
-/// own line heights.
-const TITLE_GAP: i32 = 12;
-
 /// The gap between the header and the first row (D 1.3: `pad 14 16 10`).
 const HEADER_GAP: i32 = 10;
+
+/// The title block's own line heights (D 1.5: title 19/800 over body 15, gap 4;
+/// the gap between the header and the block is [`crate::panel_draw::BLOCK_GAP`]).
 const TITLE_H: i32 = 24;
 const SUBTITLE_H: i32 = 20;
 
@@ -889,6 +882,9 @@ pub struct Layout {
     /// The `?` badge on the lockup's line, and the key-hint tooltip it opens.
     pub help: Box2,
     pub tip: Box2,
+    /// The header's `x`, which closes the card the way Esc does. The last item
+    /// of every header; the `?` sits to its left.
+    pub close_glyph: Box2,
     /// The heading pair. **Only the empty card has one** (design 1.5's No-match
     /// title and body); the list, the second step and search are the header
     /// and the rows and nothing else, so there `heading` is false and both
@@ -926,9 +922,10 @@ pub struct Layout {
     pub list: Box2,
 }
 
-/// The height of an empty-card offer's slot: the design's 46 px button and its
-/// 8 px gap (D 1.5).
-pub const EMPTY_ROW_H: i32 = crate::panel_draw::BUTTON_H + crate::panel_draw::BUTTON_GAP;
+/// How far a focused empty-card button's keyboard ring stands outside the
+/// button: the offer's control is the button grown by this on every side, so
+/// the ring is painted inside the control and is never clipped by it.
+pub const EMPTY_RING: i32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
@@ -966,16 +963,34 @@ pub fn layout_empty(rows: usize) -> Layout {
 }
 
 fn shaped(rows: usize, shape: Shape) -> Layout {
-    let content_w = WIDTH - 2 * MARGIN_X;
+    // **Two panels.** The Fill panel (D 1.3) is 400 wide with a `14 16 10`
+    // header; the No-match card (D 1.5) is the 410 `pad 18 / gap 14` panel
+    // every other floating card is.
+    let (width, margin_x, margin_top) = match shape {
+        Shape::Empty => (
+            crate::panel_draw::CARD_W,
+            crate::panel_draw::PAD,
+            crate::panel_draw::PAD,
+        ),
+        Shape::List | Shape::Search => (WIDTH, MARGIN_X, MARGIN_TOP),
+    };
+    let content_w = width - 2 * margin_x;
 
     let lockup = crate::panel_draw::lockup();
-    let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
+    let mark = Box2 { x: margin_x, y: margin_top, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
-        Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    // The `?` is the header's last item, 16 px from the edge (D 1.3).
+        Box2 { x: mark.right() + lockup.gap, y: margin_top, w: lockup.word_w, h: lockup.mark_h };
+    // The `x` is the header's last item, and the `?` (D 1.3) sits left of it.
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 {
+        x: width - margin_x - close,
+        y: mark.y + (mark.h - close) / 2,
+        w: close,
+        h: close,
+    };
     let badge = crate::panel_draw::HELP;
     let help = Box2 {
-        x: WIDTH - MARGIN_X - badge,
+        x: close_glyph.x - HEADER_BUTTON_GAP - badge,
         y: mark.y + (mark.h - badge) / 2,
         w: badge,
         h: badge,
@@ -984,19 +999,23 @@ fn shaped(rows: usize, shape: Shape) -> Layout {
     // draws fewer lines in the same box.
     let (tx, ty, tw, th) = crate::panel_draw::tip_box(
         (help.x, help.y, help.right(), help.bottom()),
-        WIDTH,
+        width,
         TIP_LINES_MAX,
     );
     let tip = Box2 { x: tx, y: ty, w: tw, h: th };
 
     let heading = shape == Shape::Empty;
     let (title, subtitle, below) = if heading {
-        let title = Box2 { x: MARGIN_X, y: mark.bottom() + TITLE_GAP, w: content_w, h: TITLE_H };
-        let subtitle =
-            Box2 { x: MARGIN_X, y: title.bottom() + 4, w: content_w, h: SUBTITLE_H };
-        (title, subtitle, subtitle.bottom() + SEARCH_GAP)
+        let title = Box2 {
+            x: margin_x,
+            y: mark.bottom() + crate::panel_draw::BLOCK_GAP,
+            w: content_w,
+            h: TITLE_H,
+        };
+        let subtitle = Box2 { x: margin_x, y: title.bottom() + 4, w: content_w, h: SUBTITLE_H };
+        (title, subtitle, subtitle.bottom() + crate::panel_draw::BLOCK_GAP)
     } else {
-        let none = Box2 { x: MARGIN_X, y: mark.bottom(), w: content_w, h: 0 };
+        let none = Box2 { x: margin_x, y: mark.bottom(), w: content_w, h: 0 };
         (none, none, mark.bottom() + HEADER_GAP)
     };
 
@@ -1012,10 +1031,16 @@ fn shaped(rows: usize, shape: Shape) -> Layout {
     // buttons.
     let (list_x, list_w) = match shape {
         Shape::List => (crate::panel_draw::LIST_PAD_X, WIDTH - 2 * crate::panel_draw::LIST_PAD_X),
-        Shape::Search | Shape::Empty => (MARGIN_X, content_w),
+        Shape::Search | Shape::Empty => (margin_x, content_w),
     };
-    let pitch = if shape == Shape::Empty { EMPTY_ROW_H } else { ROW_H };
-    let list = Box2 { x: list_x, y: list_y, w: list_w, h: pitch * rows as i32 };
+    // The empty card's list is ONE line of buttons side by side (D 1.5), so its
+    // height is a button's however many offers it has.
+    let list_h = if shape == Shape::Empty {
+        crate::panel_draw::BUTTON_H
+    } else {
+        ROW_H * rows as i32
+    };
+    let list = Box2 { x: list_x, y: list_y, w: list_w, h: list_h };
     let field = Box2 { x: list.x, y: below, w: list.w, h: list.bottom() - below };
 
     // The last row's 2 px gap is not padding: the design's list ends 8 px under
@@ -1023,11 +1048,24 @@ fn shaped(rows: usize, shape: Shape) -> Layout {
     let bottom = match shape {
         Shape::List => list.bottom() - crate::panel_draw::ROW_GAP + crate::panel_draw::LIST_PAD_BOTTOM,
         Shape::Search => list.bottom() + MARGIN_X,
-        Shape::Empty => list.bottom() + MARGIN_TOP,
+        Shape::Empty => list.bottom() + crate::panel_draw::PAD,
     };
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: bottom };
+    let window = Box2 { x: 0, y: 0, w: width, h: bottom };
 
-    Layout { window, mark, wordmark, help, tip, heading, title, subtitle, field, search, list }
+    Layout {
+        window,
+        mark,
+        wordmark,
+        help,
+        tip,
+        close_glyph,
+        heading,
+        title,
+        subtitle,
+        field,
+        search,
+        list,
+    }
 }
 
 /// **Where the search text sits inside its slot in the field.**
@@ -1406,9 +1444,21 @@ pub fn row_at_for(rows: usize, search: bool, index: usize) -> Box2 {
 }
 
 /// The `index`th offer of the empty card.
+///
+/// The offers are equal buttons side by side, [`crate::panel_draw::BUTTON_GAP`]
+/// apart (D 1.5). The box returned is the control's: the button itself grown by
+/// [`EMPTY_RING`] on every side, which is where the focus ring is painted.
 pub fn row_at_empty(rows: usize, index: usize) -> Box2 {
     let list = layout_empty(rows).list;
-    Box2 { x: list.x, y: list.y + EMPTY_ROW_H * index as i32, w: list.w, h: EMPTY_ROW_H }
+    let n = rows.max(1) as i32;
+    let gap = crate::panel_draw::BUTTON_GAP;
+    let w = (list.w - gap * (n - 1)) / n;
+    Box2 {
+        x: list.x + (w + gap) * index as i32 - EMPTY_RING,
+        y: list.y - EMPTY_RING,
+        w: w + 2 * EMPTY_RING,
+        h: list.h + 2 * EMPTY_RING,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,7 +1605,7 @@ mod win32 {
         BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, GWLP_WNDPROC, HMENU,
         IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
         SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-        WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCHITTEST,
+        WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
         WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
         WS_VISIBLE,
     };
@@ -3047,8 +3097,16 @@ mod win32 {
                     window,
                     DefWindowProcW(window, msg, wparam, lparam),
                     lparam,
-                    RECT::default(),
+                    dev(card().close_glyph),
                 )
+            }
+            WM_LBUTTONDOWN => {
+                let x = (lparam.0 & 0xffff) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                if crate::win32_draw::on_close_glyph(x, y, dev(card().close_glyph)) {
+                    set_pending(Event::Cancel);
+                }
+                LRESULT(0)
             }
             WM_MOUSEMOVE => {
                 // A pointer that left a control without entering another one is
@@ -3315,6 +3373,12 @@ mod win32 {
                 if has_help() {
                     panel_draw::draw_help_badge(mem, dev(l.help), fonts.help, panel_draw::help_hot());
                 }
+                panel_draw::draw_close_x(
+                    mem,
+                    dev(l.close_glyph),
+                    scale(1).max(1),
+                    crate::theme::TEXT_FAINT,
+                );
                 if l.heading {
                     text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
                     text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
@@ -3454,40 +3518,33 @@ mod win32 {
             let Some(action) = super::empty_rows().get(index).copied() else {
                 return;
             };
-            let (name, _says) = super::empty_label(action);
+            let name = super::empty_label(action);
             // The empty card's two offers answer the two letter keys -- see
-            // `new_login_control` and `search_control` -- so they say so. They
-            // are the design's two buttons (D 1.5): the primary is the offer
-            // the card exists for, and the other is outlined.
+            // `new_login_control` and `search_control` -- and are the design's
+            // two buttons (D 1.5): the primary is the offer the card exists
+            // for, and the other is outlined. The control is the button grown
+            // by `EMPTY_RING`, so the button is the rect less that margin.
             let kind = match action {
                 EmptyAction::NewLogin => PanelButton::Primary,
                 EmptyAction::SearchVault => PanelButton::Outline,
             };
-            let height = scale(panel_draw::BUTTON_H);
-            let top = rect.top + ((rect.bottom - rect.top) - height) / 2;
-            let button = RECT { top, bottom: top + height, ..rect };
+            let margin = scale(super::EMPTY_RING);
+            let button = RECT {
+                left: rect.left + margin,
+                top: rect.top + margin,
+                right: rect.right - margin,
+                bottom: rect.bottom - margin,
+            };
             if focused {
-                // The keyboard ring, one step outside the button.
+                // The keyboard ring, standing outside the button.
                 panel_draw::round_rect(
                     hdc,
-                    RECT {
-                        left: button.left - scale(2),
-                        top: button.top - scale(2),
-                        right: button.right + scale(2),
-                        bottom: button.bottom + scale(2),
-                    },
-                    scale(panel_draw::BUTTON_RADIUS + 2),
+                    rect,
+                    scale(panel_draw::BUTTON_RADIUS + super::EMPTY_RING),
                     crate::theme::FOCUS_RING,
                     None,
                 );
             }
-            let inset = if focused { scale(2) } else { 0 };
-            let button = RECT {
-                left: button.left + inset,
-                top: button.top + inset,
-                right: button.right - inset,
-                bottom: button.bottom - inset,
-            };
             draw_button_with_shortcut(
                 hdc,
                 button,
@@ -3705,7 +3762,7 @@ mod card_tests {
         // And the row tells the truth about why it is there: nothing was cut.
         assert_eq!(
             search_row_label(false).1,
-            empty_label(EmptyAction::SearchVault).1,
+            crate::i18n::t("picker.empty_search_sub"),
             "the same action says two different things on the two cards"
         );
     }
@@ -3892,9 +3949,14 @@ mod card_tests {
         assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
         assert!(l.wordmark.right() <= l.help.x, "the wordmark runs under the `?` badge");
         assert_eq!(
-            l.help.right(),
+            l.close_glyph.right(),
             l.window.right() - MARGIN_X,
-            "design 1.3: the `?` is the header's last item, 16 px from the edge"
+            "the `x` is the header's last item, 16 px from the edge"
+        );
+        assert_eq!(
+            l.help.right() + HEADER_BUTTON_GAP,
+            l.close_glyph.x,
+            "design 1.3: the `?` is the header's badge, directly left of the `x`"
         );
         assert!(
             l.tip.right() <= l.help.x && l.tip.bottom() <= l.window.bottom(),
@@ -3951,15 +4013,21 @@ mod card_tests {
         assert!(l.wordmark.bottom() <= l.title.y, "the title runs into the lockup");
         assert!(l.title.bottom() <= l.subtitle.y);
         assert_eq!(l.subtitle.y - l.title.bottom(), 4, "D 1.5: the title block's gap is 4");
-        assert!(l.subtitle.bottom() <= l.list.y);
-        assert_eq!(EMPTY_ROW_H, 46 + 8, "D 1.5: buttons 46 high, gap 8");
-        let last = row_at_empty(rows.len(), rows.len() - 1);
-        assert_eq!(last.bottom(), l.list.bottom(), "dead band under the last offer");
-        assert_eq!(l.window.h, l.list.bottom() + MARGIN_TOP);
-        assert_eq!(
-            row_at_empty(rows.len(), 1).y - row_at_empty(rows.len(), 0).y,
-            EMPTY_ROW_H
-        );
+        // D 1.5: panel 410, pad 18, gap 14, buttons 46 high with 8 between.
+        assert_eq!(l.window.w, 410);
+        assert_eq!((l.mark.x, l.mark.y), (18, 18));
+        assert_eq!(l.title.y, l.mark.bottom() + 14);
+        assert_eq!(l.list.y, l.subtitle.bottom() + 14, "D 1.5: the block gap is 14");
+        assert_eq!(l.list.h, 46, "D 1.5: buttons 46 high");
+        assert_eq!(l.window.h, l.list.bottom() + 18, "pad 18 under the buttons");
+        // Two EQUAL buttons side by side, 8 apart, spanning the content width.
+        let (a, b) = (row_at_empty(2, 0), row_at_empty(2, 1));
+        assert_eq!(a.y, b.y, "the offers are on one line");
+        assert_eq!(a.w, b.w, "the offers are equal");
+        assert_eq!(b.x - a.right(), 8 - 2 * EMPTY_RING, "D 1.5: gap 8 between the buttons");
+        assert_eq!(a.x + EMPTY_RING, l.list.x);
+        assert_eq!(b.right() - EMPTY_RING, l.list.right());
+        assert_eq!(l.list.w, 410 - 36);
     }
 
     /// **Search mode's cap is a cap, and it says so.**
@@ -4276,27 +4344,21 @@ mod card_tests {
     /// about some other window.
     #[test]
     fn the_empty_card_names_the_app_it_has_nothing_for() {
+        // D 1.5 words the title for any app ("No login for this app yet") and
+        // keeps the body to the two offers; the app's name is not in it.
         let (title, subtitle) = empty_text("Ledgerline.exe");
-        assert!(
-            title.contains("Ledgerline.exe"),
-            "the empty card's heading does not name the app it is about: {title:?}"
-        );
-        assert!(
-            subtitle.contains("process name and title"),
-            "3a's second line is the fact that makes *Search vault* worth offering rather than a \
-             shrug, and it is gone: {subtitle:?}"
-        );
+        assert_eq!(title, "No login for this app yet");
+        assert_eq!(subtitle, "Save one now, or find it in your vault.");
     }
 
     /// Every offer says what it does, and neither is a bare word.
     #[test]
     fn each_empty_offer_says_what_it_will_do() {
         for action in empty_rows() {
-            let (name, says) = empty_label(action);
-            assert!(!name.is_empty() && !says.is_empty(), "{action:?} has an empty label");
+            assert!(!empty_label(action).is_empty(), "{action:?} has an empty label");
         }
-        assert_eq!(empty_label(EmptyAction::NewLogin).0, "New login");
-        assert_eq!(empty_label(EmptyAction::SearchVault).0, "Search vault");
+        assert_eq!(empty_label(EmptyAction::NewLogin), "Save new login");
+        assert_eq!(empty_label(EmptyAction::SearchVault), "Search vault");
     }
 
     /// **This window may not post a thread quit.**
