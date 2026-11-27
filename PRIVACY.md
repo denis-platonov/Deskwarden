@@ -138,11 +138,11 @@ plainly:
 - **Through the Bitwarden CLI** — every account on bitwarden.com and
   bitwarden.eu. Deskwarden talks over `localhost` to `bw serve`, and `bw`
   talks to the server. On these accounts Deskwarden does not contact your
-  vault server directly and does not see your master password after handing
+  vault server directly and does not see your vault password after handing
   it to `bw`.
 - **Directly** — a self-hosted server using the built-in client.
   Deskwarden contacts your server itself and derives the keys itself, with
-  no subprocess. Your master password is used here to derive those keys and
+  no subprocess. Your vault password is used here to derive those keys and
   is wiped from memory afterwards; it goes nowhere except to your own
   server, in the same authentication request any Bitwarden client makes.
 

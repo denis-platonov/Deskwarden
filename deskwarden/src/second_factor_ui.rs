@@ -774,7 +774,7 @@ mod tests {
             "the email failure must not read as a rejected code; got {send_failed:?}"
         );
         assert!(
-            expired.contains("master password") || expired.contains("again"),
+            expired.contains("vault password") || expired.contains("again"),
             "an expired challenge means starting over, and the message has to say so; \
              got {expired:?}"
         );

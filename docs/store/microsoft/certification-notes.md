@@ -13,7 +13,7 @@ into other Windows programs' sign-in boxes.
 TEST ACCOUNT
  Server: <<test server URL, e.g. a self-hosted instance the owner keeps for this>>
  Email:  <<test account email>>
- Master password: <<test master password>>
+ Vault password: <<test vault password>>
  (A throwaway account holding fake logins only. Fill these in at submission
  time from the owner's password manager; they are deliberately NOT stored in
  this repository.) Sign-in works with the built-in client on a self-hosted

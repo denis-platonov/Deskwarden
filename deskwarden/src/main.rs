@@ -453,7 +453,7 @@ fn main() {
         fatal_startup_error(
             "Deskwarden could not work out its own install directory, so it cannot tell which \
              bw.exe is the real Bitwarden CLI.\n\nRather than guess \u{2014} and risk handing your \
-             master password to the wrong program \u{2014} it is stopping here.\n\nReinstalling \
+             vault password to the wrong program \u{2014} it is stopping here.\n\nReinstalling \
              Deskwarden should fix this.",
         );
     };

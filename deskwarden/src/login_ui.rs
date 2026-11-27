@@ -2096,7 +2096,11 @@ pub fn error_spot(message: &str) -> ErrorSpot {
         ErrorSpot::Email
     } else if m.starts_with("enter your server") {
         ErrorSpot::ServerUrl
-    } else if m.starts_with("enter your master password")
+    } else if m.starts_with("enter your vault password")
+        || m.starts_with("type your vault password")
+        || m.contains("vault password didn't work")
+        || m.contains("vault password is not right")
+        || m.starts_with("enter your master password")
         || m.starts_with("type your master password")
         || m.contains("master password didn't work")
         || m.contains("master password is not right")
@@ -5451,7 +5455,7 @@ Cryptography error, The decryption operation failed";
         let shown = friendly_auth_error(WRONG_PASSWORD_STDERR);
         assert_eq!(
             shown,
-            "That master password didn't work. Check it and try again."
+            "That vault password didn't work. Check it and try again."
         );
         // Whatever else changes, none of the CLI's internals may reach the
         // window: those are for the log.
@@ -5466,7 +5470,7 @@ Cryptography error, The decryption operation failed";
             friendly_auth_error("Username or password is incorrect. Try again.");
         assert_eq!(
             shown,
-            "That email or master password didn't work. Check them and try again."
+            "That email or vault password didn't work. Check them and try again."
         );
     }
 
@@ -6259,7 +6263,7 @@ mod first_run_notice_tests {
             "control: this is not the login window at all; got {with:?}"
         );
 
-        for field in ["Master password", "Email"] {
+        for field in ["Vault password", "Email"] {
             assert!(
                 !with.iter().any(|t| t == field),
                 "{field:?} is still painted under the modal, so credentials can be typed \
@@ -6293,7 +6297,7 @@ mod first_run_notice_tests {
             walk(&clipped.shape, &mut without);
         }
         assert!(
-            without.iter().any(|t| t == "Master password"),
+            without.iter().any(|t| t == "Vault password"),
             "control: the card does not paint a master-password label even with no modal, \
              so its absence above proves nothing; got {without:?}"
         );
@@ -6549,7 +6553,7 @@ mod first_run_notice_tests {
         for wanted in [
             "Log in",
             "Email",
-            "Master password",
+            "Vault password",
             "Server",
             "bitwarden.com",
             "bitwarden.eu",
@@ -6576,10 +6580,10 @@ mod first_run_notice_tests {
     fn the_sign_in_error_and_the_in_flight_state_are_painted() {
         let ctx = styled_context();
         let mut form = LoginForm::default();
-        form.error = Some("That email and master password do not match.".to_string());
+        form.error = Some("That email and vault password do not match.".to_string());
         let (painted, _) =
             screen(&ctx, BwStatus::Unauthenticated, HelloState::unavailable(), &mut form, false, None);
-        assert!(has(&painted, "That email and master password do not match."));
+        assert!(has(&painted, "That email and vault password do not match."));
         assert!(!has(&painted, "Log in and set up Windows Hello"), "no Hello, no opt-in");
         let (busy, action) = screen(
             &ctx,
@@ -6617,7 +6621,7 @@ mod first_run_notice_tests {
             "Still logged in",
             "bitwarden.com",
             "Locks after 15 minutes of no activity",
-            "Master password",
+            "Vault password",
             "Unlock",
             "Unlock with Windows Hello",
             "Not you? Log out",
@@ -6709,11 +6713,11 @@ mod first_run_notice_tests {
     fn with_hello_off_the_lock_screen_has_no_hello_button_and_shows_the_error_under_the_field() {
         let ctx = styled_context();
         let mut form = LoginForm::default();
-        form.error = Some("That master password is not right.".to_string());
+        form.error = Some("That vault password is not right.".to_string());
         let (painted, _) =
             screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, None);
         assert!(has(&painted, "Unlock"));
-        assert!(has(&painted, "That master password is not right."));
+        assert!(has(&painted, "That vault password is not right."));
         assert!(!painted.iter().any(|(t, _)| t.contains("Windows Hello")), "{painted:?}");
         let logout = at(&painted, "Not you? Log out").center();
         let (_, action) =
@@ -6808,7 +6812,7 @@ mod first_run_notice_tests {
     fn the_form_has_a_title_a_line_and_forgot() {
         let mut form = LoginForm::default();
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
-        for word in [sign_in_title(), sign_in_subtitle(), "Email", "Master password", "Forgot?", "Server"] {
+        for word in [sign_in_title(), sign_in_subtitle(), "Email", "Vault password", "Forgot?", "Server"] {
             assert!(painted.text(word).is_some(), "{word} is missing");
         }
     }
@@ -6819,7 +6823,7 @@ mod first_run_notice_tests {
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
         let message = y_of(&painted, enter_email());
         assert!(message > y_of(&painted, "Email"), "under the Email label");
-        assert!(message < y_of(&painted, "Master password"), "above the next field");
+        assert!(message < y_of(&painted, "Vault password"), "above the next field");
         let p = crate::kit::tokens::palette(&crate::kit::testing::ctx());
         assert!(
             painted.rects.iter().any(|r| r.stroke.color == p.error && r.stroke.width == 1.5),
@@ -6829,10 +6833,10 @@ mod first_run_notice_tests {
 
     #[test]
     fn a_password_error_sits_under_the_password_box() {
-        let mut form = login_form(|form| { form.error = Some("That email or master password didn't work. Check them and try again.".to_string()); });
+        let mut form = login_form(|form| { form.error = Some("That email or vault password didn't work. Check them and try again.".to_string()); });
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
         let message = y_of(&painted, "didn't work");
-        assert!(message > y_of(&painted, "Master password"));
+        assert!(message > y_of(&painted, "Vault password"));
         assert!(message < y_of(&painted, "Server"));
     }
 
@@ -6845,7 +6849,7 @@ mod first_run_notice_tests {
         assert!(painted.text("Try again").is_some());
         assert!(painted.text(&down).is_none(), "the sentence is the banner's, not a second line");
         assert!(y_of(&painted, "You're offline") < y_of(&painted, sign_in_title()), "above the title");
-        assert!(painted.text("Master password").is_some(), "the form is still there");
+        assert!(painted.text("Vault password").is_some(), "the form is still there");
 
         let mut form = login_form(|form| { form.error = Some(down); form.server_choice = ServerChoice::SelfHosted; });
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
@@ -6881,10 +6885,10 @@ mod first_run_notice_tests {
     fn too_many_tries_replaces_the_form_and_try_again_puts_it_back() {
         let mut form = login_form(|form| { form.error = Some(friendly_auth_error("Too many requests from your network")); });
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
-        for word in [too_many_title(), too_many_line(), "Try again in", too_many_wait(), "Forgot master password?"] {
+        for word in [too_many_title(), too_many_line(), "Try again in", too_many_wait(), "Forgot vault password?"] {
             assert!(painted.text(word).is_some(), "{word} is missing");
         }
-        assert!(painted.text("Master password").is_none(), "the form is gone");
+        assert!(painted.text("Vault password").is_none(), "the form is gone");
 
         // Pressing "Try again" clears the message and the form returns.
         let ctx = crate::kit::testing::ctx();
@@ -6924,7 +6928,7 @@ mod first_run_notice_tests {
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
         assert!(painted.text("You're in").is_some());
         assert!(painted.text("Opening your vault").is_some());
-        assert!(painted.text("Master password").is_none(), "no form under it");
+        assert!(painted.text("Vault password").is_none(), "no form under it");
 
         let mut form = LoginForm::default();
         let _ = apply_auth_result(Err("Invalid username or password".to_string()), &mut form);
@@ -7296,7 +7300,7 @@ mod auth_in_flight_tests {
             (true, crate::kit::tokens::Palette::LIGHT.text_ghost, "in flight"),
         ] {
             let found = label_colors(auth_in_progress);
-            for wanted in ["Email", "Master password"] {
+            for wanted in ["Email", "Vault password"] {
                 let color = found
                     .iter()
                     .find(|(text, _)| text == wanted)
@@ -14264,7 +14268,7 @@ mod two_step_message_tests {
         );
         assert!(
             friendly_auth_error("error=The decryption operation failed")
-                .contains("master password"),
+                .contains("vault password"),
             "control: friendly_auth_error still recognises its other arms"
         );
     }
@@ -14286,7 +14290,7 @@ mod two_step_message_tests {
         .map(|stderr| friendly_auth_error(stderr))
         .collect();
         assert!(
-            said.iter().any(|m| m.contains("master password")),
+            said.iter().any(|m| m.contains("vault password")),
             "control: these inputs really do reach this function's arms; got {said:?}"
         );
         for message in &said {
@@ -14475,7 +14479,7 @@ mod cli_setup_modal_layout_tests {
     #[test]
     fn the_modal_replaces_the_credential_form() {
         let (_, painted) = settle(&crate::bw_acquire::CliSetupState::Asking, 12);
-        for gone in ["Email", "Master password"] {
+        for gone in ["Email", "Vault password"] {
             assert!(
                 !painted.iter().any(|(text, _)| text == gone),
                 "{gone:?} is still painted under the modal, where it could be typed into"

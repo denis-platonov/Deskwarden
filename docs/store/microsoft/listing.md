@@ -57,7 +57,7 @@ WHAT IT DOES
 - Password generator and passphrases that run entirely on your PC; strength
   on every item; optional breach checking that never sends your password
   (only the first five characters of its hash).
-- Bitwarden Send, per-item master-password re-prompt, import and export.
+- Bitwarden Send, per-item vault-password re-prompt, import and export.
 - Copied passwords are kept out of Windows clipboard history and cleared
   after a minute (both adjustable).
 - Windows Hello quick unlock.

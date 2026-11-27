@@ -6818,7 +6818,7 @@ mod tests {
             "the copy does not say who can use it, and \"local\" reads as \"only me\": {text}"
         );
         assert!(
-            text.contains("master password"),
+            text.contains("vault password"),
             "the copy does not say a key is the whole credential: {text}"
         );
         // The control: the two states are not the same sentence with a word
@@ -6838,7 +6838,7 @@ mod tests {
             text.contains("usernames, passwords, notes and two-factor secrets"),
             "got {text}"
         );
-        assert!(text.contains("master password"), "got {text}");
+        assert!(text.contains("vault password"), "got {text}");
         assert!(!text.contains("Off, which is the default"), "the off copy is being shown");
     }
 
