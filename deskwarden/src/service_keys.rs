@@ -117,7 +117,7 @@ pub fn session_record(now_unix: u64, random: fn() -> [u8; 32]) -> (KeyRecord, St
     let key = crate::service_token::mint(random);
     let secret = key.expose().to_string();
     let record = KeyRecord {
-        name: "Signed in with the master password".to_string(),
+        name: "Signed in with the vault password".to_string(),
         hash: hash_key(&secret),
         created_unix: now_unix,
         expires_unix: Some(now_unix + SESSION_LIFETIME_SECS),

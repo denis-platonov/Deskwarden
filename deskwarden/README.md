@@ -95,7 +95,7 @@ a previous run).
 
 ## Security notes
 
-- Your master password is only ever passed to the `bw` CLI through an
+- Your vault password is only ever passed to the `bw` CLI through an
   environment variable, never as a command-line argument (which would be
   visible to other processes), and its buffer is wiped after use.
 - The cached session token is encrypted at rest with DPAPI, and decrypted
@@ -128,7 +128,7 @@ a previous run).
   file's header and two ciphertexts and nothing else. Anything running as you
   on this PC that can pass Windows Hello can read it. It is **not** deleted
   when the vault locks — surviving a restart is what it is for — and is
-  deleted on log out, on any master-password re-prompt, and when the setting
+  deleted on log out, on any vault-password re-prompt, and when the setting
   is turned off. It is refused and deleted after seven days, on a change of
   account, or if it cannot be opened. The setting is unavailable without
   Windows Hello, and no weaker file is written instead.

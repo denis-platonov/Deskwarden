@@ -2853,7 +2853,7 @@ impl Preview {
             LoginVariant::SignInError => {
                 self.form.email = "a.novak@ledgerline.com".to_string();
                 self.form.error =
-                    Some("That email or master password didn't work. Check them and try again.".to_string());
+                    Some("That email or vault password didn't work. Check them and try again.".to_string());
             }
             LoginVariant::SignInOffline => {
                 self.form.email = "a.novak@ledgerline.com".to_string();
@@ -2891,7 +2891,7 @@ impl Preview {
             }
             LoginVariant::UnlockPasswordError => {
                 self.form.password = "correct horse".to_string();
-                self.form.error = Some("That master password is not right.".to_string());
+                self.form.error = Some("That vault password is not right.".to_string());
             }
             LoginVariant::Plain => {}
         }
@@ -4860,7 +4860,7 @@ static I18N_SHEET_FONTS_LOADED: std::sync::atomic::AtomicBool = std::sync::atomi
 const I18N_SHEET: [(&str, &str); 8] = [
     (
         "en",
-        "title = Welcome back\nbody = Enter your master password to unlock your vault.\nbutton = Unlock\nitems[one] = {n} item\nitems[other] = {n} items\n",
+        "title = Welcome back\nbody = Enter your vault password to unlock your vault.\nbutton = Unlock\nitems[one] = {n} item\nitems[other] = {n} items\n",
     ),
     (
         "ja",

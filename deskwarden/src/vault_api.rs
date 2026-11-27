@@ -746,7 +746,7 @@ impl VaultApi {
             return ApiResponse::refused(400, "Say who the code is for.");
         };
         if asked.password.is_empty() {
-            return ApiResponse::refused(400, "Type your master password.");
+            return ApiResponse::refused(400, "Type your vault password.");
         }
         match engine.mint_invite_code(&asked.email, asked.password.as_bytes()) {
             Ok(code) => ApiResponse::ok(to_value(&code)),
@@ -1255,8 +1255,8 @@ pub(crate) mod tests {
             .set_up(crate::rest::sharing::SharingSetup { state_path: Some(state), ..crate::rest::sharing::SharingSetup::none() });
         let nothing = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
         for (body, sentence) in [
-            (r#"{"email":"carol@example.com"}"#, "Type your master password."),
-            (r#"{"email":"carol@example.com","password":""}"#, "Type your master password."),
+            (r#"{"email":"carol@example.com"}"#, "Type your vault password."),
+            (r#"{"email":"carol@example.com","password":""}"#, "Type your vault password."),
             (r#"{"password":"master"}"#, "Say who the code is for."),
             ("not json", "Say who the code is for."),
         ] {

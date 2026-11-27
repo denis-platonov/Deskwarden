@@ -156,7 +156,7 @@ pub fn message_for(refusal: ApiKeyRefusal) -> &'static str {
              settings \u{2192} Security \u{2192} Keys."
         }
         ApiKeyRefusal::PasswordRejected => {
-            "That master password didn't unlock this account. The key pair is fine \u{2014} \
+            "That vault password didn't unlock this account. The key pair is fine \u{2014} \
              only the password needs retyping."
         }
         ApiKeyRefusal::Unreachable => {
@@ -699,7 +699,7 @@ mod tests {
             "a rotated key is the commonest cause and the only one with a fix the user can act on; \
              got {key_pair:?}"
         );
-        assert!(password.contains("master password"), "got {password:?}");
+        assert!(password.contains("vault password"), "got {password:?}");
         assert!(
             !password.contains("API key"),
             "the password failure must not send the user back to a key that worked; got \

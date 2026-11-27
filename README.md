@@ -79,7 +79,7 @@ open.
 - **Live TOTP codes** with a countdown, and adding one by **scanning a QR
   code off your own screen** — drag a rectangle over it, no camera, no
   upload.
-- **Bitwarden Send**, **per-item master-password re-prompt**, and **export**
+- **Bitwarden Send**, **per-item vault-password re-prompt**, and **export**
   through the CLI.
 - **Real favicons** and card-network marks, fetched and cached locally.
 
@@ -199,7 +199,7 @@ change, so this rots -- if a cell is wrong now, please open an issue.
   copy in this PC's TPM.
 - **An optional encrypted copy of your vault on this PC** (off by default),
   sealed so that a copied disk cannot be read on another machine. It survives
-  a restart, and is deleted on logout, on a master-password re-prompt, or
+  a restart, and is deleted on logout, on a vault-password re-prompt, or
   after seven days.
 - **Clipboard that clears itself**, and marks copied secrets so clipboard
   managers and cloud history do not retain them.
@@ -312,9 +312,9 @@ secret and are not filtered.
 
 ### What is not built yet
 
-- **`POST /auth` answers `501`.** The master-password exchange that would issue
+- **`POST /auth` answers `501`.** The vault-password exchange that would issue
   a short-lived session token is designed but not implemented; the service has
-  no way to take a master password at all. Named API keys are the only way in.
+  no way to take a vault password at all. Named API keys are the only way in.
 - **No route changes anything.** Write access exists in the scope model and is
   checked, but every route this service serves today is a read; a write-scoped
   request to `/object/item/{id}` is permitted and still modifies nothing.
@@ -376,7 +376,7 @@ The direct backend's own process is larger because it holds the vault and the
 cryptography itself. It is still about a seventh of the pair it replaces.
 
 **The vault window** costs ~76 MB while open, usually in a process of its
-own. Usually, not always: on the direct backend, before a master password has
+own. Usually, not always: on the direct backend, before a vault password has
 been entered once, only the tray process can ask for one -- so it hosts the
 window itself and you see a single process carrying both figures. It exits
 when you close it, and that is the point: it is an accelerated-graphics window,
@@ -427,8 +427,8 @@ Everything Deskwarden links against, and what it's for:
 | `tray-icon`, `global-hotkey` | The system tray icon/menu and the global fill hotkey. |
 | `ureq` | HTTP client — talks to the local `bw serve` bridge and, for real website favicons, the Bitwarden icon service (or a self-hosted server's own icon proxy). |
 | `serde`, `serde_json` | (De)serializing everything that crosses the `bw serve` HTTP boundary. |
-| `aes-gcm`, `sha2` | Sealing the master password under a Windows Hello signature-derived key for quick unlock. |
-| `zeroize` | Wiping decrypted secrets (session tokens, the master password buffer) from memory after use. |
+| `aes-gcm`, `sha2` | Sealing the vault password under a Windows Hello signature-derived key for quick unlock. |
+| `zeroize` | Wiping decrypted secrets (session tokens, the vault password buffer) from memory after use. |
 | `png` | Decoding fetched favicons to RGBA. |
 | `directories` | Locating the standard Windows config/cache directories. |
 | `semver` | Comparing versions for the update checker. |

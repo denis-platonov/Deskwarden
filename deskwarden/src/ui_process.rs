@@ -435,7 +435,7 @@ impl UiStartFailure {
             Self::NoStoredVaultKey => {
                 "Deskwarden could not open the vault window. This account is set to use \
                  Deskwarden's built-in client, but no vault key is stored on this PC for it, \
-                 and the window has no way to ask for your master password. Sign in through \
+                 and the window has no way to ask for your vault password. Sign in through \
                  Deskwarden once to store one, or turn the built-in client off in Preferences."
             }
             Self::NoServerUrl => {
