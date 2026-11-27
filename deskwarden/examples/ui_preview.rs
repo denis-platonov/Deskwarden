@@ -101,11 +101,10 @@
 use deskwarden::breach::BreachCache;
 use deskwarden::hello::HelloState;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
-use deskwarden::kind_mark;
 use deskwarden::local_time;
 use deskwarden::receive_history::{ReceiveHistory, ReceivedRecord};
 use deskwarden::send;
-use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
+use deskwarden::vault_bridge::{Folder, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::item_list;
@@ -117,7 +116,7 @@ use deskwarden::vault_window::send_ui;
 use deskwarden::otpauth::OtpRefusal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
 use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
-use eframe::egui::{self, Margin};
+use eframe::egui;
 
 /// Set each frame from `--dark`, so the mock panels this harness draws
 /// itself (the real window fills its list column with the palette) follow it.
@@ -656,20 +655,6 @@ enum Surface {
     ///   the comparison the report is about: four marks that have to be
     ///   tellable from each other AND from the monogram a login still gets.
     VaultListKinds,
-    /// **The kind marks themselves, both states, side by side.**
-    ///
-    /// The row shot above shows the marks in the layout they ship in; this
-    /// one shows them against each other, and -- the part no list shot can
-    /// show, because a list has one selection -- every mark in the SELECTED
-    /// treatment as well as the unselected one. A mark that vanished into
-    /// `theme::BLUE_WASH` when its row was picked would be a defect nobody
-    /// could see in a picture of a list.
-    ///
-    /// Drawn through `kind_mark::paint_mark` and `theme::avatar_tile` -- the
-    /// same two calls the row makes -- for the reason
-    /// [`Surface::ProgressBarCycle`] is drawn through `paint_progress_bar`:
-    /// a second drawing of the marks could drift from the shipped one.
-    ItemKindMarks,
     /// **The v2 kit, every piece on one sheet**: both sidebars, the mark ramp,
     /// switches, segments, buttons, a card with tags, a help bubble, a hint
     /// and a toast. Slice 1 of the 1.0 redesign; held beside design 1a/1c.
@@ -919,17 +904,6 @@ enum Surface {
     LoginSigninTooMany,
     /// The "You're in" stage.
     LoginSigninDone,
-    /// **One cycle of design 7's `dw-bar`, laid out as a filmstrip.**
-    ///
-    /// The one thing a PNG of this widget cannot show is the thing it is:
-    /// a still frame of a sliding bar is a blue dash somewhere in a grey
-    /// rail, and at the design's own opening keyframe -- `translateX(-100%)`
-    /// -- it is an empty rail and nothing else. So this surface draws the
-    /// SAME painter the live widget uses at six fixed phases across one
-    /// period, which is a picture of the motion rather than a picture taken
-    /// during it. Everything else here renders one state; this renders the
-    /// only part of the design that is a state MACHINE over time.
-    ProgressBarCycle,
 }
 
 /// The detail pane's exact width in the shipped vault window.
@@ -1065,7 +1039,6 @@ const ALL: &[Surface] = &[
     Surface::VaultList,
     Surface::VaultListWide,
     Surface::VaultListKinds,
-    Surface::ItemKindMarks,
     Surface::KitSheet,
     Surface::I18nFonts,
     Surface::CardLogos,
@@ -1172,7 +1145,6 @@ const ALL: &[Surface] = &[
     Surface::LoginSigninBusy,
     Surface::LoginSigninTooMany,
     Surface::LoginSigninDone,
-    Surface::ProgressBarCycle,
 ];
 
 impl Surface {
@@ -1239,7 +1211,6 @@ impl Surface {
             Surface::VaultList => "vault_item_list",
             Surface::VaultListWide => "vault_item_list_wide",
             Surface::VaultListKinds => "vault_item_list_kinds",
-            Surface::ItemKindMarks => "item_kind_marks",
             Surface::KitSheet => "kit_sheet",
             Surface::I18nFonts => "i18n_fonts",
             Surface::CardLogos => "card_logos",
@@ -1350,7 +1321,6 @@ impl Surface {
             Surface::LoginSigninBusy => "login_signin_busy",
             Surface::LoginSigninTooMany => "login_signin_too_many",
             Surface::LoginSigninDone => "login_signin_done",
-            Surface::ProgressBarCycle => "progress_bar_cycle",
         }
     }
 
@@ -1397,7 +1367,6 @@ impl Surface {
             // Wide enough for the design's own 260px track with room
             // either side, and tall enough for six of them stacked with
             // their labels.
-            Surface::ProgressBarCycle => egui::vec2(420.0, 420.0),
             Surface::LoginDetail
             | Surface::LoginDetailFavicon
             | Surface::CardDetail
@@ -1516,7 +1485,6 @@ impl Surface {
             // reviewer's screen rather than telling them anything.
             Surface::VaultListKinds => egui::vec2(LIST_WIDTH, 620.0),
             // A sheet, not a pane: its size is what the sheet needs.
-            Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
             Surface::KitSheet => egui::vec2(1280.0, 900.0),
             Surface::I18nFonts => egui::vec2(1280.0, 980.0),
             Surface::CardLogos => egui::vec2(1000.0, 520.0),
@@ -1752,7 +1720,7 @@ fn main() -> eframe::Result {
     } else if login {
         vec![Surface::LoginUnlock]
     } else if kinds {
-        vec![Surface::VaultListKinds, Surface::ItemKindMarks, Surface::LoginDetailFavicon]
+        vec![Surface::VaultListKinds, Surface::LoginDetailFavicon]
     } else if kit {
         vec![Surface::KitSheet]
     } else if i18n_sheet {
@@ -2322,7 +2290,6 @@ impl eframe::App for Preview {
                 let surface = self.current();
                 self.draw_api_key(root, surface)
             }
-            Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
             Surface::LoginSignin => self.draw_login(root, &ctx, true, false, None),
             Surface::LoginCliSetup => self.draw_login(
                 root,
@@ -2441,7 +2408,6 @@ impl eframe::App for Preview {
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultListWide => self.draw_vault_list_wide(root),
             Surface::VaultListKinds => self.draw_vault_list_kinds(root),
-            Surface::ItemKindMarks => draw_item_kind_marks(root),
             Surface::KitSheet => draw_kit_sheet(root),
             Surface::I18nFonts => draw_i18n_fonts(root),
             Surface::CardLogos => draw_card_logos(root),
@@ -4842,18 +4808,6 @@ fn rehearsal_view() -> scratch_window::RehearsalView {
     }
 }
 
-
-/// **The four kind marks, in both of the tile's states.**
-///
-/// Every tile here is `theme::avatar_tile` and every mark is
-/// `kind_mark::paint_mark` -- the two calls `kind_mark::avatar` makes, which
-/// is what the item row calls. Nothing on this sheet is a second drawing that
-/// could drift from the shipped one.
-///
-/// The LOGIN column is the control, and it is why the sheet is worth taking:
-/// the question the report asks is not "is this a nice key" but "can a note,
-/// an identity, an SSH key and a card be told apart at 32pt -- from each
-/// other, and from the letters a login still shows".
 /// **The v2 kit sheet**: everything slice 1 of the 1.0 redesign built, drawn
 /// through `kit`'s own calls, to hold beside the design (artboards 1a and 1c).
 fn draw_card_logos(root: &mut egui::Ui) {
@@ -5060,7 +5014,7 @@ fn draw_kit_sheet(root: &mut egui::Ui) {
     let mut x = area.left() + 580.0;
     let base = area.top() + 24.0 + 56.0;
     for (w, h) in [(48.0, 56.0), (32.0, 37.0), (22.0, 26.0), (14.0, 16.0)] {
-        theme::paint_mark(root.painter(), Rect::from_min_size(pos2(x, base - h), vec2(w, h)));
+        theme::paint_mark_colours(root.painter(), Rect::from_min_size(pos2(x, base - h), vec2(w, h)), theme::QUADRANT_FILLS);
         x += w + 26.0;
     }
     let tile = Rect::from_min_size(pos2(x + 10.0, area.top() + 24.0), vec2(92.0, 92.0));
@@ -5115,57 +5069,6 @@ fn draw_kit_sheet(root: &mut egui::Ui) {
 
     // 7. A toast, at the bottom.
     toast::paint_message(root.ctx(), "Folder created");
-}
-
-fn draw_item_kind_marks(root: &mut egui::Ui) {
-    theme::paint_window_background(root);
-    egui::Frame::new()
-        .fill(list_ground())
-        .inner_margin(Margin::same(24))
-        .show(root, |ui| {
-            ui.label(
-                theme::bold("Item-kind marks, at the list row's 32pt", 15.0).color(theme::INK),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                theme::semibold(
-                    "kind_mark::paint_mark in theme::avatar_tile -- the row's own two calls",
-                    12.0,
-                )
-                .color(theme::TEXT_FAINT),
-            );
-            ui.add_space(20.0);
-            const TILE: f32 = 32.0;
-            let columns: [(&str, Option<ItemKind>); 5] = [
-                ("Note", Some(ItemKind::SecureNote)),
-                ("Card", Some(ItemKind::Card)),
-                ("Identity", Some(ItemKind::Identity)),
-                ("SSH key", Some(ItemKind::SshKey)),
-                ("Login", None),
-            ];
-            for (label, selected) in [("Unselected row", false), ("Selected row", true)] {
-                ui.label(theme::semibold(label, 11.0).color(theme::TEXT_GHOST));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 18.0;
-                    for (name, kind) in columns {
-                        ui.vertical(|ui| {
-                            match kind {
-                                Some(kind) => {
-                                    let tile = theme::avatar_tile(ui, TILE, selected);
-                                    kind_mark::paint_mark(ui, kind, tile, selected);
-                                }
-                                // The control: what a login still shows.
-                                None => theme::avatar(ui, "LE", TILE, selected),
-                            }
-                            ui.add_space(6.0);
-                            ui.label(theme::semibold(name, 11.0).color(theme::TEXT_SECONDARY));
-                        });
-                    }
-                });
-                ui.add_space(24.0);
-            }
-        });
 }
 
 /// A stand-in favicon, built rather than downloaded.
@@ -5811,57 +5714,6 @@ const LIST_JSON: &str = r#"[
       "expMonth": "06", "expYear": "2031" }
   }
 ]"#;
-
-/// **Design 7's `dw-bar`, one cycle, as six stills.**
-///
-/// Every other surface in this file is a picture of a state. This one is a
-/// picture of a state machine, and it exists because of what a PNG of an
-/// animated widget honestly cannot say. A single frame of a sliding bar is a
-/// blue dash somewhere in a grey rail; whether it MOVES -- and whether it
-/// moves on the design's curve rather than at a constant crawl -- is exactly
-/// the property a still cannot carry. At the design's own opening keyframe,
-/// `translateX(-100%)`, there is not even a dash: the knob is entirely outside
-/// the track and `theme::paint_progress_bar` clips it away, so a reviewer
-/// looking at a PNG taken at t=0 would see an empty rail and reasonably
-/// conclude the bar was broken.
-///
-/// So the phases are laid out side by side and labelled. It is
-/// `theme::paint_progress_bar` -- the SAME painter the live widget calls, one
-/// line below its own clock -- so nothing here is a second drawing of the bar
-/// that could drift from the shipped one. What a reader can check off this
-/// picture: the knob is a third of the track, it starts and ends out of sight,
-/// and the middle rows are further apart than the outer ones, which is the
-/// `ease-in-out` the design asks for and the difference between a bar that
-/// reads as motion and a marquee.
-fn draw_progress_bar_cycle(root: &mut egui::Ui) {
-    theme::paint_window_background(root);
-    egui::Frame::new()
-        .fill(list_ground())
-        .inner_margin(Margin::same(24))
-        .show(root, |ui| {
-            ui.label(theme::bold("dw-bar, one 1.4s cycle", 15.0).color(theme::INK));
-            ui.add_space(4.0);
-            ui.label(
-                theme::semibold("theme::paint_progress_bar at six fixed phases", 12.0)
-                    .color(theme::TEXT_FAINT),
-            );
-            ui.add_space(18.0);
-            for step in 0..=5 {
-                let at = f64::from(step) * f64::from(theme::BAR_PERIOD) / 5.0;
-                let phase = theme::bar_phase(at);
-                ui.label(
-                    theme::semibold(format!("t = {at:.2} s"), 11.0).color(theme::TEXT_GHOST),
-                );
-                ui.add_space(3.0);
-                let (track, _) = ui.allocate_exact_size(
-                    egui::vec2(260.0, theme::BAR_HEIGHT),
-                    egui::Sense::hover(),
-                );
-                theme::paint_progress_bar(ui.painter(), track, phase);
-                ui.add_space(20.0);
-            }
-        });
-}
 
 fn save_png(path: &PathBuf, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
     let [w, h] = image.size;
