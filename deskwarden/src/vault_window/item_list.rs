@@ -1284,7 +1284,6 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "launch-confirm-scrim",
     "new-item-scrim",
     "password-generator-scrim",
-    "prefs-modal-scrim",
     "record-forget-scrim",
     "record-import-scrim",
     "record-join-scrim",
