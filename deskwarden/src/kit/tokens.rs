@@ -185,6 +185,57 @@ pub fn palette(ctx: &egui::Context) -> Palette {
 /// Swaps the palette for every widget in this context, from the next frame.
 pub fn set_palette(ctx: &egui::Context, palette: Palette) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, palette));
+    sync_style(ctx);
+}
+
+/// Brings egui's own style (the colours of anything drawn without an explicit
+/// one: plain labels, text boxes, buttons) in line with the context's current
+/// palette. `theme::apply` builds the light style once; under a dark palette
+/// that would leave default ink dark on a dark ground, so the style is
+/// rewritten from the palette whenever the palette changes, and not otherwise.
+///
+/// Called by [`set_palette`], so every window that picks a palette gets
+/// egui's own defaults (panel fill, text-box ink) in that palette too.
+fn sync_style(ctx: &egui::Context) {
+    // The palette is read BEFORE any `ctx.data` closure: reading it inside one
+    // takes the same lock and deadlocks.
+    let p = palette(ctx);
+    let seen = egui::Id::new("kit-style-palette");
+    let last = ctx.data(|d| d.get_temp::<Palette>(seen));
+    if last == Some(p) || (last.is_none() && p == Palette::LIGHT) {
+        ctx.data_mut(|d| d.insert_temp(seen, p));
+        return;
+    }
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        let v = &mut style.visuals;
+        let stroke = egui::Stroke::new;
+        v.panel_fill = p.window_bg;
+        v.window_fill = p.card;
+        v.faint_bg_color = p.list_bg;
+        v.extreme_bg_color = p.card;
+        v.selection.bg_fill = p.blue_edge;
+        v.selection.stroke = stroke(1.0, p.blue);
+        v.hyperlink_color = p.blue_deep;
+        v.window_stroke = stroke(1.0, p.border);
+        v.widgets.noninteractive.fg_stroke = stroke(1.0, p.ink);
+        v.widgets.noninteractive.bg_stroke = stroke(1.0, p.hairline);
+        v.widgets.inactive.bg_fill = p.card;
+        v.widgets.inactive.weak_bg_fill = p.card;
+        v.widgets.inactive.bg_stroke = stroke(1.0, p.border);
+        v.widgets.inactive.fg_stroke = stroke(1.0, p.ink);
+        v.widgets.hovered.bg_fill = p.secondary_hover;
+        v.widgets.hovered.weak_bg_fill = p.secondary_hover;
+        v.widgets.hovered.bg_stroke = stroke(1.0, p.blue_edge);
+        v.widgets.hovered.fg_stroke = stroke(1.0, p.ink);
+        v.widgets.active.bg_fill = p.blue_wash;
+        v.widgets.active.weak_bg_fill = p.blue_wash;
+        v.widgets.active.bg_stroke = stroke(1.0, p.blue);
+        v.widgets.active.fg_stroke = stroke(1.0, p.blue_deep);
+        v.widgets.open.weak_bg_fill = p.blue_wash;
+        v.widgets.open.bg_stroke = stroke(1.0, p.blue);
+    });
+    ctx.data_mut(|d| d.insert_temp(seen, p));
+    ctx.request_repaint();
 }
 
 /// The design's two sidebars, chosen by a setting (General > Look). Saved

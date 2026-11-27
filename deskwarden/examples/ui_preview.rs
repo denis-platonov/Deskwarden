@@ -118,6 +118,19 @@ use deskwarden::otpauth::OtpRefusal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
 use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
+
+/// Set each frame from `--dark`, so the mock panels this harness draws
+/// itself (the real window fills its list column with the palette) follow it.
+static DARK_SHOTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The list column's ground in the palette the shot is taken in.
+fn list_ground() -> egui::Color32 {
+    if DARK_SHOTS.load(std::sync::atomic::Ordering::Relaxed) {
+        deskwarden::kit::tokens::Palette::DARK.list_bg
+    } else {
+        deskwarden::kit::tokens::Palette::LIGHT.list_bg
+    }
+}
 use std::path::PathBuf;
 
 /// The instant every time-dependent preview is drawn at.
@@ -988,13 +1001,13 @@ const PREFS_BODY_HEIGHT: f32 = 780.0 - PREFS_CHROME_HEIGHT;
 const PREFS_CHROME_HEIGHT: f32 = 40.0;
 
 /// The detail pane's own frame, copied from the `CentralPanel` in
-/// `vault_window::mod` that hosts it: `theme::CANVAS` and **no margin**. The
+/// `vault_window::mod` that hosts it: `list_ground()` and **no margin**. The
 /// app moved its `Margin::symmetric(20, 18)` to the Sends branch so the detail
 /// and edit header strips reach the pane's edges (see that module's
 /// `detail_pane_frame_placement_tests`); a margin here drew the edit form as a
 /// card floating on grey that the app does not show.
 fn pane_frame() -> egui::Frame {
-    egui::Frame::new().fill(theme::CANVAS)
+    egui::Frame::new().fill(list_ground())
 }
 
 /// Every surface, in the order `--all` walks them.
@@ -2229,6 +2242,10 @@ impl eframe::App for Preview {
         }
         if self.dark {
             deskwarden::kit::tokens::set_palette(&ctx, deskwarden::kit::tokens::Palette::DARK);
+            DARK_SHOTS.store(true, std::sync::atomic::Ordering::Relaxed);
+            // The real windows paint their own ground first (window_host does,
+            // every frame); without it a dark shot sits on egui's light panel.
+            theme::paint_window_background(root);
         }
         self.frames += 1;
         if self.frames == 1 {
@@ -3673,7 +3690,7 @@ impl Preview {
         let (search, selected, visible) =
             (&mut self.kinds_search, &mut self.kinds_selected, &mut self.kinds_visible);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .frame(egui::Frame::new().fill(list_ground()))
             .show(root, |ui| {
                 let _ = item_list::draw_item_list(
                     ui,
@@ -3709,7 +3726,7 @@ impl Preview {
     }
 
     /// The vault window's item list, drawn through `draw_item_list` itself on
-    /// the same `theme::CANVAS` panel `vault_window::mod` hosts it in.
+    /// the same `list_ground()` panel `vault_window::mod` hosts it in.
     ///
     /// The action is dropped: every one of them wants a vault behind it, and a
     /// preview must never reach one. The search buffer and the selection are
@@ -3725,7 +3742,7 @@ impl Preview {
         let (search, selected, visible) =
             (&mut self.list_search, &mut self.list_selected, &mut self.list_visible);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .frame(egui::Frame::new().fill(list_ground()))
             .show(root, |ui| {
                 let _ = item_list::draw_item_list(
                     ui,
@@ -3777,7 +3794,7 @@ impl Preview {
             &mut self.wide_visible,
         );
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .frame(egui::Frame::new().fill(list_ground()))
             .show(root, |ui| {
                 let _ = item_list::draw_item_list(
                     ui,
@@ -3883,7 +3900,7 @@ impl Preview {
         password_health::show_filter(root.ctx(), chip.unwrap_or(password_health::HealthFilter::All));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .frame(egui::Frame::new().fill(list_ground()))
             .show(root, |ui| {
                 let _ = password_health::draw_password_health(ui, &report, false);
             });
@@ -4033,7 +4050,7 @@ impl Preview {
     }
 
     /// **Design 5b's Sends screen**, drawn through `send_ui::draw_send_pane`
-    /// itself on the same `theme::CANVAS` `CentralPanel` -- margins included,
+    /// itself on the same `list_ground()` `CentralPanel` -- margins included,
     /// which here means NO margin: `vault_window::mod` gives that panel none,
     /// because both of this screen's columns carry white strips that have to
     /// span them edge to edge, and a margin on the container is exactly the
@@ -4114,7 +4131,7 @@ impl Preview {
             _ => &mut self.sends_none_selected,
         };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .frame(egui::Frame::new().fill(list_ground()))
             .show(root, |ui| {
                 let delete = if matches!(surface, Surface::SendsConfirm) {
                     send_ui::SendDeleteView { confirming: Some("send-wifi"), ..send_ui::SendDeleteView::default() }
@@ -5103,7 +5120,7 @@ fn draw_kit_sheet(root: &mut egui::Ui) {
 fn draw_item_kind_marks(root: &mut egui::Ui) {
     theme::paint_window_background(root);
     egui::Frame::new()
-        .fill(theme::CANVAS)
+        .fill(list_ground())
         .inner_margin(Margin::same(24))
         .show(root, |ui| {
             ui.label(
@@ -5819,7 +5836,7 @@ const LIST_JSON: &str = r#"[
 fn draw_progress_bar_cycle(root: &mut egui::Ui) {
     theme::paint_window_background(root);
     egui::Frame::new()
-        .fill(theme::CANVAS)
+        .fill(list_ground())
         .inner_margin(Margin::same(24))
         .show(root, |ui| {
             ui.label(theme::bold("dw-bar, one 1.4s cycle", 15.0).color(theme::INK));
