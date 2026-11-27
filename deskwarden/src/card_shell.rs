@@ -152,6 +152,18 @@ const BLUR_GRID: usize = 4;
 /// draws it now, so it follows the new curve.
 pub const BORDER_RGB: [u8; 3] = [0xd7, 0xd3, 0xd3];
 
+/// The dark theme's hairline: the palette's `kbd_border`, a step above the
+/// dark card so the edge still reads against a dark desktop.
+pub const DARK_BORDER_RGB: [u8; 3] = [0x4a, 0x47, 0x44];
+
+/// The dark theme's shadow: black, since the light shadow's warm grey would
+/// not show on a dark desktop at all.
+pub const DARK_SHADOW_RGB: [u8; 3] = [0, 0, 0];
+
+/// The dark shadow's strength at the card's edge: higher than
+/// [`PEAK_ALPHA`], because a shadow on a dark ground has less to darken.
+pub const DARK_PEAK_ALPHA: f32 = 0.55;
+
 /// The hairline's width in device pixels: one logical pixel, never less than
 /// one device pixel.
 pub fn border_px(scale_pct: i32) -> i32 {
@@ -255,6 +267,9 @@ pub enum Look {
     /// the shadow: the bare-Win32 cards, which paint nothing of their own
     /// along the curve.
     Card([u8; 3]),
+    /// [`Look::Card`] for the dark theme: the same card, with the dark
+    /// hairline and a black shadow that is strong enough to show.
+    DarkCard([u8; 3]),
     /// **Only the shadow**: the footprint is fully transparent (alpha 0) and
     /// the shadow is cut out of it by the same antialiased curve. The main
     /// windows paint their own content and edge on the GL surface and cut their
@@ -283,6 +298,10 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
     let offset = dev(OFFSET_Y as f32, scale_pct);
     let sigma = dev(SIGMA, scale_pct);
     let border = border_px(scale_pct) as f32;
+    let (line_rgb, shadow_rgb, peak) = match look {
+        Look::DarkCard(_) => (DARK_BORDER_RGB, DARK_SHADOW_RGB, DARK_PEAK_ALPHA),
+        _ => (BORDER_RGB, SHADOW_RGB, PEAK_ALPHA),
+    };
 
     // ---- the shadow: a card-shaped mask, blurred on a coarser grid ---------
     let k = BLUR_GRID;
@@ -326,7 +345,7 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
                 out[y * sw_u + x] = 0;
                 continue;
             }
-            let shadow_a = (sample(x, y) * PEAK_ALPHA).clamp(0.0, 1.0);
+            let shadow_a = (sample(x, y) * peak).clamp(0.0, 1.0);
             // `c` is the card's whole footprint; `inner` the part of it that
             // is the card's colour rather than the hairline round it.
             let c = coverage(d);
@@ -342,7 +361,7 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
                     | channel(SHADOW_RGB[2]);
                 continue;
             }
-            let Look::Card(fill) = look else { continue };
+            let (Look::Card(fill) | Look::DarkCard(fill)) = look else { continue };
             let inner = coverage(d + border).min(c);
             // Premultiplied "card (fill + hairline) over shadow".
             let a = c + shadow_a * (1.0 - c);
@@ -353,9 +372,9 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
                 v.round().clamp(0.0, 255.0) as u32
             };
             out[y * sw_u + x] = ((a * 255.0).round().clamp(0.0, 255.0) as u32) << 24
-                | channel(fill[0], BORDER_RGB[0], SHADOW_RGB[0]) << 16
-                | channel(fill[1], BORDER_RGB[1], SHADOW_RGB[1]) << 8
-                | channel(fill[2], BORDER_RGB[2], SHADOW_RGB[2]);
+                | channel(fill[0], line_rgb[0], shadow_rgb[0]) << 16
+                | channel(fill[1], line_rgb[1], shadow_rgb[1]) << 8
+                | channel(fill[2], line_rgb[2], shadow_rgb[2]);
         }
     }
 }
@@ -639,8 +658,7 @@ fn set_per_pixel_alpha(window: HWND, on: bool) {
 fn fill_with_window_background(window: HWND, dc: windows::Win32::Graphics::Gdi::HDC) {
     use windows::Win32::Graphics::Gdi::{CreateSolidBrush, FillRect};
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-    let bg = crate::theme::WINDOW_BG;
-    let colour = COLORREF(u32::from(bg.r()) | (u32::from(bg.g()) << 8) | (u32::from(bg.b()) << 16));
+    let colour = crate::win32_draw::rgb(crate::gdi_palette::window_bg());
     unsafe {
         let mut rect = RECT::default();
         if GetClientRect(window, &mut rect).is_ok() {
@@ -879,7 +897,11 @@ pub fn attach(card: HWND, fill: Color32) {
             original,
             size: (0, 0),
             scale_pct: screen_scale_pct(),
-            look: Look::Card([fill.r(), fill.g(), fill.b()]),
+            look: if crate::gdi_palette::is_dark() {
+                Look::DarkCard([fill.r(), fill.g(), fill.b()])
+            } else {
+                Look::Card([fill.r(), fill.g(), fill.b()])
+            },
             affinity: 0,
             sizing: false,
             opaque: false,
@@ -1132,6 +1154,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_dark_card_keeps_its_fill_and_has_an_edge_and_a_shadow_that_read_on_dark() {
+        let fill = [0x26, 0x24, 0x23];
+        let (card_w, card_h) = (200, 120);
+        let (sw, sh) = shell_size(card_w, card_h, 100);
+        let mut dark = vec![0u32; (sw * sh) as usize];
+        render_look_into(&mut dark, card_w, card_h, 100, Look::DarkCard(fill));
+        let mut light = vec![0u32; (sw * sh) as usize];
+        render_look_into(&mut light, card_w, card_h, 100, Look::Card(fill));
+        let m = margins(100);
+        let at = |buf: &[u32], x: i32, y: i32| buf[(y * sw + x) as usize];
+        // The middle of the card is the fill, opaque.
+        let centre = at(&dark, m.left + card_w / 2, m.top + card_h / 2);
+        assert_eq!(centre, 0xff00_0000 | (0x26 << 16) | (0x24 << 8) | 0x23);
+        // The hairline is the dark one, a step above the card: its pixel is
+        // lighter than the fill.
+        let edge = at(&dark, m.left + card_w / 2, m.top);
+        assert!((edge >> 16) & 0xff > 0x26, "{edge:#x}");
+        // The shadow below the card is stronger than the light shadow's.
+        let below = |buf: &[u32]| (at(buf, m.left + card_w / 2, m.top + card_h + 8) >> 24) & 0xff;
+        assert!(below(&dark) > below(&light), "{} vs {}", below(&dark), below(&light));
     }
 
     #[test]

@@ -1124,7 +1124,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     /// Takes over a control's painting without losing the focus and keyboard
@@ -1345,7 +1348,7 @@ mod win32 {
 
             // The window IS the card, so its whole client area is
             // `theme::CARD`.
-            fill_rect(mem, client, crate::theme::CARD);
+            fill_rect(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
@@ -1406,7 +1409,7 @@ mod win32 {
             let rows = view();
             let dpi = DPI_PERCENT.load(Ordering::SeqCst);
 
-            fill_rect(mem, whole, crate::theme::CARD);
+            fill_rect(mem, whole, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             if let (Some(fonts), Some(row)) = (fonts, rows.get(index)) {
@@ -1463,7 +1466,7 @@ mod win32 {
     /// The header's close glyph, drawn as two strokes because no bundled face
     /// has it at this weight.
     fn paint_close_glyph(hdc: HDC, at: Box2) {
-        panel_draw::draw_close_x(hdc, dev(at), scale(1).max(1), crate::theme::TEXT_FAINT);
+        panel_draw::draw_close_x(hdc, dev(at), scale(1).max(1), crate::gdi_palette::text_faint());
     }
 
     fn fill_rect(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {

@@ -81,6 +81,7 @@ pub mod file_picker;
 pub mod fill_recall;
 pub mod fill_stats;
 pub mod foreground;
+pub mod gdi_palette;
 pub mod generate_prompt;
 pub mod generator_mode;
 pub mod hello;
