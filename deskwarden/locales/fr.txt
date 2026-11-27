@@ -1470,7 +1470,6 @@ prefs.sync_poll_sub = Minutes entre deux vérifications
 prefs.sync_poll_tip = Chaque vérification télécharge le coffre : un intervalle court coûte donc plus cher sur un gros coffre.
 prefs.picker_shortcut_tip = Sans association, il interroge Deskwarden sur cette fenêtre, ce qui en fait le raccourci à utiliser quand rien ne se passe.
 prefs.updates_label = Mises à jour
-prefs.modal_title = Préférences
 settings.nav_heading = Paramètres
 settings.back_label = Retour
 settings.open_at_sign_in_label = Ouvrir à ma connexion à Windows

@@ -1448,7 +1448,6 @@ prefs.sync_poll_sub = Minūtes starp pārbaudēm
 prefs.sync_poll_tip = Katra pārbaude lejupielādē glabātuvi, tāpēc īss intervāls lielai glabātuvei izmaksā vairāk.
 prefs.picker_shortcut_tip = Ja nekas nav sasaistīts, tā vietā tas jautā Deskwarden par šo logu, tāpēc tā ir saīsne, pie kuras sniegties, kad nekas nenotiek.
 prefs.updates_label = Atjauninājumi
-prefs.modal_title = Iestatījumi
 settings.nav_heading = Iestatījumi
 settings.back_label = Atpakaļ
 settings.open_at_sign_in_label = Atvērt, kad pieteicos Windows

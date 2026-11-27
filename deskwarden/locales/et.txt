@@ -1407,7 +1407,6 @@ prefs.sync_poll_sub = Minuteid kontrollide vahel
 prefs.sync_poll_tip = Iga kontroll laadib hoidla alla, seega lühike intervall maksab suure hoidla puhul rohkem.
 prefs.picker_shortcut_tip = Ilma sobituseta küsib see hoopis Deskwardenilt selle akna kohta, mistõttu on see kiirklahv, mida kasutada, kui midagi ei juhtu.
 prefs.updates_label = Uuendused
-prefs.modal_title = Eelistused
 settings.nav_heading = Seaded
 settings.back_label = Tagasi
 settings.open_at_sign_in_label = Ava Windowsi sisselogimisel

@@ -1403,7 +1403,6 @@ prefs.sync_poll_sub = Λεπτά μεταξύ των ελέγχων
 prefs.sync_poll_tip = Κάθε έλεγχος κατεβάζει το θησαυροφυλάκιο, οπότε ένα μικρό διάστημα κοστίζει περισσότερο σε ένα μεγάλο θησαυροφυλάκιο.
 prefs.picker_shortcut_tip = Όταν δεν υπάρχει αντιστοίχιση, ρωτά το Deskwarden για εκείνο το παράθυρο, κάτι που την κάνει τη συντόμευση που θα χρησιμοποιήσετε όταν δεν συμβαίνει τίποτα.
 prefs.updates_label = Ενημερώσεις
-prefs.modal_title = Προτιμήσεις
 settings.nav_heading = Ρυθμίσεις
 settings.back_label = Πίσω
 settings.open_at_sign_in_label = Άνοιγμα όταν συνδέομαι στα Windows

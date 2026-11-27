@@ -1361,7 +1361,6 @@ prefs.sync_poll_sub = Số phút giữa các lần kiểm tra
 prefs.sync_poll_tip = Mỗi lần kiểm tra tải xuống kho, nên khoảng thời gian ngắn tốn kém hơn với kho lớn.
 prefs.picker_shortcut_tip = Khi chưa liên kết gì, nó hỏi Deskwarden về cửa sổ đó, nên đây là phím tắt nên dùng khi không có gì xảy ra.
 prefs.updates_label = Cập nhật
-prefs.modal_title = Tùy chọn
 settings.nav_heading = Cài đặt
 settings.back_label = Quay lại
 settings.open_at_sign_in_label = Mở khi tôi đăng nhập Windows

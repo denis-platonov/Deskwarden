@@ -1460,7 +1460,6 @@ prefs.sync_poll_sub = Minutes between checks
 prefs.sync_poll_tip = Each check downloads the vault, so a short interval costs more on a large one.
 prefs.picker_shortcut_tip = With nothing matched it asks Deskwarden about that window instead, which is what makes this the shortcut to reach for when nothing happens.
 prefs.updates_label = Updates
-prefs.modal_title = Preferences
 settings.nav_heading = Settings
 settings.back_label = Back
 settings.open_at_sign_in_label = Open when I sign in to Windows

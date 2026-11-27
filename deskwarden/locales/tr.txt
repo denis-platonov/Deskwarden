@@ -1403,7 +1403,6 @@ prefs.sync_poll_sub = Denetimler arası dakika
 prefs.sync_poll_tip = Her denetim kasayı indirir, bu yüzden kısa bir aralık büyük bir kasada daha pahalıdır.
 prefs.picker_shortcut_tip = Hiçbir şey eşleşmemişse Deskwarden'e o pencereyi sorar; hiçbir şey olmadığında başvurulacak kısayol bu yüzden budur.
 prefs.updates_label = Güncellemeler
-prefs.modal_title = Tercihler
 settings.nav_heading = Ayarlar
 settings.back_label = Geri
 settings.open_at_sign_in_label = Windows'ta oturum açtığımda aç

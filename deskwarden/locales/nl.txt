@@ -1429,7 +1429,6 @@ prefs.sync_poll_sub = Minuten tussen controles
 prefs.sync_poll_tip = Elke controle downloadt de kluis, dus een kort interval kost meer bij een grote kluis.
 prefs.picker_shortcut_tip = Zonder koppeling vraagt hij Deskwarden naar dat venster, en daarom is dit de sneltoets om te gebruiken als er niets gebeurt.
 prefs.updates_label = Updates
-prefs.modal_title = Voorkeuren
 settings.nav_heading = Instellingen
 settings.back_label = Terug
 settings.open_at_sign_in_label = Openen wanneer ik in Windows inlog

@@ -1443,7 +1443,6 @@ prefs.sync_poll_sub = Minute între verificări
 prefs.sync_poll_tip = Fiecare verificare descarcă seiful, deci un interval scurt costă mai mult pe un seif mare.
 prefs.picker_shortcut_tip = Când nu e asociat nimic, întreabă Deskwarden despre acea fereastră, ceea ce o face scurtătura potrivită când nu se întâmplă nimic.
 prefs.updates_label = Actualizări
-prefs.modal_title = Preferințe
 settings.nav_heading = Setări
 settings.back_label = Înapoi
 settings.open_at_sign_in_label = Deschide când mă autentific în Windows

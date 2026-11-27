@@ -1485,7 +1485,6 @@ prefs.sync_poll_sub = Хвилин між перевірками
 prefs.sync_poll_tip = Кожна перевірка завантажує сховище, тому короткий інтервал коштує дорожче для великого сховища.
 prefs.picker_shortcut_tip = Якщо нічого не прив’язано, воно питає Deskwarden про це вікно, тому саме це скорочення варто натискати, коли нічого не відбувається.
 prefs.updates_label = Оновлення
-prefs.modal_title = Налаштування
 settings.nav_heading = Налаштування
 settings.back_label = Назад
 settings.open_at_sign_in_label = Запускати під час входу в Windows

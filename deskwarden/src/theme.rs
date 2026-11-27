@@ -979,7 +979,7 @@ pub fn paint_window_background(ui: &Ui) {
     ui.painter().rect_filled(
         ui.max_rect(),
         CornerRadius::same(window_corner_radius(ui.ctx())),
-        WINDOW_BG,
+        crate::kit::tokens::palette(ui.ctx()).window_bg,
     );
 }
 

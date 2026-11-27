@@ -1485,7 +1485,6 @@ prefs.sync_poll_sub = Minuty między sprawdzeniami
 prefs.sync_poll_tip = Każde sprawdzenie pobiera sejf, więc krótki odstęp kosztuje więcej przy dużym sejfie.
 prefs.picker_shortcut_tip = Gdy nic nie jest dopasowane, pyta Deskwarden o to okno, dlatego to jest skrót, po który warto sięgnąć, gdy nic się nie dzieje.
 prefs.updates_label = Aktualizacje
-prefs.modal_title = Ustawienia
 settings.nav_heading = Ustawienia
 settings.back_label = Wstecz
 settings.open_at_sign_in_label = Otwieraj po zalogowaniu do Windows

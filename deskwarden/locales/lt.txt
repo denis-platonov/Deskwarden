@@ -1448,7 +1448,6 @@ prefs.sync_poll_sub = Minutės tarp patikrų
 prefs.sync_poll_tip = Kiekviena patikra atsisiunčia saugyklą, todėl trumpas intervalas didelei saugyklai kainuoja daugiau.
 prefs.picker_shortcut_tip = Kai nieko nesusieta, vietoj to jis klausia Deskwarden apie tą langą, todėl tai spartusis klavišas, prie kurio reikia griebtis, kai nieko neįvyksta.
 prefs.updates_label = Naujinimai
-prefs.modal_title = Nuostatos
 settings.nav_heading = Nustatymai
 settings.back_label = Atgal
 settings.open_at_sign_in_label = Atidaryti, kai prisijungiu prie Windows

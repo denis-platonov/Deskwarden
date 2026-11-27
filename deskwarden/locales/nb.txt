@@ -1433,7 +1433,6 @@ prefs.sync_poll_sub = Minutter mellom sjekkene
 prefs.sync_poll_tip = Hver sjekk laster ned hvelvet, så et kort intervall koster mer for et stort hvelv.
 prefs.picker_shortcut_tip = Uten noe koblet spør den Deskwarden om det vinduet i stedet, og det er derfor dette er hurtigtasten å bruke når ingenting skjer.
 prefs.updates_label = Oppdateringer
-prefs.modal_title = Innstillinger
 settings.nav_heading = Innstillinger
 settings.back_label = Tilbake
 settings.open_at_sign_in_label = Åpne når jeg logger på Windows

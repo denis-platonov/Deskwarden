@@ -1366,7 +1366,6 @@ prefs.sync_poll_sub = 兩次檢查之間的分鐘數
 prefs.sync_poll_tip = 每次檢查都會下載密碼庫，因此密碼庫較大時，間隔越短開銷越大。
 prefs.picker_shortcut_tip = 沒有比對時，它會改為就該視窗詢問 Deskwarden，因此在毫無反應時應該使用這個快速鍵。
 prefs.updates_label = 更新
-prefs.modal_title = 偏好設定
 settings.nav_heading = 設定
 settings.back_label = 返回
 settings.open_at_sign_in_label = 登入 Windows 時開啟

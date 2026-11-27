@@ -1589,14 +1589,16 @@ impl Surface {
             // a window nobody opens any more.
             Surface::VaultSetupSpinner => egui::vec2(1240.0, 740.0),
             // The pickers' own windows, at the sizes `picker_ui` opens them in.
-            Surface::PickerItems | Surface::PickerItemsNoMatch => egui::vec2(480.0, 620.0),
+            Surface::PickerItems | Surface::PickerItemsNoMatch => {
+                egui::Vec2::from(deskwarden::picker_ui::ITEM_WINDOW)
+            }
             Surface::PickerApps | Surface::PickerAppsBackendDown | Surface::PickerAppsRefused => {
-                egui::vec2(480.0, 680.0)
+                egui::Vec2::from(deskwarden::picker_ui::APP_WINDOW)
             }
             Surface::PickerNoticeEmpty
             | Surface::PickerNoticeNoLogins
             | Surface::PickerNoticeUnreachable
-            | Surface::PickerNoticeLocked => egui::vec2(480.0, 400.0),
+            | Surface::PickerNoticeLocked => egui::Vec2::from(deskwarden::picker_ui::NOTICE_WINDOW),
             // **The vault window's own size, for all four**, which is the
             // whole of design turn 7: the frame is decided once and only the
             // body changes. Rendered at four different sizes these pictures
@@ -1681,6 +1683,9 @@ fn main() -> eframe::Result {
     // reports they answer were filed together and are looked at together.
     let kinds = arg("--kinds");
     let kit = arg("--kit");
+    // `--dark`: every surface painted with the dark palette (what a window
+    // opened under Settings > Theme > Dark gets), shots in `<dir>_dark`.
+    let dark = arg("--dark");
     // The translation system's glyph sheet: every script the app draws.
     let i18n_sheet = arg("--i18n");
     let shell = arg("--shell");
@@ -1937,6 +1942,16 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_login.png")
     };
 
+    let out = if dark {
+        let name = out.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let named = match out.extension() {
+            Some(ext) => format!("{name}_dark.{}", ext.to_string_lossy()),
+            None => format!("{name}_dark"),
+        };
+        out.with_file_name(named)
+    } else {
+        out
+    };
     // Cloned before the closure takes it: the count check below outlives
     // the run.
     let out_dir = out.clone();
@@ -1945,6 +1960,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             Ok(Box::new(Preview {
+                dark,
                 corners: deskwarden::window_host::CornerMask::new(),
                 queue,
                 at: 0,
@@ -2064,6 +2080,8 @@ const WARMUP_FRAMES: u32 = 12;
 const MOTION_SETTLE_SECONDS: f64 = 0.9;
 
 struct Preview {
+    /// Paint with the dark palette (`--dark`).
+    dark: bool,
     /// Cuts the login window's corners; see `window_host::CornerMask`.
     corners: deskwarden::window_host::CornerMask,
     /// The surfaces to draw, and where in them we are.
@@ -2208,6 +2226,9 @@ impl eframe::App for Preview {
             self.styled = true;
             ctx.request_repaint();
             return;
+        }
+        if self.dark {
+            deskwarden::kit::tokens::set_palette(&ctx, deskwarden::kit::tokens::Palette::DARK);
         }
         self.frames += 1;
         if self.frames == 1 {

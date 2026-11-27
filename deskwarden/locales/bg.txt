@@ -1403,7 +1403,6 @@ prefs.sync_poll_sub = Минути между проверките
 prefs.sync_poll_tip = Всяка проверка изтегля трезора, така че кратък интервал струва повече при голям трезор.
 prefs.picker_shortcut_tip = Когато нищо не е свързано, пита Deskwarden за този прозорец, което го прави пряк път, който да ползвате, когато нищо не се случва.
 prefs.updates_label = Обновления
-prefs.modal_title = Настройки
 settings.nav_heading = Настройки
 settings.back_label = Назад
 settings.open_at_sign_in_label = Отваряне при влизане в Windows

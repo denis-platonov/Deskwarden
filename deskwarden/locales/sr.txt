@@ -1444,7 +1444,6 @@ prefs.sync_poll_sub = Минути између провера
 prefs.sync_poll_tip = Свака провера преузима сеф, па кратак интервал више кошта код великог сефа.
 prefs.picker_shortcut_tip = Када ништа није повезано, пита Deskwarden о том прозору, због чега је ово пречица коју треба користити када се ништа не дешава.
 prefs.updates_label = Ажурирања
-prefs.modal_title = Подешавања
 settings.nav_heading = Подешавања
 settings.back_label = Назад
 settings.open_at_sign_in_label = Отвори када се пријавим у Windows
