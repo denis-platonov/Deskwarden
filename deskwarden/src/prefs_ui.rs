@@ -3555,7 +3555,7 @@ fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
 /// The question, under the row that raised it.
 ///
 /// Shaped exactly like [`key_row`]'s pending half -- the prompt in
-/// [`theme::ERROR`], then the two buttons side by side -- because this window
+/// [`ERROR`], then the two buttons side by side -- because this window
 /// now asks twice and two confirmations that looked different would read as
 /// two different kinds of question.
 fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
@@ -12238,7 +12238,7 @@ mod tests {
 
     /// The top edge of the nav rail, found by its own fill.
     ///
-    /// The rail is the full-height `theme::CARD` rectangle at the left of the
+    /// The rail is the full-height `CARD` rectangle at the left of the
     /// body, `NAV_WIDTH` wide -- located by shape rather than by index
     /// because this page paints several white rectangles and their order is
     /// not this test's business.

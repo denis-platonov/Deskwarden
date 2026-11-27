@@ -23067,7 +23067,7 @@ mod detail_pane_frame_placement_tests {
     //! **The report.** "There is another band around the whole details panel
     //! when screen becomes smaller - shouldn't be", and then the detail that
     //! identified it: "even color is darker of that band". The darker colour
-    //! was this panel's own `theme::CANVAS` showing through a
+    //! was this panel's own `CANVAS` showing through a
     //! `Margin::symmetric(20, 18)`, against the white header strip inside
     //! it. The strip is meant to reach the panel's edges the way the item
     //! pane's toolbar does; stopped 20pt short, it reads as a card floating

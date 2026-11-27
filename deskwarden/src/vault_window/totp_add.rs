@@ -78,7 +78,7 @@ pub use ui::{
 
 // The 26px button height this form used to declare is gone with the two bare
 // `egui::Button`s it sized. 6d's footer answers are `theme`'s own -- see
-// `manual_footer` -- and `theme::BUTTON_HEIGHT` is 6d's declared 32.
+// `manual_footer` -- and `BUTTON_HEIGHT` is 6d's declared 32.
 
 // ---------------------------------------------------------------------------
 // The copy
@@ -129,7 +129,7 @@ pub const ADD_TOTP_SHORTCUT: &str = "CTRL+SHIFT+2";
 /// **The caption over the one field**, verbatim from design 6d.
 ///
 /// It is drawn where 6d draws it -- in a `div` above the box, at
-/// `SECRET_LABEL_PX` in [`theme::TEXT_MUTED`] -- and not as the
+/// `SECRET_LABEL_PX` in [`TEXT_MUTED`] -- and not as the
 /// `TextEdit::hint_text` it used to be. See `SECRET_BLOCK_GAP` on why the
 /// difference is not cosmetic: a placeholder is gone by the second character,
 /// and what this sentence says is that the box takes *either* form.
@@ -1133,7 +1133,7 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
 /// seed it stands in for is: see [`secret_as_typed`]. 6c draws its own mask
 /// in fours; this row is the owner's.
 /// **This app's general rule is the opposite**, and the exception is this
-/// card's alone. `theme::MASKED_BULLETS` forbids a length-tracking mask -- it
+/// card's alone. `MASKED_BULLETS` forbids a length-tracking mask -- it
 /// tells a shoulder-surfer how many characters to expect -- and the Send
 /// composer's password row obeys it. This row does not, because it is the
 /// CONFIRMATION of a seed the user has just captured off their own screen,

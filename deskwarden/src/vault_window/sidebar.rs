@@ -3310,7 +3310,7 @@ mod tests {
     /// tests ask for the fourth.
     ///
     /// A divider is identified by what it IS rather than by counting shapes:
-    /// a `theme::HAIRLINE`-filled rect exactly `inset_hairline`'s 1pt tall.
+    /// a `HAIRLINE`-filled rect exactly `inset_hairline`'s 1pt tall.
     fn painted_sidebar_parts(
         lock_countdown: &str,
         lists: VaultLists<'_>,
@@ -3365,7 +3365,7 @@ mod tests {
         (rects, paths, hairlines, bounds)
     }
 
-    /// Every `inset_hairline` in `shape`: a `theme::HAIRLINE` fill, 1pt tall,
+    /// Every `inset_hairline` in `shape`: a `HAIRLINE` fill, 1pt tall,
     /// no stroke. Named by its appearance rather than by position, so a test
     /// that says "the second divider" is talking about a divider and not about
     /// whatever egui happened to paint second.

@@ -172,8 +172,6 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-/// The slider's empty rail.
-
 fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
     card(ui, |ui| {
         let size = ButtonSize { height: 48.0, pad_x: 20.0, radius: 14, font_px: 16.0 };

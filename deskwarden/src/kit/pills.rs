@@ -245,7 +245,7 @@ fn calendar_day(ui: &mut Ui, p: &Palette, rect: Rect, day: u32, selected: bool, 
     }
     let galley = ui.painter().layout_no_wrap(
         day.to_string(),
-        egui::FontId::new(CALENDAR_TEXT_PX, egui::FontFamily::Name(crate::theme::REGULAR.into())),
+        egui::FontId::new(CALENDAR_TEXT_PX, egui::FontFamily::Proportional),
         ink,
     );
     ui.painter().galley(egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0), galley, ink);
@@ -284,8 +284,6 @@ mod tests {
         for p in [Palette::LIGHT, Palette::DARK] {
             let ctx = testing::ctx();
             set_palette(&ctx, p);
-            let _ = testing::frame(&ctx, 0.0, egui::vec2(400.0, 300.0), vec![], |_| {});
-            let _ = testing::frame(&ctx, 0.0, egui::vec2(400.0, 300.0), vec![], |_| {});
             let painted = testing::frame(&ctx, 0.0, egui::vec2(400.0, 300.0), vec![], |ui| {
                 let mut shown = day(1);
                 let _ = date_picker_at(ui, &mut shown, Some(day(14)), day(1), day(31));

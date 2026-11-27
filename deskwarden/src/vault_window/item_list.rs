@@ -174,7 +174,7 @@ pub enum RowCommand {
 
 impl RowCommand {
     /// Whether this command **destroys something**, and so should be drawn in
-    /// [`theme::ERROR`] wherever a menu offers it -- see [`menu_command`].
+    /// [`ERROR`] wherever a menu offers it -- see [`menu_command`].
     ///
     /// **Derived from the command rather than carried as a field on
     /// [`MenuCommand`],** which is the whole point of putting it here. Four
@@ -1098,8 +1098,8 @@ pub fn list_placeholder(
 /// Paints one [`ListPlaceholder`] where the rows would be.
 ///
 /// **Deliberately the same visual language as `loading_ui::show_while`**, the
-/// window this app already shows while `bw serve` starts: a `theme::BLUE`
-/// spinner over a `theme::semibold` line in `theme::TEXT_SECONDARY`, at the
+/// window this app already shows while `bw serve` starts: a `BLUE`
+/// spinner over a `theme::semibold` line in `TEXT_SECONDARY`, at the
 /// same sizes. Two spinners invented separately would read as two apps.
 ///
 /// The repaint request is `super::LOADING_FRAME_INTERVAL` -- the same constant
@@ -1319,7 +1319,7 @@ pub(crate) fn a_modal_is_up(ctx: &egui::Context) -> bool {
     ctx.memory(|m| {
         MODAL_SCRIM_AREAS.iter().any(|name| {
             m.areas()
-                // **`theme::SCRIM_ORDER`, which is not `Foreground`.** A
+                // **`SCRIM_ORDER`, which is not `Foreground`.** A
                 // `LayerId` is an order AND an id, so this lookup went blind
                 // the moment the scrims moved down a layer -- and a blind
                 // gate is an arrow key reaching the item list behind an open
@@ -2635,7 +2635,7 @@ fn drag_ghost(ui: &egui::Ui, name: &str) {
 /// greying it rather than dropping it (see [`MenuCommand::enabled`]), so the
 /// two are set together here and cannot be drawn apart.
 ///
-/// A destructive entry is painted in [`theme::ERROR`] -- see
+/// A destructive entry is painted in [`ERROR`] -- see
 /// [`menu_command_button`], which does the drawing, and
 /// [`RowCommand::is_destructive`], which decides. That is here and not at the
 /// four call sites that build entries, so this file's Delete and the detail
@@ -2662,14 +2662,14 @@ pub(super) fn menu_command(ui: &mut egui::Ui, entry: &MenuCommand) -> bool {
 /// not from [`menu_entries`], and the trashed pane's "Delete forever",
 /// which comes from [`out_of_vault_entries`] but wants a hover sentence of
 /// its own. Both used to hand-roll `Button::new(RichText::new(..).color(
-/// theme::ERROR))`, which made two definitions of "a destructive menu entry
+/// ERROR))`, which made two definitions of "a destructive menu entry
 /// is red" that nothing kept in step; folding them onto this one is what lets
 /// the row menu's Delete become red by changing one match arm rather than
 /// three call sites.
 ///
 /// **The red goes on the WORDS and on nothing else**, which is not a detail
 /// but the entire lesson of the entry this replaced: that one carried a
-/// `.fill(theme::CARD)`, `Button::fill` is documented to "override any
+/// `.fill(CARD)`, `Button::fill` is documented to "override any
 /// on-hover effects", and the result was the one row in the menu that never
 /// lit up under the pointer -- the "delete item doesn't get hovered in menu"
 /// report. A [`RichText`] colour touches the galley and leaves
@@ -2695,7 +2695,7 @@ pub(super) fn menu_command_button(ui: &mut egui::Ui, entry: &MenuCommand) -> egu
 /// `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)` -- the design's selected
 /// row.
 ///
-/// **The value moved to [`theme::SELECTED_ROW_SHADOW`]; this is the local
+/// **The value moved to [`SELECTED_ROW_SHADOW`]; this is the local
 /// name for it, not a second copy.** Design 5b's Sends screen takes this same
 /// column over and draws its own rows, and while this token was private here
 /// that screen's selected row simply had no shadow -- one of three ways the
@@ -4174,7 +4174,7 @@ mod row_tile_tests {
 
     /// Design 2b's header strip: `padding: 12px` around a `height: 34px`
     /// search box, i.e. 12 + 34 + 12. Written out rather than derived from
-    /// `theme::SEARCH_FIELD_HEIGHT` so this stays an INDEPENDENT statement of
+    /// `SEARCH_FIELD_HEIGHT` so this stays an INDEPENDENT statement of
     /// the geometry -- a test that recomputed the strip from the same
     /// constants the code uses would stay green if both moved together.
     const STRIP_HEIGHT: f32 = 72.0;
@@ -7234,7 +7234,7 @@ mod keyboard_selection_tests {
     /// stale the day the real scrims moved off `Order::Foreground`, leaving
     /// this test asserting that a gate it had blinded still worked. That is
     /// the same hazard, one level down, that put six hand-written scrims in
-    /// this crate on the wrong layer together; see `theme::SCRIM_ORDER`.
+    /// this crate on the wrong layer together; see `SCRIM_ORDER`.
     ///
     /// Named with `folder_modal`'s own id, so if the id there changes,
     /// `every_modal_scrim_in_the_crate_is_named_here` is what fails.

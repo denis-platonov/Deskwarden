@@ -118,7 +118,7 @@ use zeroize::Zeroizing;
 // than left unused. It was the height of the four bare `egui::Button`s these
 // two forms used to draw, and every one of them is now a
 // `theme::primary_button_enabled` or a `theme::secondary_button`, which are
-// `theme::BUTTON_HEIGHT`'s 32. Its doc comment had also stopped being true:
+// `BUTTON_HEIGHT`'s 32. Its doc comment had also stopped being true:
 // the Sends pane's own footer moved to 32 when the composer did, so this
 // constant named a match with something that no longer measured that.
 
@@ -853,7 +853,7 @@ fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
 }
 
 /// Design §5a's picked-record chip: a monogram tile and the record's name, in
-/// a blue-wash box edged in [`theme::BLUE_EDGE`].
+/// a blue-wash box edged in [`BLUE_EDGE`].
 ///
 /// # Three things §5a draws here that are deliberately not built
 ///
@@ -1004,7 +1004,7 @@ pub fn include_rows(
             ticked: draft.selection.password,
             // **A fixed mask, not one that tracks the password's length.**
             // §5a draws twelve bullets and this draws ten, and the difference
-            // is a rule this app already has: `theme::MASKED_BULLETS`'s doc
+            // is a rule this app already has: `MASKED_BULLETS`'s doc
             // forbids a length-tracking mask outright, because it tells a
             // shoulder-surfer how many characters to expect. The row's job is
             // to say a password is in the parcel, which a constant mask says
@@ -1424,7 +1424,7 @@ pub fn copy_link_id() -> egui::Id {
 /// the moment the user is deciding what to send from it.
 ///
 /// Built exactly the way [`super::folder_modal::draw_folder_edit_modal`] is —
-/// a full-window click-catching scrim on `theme::SCRIM_ORDER`, then a
+/// a full-window click-catching scrim on `SCRIM_ORDER`, then a
 /// centred card — because that is this window's established modal, and a
 /// second one built differently is two modals that dim, layer and swallow
 /// clicks two ways. Nothing about the form itself moves in here: every
@@ -2651,7 +2651,7 @@ mod paint_tests {
         assert!(by(notes_label()).value.is_empty());
 
         // **The mask does not track the password's length.** §5a draws twelve
-        // bullets; `theme::MASKED_BULLETS`'s doc forbids a mask that counts,
+        // bullets; `MASKED_BULLETS`'s doc forbids a mask that counts,
         // because it tells a shoulder-surfer how many characters to expect.
         let password = by(password_label());
         assert!(password.secret, "the password row is not marked a secret");

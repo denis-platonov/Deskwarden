@@ -1785,7 +1785,7 @@ impl<'a> RecordTiles<'a> {
 /// Drawn by a child `Ui` placed exactly on `tile`, because the records tile is
 /// a widget that allocates, and this screen lays its rows out against explicit
 /// rectangles. `opacity` is design 5b's faded row (see
-/// [`theme::ENDED_ROW_OPACITY`]), applied to the child as a whole so the tile
+/// [`ENDED_ROW_OPACITY`]), applied to the child as a whole so the tile
 /// recedes with its row whatever is drawn in it.
 fn paint_send_tile(
     ui: &mut egui::Ui,
@@ -2225,7 +2225,7 @@ const ACCESS_ROW_SPACING: f32 = 10.0;
 /// border-box has cost this project rework more than once, which is why the
 /// arithmetic is written down here rather than the answer.
 ///
-/// 32 is [`theme::BUTTON_HEIGHT`] exactly, which is not a coincidence worth
+/// 32 is [`BUTTON_HEIGHT`] exactly, which is not a coincidence worth
 /// hiding: it is the height every small action control in this app already
 /// is, and a row whose box matched the design to the point and matched
 /// nothing else in the app would be the odd one out in a card full of this
@@ -2348,7 +2348,7 @@ const ACCESS_LABEL_PX: f32 = 13.0;
 /// §5a's answer is 96 and that is the first answer this returns. It is not
 /// the only one it can return, and the reason is the detail column: 250
 /// points of card at `settings::MIN_VAULT_WINDOW_SIZE` is 226 inside
-/// `theme::FORM_CARD_PAD_X`, and `96 + 14 + 150` is 260. Something has to
+/// `FORM_CARD_PAD_X`, and `96 + 14 + 150` is 260. Something has to
 /// give, and it is worth being exact about what:
 ///
 ///   * **Not the control.** [`EXPIRY_FIELD_WIDTH`] is 150 because the widest
@@ -4427,14 +4427,14 @@ mod paint_tests {
     /// and it is a fixed box rather than a run that grows with the set.**
     ///
     /// This test's ancestor asserted the shape of a four-cell segmented run:
-    /// every cell [`theme::SEGMENT_HEIGHT`] tall, consecutive cells joined
-    /// within [`theme::SEGMENT_SEAM`], the one in force filled blue. The
+    /// every cell [`SEGMENT_HEIGHT`] tall, consecutive cells joined
+    /// within [`SEGMENT_SEAM`], the one in force filled blue. The
     /// control moved to `theme::dropdown` when the set reached nine (see
     /// [`draw_access_block`] for the measurement that forced it), so the run's
     /// geometry is gone -- but the property those three assertions were
     /// protecting is not, and this asserts it at the new shape:
     ///
-    ///  * there is **one** control for the question, [`theme::DROPDOWN_HEIGHT`]
+    ///  * there is **one** control for the question, [`DROPDOWN_HEIGHT`]
     ///    tall -- not a row of buttons and not two controls between which the
     ///    answer moves;
     ///  * it **says the answer in force** when shut, so the form does not

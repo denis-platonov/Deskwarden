@@ -603,8 +603,8 @@ const PANEL_KEY: Color32 = crate::kit::tokens::Palette::LIGHT.blue_soft;
 // 4d's refusal band, which is 4e's one red.
 //
 // **The palette's own entries, not a third copy of the hexes.** These were
-// `#fdf3f2` and `#e8a9a2` written out here, and they are `theme::DANGER_WASH`
-// and `theme::DANGER_EDGE` to the byte -- one of three files that each named
+// `#fdf3f2` and `#e8a9a2` written out here, and they are `DANGER_WASH`
+// and `DANGER_EDGE` to the byte -- one of three files that each named
 // the same red privately, which does not stop a fourth surface reaching for
 // red and only stops anyone noticing when one of them gets it wrong.
 //
