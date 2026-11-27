@@ -2498,7 +2498,7 @@ pub fn draw_recipient_row(
     ui.add_space(ACCESS_ROW_SPACING);
     let field = access_row(ui, recipient_label(), label_width, enabled, |ui| {
         let width = ui.available_width();
-        ui.add_enabled_ui(enabled, |ui| theme::inline_field(ui, recipient, recipient_hint(), width, false))
+        ui.add_enabled_ui(enabled, |ui| crate::kit::input::inline(ui, recipient, recipient_hint(), width, false))
             .inner
     });
     match draw_people_suggestions(
@@ -2879,7 +2879,7 @@ pub fn draw_access_block(
         // different-looking controls on one card. See that function.
         let changed = ui
             .add_enabled_ui(enabled, |ui| {
-                theme::inline_field(ui, &mut typed, views_hint(), VIEW_LIMIT_FIELD_WIDTH, false)
+                crate::kit::input::inline(ui, &mut typed, views_hint(), VIEW_LIMIT_FIELD_WIDTH, false)
             })
             .inner
             .changed();
@@ -2938,7 +2938,7 @@ pub fn draw_access_block(
             .x;
         let room = (ui.available_width() - link - ACCESS_LINK_GAP).max(0.0);
         ui.add_enabled_ui(enabled, |ui| {
-            theme::inline_field(ui, &mut buffer, password_hint(), room, true);
+            crate::kit::input::inline(ui, &mut buffer, password_hint(), room, true);
         });
         ui.add_space(ACCESS_LINK_GAP);
         if enabled && theme::link_label(ui, generate_label(), ACCESS_LINK_PX).clicked() {

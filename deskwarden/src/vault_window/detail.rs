@@ -3778,7 +3778,7 @@ pub fn draw_detail_read(
                         // password's carries: a rule over a gap is a
                         // separator with nothing on one side of it.
                         if has_code {
-                            theme::row_rule(ui);
+                            crate::kit::card::row_rule(ui);
                         }
                         masked_row(
                         ui,
@@ -5070,7 +5070,7 @@ fn app_match_card(
     let open = app_name_open_action(m, website);
     for (index, app_row) in app_match_rows(m, app.name).iter().enumerate() {
         if index > 0 {
-            theme::row_rule(ui);
+            crate::kit::card::row_rule(ui);
         }
         if app_row.app {
             app_name_row(ui, app_row, app.icon, open.as_ref(), action);
@@ -5096,7 +5096,7 @@ fn app_match_card(
     // it is the only one that is not a fact about the app: the three above say
     // WHICH window this rule is for, and this one says what would be typed
     // into it.
-    theme::row_rule(ui);
+    crate::kit::card::row_rule(ui);
     app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), removable, action);
 }
 
@@ -5693,7 +5693,7 @@ fn sharing_card(
                 }
                 if shared.confirming {
                     // In Revoke's slot: the first control laid right to left.
-                    if theme::row_button(ui, send_ui::cancel_label()).clicked() {
+                    if crate::kit::controls::row_button(ui, send_ui::cancel_label()).clicked() {
                         *action = DetailAction::CancelRevokeSend;
                     }
                     return;
@@ -5704,13 +5704,13 @@ fn sharing_card(
                 // that takes something away reads last. In the danger ink now
                 // that it deletes, as the Sent screen's Revoke is red; step
                 // one still destroys nothing.
-                if theme::row_button_danger(ui, revoke_label())
+                if crate::kit::controls::row_button_danger(ui, revoke_label())
                     .on_hover_text(crate::i18n::t("detail.revoke_hover"))
                     .clicked()
                 {
                     *action = DetailAction::RevokeSend;
                 }
-                if theme::row_button(ui, send_again_label())
+                if crate::kit::controls::row_button(ui, send_again_label())
                     .on_hover_text(crate::i18n::t("detail.send_again_hover"))
                     .clicked()
                 {
@@ -5726,7 +5726,7 @@ fn sharing_card(
                 ui.add_space(10.0);
                 // Cancel wins an ambiguous frame: the safe answer to one on a
                 // destructive control is not to destroy.
-                if theme::destructive_button(ui, send_ui::confirm_label()).clicked()
+                if crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Danger, crate::kit::controls::SMALL, send_ui::confirm_label(), None).clicked()
                     && *action != DetailAction::CancelRevokeSend
                 {
                     *action = DetailAction::ConfirmRevokeSend;
@@ -5749,7 +5749,7 @@ fn sharing_card(
 ///
 /// **One click, no arming.** See the module note above this pair.
 fn app_card_remove_control(ui: &mut egui::Ui, action: &mut DetailAction) {
-    if theme::row_button(ui, app_remove_label())
+    if crate::kit::controls::row_button(ui, app_remove_label())
         .on_hover_text(crate::i18n::t("detail.app_remove_hover"))
         .clicked()
     {
@@ -5773,7 +5773,7 @@ fn app_card_open_control(ui: &mut egui::Ui, choices: &[OpenChoice], action: &mut
         // thing, because "Open" alone beside a Program file row and a website
         // is a question.
         [only] => {
-            if theme::row_button(ui, &open_choice_label(only))
+            if crate::kit::controls::row_button(ui, &open_choice_label(only))
                 .on_hover_text(open_choice_hover(only))
                 .clicked()
             {
@@ -5783,7 +5783,7 @@ fn app_card_open_control(ui: &mut egui::Ui, choices: &[OpenChoice], action: &mut
         // Both. The user's own words: "show dropdown exe or web if both
         // present".
         many => {
-            let open = theme::row_button(ui, open_menu_label()).on_hover_text(open_menu_hover());
+            let open = crate::kit::controls::row_button(ui, open_menu_label()).on_hover_text(open_menu_hover());
             crate::kit::menu::menu(&open, |ui| {
                 for choice in many {
                     if crate::kit::menu::item(ui, crate::kit::menu::Item::new(&open_choice_label(choice)))
@@ -5914,7 +5914,7 @@ fn card_with_side(
             }
             // The heading's `border-bottom`, which is the card's own `#eae7e7`
             // and NOT the lighter rule that goes between rows.
-            theme::hairline(ui);
+            crate::kit::card::hairline(ui);
             contents(ui);
         });
 }
@@ -8042,7 +8042,7 @@ pub(crate) fn history_rows(
             continue;
         }
         if owed {
-            theme::row_rule(ui);
+            crate::kit::card::row_rule(ui);
         }
         owed = true;
         masked_row(
@@ -8064,7 +8064,7 @@ pub(crate) fn history_rows(
     let hidden = history.len().saturating_sub(MAX_HISTORY_ROWS);
     if hidden > 0 {
         if owed {
-            theme::row_rule(ui);
+            crate::kit::card::row_rule(ui);
         }
         empty_pane_note(
             ui,
@@ -8118,7 +8118,7 @@ fn ssh_key_rows(
         if *first {
             *first = false;
         } else {
-            theme::hairline(ui);
+            crate::kit::card::hairline(ui);
         }
     };
     if let Some(v) = &public_key {
@@ -8186,7 +8186,7 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
         // screenshot. Pinned by
         // `exactly_one_hairline_separates_a_card_heading_from_what_follows_it`.
         if group_index > 0 {
-            theme::hairline(ui);
+            crate::kit::card::hairline(ui);
         }
         egui::Frame::new()
             .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_HEADING_PAD_Y))
@@ -8196,7 +8196,7 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
             });
         for (row_index, (label, value)) in rows.iter().enumerate() {
             if row_index > 0 {
-                theme::row_rule(ui);
+                crate::kit::card::row_rule(ui);
             }
             credential_row(ui, label, value, None, action, DetailAction::CopyValue(value.clone()));
         }
@@ -8399,7 +8399,7 @@ fn custom_fields_card_rows(
 ) {
     for (n, row) in rows.iter().enumerate() {
         if n > 0 {
-            theme::row_rule(ui);
+            crate::kit::card::row_rule(ui);
         }
         match row.face {
             CustomFieldFace::Text(value) => credential_row(
@@ -12504,9 +12504,9 @@ mod tests {
             "the fixture already carries a binding"
         );
 
-        let mut pane = Pane::new();
+        let mut pane = Pane::new().tall();
         let without = pane.idle(&unbound, &TotpState::NoSecret);
-        let mut pane = Pane::new();
+        let mut pane = Pane::new().tall();
         let with = pane.idle(&bound, &TotpState::NoSecret);
 
         assert!(
@@ -14398,7 +14398,7 @@ mod tests {
         let between = rects
             .iter()
             .filter(|(r, fill)| {
-                *fill == theme::HAIRLINE
+                (*fill == theme::HAIRLINE || *fill == crate::kit::tokens::Palette::LIGHT.hairline)
                     && r.height() <= 1.5
                     && r.top() >= contact.bottom()
                     && r.bottom() <= government.top()

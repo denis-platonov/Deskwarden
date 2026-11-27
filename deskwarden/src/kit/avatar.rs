@@ -113,6 +113,29 @@ fn paint_chip(painter: &Painter, tile: Rect, net: Net) {
     logos::paint(painter, inner.center(), mark_box.min(inner.size()), text, Mark::Net(net), Label::Short);
 }
 
+/// A square tile for a named thing with an optional picture: the picture on
+/// white when there is one, else the name's initials on its palette pair, at
+/// `size` with the corner radius the design's tiles keep at that size. A
+/// `marked` tile (the picker's selected row, a card on the sequence band)
+/// wears a one-point blue edge. Allocates the square and answers it.
+pub fn tile(ui: &mut eframe::egui::Ui, size: f32, name: &str, icon: Option<&TextureHandle>, marked: bool) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), eframe::egui::Sense::hover());
+    let look = match icon {
+        Some(texture) => Look::Favicon(texture.clone()),
+        None => {
+            let (bg, fg) = initials_colours(name);
+            Look::Initials { text: crate::theme::initials(name), bg, fg }
+        }
+    };
+    let radius = (size / 4.0).round() as u8;
+    paint(ui.painter(), rect, &look, radius);
+    if marked {
+        let edge = crate::kit::tokens::palette(ui.ctx()).blue_edge;
+        ui.painter().rect_stroke(rect, CornerRadius::same(radius), Stroke::new(1.0, edge), StrokeKind::Inside);
+    }
+    rect
+}
+
 /// The palette pair for an item named `name`: an FNV-1a hash of its bytes,
 /// so the same name always gets the same colours.
 pub fn initials_colours(name: &str) -> (Color32, Color32) {
@@ -230,5 +253,24 @@ mod tests {
         let tile = p.rects.iter().find(|r| r.rect == rect).expect("the tile");
         assert_eq!(tile.fill, Color32::WHITE);
         assert_eq!(tile.stroke.color, rgb(0xe6e3df));
+    }
+
+    #[test]
+    fn a_named_tile_is_a_square_of_initials_and_a_marked_one_wears_a_blue_edge() {
+        let ctx = testing::ctx();
+        let mut plain = Rect::NOTHING;
+        let painted = testing::frame(&ctx, 0.0, vec2(200.0, 200.0), vec![], |ui| {
+            plain = tile(ui, 28.0, "Chrome", None, false);
+        });
+        assert_eq!(plain.size(), vec2(28.0, 28.0));
+        assert!(painted.text("CH").is_some() || painted.text("C").is_some(), "the initials are drawn");
+        let (bg, _) = initials_colours("Chrome");
+        assert!(painted.rects.iter().any(|r| r.fill == bg && r.rect == plain));
+        let marked = testing::frame(&ctx, 0.1, vec2(200.0, 200.0), vec![], |ui| {
+            tile(ui, 28.0, "Chrome", None, true);
+        });
+        let edge = crate::kit::tokens::Palette::LIGHT.blue_edge;
+        assert!(marked.rects.iter().any(|r| r.stroke.color == edge && r.stroke.width == 1.0));
+        assert!(painted.rects.iter().any(|r| r.rect == plain && r.corner_radius == CornerRadius::same(7)), "28 rounds at 7");
     }
 }

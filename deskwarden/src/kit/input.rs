@@ -37,6 +37,100 @@ pub fn text(ui: &mut Ui, id: egui::Id, value: &mut String, placeholder: &str, mo
     response
 }
 
+/// [`text`] for a form row that does not name its own id: the id is the one
+/// egui would give the next widget, so the field keeps its keyboard focus from
+/// frame to frame the way the bare `TextEdit` it replaces did. The edit
+/// form's rows (Cardholder name, Path, Arguments, Public key...) are this.
+pub fn field(ui: &mut Ui, value: &mut String, width: f32) -> Response {
+    let id = ui.next_auto_id().with("field");
+    text(ui, id, value, "", false, width)
+}
+
+/// [`secret`] for a form row, at [`SIGN_IN`]'s size with no placeholder and an
+/// auto id, like [`field`]: the card's security code and PIN, a hidden custom
+/// field, the SSH private key.
+pub fn field_secret(ui: &mut Ui, value: &mut String, revealed: &mut bool, width: f32) -> Response {
+    let id = ui.next_auto_id().with("field");
+    secret(ui, id, value, revealed, "", width, SIGN_IN)
+}
+
+/// [`field`] across the room the row has left.
+pub fn field_fill(ui: &mut Ui, value: &mut String) -> Response {
+    let width = ui.available_width();
+    field(ui, value, width)
+}
+
+/// [`field_secret`] across the room the row has left.
+pub fn field_secret_fill(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
+    let width = ui.available_width();
+    field_secret(ui, value, revealed, width)
+}
+
+/// The inset of a field's text from its edge, which the rows that paint a
+/// chip inside a [`field_disabled`] box have to keep clear of.
+pub const FIELD_INSET: f32 = 16.0;
+
+/// A form row's greyed read-out (the `Type` row, a website on a create form,
+/// the one-time code's "added after saving"): a box `room` wide, [`text`]'s
+/// 50 high, `text` elided to fit and `reserve` points kept clear at the
+/// right-hand end for something the caller paints there. It senses nothing, so
+/// the pointer passes over it. Answers the box so a caller can hang a hover on
+/// it.
+pub fn field_disabled(ui: &mut Ui, text: &str, room: f32, reserve: f32) -> Rect {
+    let p = tokens::palette(ui.ctx());
+    let width = room.min(ui.available_width()).max(0.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 50.0), Sense::hover());
+    look_box(ui, rect, SIGN_IN, p.border, p.field_bg);
+    let room_for_text = (rect.width() - 2.0 * FIELD_INSET - reserve.max(0.0)).max(1.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), FontId::proportional(16.0), p.text_faint);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room_for_text);
+    let galley = ui.painter().layout_job(job);
+    let at = egui::pos2(rect.left() + FIELD_INSET, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(at, galley, p.text_faint);
+    rect
+}
+
+/// [`field_disabled`] across the room the row has left.
+pub fn field_disabled_fill(ui: &mut Ui, text: &str) -> Rect {
+    let width = ui.available_width();
+    field_disabled(ui, text, width, 0.0)
+}
+
+/// How tall the compact field is: the same 42 as [`controls::ROW`]'s buttons,
+/// so it can share a line with them.
+pub const INLINE_HEIGHT: f32 = 42.0;
+
+/// The compact field of the Send composer's access rows (Share with, Views,
+/// Password): [`INLINE_HEIGHT`] high at radius 12, 15 pt type, `hint` while it
+/// is empty, bullets when `password` (no eye: Generate sits beside it).
+pub fn inline(ui: &mut Ui, value: &mut String, hint: &str, width: f32, password: bool) -> Response {
+    let id = ui.next_auto_id().with("field");
+    let p = tokens::palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, INLINE_HEIGHT), Sense::hover());
+    let focused = ui.memory(|m| m.has_focus(id));
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(12),
+        p.card,
+        Stroke::new(1.0, if focused { p.blue } else { p.border }),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(Vec2::new(14.0, 0.0));
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .password(password)
+            .frame(egui::Frame::NONE)
+            .font(FontId::proportional(15.0))
+            .hint_text(hint)
+            .desired_width(inner.width())
+            .vertical_align(egui::Align::Center),
+    );
+    ui.advance_cursor_after_rect(rect);
+    response
+}
+
 /// What the password field did this frame, and where its parts are.
 pub struct PasswordResponse {
     pub response: Response,
@@ -354,5 +448,44 @@ mod tests {
         assert_eq!(grouped_card_number("41111111111111111112"), "4111 1111 1111 1111 111", "capped at 19 digits");
         assert_eq!(grouped_card_number("4111 1"), "4111 1");
         assert_eq!(grouped_card_number(""), "");
+    }
+
+    #[test]
+    fn a_form_field_keeps_its_focus_on_the_id_egui_gave_it() {
+        let ctx = testing::ctx();
+        let mut value = String::new();
+        let mut id = egui::Id::NULL;
+        testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            id = ui.next_auto_id().with("field");
+            let r = field(ui, &mut value, 300.0);
+            assert_eq!(r.rect.height(), 50.0);
+        });
+        ctx.memory_mut(|m| m.request_focus(id));
+        let p = testing::frame(&ctx, 0.1, SCREEN, vec![], |ui| {
+            field(ui, &mut value, 300.0);
+        });
+        assert!(p.rects.iter().any(|r| r.stroke.color == P.blue && r.rect.height() == 50.0), "focused, blue");
+    }
+
+    #[test]
+    fn a_greyed_form_field_elides_its_text_and_leaves_room_for_a_chip() {
+        let ctx = testing::ctx();
+        let long = "a very long application name that cannot possibly fit in the box";
+        let mut rect = egui::Rect::NOTHING;
+        let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| rect = field_disabled(ui, long, 300.0, 80.0));
+        assert_eq!(rect.size(), vec2(300.0, 50.0));
+        let text = p.texts.iter().find(|t| t.0.starts_with("a very")).expect("the text");
+        assert!(text.2.right() <= rect.right() - FIELD_INSET - 80.0 + 1.0, "{:?} runs into the chip's room in {rect:?}", text.2);
+        assert!(p.rects.iter().any(|r| r.fill == P.field_bg), "greyed");
+    }
+
+    #[test]
+    fn the_inline_field_is_forty_two_high_and_masks_a_password() {
+        let ctx = testing::ctx();
+        let mut value = String::from("hunter2");
+        let mut rect = egui::Rect::NOTHING;
+        let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| rect = inline(ui, &mut value, "Password", 200.0, true).rect);
+        assert_eq!(rect.height(), INLINE_HEIGHT.min(rect.height()));
+        assert!(p.text("hunter2").is_none(), "the value is not painted");
     }
 }

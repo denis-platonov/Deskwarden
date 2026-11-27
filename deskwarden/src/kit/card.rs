@@ -18,6 +18,14 @@ pub fn row_rule(ui: &mut Ui) {
     ui.painter().rect_filled(rect, CornerRadius::ZERO, p.row_rule);
 }
 
+/// A full-width 1 px rule in the card's own hairline colour: under a heading
+/// band, where [`row_rule`] is the lighter one between rows.
+pub fn hairline(ui: &mut Ui) {
+    let p = palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, p.hairline);
+}
+
 /// "Username", "2FA code", "Fills in": the small grey label over a value.
 pub fn field_label(ui: &mut Ui, text: &str) -> Response {
     let p = palette(ui.ctx());
