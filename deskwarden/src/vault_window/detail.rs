@@ -16674,7 +16674,7 @@ mod tests {
                 0.0,
                 "a value already in the pane's own face is being moved"
             );
-            let digits = ui.painter().layout_job(digits_job("0"));
+            let digits = ui.painter().layout_job(digits_job("0", crate::kit::tokens::Palette::LIGHT.ink));
             let drop = digits_baseline_drop(&digits, &ordinary);
             assert!(
                 drop > 0.0,
@@ -21939,7 +21939,7 @@ mod breach_badge_tests {
                 "{count}: {text:?}"
             );
             assert!(segment_is_urgent(BreachStatus::Breached(count)));
-            assert_eq!(segment_color(BreachStatus::Breached(count)), crate::kit::tokens::Palette::LIGHT.error);
+            assert_eq!(segment_color(BreachStatus::Breached(count), &crate::kit::tokens::Palette::LIGHT), crate::kit::tokens::Palette::LIGHT.error);
         }
     }
 
