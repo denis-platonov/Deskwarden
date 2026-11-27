@@ -2474,27 +2474,26 @@ mod win32 {
     /// black `At least this many digits` over a dead stepper would be the card
     /// offering a choice it is about to discard.
     fn paint_body_labels(hdc: HDC, l: &super::Layout, fonts: &Fonts, form: &GenerateForm) {
-        use crate::theme::{INK, TEXT_FAINT, TEXT_GHOST};
         let right = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
 
         // The length row. The number follows a drag in progress rather than the
         // committed size -- see `SLIDER_DRAG`.
         let (caption, committed) = form.size_row();
         let shown = dragging().map(|size| size.to_string()).unwrap_or(committed);
-        let size_ink = if form.in_flight() { TEXT_GHOST } else { INK };
+        let size_ink = if form.in_flight() { crate::gdi_palette::text_ghost() } else { crate::gdi_palette::ink() };
         text(hdc, fonts.prose, l.length_label, caption, size_ink);
         text_in(hdc, fonts.button, dev(l.length_value), &shown, size_ink, right);
 
         // The slider's bounds, read off the kind's own table so they change
         // with the run above them.
         let (low, high) = form.bounds();
-        text(hdc, fonts.sample, l.slider_low, &low.to_string(), TEXT_FAINT);
-        text_in(hdc, fonts.sample, dev(l.slider_high), &high.to_string(), TEXT_FAINT, right);
+        text(hdc, fonts.sample, l.slider_low, &low.to_string(), crate::gdi_palette::text_faint());
+        text_in(hdc, fonts.sample, dev(l.slider_high), &high.to_string(), crate::gdi_palette::text_faint(), right);
 
-        let classes_ink = if form.classes_live() { INK } else { TEXT_GHOST };
+        let classes_ink = if form.classes_live() { crate::gdi_palette::ink() } else { crate::gdi_palette::text_ghost() };
         text(hdc, fonts.prose, l.classes_caption, generate_classes_caption(), classes_ink);
 
-        let min_ink = if form.min_number_live() { INK } else { TEXT_GHOST };
+        let min_ink = if form.min_number_live() { crate::gdi_palette::ink() } else { crate::gdi_palette::text_ghost() };
         text(hdc, fonts.prose, l.min_label, generate_min_number_label(), min_ink);
         // The stepper's middle cell: one cell of a joined three, drawn through
         // the same painter its two buttons are so the seams line up.
@@ -2517,7 +2516,7 @@ mod win32 {
             fonts.sample,
             l.avoid_sample,
             GENERATE_AVOID_SAMPLE,
-            if form.classes_live() { TEXT_FAINT } else { TEXT_GHOST },
+            if form.classes_live() { crate::gdi_palette::text_faint() } else { crate::gdi_palette::text_ghost() },
         );
     }
 
@@ -2538,9 +2537,9 @@ mod win32 {
         let track_h = scale(super::SLIDER_TRACK_H).max(2);
         let r = scale(super::SLIDER_HANDLE_R).max(4);
         let (done, todo, edge) = if live {
-            (crate::theme::BLUE, crate::theme::TOGGLE_OFF, crate::theme::BLUE)
+            (crate::gdi_palette::blue(), crate::gdi_palette::switch_off(), crate::gdi_palette::blue())
         } else {
-            (crate::theme::BORDER, crate::theme::HAIRLINE, crate::theme::BORDER)
+            (crate::gdi_palette::border(), crate::gdi_palette::hairline(), crate::gdi_palette::border())
         };
         let track = RECT {
             left: rc.left + r,
@@ -2558,12 +2557,12 @@ mod win32 {
         // which is what the `CTRL+R` run's focus treatment already does on this
         // card: a round control gets a halo, not a box.
         if focused {
-            circle(hdc, centre_x, centre_y, r + scale(3), crate::theme::FOCUS_RING, None);
+            circle(hdc, centre_x, centre_y, r + scale(3), crate::gdi_palette::focus(), None);
         }
         let knob = if live && (hovered || dragging().is_some()) {
-            crate::theme::BLUE_WASH
+            crate::gdi_palette::blue_wash()
         } else {
-            crate::theme::CARD
+            crate::gdi_palette::card()
         };
         circle(hdc, centre_x, centre_y, r, knob, Some(edge));
     }
@@ -2586,13 +2585,13 @@ mod win32 {
         fonts: &Fonts,
     ) {
         let (fill, edge) = if !live {
-            (crate::theme::CARD, crate::theme::HAIRLINE)
+            (crate::gdi_palette::card(), crate::gdi_palette::hairline())
         } else if on {
-            (crate::theme::BLUE_WASH, crate::theme::BLUE)
+            (crate::gdi_palette::blue_wash(), crate::gdi_palette::blue())
         } else if hovered {
-            (crate::theme::CANVAS, crate::theme::BORDER)
+            (crate::gdi_palette::field_bg(), crate::gdi_palette::border())
         } else {
-            (crate::theme::CARD, crate::theme::BORDER)
+            (crate::gdi_palette::card(), crate::gdi_palette::border())
         };
         rounded_dev(hdc, rc, scale(super::RADIUS), fill, Some((scale(1).max(1), edge)));
 
@@ -2602,11 +2601,11 @@ mod win32 {
         let tick_rect =
             RECT { left, top, right: left + box_side, bottom: top + box_side };
         let (tick_fill, tick_edge) = if !live {
-            (if on { crate::theme::BORDER } else { crate::theme::CARD }, crate::theme::HAIRLINE)
+            (if on { crate::gdi_palette::border() } else { crate::gdi_palette::card() }, crate::gdi_palette::hairline())
         } else if on {
-            (crate::theme::BLUE, crate::theme::BLUE)
+            (crate::gdi_palette::blue(), crate::gdi_palette::blue())
         } else {
-            (crate::theme::CARD, crate::theme::BORDER)
+            (crate::gdi_palette::card(), crate::gdi_palette::border())
         };
         rounded_dev(
             hdc,
@@ -2616,11 +2615,11 @@ mod win32 {
             Some((scale(1).max(1), tick_edge)),
         );
         if on {
-            paint_tick(hdc, tick_rect, crate::theme::CARD);
+            paint_tick(hdc, tick_rect, if live { crate::gdi_palette::on_blue() } else { crate::gdi_palette::card() });
         }
 
-        let name_ink = if live { crate::theme::INK } else { crate::theme::TEXT_GHOST };
-        let sample_ink = if live { crate::theme::TEXT_FAINT } else { crate::theme::TEXT_GHOST };
+        let name_ink = if live { crate::gdi_palette::ink() } else { crate::gdi_palette::text_ghost() };
+        let sample_ink = if live { crate::gdi_palette::text_faint() } else { crate::gdi_palette::text_ghost() };
         let text_left = tick_rect.right + scale(super::TILE_TEXT_GAP);
         // The name is measured so the sample can follow it, which is the
         // image's `gap` between two runs rather than a second column: the
@@ -2682,15 +2681,15 @@ mod win32 {
     /// because the value is the one that comes straight back.
     fn paint_toggle(hdc: HDC, rc: RECT, on: bool, live: bool, focused: bool) {
         let (track, knob) = if !live {
-            (crate::theme::HAIRLINE, crate::theme::CANVAS)
+            (crate::gdi_palette::hairline(), crate::gdi_palette::field_bg())
         } else if on {
-            (crate::theme::BLUE, crate::theme::CARD)
+            (crate::gdi_palette::blue(), crate::gdi_palette::on_blue())
         } else {
-            (crate::theme::TOGGLE_OFF, crate::theme::CARD)
+            (crate::gdi_palette::switch_off(), crate::gdi_palette::on_blue())
         };
         let radius = (rc.bottom - rc.top) / 2;
         if focused {
-            rounded_dev(hdc, rc, radius, crate::theme::FOCUS_RING, None);
+            rounded_dev(hdc, rc, radius, crate::gdi_palette::focus(), None);
         }
         let inset = if focused { scale(2).max(1) } else { 0 };
         let pill = RECT {
@@ -2745,7 +2744,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     /// Takes over a control's painting without losing the focus and keyboard
@@ -3128,15 +3130,15 @@ mod win32 {
 
             // The window IS the card, so its whole client area is `theme::CARD`;
             // the well the options sit in is the one soft block on it.
-            fill_rect(mem, client, crate::theme::CARD);
+            fill_rect(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
-            rounded(mem, l.well, super::WELL_RADIUS, crate::theme::WINDOW_BG, None);
+            rounded(mem, l.well, super::WELL_RADIUS, crate::gdi_palette::secondary_hover(), None);
 
             if let Some(fonts) = fonts {
                 paint_lockup(mem, &l, fonts.brand);
 
                 // The label over the value (D 1.8): 15 in the faint ink.
-                text(mem, fonts.caption, l.caption, generate_caption(), crate::theme::TEXT_FAINT);
+                text(mem, fonts.caption, l.caption, generate_caption(), crate::gdi_palette::text_faint());
 
                 // The one-line states sit on the value's first line.
                 let first_line = Box2 { h: super::VALUE_H, ..l.value };
@@ -3146,14 +3148,14 @@ mod win32 {
                         fonts.value,
                         first_line,
                         generate_working_text(),
-                        crate::theme::TEXT_FAINT,
+                        crate::gdi_palette::text_faint(),
                     ),
                     ValueState::Failed(message) => text_in(
                         mem,
                         fonts.caption,
                         dev(l.value),
                         message.as_str(),
-                        crate::theme::ERROR,
+                        crate::gdi_palette::error(),
                         DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS,
                     ),
                     ValueState::Ready => {
@@ -3230,7 +3232,7 @@ mod win32 {
                         font,
                         line,
                         &mut chars[range.start..end],
-                        crate::theme::INK,
+                        crate::gdi_palette::ink(),
                         format,
                     );
                 }
@@ -3265,10 +3267,10 @@ mod win32 {
     ) -> (eframe::egui::Color32, eframe::egui::Color32) {
         use crate::password_strength::Strength;
         match rating {
-            Strength::Weak => (crate::theme::DANGER_WASH, crate::theme::ERROR),
-            Strength::Fair => (crate::theme::CAUTION_WASH, crate::theme::CAUTION_INK),
-            Strength::Good => (crate::theme::BLUE_WASH, crate::theme::BLUE_DEEP),
-            Strength::Strong => (crate::theme::DONE_WASH, crate::theme::DONE_INK),
+            Strength::Weak => (crate::gdi_palette::danger_wash(), crate::gdi_palette::error()),
+            Strength::Fair => (crate::gdi_palette::caution_wash(), crate::gdi_palette::caution_ink()),
+            Strength::Good => (crate::gdi_palette::blue_wash(), crate::gdi_palette::blue_deep()),
+            Strength::Strong => (crate::gdi_palette::done_wash(), crate::gdi_palette::done_ink()),
         }
     }
 
@@ -3298,9 +3300,9 @@ mod win32 {
             // otherwise a control's rounded corners show the wrong colour
             // through them.
             let under = if id == ID_SAVE || id == ID_NEW || id == ID_COPY {
-                crate::theme::CARD
+                crate::gdi_palette::card()
             } else {
-                crate::theme::WINDOW_BG
+                crate::gdi_palette::secondary_hover()
             };
             fill_rect(mem, whole, under);
             SetBkMode(mem, TRANSPARENT);
@@ -3319,7 +3321,7 @@ mod win32 {
                             mem,
                             Box2 { x: 0, y: 0, w: at.w, h: at.h },
                             crate::panel_draw::BUTTON_RADIUS + 1,
-                            crate::theme::FOCUS_RING,
+                            crate::gdi_palette::focus(),
                             None,
                         );
                         RECT {
@@ -3403,7 +3405,7 @@ mod win32 {
                             Box2 { x: 1, y: 1, w: at.w - 2, h: at.h - 2 },
                             super::RADIUS - 1,
                             2,
-                            crate::theme::FOCUS_RING,
+                            crate::gdi_palette::focus(),
                         );
                     }
                 } else if id == ID_AVOID {
@@ -3436,7 +3438,7 @@ mod win32 {
                             Box2 { x: 1, y: 1, w: at.w - 2, h: at.h - 2 },
                             super::RADIUS - 1,
                             2,
-                            crate::theme::FOCUS_RING,
+                            crate::gdi_palette::focus(),
                         );
                     }
                 } else {
@@ -3464,7 +3466,7 @@ mod win32 {
                             Box2 { x: 1, y: 1, w: at.w - 2, h: at.h - 2 },
                             super::RADIUS - 1,
                             2,
-                            crate::theme::FOCUS_RING,
+                            crate::gdi_palette::focus(),
                         );
                     }
                 }

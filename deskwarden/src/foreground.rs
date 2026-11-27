@@ -1434,7 +1434,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 99] = [
+        const OPENS_NO_WINDOW: [&str; 100] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1721,6 +1721,9 @@ mod tests {
             "test_scratch",
             // Slice 8: a registry read of Windows' app theme.
             "system_theme",
+            // Popups slice: a per-thread colour table the cards' own
+            // painters read; it draws nothing and owns no window.
+            "gdi_palette",
             "theme",
             "tray",
             // The About page's update flow: a state machine, two worker

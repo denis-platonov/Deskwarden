@@ -1314,7 +1314,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     /// The card's white as a brush, for `WM_CTLCOLOREDIT`.
@@ -1326,11 +1329,7 @@ mod win32 {
     /// deleted would leak one GDI object per repaint of a control the user is
     /// typing into.
     fn card_brush() -> HBRUSH {
-        static BRUSH: OnceLock<isize> = OnceLock::new();
-        HBRUSH(
-            *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(rgb(crate::theme::CARD)).0 as isize })
-                as *mut c_void,
-        )
+        crate::win32_draw::card_brush()
     }
 
     /// Takes over a control's painting without losing the focus and keyboard
@@ -1392,8 +1391,8 @@ mod win32 {
             // background has to be the card's white rather than the system's.
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetBkColor(hdc, rgb(crate::theme::CARD));
-                SetTextColor(hdc, rgb(crate::theme::INK));
+                SetBkColor(hdc, rgb(crate::gdi_palette::card()));
+                SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
                 LRESULT(card_brush().0 as isize)
             }
             // Frameless windows are dragged by their background.
@@ -1587,7 +1586,7 @@ mod win32 {
             let guard = FONTS.lock();
             if let Some(fonts) = guard.as_ref().ok().and_then(|slot| slot.as_ref()) {
                 SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+                SetTextColor(hdc, rgb(crate::gdi_palette::text_faint()));
                 let old = SelectObject(hdc, fonts.field);
                 let mut at = rc;
                 draw_text(
@@ -1650,12 +1649,12 @@ mod win32 {
             let l = super::layout();
 
             // The window IS the card, so its whole client area is `theme::CARD`.
-            fill_rect(mem, client, crate::theme::CARD);
+            fill_rect(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             // The preview block: the soft ground the design sets the app's tile
             // on (D 1.7: `pad 12, r14, #f7f6f5`).
-            rounded(mem, l.preview, 14, crate::theme::WINDOW_BG, None);
+            rounded(mem, l.preview, 14, crate::gdi_palette::secondary_hover(), None);
 
             // The two field boxes, and their focus halos. The `EDIT`s are
             // children sitting inside these, painted by comctl32 in the colours
@@ -1670,7 +1669,7 @@ mod win32 {
                         mem,
                         Box2 { x: at.x - 2, y: at.y - 2, w: at.w + 4, h: at.h + 4 },
                         13,
-                        crate::theme::FOCUS_RING,
+                        crate::gdi_palette::focus(),
                         None,
                     );
                 }
@@ -1678,8 +1677,8 @@ mod win32 {
                     mem,
                     at,
                     12,
-                    crate::theme::CARD,
-                    Some((1, if focused { crate::theme::BLUE } else { crate::theme::BORDER })),
+                    crate::gdi_palette::card(),
+                    Some((1, if focused { crate::gdi_palette::blue() } else { crate::gdi_palette::border() })),
                 );
             }
 
@@ -1691,10 +1690,10 @@ mod win32 {
                     bottom: scale(b.bottom()),
                 };
                 crate::win32_draw::draw_mark(mem, dev(l.mark));
-                text(mem, fonts.title, l.title, save_login_label(), crate::theme::INK);
+                text(mem, fonts.title, l.title, save_login_label(), crate::gdi_palette::ink());
 
                 for (caption, at) in row_captions().iter().zip(l.captions.iter()) {
-                    text(mem, fonts.caption, *at, caption, crate::theme::TEXT_SECONDARY);
+                    text(mem, fonts.caption, *at, caption, crate::gdi_palette::text_nav());
                 }
 
                 // **The app is the one pre-filled fact**, and its value is
@@ -1709,8 +1708,8 @@ mod win32 {
                     crate::panel_draw::avatar_colours(0),
                     DPI_PERCENT.load(Ordering::SeqCst),
                 );
-                text(mem, fonts.name, l.app_value, &app, crate::theme::INK);
-                text(mem, fonts.sub, l.folder_value, folder_row_text(), crate::theme::TEXT_FAINT);
+                text(mem, fonts.name, l.app_value, &app, crate::gdi_palette::ink());
+                text(mem, fonts.sub, l.folder_value, folder_row_text(), crate::gdi_palette::text_faint());
             }
 
             paint_close_glyph(mem, l.close_glyph, CLOSE_HOT.load(Ordering::SeqCst));
@@ -1747,7 +1746,7 @@ mod win32 {
 
             // Every button sits on the card's white, which is what its rounded
             // corners show through.
-            fill_rect(mem, whole, crate::theme::CARD);
+            fill_rect(mem, whole, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
@@ -1787,7 +1786,7 @@ mod win32 {
                             mem,
                             Box2 { x: 0, y: 0, w: box2.w, h: box2.h },
                             radius + 1,
-                            crate::theme::FOCUS_RING,
+                            crate::gdi_palette::focus(),
                             None,
                         );
                         let inner = RECT {

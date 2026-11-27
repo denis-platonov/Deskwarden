@@ -145,17 +145,21 @@ pub const TIP_PX: i32 = 14;
 // ---- colours not in `theme` ------------------------------------------------
 
 /// The `?` badge's fill (D 0: `#eceae7`).
-pub const HELP_FILL: Color32 = Color32::from_rgb(0xec, 0xea, 0xe7);
-/// The tooltip's ground is the design's `ink`.
-pub const TIP_FILL: Color32 = crate::theme::INK;
+pub fn help_fill() -> Color32 {
+    crate::gdi_palette::badge_bg()
+}
+/// The tooltip's ground (the palette's `tip_bg`: the design's `ink` on light).
+pub fn tip_fill() -> Color32 {
+    crate::gdi_palette::tip_bg()
+}
 
 /// An account's avatar colours (D 1.3's `OV` table): the first account is the
 /// brand blue, then a pale blue, then a neutral -- and round again.
 pub fn avatar_colours(index: usize) -> (Color32, Color32) {
     match index % 3 {
-        0 => (crate::theme::BLUE, Color32::WHITE),
-        1 => (Color32::from_rgb(0xdb, 0xe4, 0xf7), crate::theme::BLUE_DEEP),
-        _ => (HELP_FILL, crate::theme::INK),
+        0 => (crate::gdi_palette::blue(), crate::gdi_palette::on_blue()),
+        1 => (crate::gdi_palette::focus(), crate::gdi_palette::blue_deep()),
+        _ => (help_fill(), crate::gdi_palette::ink()),
     }
 }
 
@@ -221,7 +225,7 @@ pub fn draw_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT) {
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(crate::theme::INK));
+        SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
         let mut rc = word;
         draw_text(hdc, WORDMARK, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         SelectObject(hdc, old);
@@ -274,11 +278,11 @@ pub fn draw_enter_badge(hdc: HDC, row: RECT, font: HFONT, scale: i32) -> i32 {
     let chars: Vec<u16> = enter_label().encode_utf16().collect();
     let text_w = text_width_utf16(hdc, font, &chars);
     let rc = enter_badge_rect(row, text_w, scale);
-    round_rect(hdc, rc, px(ENTER_RADIUS, scale), crate::theme::BLUE, None);
+    round_rect(hdc, rc, px(ENTER_RADIUS, scale), crate::gdi_palette::blue(), None);
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(Color32::WHITE));
+        SetTextColor(hdc, rgb(crate::gdi_palette::on_blue()));
         let mut at = rc;
         draw_text(hdc, enter_label(), &mut at, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old);
@@ -306,13 +310,13 @@ pub fn pill_width(text_w: i32, scale: i32) -> i32 {
 
 /// The `?` badge: a 20 px circle, `?` at 12/800. Darker while `hot`.
 pub fn draw_help_badge(hdc: HDC, rc: RECT, font: HFONT, hot: bool) {
-    let fill = if hot { crate::theme::BORDER_STRONG } else { HELP_FILL };
+    let fill = if hot { crate::gdi_palette::kbd_border() } else { help_fill() };
     // A circle is a rounded rectangle whose radius is half its side.
     round_rect(hdc, rc, (rc.right - rc.left).min(rc.bottom - rc.top) / 2, fill, None);
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(crate::theme::TEXT_MUTED));
+        SetTextColor(hdc, rgb(crate::gdi_palette::text_muted()));
         let mut at = rc;
         draw_text(hdc, "?", &mut at, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old);
@@ -321,11 +325,11 @@ pub fn draw_help_badge(hdc: HDC, rc: RECT, font: HFONT, hot: bool) {
 
 /// The dark key-hint tooltip over `rc` (DEVICE pixels), one line per entry.
 pub fn draw_key_tooltip(hdc: HDC, rc: RECT, font: HFONT, lines: &[&str], scale: i32) {
-    round_rect(hdc, rc, px(TIP_RADIUS, scale), TIP_FILL, None);
+    round_rect(hdc, rc, px(TIP_RADIUS, scale), tip_fill(), None);
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(Color32::WHITE));
+        SetTextColor(hdc, rgb(crate::gdi_palette::tip_ink()));
         for (i, line) in lines.iter().enumerate() {
             let top = rc.top + px(TIP_PAD_Y, scale) + i as i32 * px(TIP_LINE_H, scale);
             let mut at = RECT {
@@ -351,7 +355,7 @@ pub fn draw_link(hdc: HDC, rc: RECT, label: &str, font: HFONT, hot: bool, centre
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(if hot { crate::theme::INK } else { crate::theme::TEXT_FAINT }));
+        SetTextColor(hdc, rgb(if hot { crate::gdi_palette::ink() } else { crate::gdi_palette::text_faint() }));
         let mut at = rc;
         let align = if centre { DT_CENTER } else { DT_LEFT };
         draw_text(hdc, label, &mut at, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -365,7 +369,7 @@ pub fn draw_accent_link(hdc: HDC, rc: RECT, label: &str, font: HFONT, hot: bool)
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(if hot { crate::theme::BLUE_DEEP } else { crate::theme::BLUE }));
+        SetTextColor(hdc, rgb(if hot { crate::gdi_palette::blue_deep() } else { crate::gdi_palette::blue() }));
         let mut at = rc;
         draw_text(
             hdc,
@@ -395,7 +399,7 @@ pub fn draw_close_x(hdc: HDC, rc: RECT, weight: i32, ink: Color32) {
 
 /// The regenerate glyph (D 1.8): a circular arrow, stroked, in `rc`.
 pub fn draw_regenerate_icon(hdc: HDC, rc: RECT, ink: Color32, scale: i32) {
-    use windows::Win32::Graphics::Gdi::Arc;
+    use windows::Win32::Graphics::Gdi::Polyline;
     unsafe {
         let w = (rc.right - rc.left).min(rc.bottom - rc.top);
         let cx = (rc.left + rc.right) / 2;
@@ -403,8 +407,15 @@ pub fn draw_regenerate_icon(hdc: HDC, rc: RECT, ink: Color32, scale: i32) {
         let r = w / 2;
         let pen = CreatePen(PS_SOLID, px(2, scale).max(1), rgb(ink));
         let old = SelectObject(hdc, pen);
-        // A three-quarter circle open at the upper right, with a two-stroke head.
-        let _ = Arc(hdc, cx - r, cy - r, cx + r, cy + r, cx + r, cy - r / 2, cx + r / 2, cy - r);
+        // A circle open at the upper right, with a two-stroke head. A polyline
+        // and not GDI's `Arc`: the tray's tile showed only the head with it
+        // (the arc's direction and endpoint rules left no stroke at all).
+        let at = |deg: f32| {
+            let rad = deg.to_radians();
+            POINT { x: cx + (r as f32 * rad.cos()).round() as i32, y: cy + (r as f32 * rad.sin()).round() as i32 }
+        };
+        let ring: Vec<POINT> = (0..=44).map(|i| at(-60.0 - 330.0 * i as f32 / 44.0)).collect();
+        let _ = Polyline(hdc, &ring);
         let _ = MoveToEx(hdc, cx + r / 2, cy - r - px(2, scale), None);
         let _ = LineTo(hdc, cx + r / 2, cy - r + px(3, scale));
         let _ = MoveToEx(hdc, cx + r / 2, cy - r + px(3, scale), None);
@@ -419,10 +430,14 @@ pub fn draw_regenerate_icon(hdc: HDC, rc: RECT, ink: Color32, scale: i32) {
 // ---------------------------------------------------------------------------
 
 /// The ✕'s ink (`#8a8785`, D 1.7).
-pub const CLOSE_INK: Color32 = Color32::from_rgb(0x8a, 0x87, 0x85);
+pub fn close_ink() -> Color32 {
+    crate::gdi_palette::text_label()
+}
 
 /// The ✕'s hover wash (`#f1f0ee`, D 1.7).
-pub const CLOSE_HOVER: Color32 = Color32::from_rgb(0xf1, 0xf0, 0xee);
+pub fn close_hover() -> Color32 {
+    crate::gdi_palette::hover()
+}
 
 /// The ✕ button's corner radius (D 1.7: 32 x 32, r10).
 pub const CLOSE_RADIUS: i32 = 10;
@@ -435,20 +450,20 @@ pub const ICON_BUTTON: i32 = 46;
 /// percentage.
 pub fn draw_close_button(hdc: HDC, rc: RECT, hot: bool, scale: i32) {
     if hot {
-        round_rect(hdc, rc, px(CLOSE_RADIUS, scale), CLOSE_HOVER, None);
+        round_rect(hdc, rc, px(CLOSE_RADIUS, scale), close_hover(), None);
     }
-    draw_close_x(hdc, rc, px(2, scale).max(1), CLOSE_INK);
+    draw_close_x(hdc, rc, px(2, scale).max(1), close_ink());
 }
 
 /// The edge and the icon ink of an icon button (D 1.8): `#e0deda` and
 /// `#4a4745` at rest, both `#1b3fa0` while `hot`, ghosted while not `live`.
 pub fn icon_button_colours(hot: bool, live: bool) -> (Color32, Color32) {
     if !live {
-        (crate::theme::HAIRLINE, crate::theme::TEXT_GHOST)
+        (crate::gdi_palette::hairline(), crate::gdi_palette::text_ghost())
     } else if hot {
-        (crate::theme::BLUE, crate::theme::BLUE)
+        (crate::gdi_palette::blue(), crate::gdi_palette::blue())
     } else {
-        (crate::theme::BORDER, crate::theme::TEXT_SECONDARY)
+        (crate::gdi_palette::border(), crate::gdi_palette::text_nav())
     }
 }
 
@@ -460,7 +475,7 @@ pub fn draw_icon_button_frame(hdc: HDC, rc: RECT, hot: bool, live: bool, scale: 
         hdc,
         rc,
         px(BUTTON_RADIUS, scale),
-        rgb(crate::theme::CARD),
+        rgb(crate::gdi_palette::card()),
         Some((rgb(edge), px(1, scale).max(1))),
     );
     ink
@@ -712,7 +727,7 @@ fn paint_tip(tip: HWND) {
         if let Ok(slot) = TIP.lock() {
             if let Some(state) = slot.as_ref() {
                 // The ground behind the tooltip's rounded corners is the card.
-                let brush = CreateSolidBrush(rgb(crate::theme::CARD));
+                let brush = CreateSolidBrush(rgb(crate::gdi_palette::card()));
                 FillRect(hdc, &rc, brush);
                 let _ = DeleteObject(brush);
                 let lines: Vec<&str> = state.lines.iter().map(String::as_str).collect();
@@ -818,9 +833,9 @@ pub fn draw_account_row(
 ) -> RECT {
     let wash = wash_rect(rect, scale);
     if look.selected {
-        round_rect(hdc, wash, px(ROW_RADIUS, scale), crate::theme::BLUE_WASH, None);
+        round_rect(hdc, wash, px(ROW_RADIUS, scale), crate::gdi_palette::blue_wash(), None);
     } else if look.hovered {
-        round_rect(hdc, wash, px(ROW_RADIUS, scale), crate::theme::WINDOW_BG, None);
+        round_rect(hdc, wash, px(ROW_RADIUS, scale), crate::gdi_palette::secondary_hover(), None);
     }
 
     // The badge and the chip first, so the text lane can stop short of them:
@@ -839,7 +854,7 @@ pub fn draw_account_row(
         Tile::Initials(name, index) => {
             draw_avatar(hdc, tile, &crate::theme::initials(name), fonts.avatar, avatar_colours(index), scale)
         }
-        Tile::Blank => round_rect(hdc, tile, px(AVATAR_RADIUS, scale), HELP_FILL, None),
+        Tile::Blank => round_rect(hdc, tile, px(AVATAR_RADIUS, scale), help_fill(), None),
         Tile::None => {}
     }
 
@@ -854,13 +869,13 @@ pub fn draw_account_row(
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
 
-        SetTextColor(hdc, rgb(crate::theme::INK));
+        SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
         let old = SelectObject(hdc, fonts.name);
         let mut at = RECT { left, right, ..name_band };
         draw_text(hdc, look.name, &mut at, line);
         SelectObject(hdc, old);
 
-        SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+        SetTextColor(hdc, rgb(crate::gdi_palette::text_faint()));
         let old = SelectObject(hdc, fonts.sub);
         let mut at = RECT { left, right, ..sub_band };
         draw_text(hdc, look.sub, &mut at, line);
@@ -889,7 +904,9 @@ pub enum PanelButton {
 }
 
 /// The edge of the [`PanelButton::Danger`] button (`#f0cfca`).
-pub const DANGER_EDGE_SOFT: Color32 = Color32::from_rgb(0xf0, 0xcf, 0xca);
+pub fn danger_edge_soft() -> Color32 {
+    crate::gdi_palette::danger_edge()
+}
 
 /// The [`ButtonSkin`] for `kind`, hovered or not.
 pub fn skin(kind: PanelButton, hovered: bool) -> ButtonSkin {
@@ -901,8 +918,8 @@ pub fn skin(kind: PanelButton, hovered: bool) -> ButtonSkin {
             // The outline skin with the danger ink and edge; its hover fill is
             // set below, because `ButtonSkin`'s own is the outline's grey.
             let mut skin = ButtonSkin::panel_outline();
-            skin.text = rgb(crate::theme::ERROR);
-            skin.border = Some(rgb(DANGER_EDGE_SOFT));
+            skin.text = rgb(crate::gdi_palette::error());
+            skin.border = Some(rgb(danger_edge_soft()));
             skin
         }
     };
@@ -911,7 +928,7 @@ pub fn skin(kind: PanelButton, hovered: bool) -> ButtonSkin {
     }
     let mut skin = base.hovered();
     if kind == PanelButton::Danger {
-        skin.fill = rgb(crate::theme::DANGER_WASH);
+        skin.fill = rgb(crate::gdi_palette::danger_wash());
     }
     skin
 }
@@ -990,7 +1007,7 @@ pub fn check_points(progress: f32) -> Vec<(f32, f32)> {
 /// [`check_progress`].
 pub fn draw_done_check(hdc: HDC, centre: POINT, scale: i32, elapsed_ms: u32) {
     let r = (px(DONE_DISC, scale) as f32 / 2.0 * ring_scale(elapsed_ms)).round() as i32;
-    crate::win32_draw::aa_circle(hdc, centre.x, centre.y, r, rgb(crate::theme::DONE_WASH), None);
+    crate::win32_draw::aa_circle(hdc, centre.x, centre.y, r, rgb(crate::gdi_palette::done_wash()), None);
     unsafe {
         let points = check_points(check_progress(elapsed_ms));
         if points.len() < 2 {
@@ -1004,7 +1021,7 @@ pub fn draw_done_check(hdc: HDC, centre: POINT, scale: i32, elapsed_ms: u32) {
         };
         // A `PS_SOLID` pen wider than one pixel is a geometric pen with round
         // caps and joins, which is what the design's `stroke-linecap: round` is.
-        let pen = CreatePen(PS_SOLID, (2.6 * unit).round().max(1.0) as i32, rgb(crate::theme::DONE_MARK));
+        let pen = CreatePen(PS_SOLID, (2.6 * unit).round().max(1.0) as i32, rgb(crate::gdi_palette::done_mark()));
         let old = SelectObject(hdc, pen);
         let first = to(points[0]);
         let _ = MoveToEx(hdc, first.x, first.y, None);
@@ -1092,10 +1109,27 @@ mod tests {
     }
 
     #[test]
+    fn the_buttons_follow_the_theme_and_the_primary_stays_blue_with_white_ink() {
+        use crate::kit::tokens::Palette;
+        for (dark, palette) in [(false, Palette::LIGHT), (true, Palette::DARK)] {
+            crate::gdi_palette::set_dark(dark);
+            let primary = skin(PanelButton::Primary, false);
+            assert_eq!(primary.fill, rgb(palette.blue));
+            assert_eq!(primary.text, rgb(palette.on_blue));
+            let outline = skin(PanelButton::Outline, false);
+            assert_eq!(outline.fill, rgb(palette.card));
+            assert_eq!(outline.text, rgb(palette.ink));
+            assert_eq!(outline.border, Some(rgb(palette.border)));
+            assert_ne!(skin(PanelButton::Primary, true).fill, primary.fill, "hover must show");
+        }
+        crate::gdi_palette::set_dark(false);
+    }
+
+    #[test]
     fn the_avatars_cycle_through_the_designs_three_colourways() {
-        assert_eq!(avatar_colours(0).0, crate::theme::BLUE);
-        assert_eq!(avatar_colours(1).1, crate::theme::BLUE_DEEP);
-        assert_eq!(avatar_colours(2).0, HELP_FILL);
+        assert_eq!(avatar_colours(0).0, crate::gdi_palette::blue());
+        assert_eq!(avatar_colours(1).1, crate::gdi_palette::blue_deep());
+        assert_eq!(avatar_colours(2).0, help_fill());
         assert_eq!(avatar_colours(3), avatar_colours(0));
     }
 
@@ -1154,8 +1188,8 @@ mod tests {
     #[test]
     fn the_close_button_and_the_icon_buttons_are_the_designs() {
         assert_eq!((CLOSE_LARGE, CLOSE_RADIUS, ICON_BUTTON), (32, 10, 46));
-        assert_eq!(CLOSE_INK, Color32::from_rgb(0x8a, 0x87, 0x85));
-        assert_eq!(CLOSE_HOVER, Color32::from_rgb(0xf1, 0xf0, 0xee));
+        assert_eq!(close_ink(), Color32::from_rgb(0x8a, 0x87, 0x85));
+        assert_eq!(close_hover(), Color32::from_rgb(0xf1, 0xf0, 0xee));
         // D 1.8: hover turns the edge AND the icon `#1b3fa0`.
         let (rest_edge, rest_ink) = icon_button_colours(false, true);
         let (hot_edge, hot_ink) = icon_button_colours(true, true);

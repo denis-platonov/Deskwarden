@@ -896,6 +896,12 @@ pub fn show(
     run_with(&win32::REAL, Popup::new(vault, status), copy)
 }
 
+/// The shipped window calls, for the preview example: it swaps `protect` and
+/// `next` and nothing else (the same shape as every other card's `REAL`).
+pub fn real_calls() -> &'static PopupCalls {
+    &win32::REAL
+}
+
 mod win32 {
     use super::{
         hit, layout, place, Event, Field, Hit, Layout, PopupCalls, PopupWindow, Shape, Tone, View,
@@ -1088,7 +1094,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     fn dev(b: Box2) -> RECT {
@@ -1189,7 +1198,7 @@ mod win32 {
             if previous != 0 {
                 EDIT_ORIGINAL_PROC.store(previous, Ordering::SeqCst);
             }
-            let brush = CreateSolidBrush(rgb(crate::theme::CANVAS));
+            let brush = CreateSolidBrush(rgb(crate::gdi_palette::field_bg()));
             EDIT_BRUSH.store(brush.0 as isize, Ordering::SeqCst);
         }
         EDIT.store(edit.0 as isize, Ordering::SeqCst);
@@ -1453,8 +1462,8 @@ mod win32 {
             }
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetTextColor(hdc, rgb(crate::theme::INK));
-                SetBkColor(hdc, rgb(crate::theme::CANVAS));
+                SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
+                SetBkColor(hdc, rgb(crate::gdi_palette::field_bg()));
                 LRESULT(EDIT_BRUSH.load(Ordering::SeqCst))
             }
             WM_DESTROY => {
@@ -1502,7 +1511,7 @@ mod win32 {
                 if let Some(font) = font {
                     let old = SelectObject(hdc, font);
                     SetBkMode(hdc, TRANSPARENT);
-                    SetTextColor(hdc, rgb(crate::theme::TEXT_GHOST));
+                    SetTextColor(hdc, rgb(crate::gdi_palette::text_ghost()));
                     draw_text(
                         hdc,
                         search_placeholder(),
@@ -1642,7 +1651,7 @@ mod win32 {
             let hover = HOVER.lock().ok().and_then(|slot| *slot);
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
-            fill_rect(mem, client, crate::theme::CARD);
+            fill_rect(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
             if let (Some(view), Some(fonts)) = (view, fonts) {
                 paint_panel(mem, &view, fonts, hover);
@@ -1658,7 +1667,6 @@ mod win32 {
     }
 
     fn paint_panel(hdc: HDC, view: &View, fonts: &Fonts, hover: Option<Hit>) {
-        use crate::theme::{BLUE, BLUE_DEEP, BLUE_WASH, CANVAS, INK, TEXT_FAINT, TEXT_GHOST, TEXT_MUTED, WINDOW_BG};
         let l = layout(view.shape);
 
         // Header.
@@ -1670,16 +1678,16 @@ mod win32 {
                 continue;
             }
             if hover == Some(what) {
-                round(hdc, button, 11, CANVAS);
+                round(hdc, button, 11, crate::gdi_palette::field_bg());
             }
             let icon = Box2 { x: button.x + 9, y: button.y + 9, w: 18, h: 18 };
-            glyph(hdc, icon, which, crate::theme::TEXT_SECONDARY);
+            glyph(hdc, icon, which, crate::gdi_palette::text_nav());
         }
 
         match view.shape {
             Shape::Locked => {
-                text(hdc, fonts.title, l.title, super::locked_title(), INK, DT_LEFT.0);
-                text(hdc, fonts.body, l.body, super::locked_body(), TEXT_FAINT, DT_LEFT.0);
+                text(hdc, fonts.title, l.title, super::locked_title(), crate::gdi_palette::ink(), DT_LEFT.0);
+                text(hdc, fonts.body, l.body, super::locked_body(), crate::gdi_palette::text_faint(), DT_LEFT.0);
                 let skin = crate::panel_draw::skin(
                     crate::panel_draw::PanelButton::Deep,
                     hover == Some(Hit::Unlock),
@@ -1694,13 +1702,13 @@ mod win32 {
                 );
             }
             Shape::Open { .. } => {
-                round(hdc, l.search, super::SEARCH_RADIUS, CANVAS);
-                glyph(hdc, l.search_icon, Glyph::Magnifier, TEXT_GHOST);
+                round(hdc, l.search, super::SEARCH_RADIUS, crate::gdi_palette::field_bg());
+                glyph(hdc, l.search_icon, Glyph::Magnifier, crate::gdi_palette::text_ghost());
 
                 unsafe {
                     SetTextCharacterExtra(hdc, scale(1));
                 }
-                text(hdc, fonts.label, l.label, &view.label, TEXT_GHOST, DT_LEFT.0);
+                text(hdc, fonts.label, l.label, &view.label, crate::gdi_palette::text_ghost(), DT_LEFT.0);
                 unsafe {
                     SetTextCharacterExtra(hdc, 0);
                 }
@@ -1711,9 +1719,9 @@ mod win32 {
                         Some(Hit::Row(n) | Hit::CopyUsername(n) | Hit::CopyPassword(n)) if n == i
                     );
                     if i == view.selected {
-                        round(hdc, boxes.row, ROW_RADIUS, BLUE_WASH);
+                        round(hdc, boxes.row, ROW_RADIUS, crate::gdi_palette::blue_wash());
                     } else if on_row {
-                        round(hdc, boxes.row, ROW_RADIUS, WINDOW_BG);
+                        round(hdc, boxes.row, ROW_RADIUS, crate::gdi_palette::secondary_hover());
                     }
                     crate::panel_draw::draw_avatar(
                         hdc,
@@ -1730,7 +1738,7 @@ mod win32 {
                         fonts.name,
                         Box2 { h: half, ..boxes.text },
                         &row.name,
-                        INK,
+                        crate::gdi_palette::ink(),
                         ell,
                     );
                     text(
@@ -1738,7 +1746,7 @@ mod win32 {
                         fonts.sub,
                         Box2 { y: boxes.text.y + half - 1, h: boxes.text.h - half + 1, ..boxes.text },
                         if row.username.is_empty() { "No username" } else { &row.username },
-                        TEXT_FAINT,
+                        crate::gdi_palette::text_faint(),
                         ell,
                     );
                     for (button, which, what, enabled) in [
@@ -1757,36 +1765,36 @@ mod win32 {
                     ] {
                         let hot = enabled && hover == Some(what);
                         if hot {
-                            round(hdc, button, 10, BLUE_WASH);
+                            round(hdc, button, 10, crate::gdi_palette::blue_wash());
                         }
                         let icon = Box2 { x: button.x + 9, y: button.y + 9, w: 18, h: 18 };
                         let ink = if !enabled {
-                            crate::theme::BORDER_STRONG
+                            crate::gdi_palette::kbd_border()
                         } else if hot {
-                            BLUE
+                            crate::gdi_palette::blue()
                         } else {
-                            TEXT_MUTED
+                            crate::gdi_palette::text_muted()
                         };
                         glyph(hdc, icon, which, ink);
                     }
                 }
                 if let Some((title, body)) = view.empty {
                     let half = l.note.h / 2;
-                    text(hdc, fonts.name, Box2 { h: half, ..l.note }, title, INK, DT_CENTER.0);
+                    text(hdc, fonts.name, Box2 { h: half, ..l.note }, title, crate::gdi_palette::ink(), DT_CENTER.0);
                     text(
                         hdc,
                         fonts.sub,
                         Box2 { y: l.note.y + half, h: l.note.h - half, ..l.note },
                         body,
-                        TEXT_FAINT,
+                        crate::gdi_palette::text_faint(),
                         DT_CENTER.0,
                     );
                 }
 
                 for (tile, (what, label)) in l.tiles.iter().zip(TILES) {
                     let hot = hover == Some(what);
-                    round(hdc, *tile, TILE_RADIUS, if hot { BLUE_WASH } else { WINDOW_BG });
-                    let ink = if hot { BLUE_DEEP } else { INK };
+                    round(hdc, *tile, TILE_RADIUS, if hot { crate::gdi_palette::blue_wash() } else { crate::gdi_palette::secondary_hover() });
+                    let ink = if hot { crate::gdi_palette::blue_deep() } else { crate::gdi_palette::ink() };
                     let which = match what {
                         Hit::Generate => Glyph::Regenerate,
                         Hit::NewItem => Glyph::Plus,
@@ -1808,13 +1816,13 @@ mod win32 {
 
         // Footer: a toast stands in for it while a copy's confirmation is up.
         let (words, tone, ink) = match &view.toast {
-            Some(toast) => (toast.as_str(), Tone::Good, INK),
-            None => (view.footer.text.as_str(), view.footer.tone, crate::theme::TEXT_MUTED),
+            Some(toast) => (toast.as_str(), Tone::Good, crate::gdi_palette::ink()),
+            None => (view.footer.text.as_str(), view.footer.tone, crate::gdi_palette::text_muted()),
         };
         let dot_colour = match tone {
-            Tone::Good => crate::theme::DONE_MARK,
-            Tone::Warn => Color32::from_rgb(0xb7, 0x79, 0x1f),
-            Tone::Quiet => TEXT_GHOST,
+            Tone::Good => crate::gdi_palette::done_mark(),
+            Tone::Warn => crate::gdi_palette::caution_dot(),
+            Tone::Quiet => crate::gdi_palette::text_ghost(),
         };
         let dot = Box2 {
             x: l.footer.x,

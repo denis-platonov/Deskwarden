@@ -2658,9 +2658,7 @@ mod win32 {
     /// not deleted would leak one GDI object per repaint of a control the user
     /// is typing into.
     fn card_brush() -> HBRUSH {
-        static BRUSH: OnceLock<isize> = OnceLock::new();
-        HBRUSH(*BRUSH.get_or_init(|| unsafe { CreateSolidBrush(rgb(crate::theme::CARD)).0 as isize })
-            as *mut c_void)
+        crate::win32_draw::card_brush()
     }
 
     /// Swaps the card to its second step: the chosen account's fields.
@@ -3045,7 +3043,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     /// Takes over a control's painting without losing the focus and keyboard
@@ -3080,8 +3081,8 @@ mod win32 {
             // same three calls.
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetBkColor(hdc, rgb(crate::theme::CARD));
-                SetTextColor(hdc, rgb(crate::theme::INK));
+                SetBkColor(hdc, rgb(crate::gdi_palette::card()));
+                SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
                 LRESULT(card_brush().0 as isize)
             }
             // Frameless windows are dragged by their background.
@@ -3310,7 +3311,7 @@ mod win32 {
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
             // The window IS the panel: white, as design 1b draws it.
-            fill(mem, client, crate::theme::CARD);
+            fill(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             let l = card();
@@ -3338,7 +3339,7 @@ mod win32 {
                             h: l.field.h + 2 * FOCUS_RING_W,
                         },
                         FIELD_RING_RADIUS,
-                        crate::theme::FOCUS_RING,
+                        crate::gdi_palette::focus(),
                         None,
                     );
                 }
@@ -3346,10 +3347,10 @@ mod win32 {
                     mem,
                     l.field,
                     FIELD_RADIUS,
-                    crate::theme::CARD,
+                    crate::gdi_palette::card(),
                     Some((
                         1,
-                        if search_focused { crate::theme::BLUE } else { crate::theme::HAIRLINE },
+                        if search_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::hairline() },
                     )),
                 );
                 // **The hairline between the two elements**, drawn inside the
@@ -3361,7 +3362,7 @@ mod win32 {
                         mem,
                         Box2 { x: box2.x, y: box2.bottom() - 1, w: box2.w, h: 1 },
                         0,
-                        crate::theme::HAIRLINE,
+                        crate::gdi_palette::hairline(),
                         None,
                     );
                 }
@@ -3377,11 +3378,11 @@ mod win32 {
                     mem,
                     dev(l.close_glyph),
                     scale(1).max(1),
-                    crate::theme::TEXT_FAINT,
+                    crate::gdi_palette::text_faint(),
                 );
                 if l.heading {
-                    text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
-                    text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
+                    text(mem, fonts.title, l.title, &title_run, crate::gdi_palette::ink());
+                    text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::gdi_palette::text_faint());
                 }
             }
 
@@ -3419,7 +3420,7 @@ mod win32 {
                 // not cover is that card's white. `draw_row` fills the whole
                 // rect edge to edge, which is what keeps a hover from hugging
                 // just the text.
-                fill(mem, whole, crate::theme::CARD);
+                fill(mem, whole, crate::gdi_palette::card());
                 if let Some(fonts) = fonts {
                     // **Focus is drawn as selection.** These rows are reached
                     // by Tab as readily as by the pointer, and a focused row
@@ -3541,7 +3542,7 @@ mod win32 {
                     hdc,
                     rect,
                     scale(panel_draw::BUTTON_RADIUS + super::EMPTY_RING),
-                    crate::theme::FOCUS_RING,
+                    crate::gdi_palette::focus(),
                     None,
                 );
             }
@@ -3629,11 +3630,11 @@ mod win32 {
             cx,
             cy,
             r + stroke / 2,
-            rgb(panel_draw::HELP_FILL),
-            Some((rgb(crate::theme::TEXT_MUTED), stroke)),
+            rgb(panel_draw::help_fill()),
+            Some((rgb(crate::gdi_palette::text_muted()), stroke)),
         );
         unsafe {
-            let pen = CreatePen(PS_SOLID, stroke, rgb(crate::theme::TEXT_MUTED));
+            let pen = CreatePen(PS_SOLID, stroke, rgb(crate::gdi_palette::text_muted()));
             let old_pen = SelectObject(hdc, pen);
             let from = (cx + r * 7 / 10, cy + r * 7 / 10);
             let _ = MoveToEx(hdc, from.0, from.1, None);
@@ -4218,23 +4219,23 @@ mod card_tests {
             "control: this scan is not reading the function that paints the card's surface"
         );
         assert!(
-            flat.contains("rounded( mem, l.field, FIELD_RADIUS, crate::theme::CARD, Some(( 1,"),
+            flat.contains("rounded( mem, l.field, FIELD_RADIUS, crate::gdi_palette::card(), Some(( 1,"),
             "the one bordered container is no longer drawn from `l.field`, so the search box and \
              the rows are not inside one field any more"
         );
         assert!(
-            !flat.contains("crate::theme::BORDER_STRONG"),
+            !flat.contains("crate::gdi_palette::kbd_border()"),
             "a second border colour is back on this card. The search input's own outline was \
              `BORDER_STRONG`, and taking it away is the whole of change two"
         );
         assert!(
-            flat.contains("if search_focused { crate::theme::BLUE } else { crate::theme::HAIRLINE }"),
+            flat.contains("if search_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::hairline() }"),
             "the field no longer changes to `theme::BLUE` when the search box has focus. \
              Removing the input's border removed its focus indication, and the field's edge is \
              where that indication moved"
         );
         assert!(
-            flat.contains("crate::theme::FOCUS_RING"),
+            flat.contains("crate::gdi_palette::focus()"),
             "the focus halo is gone. It is the other half of how this design shows focus -- \
              `paint_control` draws the same one around a focused footer button"
         );

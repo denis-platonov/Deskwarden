@@ -66,6 +66,20 @@ pub struct Palette {
     pub danger_wash: Color32,
     pub danger_ink: Color32,
     pub close_hover: Color32,
+    /// What is written on a blue fill (a primary button's label, a tick).
+    pub on_blue: Color32,
+    /// The primary button's hover fill.
+    pub primary_hover: Color32,
+    /// The deep-blue button's fill (the Locked panel's Unlock) and its hover.
+    pub deep_button: Color32,
+    pub deep_button_hover: Color32,
+    /// The key-hint tooltip's ground and the ink written on it.
+    pub tip_bg: Color32,
+    pub tip_ink: Color32,
+    /// The card shadow's colour; its alpha is the shadow's strength at the
+    /// card's own edge. (Stored as bytes, r g b a, with no premultiplying: the card
+    /// shell reads them as they are.)
+    pub shadow: Color32,
 }
 
 impl Palette {
@@ -119,6 +133,13 @@ impl Palette {
         danger_wash: rgb(0xfdf3f2),
         danger_ink: rgb(0x8c3c33),
         close_hover: rgb(0xc42b1c),
+        on_blue: rgb(0xffffff),
+        primary_hover: rgb(0x14307a),
+        deep_button: rgb(0x14307a),
+        deep_button_hover: rgb(0x1b3fa0),
+        tip_bg: rgb(0x201e1d),
+        tip_ink: rgb(0xffffff),
+        shadow: Color32::from_rgba_premultiplied(45, 43, 43, 51),
     };
 
     /// The dark theme (spec D2): the warm greys inverted, the same hues, the
@@ -173,6 +194,13 @@ impl Palette {
         danger_wash: rgb(0x2e1a18),
         danger_ink: rgb(0xf0a8a0),
         close_hover: rgb(0xc42b1c),
+        on_blue: rgb(0xffffff),
+        primary_hover: rgb(0x5a8af0),
+        deep_button: rgb(0x3b74e8),
+        deep_button_hover: rgb(0x5a8af0),
+        tip_bg: rgb(0x4a4744),
+        tip_ink: rgb(0xf2f0ee),
+        shadow: Color32::from_rgba_premultiplied(0, 0, 0, 140),
     };
 }
 
@@ -260,6 +288,14 @@ pub enum ThemeChoice {
 }
 
 impl ThemeChoice {
+    /// [`Self::palette`], asking Windows (`system_is_dark`) only when the
+    /// choice is `System`. The one rule every window follows: the egui windows
+    /// through [`ThemeFollower`], the bare-Win32 cards through
+    /// `gdi_palette::open_for_card`.
+    pub fn palette_with(self, system_is_dark: impl FnOnce() -> bool) -> Palette {
+        self.palette(self == ThemeChoice::System && system_is_dark())
+    }
+
     /// The palette this choice paints, given whether Windows is in dark mode.
     pub fn palette(self, system_is_dark: bool) -> Palette {
         match self {

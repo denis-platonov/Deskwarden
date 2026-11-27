@@ -716,9 +716,9 @@ mod win32 {
         fn skin(&self, role: Role) -> (HFONT, eframe::egui::Color32, DRAW_TEXT_FORMAT) {
             let line = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
             match role {
-                Role::Title => (self.title, crate::theme::INK, title_format()),
-                Role::Body => (self.body, crate::theme::TEXT_FAINT, body_format()),
-                Role::Button | Role::Decline => (self.button, crate::theme::INK, line),
+                Role::Title => (self.title, crate::gdi_palette::ink(), title_format()),
+                Role::Body => (self.body, crate::gdi_palette::text_faint(), body_format()),
+                Role::Button | Role::Decline => (self.button, crate::gdi_palette::ink(), line),
             }
         }
     }
@@ -1126,7 +1126,7 @@ mod win32 {
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
             let case = DONE.lock().ok().and_then(|slot| *slot);
             let l = super::done_layout();
-            fill_rect(mem, client, crate::theme::CARD);
+            fill_rect(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
             if let (Some(fonts), Some(case)) = (fonts, case) {
                 let (title, subtitle) = super::done_copy(case);
@@ -1138,8 +1138,8 @@ mod win32 {
                     DONE_MS.load(Ordering::SeqCst).max(0) as u32,
                 );
                 let centred = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
-                text(mem, fonts.done_title, l.title, title, crate::theme::INK, centred);
-                text(mem, fonts.done_sub, l.subtitle, subtitle, crate::theme::TEXT_MUTED, centred);
+                text(mem, fonts.done_title, l.title, title, crate::gdi_palette::ink(), centred);
+                text(mem, fonts.done_sub, l.subtitle, subtitle, crate::gdi_palette::text_muted(), centred);
             }
             drop(guard);
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -1229,7 +1229,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     fn subclass(control: HWND) {
@@ -1393,7 +1396,7 @@ mod win32 {
 
             // Design 1b's panels have no rules, no tinted footer and no well
             // behind the body: the words sit straight on the card.
-            fill_rect(mem, client, crate::theme::CARD);
+            fill_rect(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
@@ -1442,7 +1445,7 @@ mod win32 {
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
             // The button sits on the card's white.
-            fill_rect(mem, whole, crate::theme::CARD);
+            fill_rect(mem, whole, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
@@ -1478,8 +1481,8 @@ mod win32 {
                         mem,
                         ring,
                         crate::panel_draw::BUTTON_RADIUS + 1,
-                        crate::theme::FOCUS_RING,
-                        crate::theme::FOCUS_RING,
+                        crate::gdi_palette::focus(),
+                        crate::gdi_palette::focus(),
                     );
                     let inner = RECT {
                         left: whole.left + 2,
@@ -1524,7 +1527,7 @@ mod win32 {
     fn paint_close_glyph(hdc: HDC, at: Box2) {
         unsafe {
             use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
+            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::gdi_palette::text_faint()));
             let old = SelectObject(hdc, pen);
             let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
             let pad = w / 3;
@@ -2011,12 +2014,12 @@ mod tests {
         use crate::panel_draw::{skin, PanelButton};
         use crate::win32_draw::rgb;
         let rest = skin(PanelButton::Danger, false);
-        assert_eq!(rest.text, rgb(crate::theme::ERROR));
-        assert_eq!(rest.border, Some(rgb(crate::panel_draw::DANGER_EDGE_SOFT)));
-        assert_eq!(rest.fill, rgb(crate::theme::CARD));
-        assert_eq!(skin(PanelButton::Danger, true).fill, rgb(crate::theme::DANGER_WASH));
+        assert_eq!(rest.text, rgb(crate::gdi_palette::error()));
+        assert_eq!(rest.border, Some(rgb(crate::panel_draw::danger_edge_soft())));
+        assert_eq!(rest.fill, rgb(crate::gdi_palette::card()));
+        assert_eq!(skin(PanelButton::Danger, true).fill, rgb(crate::gdi_palette::danger_wash()));
         // The other skins are untouched by the addition.
-        assert_eq!(skin(PanelButton::Outline, true).fill, rgb(crate::theme::WINDOW_BG));
+        assert_eq!(skin(PanelButton::Outline, true).fill, rgb(crate::gdi_palette::secondary_hover()));
     }
 
     #[test]

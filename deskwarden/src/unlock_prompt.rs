@@ -1366,7 +1366,10 @@ mod win32 {
     /// corner `DWMWCP_ROUND` gave every card. The card's own background is
     /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        crate::card_shell::attach(window, crate::theme::CARD);
+        // The theme is chosen here, on the window's own thread, before the
+        // first paint: every painter below reads it.
+        crate::gdi_palette::open_for_card();
+        crate::card_shell::attach(window, crate::gdi_palette::card());
     }
 
     fn subclass(button: HWND, slot: &AtomicIsize) {
@@ -1394,13 +1397,13 @@ mod win32 {
             // background has to be the card's white rather than the system's.
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetBkColor(hdc, rgb(crate::theme::CARD));
+                SetBkColor(hdc, rgb(crate::gdi_palette::card()));
                 SetTextColor(
                     hdc,
                     rgb(if BUSY.load(Ordering::SeqCst) {
-                        crate::theme::TEXT_GHOST
+                        crate::gdi_palette::text_ghost()
                     } else {
-                        crate::theme::INK
+                        crate::gdi_palette::ink()
                     }),
                 );
                 LRESULT(card_brush().0 as isize)
@@ -1517,9 +1520,7 @@ mod win32 {
     }
 
     fn card_brush() -> HBRUSH {
-        static BRUSH: OnceLock<isize> = OnceLock::new();
-        HBRUSH(*BRUSH.get_or_init(|| unsafe { CreateSolidBrush(rgb(crate::theme::CARD)).0 as isize })
-            as *mut c_void)
+        crate::win32_draw::card_brush()
     }
 
     /// The close glyph's rect in DEVICE pixels.
@@ -1566,7 +1567,7 @@ mod win32 {
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
             // The whole window is the card: design 1b's white panel.
-            fill(mem, client, crate::theme::CARD);
+            fill(mem, client, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             let l = super::layout();
@@ -1580,19 +1581,19 @@ mod win32 {
                     fitted_pill(mem, fonts.pill, dev(l.pill), word),
                     word,
                     fonts.pill,
-                    crate::theme::BLUE_WASH,
-                    crate::theme::BLUE_DEEP,
+                    crate::gdi_palette::blue_wash(),
+                    crate::gdi_palette::blue_deep(),
                 );
 
                 let name = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
                 let (title, body) = super::prompt_text((!name.is_empty()).then_some(name.as_str()));
-                text(mem, fonts.title, l.title, &title, crate::theme::INK, DT_LEFT | DT_END_ELLIPSIS, 0);
+                text(mem, fonts.title, l.title, &title, crate::gdi_palette::ink(), DT_LEFT | DT_END_ELLIPSIS, 0);
                 // A refused attempt says why in the body's place.
                 let line = super::error_line();
                 if line.is_empty() {
-                    text(mem, fonts.subtitle, l.subtitle, &body, crate::theme::TEXT_FAINT, DT_LEFT | DT_END_ELLIPSIS, 0);
+                    text(mem, fonts.subtitle, l.subtitle, &body, crate::gdi_palette::text_faint(), DT_LEFT | DT_END_ELLIPSIS, 0);
                 } else {
-                    text(mem, fonts.subtitle, l.subtitle, &line, crate::theme::ERROR, DT_LEFT | DT_END_ELLIPSIS, 0);
+                    text(mem, fonts.subtitle, l.subtitle, &line, crate::gdi_palette::error(), DT_LEFT | DT_END_ELLIPSIS, 0);
                 }
             }
 
@@ -1603,14 +1604,14 @@ mod win32 {
                 .map(|f| handle_of(f) == focused)
                 .unwrap_or(false);
             if field_focused {
-                rounded(mem, inset(l.field, -3, -3, -3, -3), super::FIELD_RADIUS + 3, crate::theme::FOCUS_RING, None);
+                rounded(mem, inset(l.field, -3, -3, -3, -3), super::FIELD_RADIUS + 3, crate::gdi_palette::focus(), None);
             }
             rounded(
                 mem,
                 l.field,
                 super::FIELD_RADIUS,
-                crate::theme::CARD,
-                Some((1, if field_focused { crate::theme::BLUE } else { crate::theme::BORDER_STRONG })),
+                crate::gdi_palette::card(),
+                Some((1, if field_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::kbd_border() })),
             );
 
             if busy {
@@ -1661,7 +1662,7 @@ mod win32 {
             let old = SelectObject(mem, bmp);
             // Drawn over the card it sits on, so the rounded corners show the
             // card's white rather than system grey.
-            fill(mem, rc, crate::theme::CARD);
+            fill(mem, rc, crate::gdi_palette::card());
             SetBkMode(mem, TRANSPARENT);
 
             let whole = RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom };
@@ -1674,7 +1675,7 @@ mod win32 {
                 // A ring only when the keyboard has really moved here: the
                 // caret starts in the password box, so this is Tab's doing.
                 if focused {
-                    crate::win32_draw::aa_round_rect(mem, whole, radius + scale(1), rgb(crate::theme::FOCUS_RING), None);
+                    crate::win32_draw::aa_round_rect(mem, whole, radius + scale(1), rgb(crate::gdi_palette::focus()), None);
                     let inner = RECT { left: 2, top: 2, right: rc.right - 2, bottom: rc.bottom - 2 };
                     crate::win32_draw::draw_button(mem, inner, label, font, skin, radius);
                 } else {
@@ -1719,7 +1720,7 @@ mod win32 {
                 let _ = GetClientRect(field, &mut rc);
                 let old = SelectObject(dc, font);
                 SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, rgb(crate::theme::TEXT_GHOST));
+                SetTextColor(dc, rgb(crate::gdi_palette::text_ghost()));
                 // Past the caret's own column.
                 rc.left += scale(2);
                 crate::win32_draw::draw_text(
@@ -1746,7 +1747,7 @@ mod win32 {
                 .unwrap_or(0);
             (millis % 1400) as f32 / 1400.0
         };
-        rounded(hdc, at, 2, crate::theme::TOGGLE_OFF, None);
+        rounded(hdc, at, 2, crate::gdi_palette::switch_off(), None);
         let knob_w = (at.w as f32 * 0.32) as i32;
         // A there-and-back sweep, so the knob never jumps from right to left.
         let travel = at.w - knob_w;
@@ -1757,14 +1758,14 @@ mod win32 {
             w: knob_w,
             h: at.h,
         };
-        rounded(hdc, knob, 2, crate::theme::BLUE, None);
+        rounded(hdc, knob, 2, crate::gdi_palette::blue(), None);
     }
 
     /// The card header's ✕, drawn as two strokes because no bundled face has
     /// the glyph at this weight.
     fn paint_close_glyph(hdc: HDC, at: Box2) {
         unsafe {
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
+            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::gdi_palette::text_faint()));
             let old = SelectObject(hdc, pen);
             let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
             let pad = w / 3;

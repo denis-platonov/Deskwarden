@@ -37,6 +37,19 @@ pub(crate) fn rgb(c: eframe::egui::Color32) -> COLORREF {
     COLORREF((c.r() as u32) | ((c.g() as u32) << 8) | ((c.b() as u32) << 16))
 }
 
+/// The brush a card class paints its background with and answers
+/// `WM_CTLCOLOR*` with: the card colour of the theme this thread chose
+/// ([`crate::gdi_palette`]). One brush per theme, made once and never deleted
+/// (a card class is registered once and outlives every card).
+pub(crate) fn card_brush() -> HBRUSH {
+    use std::sync::OnceLock;
+    static LIGHT: OnceLock<isize> = OnceLock::new();
+    static DARK: OnceLock<isize> = OnceLock::new();
+    let slot = if crate::gdi_palette::is_dark() { &DARK } else { &LIGHT };
+    HBRUSH(*slot.get_or_init(|| unsafe { CreateSolidBrush(rgb(crate::gdi_palette::card())).0 as isize })
+        as *mut std::ffi::c_void)
+}
+
 // ---------------------------------------------------------------------------
 // Cyrillic on the GDI cards.
 //
@@ -551,10 +564,10 @@ impl ButtonSkin {
     /// The blue call-to-action.
     pub fn primary() -> Self {
         Self {
-            fill: rgb(crate::theme::BLUE),
-            text: rgb(crate::theme::CARD),
+            fill: rgb(crate::gdi_palette::blue()),
+            text: rgb(crate::gdi_palette::on_blue()),
             border: None,
-            hover_fill: rgb(crate::theme::BLUE_BRIGHT),
+            hover_fill: rgb(crate::gdi_palette::primary_hover()),
         }
     }
 
@@ -562,30 +575,30 @@ impl ButtonSkin {
     /// on a card, so without an outline it does not read as a control.
     pub fn secondary() -> Self {
         Self {
-            fill: rgb(crate::theme::CARD),
-            text: rgb(crate::theme::INK),
-            border: Some(rgb(crate::theme::BORDER)),
-            hover_fill: rgb(crate::theme::CARD_TINT),
+            fill: rgb(crate::gdi_palette::card()),
+            text: rgb(crate::gdi_palette::ink()),
+            border: Some(rgb(crate::gdi_palette::border())),
+            hover_fill: rgb(crate::gdi_palette::list_bg()),
         }
     }
 
     /// The v2 panel's primary button (design 1b): brand blue, hover deep blue.
     pub fn panel_primary() -> Self {
         Self {
-            fill: rgb(crate::theme::BLUE),
-            text: rgb(crate::theme::CARD),
+            fill: rgb(crate::gdi_palette::blue()),
+            text: rgb(crate::gdi_palette::on_blue()),
             border: None,
-            hover_fill: rgb(crate::theme::BLUE_DEEP),
+            hover_fill: rgb(crate::gdi_palette::primary_hover()),
         }
     }
 
     /// The v2 panel's outline button: a 1 px edge, hover on the soft ground.
     pub fn panel_outline() -> Self {
         Self {
-            fill: rgb(crate::theme::CARD),
-            text: rgb(crate::theme::INK),
-            border: Some(rgb(crate::theme::BORDER)),
-            hover_fill: rgb(crate::theme::WINDOW_BG),
+            fill: rgb(crate::gdi_palette::card()),
+            text: rgb(crate::gdi_palette::ink()),
+            border: Some(rgb(crate::gdi_palette::border())),
+            hover_fill: rgb(crate::gdi_palette::secondary_hover()),
         }
     }
 
@@ -593,17 +606,17 @@ impl ButtonSkin {
     /// blue.
     pub fn panel_deep() -> Self {
         Self {
-            fill: rgb(crate::theme::BLUE_DEEP),
-            text: rgb(crate::theme::CARD),
+            fill: rgb(crate::gdi_palette::deep_button()),
+            text: rgb(crate::gdi_palette::on_blue()),
             border: None,
-            hover_fill: rgb(crate::theme::BLUE),
+            hover_fill: rgb(crate::gdi_palette::deep_button_hover()),
         }
     }
 
     /// Greyed, derived rather than hand-picked, so a palette change cannot
     /// leave the disabled variant behind.
     pub fn disabled(self) -> Self {
-        Self { fill: rgb(crate::theme::TOGGLE_OFF), text: rgb(crate::theme::TEXT_GHOST), ..self }
+        Self { fill: rgb(crate::gdi_palette::switch_off()), text: rgb(crate::gdi_palette::text_ghost()), ..self }
     }
 
     /// Hovered, derived the same way `disabled()` is: the fill changes to
@@ -1061,12 +1074,12 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
             hdc,
             RECT { left, top, right, bottom: top + h },
             radius,
-            rgb(crate::theme::CANVAS),
-            Some((rgb(crate::theme::BORDER_STRONG), 1)),
+            rgb(crate::gdi_palette::field_bg()),
+            Some((rgb(crate::gdi_palette::kbd_border()), 1)),
         );
 
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+        SetTextColor(hdc, rgb(crate::gdi_palette::text_faint()));
         let mut rc = RECT { left, top, right, bottom: top + h };
         draw_text(hdc, hint, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old_font);
@@ -1153,14 +1166,14 @@ pub fn draw_segment_cell(
     radius: i32,
 ) {
     let (fill, ink, edge) = if !live {
-        let fill = if selected { crate::theme::BLUE_WASH } else { crate::theme::CARD };
-        (fill, crate::theme::TEXT_GHOST, crate::theme::BORDER)
+        let fill = if selected { crate::gdi_palette::blue_wash() } else { crate::gdi_palette::card() };
+        (fill, crate::gdi_palette::text_ghost(), crate::gdi_palette::border())
     } else if selected {
-        (crate::theme::BLUE, crate::theme::CARD, crate::theme::BLUE)
+        (crate::gdi_palette::blue(), crate::gdi_palette::on_blue(), crate::gdi_palette::blue())
     } else if hovered {
-        (crate::theme::CANVAS, crate::theme::INK, crate::theme::BORDER)
+        (crate::gdi_palette::field_bg(), crate::gdi_palette::ink(), crate::gdi_palette::border())
     } else {
-        (crate::theme::CARD, crate::theme::INK, crate::theme::BORDER)
+        (crate::gdi_palette::card(), crate::gdi_palette::ink(), crate::gdi_palette::border())
     };
     let first = index == 0;
     let last = index + 1 >= count;
@@ -1521,7 +1534,7 @@ pub fn draw_card_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT, tracking:
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(crate::theme::TEXT_SECONDARY));
+        SetTextColor(hdc, rgb(crate::gdi_palette::text_nav()));
         SetTextCharacterExtra(hdc, tracking);
         let mut rc = word;
         draw_text(
@@ -1563,7 +1576,7 @@ pub fn draw_field_mark(hdc: HDC, gutter: RECT, mark: crate::theme::FieldMark, sc
             y: top + (q.y * unit).round() as i32,
         };
 
-        let ink = rgb(crate::theme::TEXT_SECONDARY);
+        let ink = rgb(crate::gdi_palette::text_nav());
         // At least one pixel: a stroke that rounded to zero is a mark that
         // simply is not there, which is worse than a heavy one.
         let pen = CreatePen(PS_SOLID, (FIELD_MARK_STROKE * unit).round().max(1.0) as i32, ink);
@@ -1731,11 +1744,11 @@ pub fn draw_row(
 ) {
     unsafe {
         let fill = if state.selected {
-            rgb(crate::theme::BLUE_WASH)
+            rgb(crate::gdi_palette::blue_wash())
         } else if state.hovered {
-            rgb(crate::theme::CARD_TINT)
+            rgb(crate::gdi_palette::list_bg())
         } else {
-            rgb(crate::theme::CARD)
+            rgb(crate::gdi_palette::card())
         };
         let brush = CreateSolidBrush(fill);
         let old_brush = SelectObject(hdc, brush);
@@ -1765,7 +1778,7 @@ pub fn draw_row(
 
         SetBkMode(hdc, TRANSPARENT);
 
-        SetTextColor(hdc, rgb(crate::theme::INK));
+        SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
         let old_font = SelectObject(hdc, name_font);
         let mut name_rc = RECT {
             left: text_left,
@@ -1781,7 +1794,7 @@ pub fn draw_row(
         );
         SelectObject(hdc, old_font);
 
-        SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+        SetTextColor(hdc, rgb(crate::gdi_palette::text_faint()));
         let old_font = SelectObject(hdc, user_font);
         let mut user_rc = RECT {
             left: text_left,
