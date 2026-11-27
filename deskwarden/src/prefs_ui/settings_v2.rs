@@ -106,7 +106,9 @@ impl Page {
             Page::Devices => crate::i18n::t("settings.subtitle_devices").into(),
             Page::Shortcuts => return None,
             Page::Account => return None,
-            Page::About => crate::i18n::tf("settings.subtitle_about", &[("version", env!("CARGO_PKG_VERSION"))]),
+            // The version is the first tile on the page; saying it here too
+            // was the same line twice.
+            Page::About => return None,
         })
     }
 

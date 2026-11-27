@@ -1210,9 +1210,6 @@ fn update_checking_description() -> &'static str {
 fn update_up_to_date_description() -> &'static str {
     crate::i18n::t("prefs.update_up_to_date_description")
 }
-fn update_ready_description() -> &'static str {
-    crate::i18n::t("prefs.update_ready_description")
-}
 fn update_unavailable_description() -> &'static str {
     crate::i18n::t("prefs.update_unavailable_description")
 }
@@ -1278,8 +1275,8 @@ const UPDATE_NOTES_MAX_HEIGHT: f32 = 360.0;
 /// blank source line is painted as, and the reason it is a real number is
 /// that the gap between "Added" and "Fixed" is information the author put
 /// there.
-const UPDATE_NOTES_LINE_GAP: f32 = 2.0;
-const UPDATE_NOTES_PARAGRAPH_GAP: f32 = 6.0;
+const UPDATE_NOTES_LINE_GAP: f32 = 4.0;
+const UPDATE_NOTES_PARAGRAPH_GAP: f32 = 12.0;
 
 /// How far one level of bullet nesting insets a line, and the glyph that
 /// replaces the source's `-`.
@@ -1287,14 +1284,15 @@ const UPDATE_NOTES_PARAGRAPH_GAP: f32 = 6.0;
 /// The nesting depth this is multiplied by is bounded in
 /// `updater::MAX_BULLET_DEPTH`, because the leading spaces that produce it
 /// are chosen by whoever wrote the release.
-const UPDATE_NOTES_BULLET_STEP: f32 = 12.0;
-const UPDATE_NOTES_BULLET_GLYPH: &str = "•  ";
+const UPDATE_NOTES_BULLET_STEP: f32 = 18.0;
+/// The hanging column a bullet's dot sits in; wrapped lines align after it.
+const UPDATE_NOTES_BULLET_COLUMN: f32 = 16.0;
 
 /// The notes scrollbar's width and the gap either side of it. Named, because
 /// the region's content width is this much less than the row's and the two
 /// numbers have to be the same ones -- a mismatch shows as this card being a
 /// few points wider than the Version card directly above it.
-const UPDATE_NOTES_BAR_WIDTH: f32 = 6.0;
+const UPDATE_NOTES_BAR_WIDTH: f32 = 4.0;
 const UPDATE_NOTES_BAR_MARGIN: f32 = 4.0;
 
 /// The progress bar's height and corner, matched to the stepper's radius so
@@ -5174,7 +5172,7 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
                 (crate::i18n::tf("prefs.update_downloading_status", &[("version", &release.version.to_string())]), None)
             }
             UpdateStage::Ready(r) => {
-                (format!("{} {}", crate::i18n::tf("prefs.update_ready_version", &[("version", &r.version.to_string())]), update_ready_description()), Some(update_restart_button()))
+                (crate::i18n::tf("prefs.update_ready_version", &[("version", &r.version.to_string())]), Some(update_restart_button()))
             }
             // The message comes from `updater` and is the reason as that
             // module saw it. Shown rather than reduced to "something went
@@ -5436,22 +5434,13 @@ fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
                 if !opening {
                     ui.add_space(UPDATE_NOTES_PARAGRAPH_GAP);
                 }
-                notes_line(ui, spans, 0.0, Some(*level), n);
+                notes_line(ui, spans, 0.0, Some(*level), n, false);
             }
             NotesBlock::Bullet { depth, spans } => {
-                // The glyph joins the line's own runs rather than being a
-                // second widget beside them, so a bullet whose text wraps
-                // wraps under its own text and not under the glyph.
-                let mut with_glyph = vec![crate::updater::NotesSpan {
-                    text: UPDATE_NOTES_BULLET_GLYPH.to_string(),
-                    style: crate::updater::NotesStyle::Plain,
-                    link: None,
-                }];
-                with_glyph.extend_from_slice(spans);
                 let inset = *depth as f32 * UPDATE_NOTES_BULLET_STEP;
-                notes_line(ui, &with_glyph, inset, None, n);
+                notes_line(ui, spans, inset, None, n, true);
             }
-            NotesBlock::Paragraph { spans } => notes_line(ui, spans, 0.0, None, n),
+            NotesBlock::Paragraph { spans } => notes_line(ui, spans, 0.0, None, n, false),
         }
     }
 }
@@ -5459,9 +5448,9 @@ fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
 /// One line: its runs laid out into a single wrapped galley, inset for a
 /// bullet's depth.
 ///
-/// A bullet's glyph and its text share the galley rather than being two
-/// widgets side by side, so a bullet whose text wraps wraps under itself the
-/// way the rest of the line does. `wrap.max_width` is set from the width the
+/// A bullet's dot is painted in a hanging column of its own and the text
+/// is laid out beside it, so a bullet whose text wraps wraps under its text
+/// and not under the dot. `wrap.max_width` is set from the width the
 /// region actually has, minus the inset -- not from a constant, because this
 /// card is drawn at two different widths by the window shell and the vault
 /// modal.
@@ -5488,6 +5477,7 @@ fn notes_line(
     inset: f32,
     heading: Option<u8>,
     line: usize,
+    bullet: bool,
 ) {
     use crate::updater::NotesStyle;
     use egui::text::{LayoutJob, TextFormat};
@@ -5499,84 +5489,54 @@ fn notes_line(
 
     // The palette, not `theme::` constants: these lines sit on the Settings
     // card, which is dark under a dark theme.
+    use crate::kit::tokens::{font_id, SECTION, SUBTITLE};
     let p = crate::kit::tokens::palette(ui.ctx());
+    let column = if bullet { UPDATE_NOTES_BULLET_COLUMN } else { 0.0 };
     let mut job = LayoutJob::default();
-    job.wrap.max_width = (ui.available_width() - inset).max(1.0);
+    job.wrap.max_width = (ui.available_width() - inset - column).max(1.0);
 
-    // Char ranges into the finished job's text, one per followable link, in
-    // the order they were appended. Chars rather than bytes because that is
-    // what a galley's rows are counted in -- one glyph per char.
     let mut links: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
     let mut chars_appended = 0usize;
+    let body = font_id(SUBTITLE);
+    let strong = FontId::new(SUBTITLE.size, FontFamily::Name(theme::BOLD.into()));
 
     if let Some(level) = heading {
-        // Two sizes, not six. A release body's headings are section names
-        // ("Added", "Fixed"); a scale with six steps inside a region this size
-        // would be a hierarchy nobody can see.
-        //
-        // **A heading's runs are all painted alike, links included, and so
-        // none of them is clickable here.** A heading is a section name, it
-        // is painted in one weight and one colour by design, and a run inside
-        // it that opened a browser while looking exactly like the words
-        // either side of it would be the "looks like a link / acts like a
-        // link" pair coming apart in the other direction. The destination is
-        // still beside the words, as it is everywhere else.
-        let size = if level <= 2 { 13.0 } else { 12.0 };
+        // A release's own title reads like the page's row titles; the
+        // Added / Changed / Fixed groups like its UPDATES / SUPPORT labels.
         for span in spans {
-            job.append(
-                &span.text,
-                0.0,
+            let format = if level <= 2 {
+                TextFormat { font_id: font_id(crate::kit::tokens::ROW_TITLE), color: p.ink, ..Default::default() }
+            } else {
                 TextFormat {
-                    font_id: FontId::new(size, FontFamily::Name(theme::SEMIBOLD.into())),
-                    color: p.ink,
+                    font_id: font_id(SECTION),
+                    color: p.text_faint,
+                    extra_letter_spacing: SECTION.size * SECTION.tracking_em,
                     ..Default::default()
-                },
-            );
+                }
+            };
+            let text = if level <= 2 { span.text.clone() } else { span.text.to_uppercase() };
+            job.append(&text, 0.0, format);
         }
     } else {
         for span in spans {
             let format = match span.style {
-                NotesStyle::Plain => TextFormat {
-                    font_id: FontId::new(12.0, FontFamily::Proportional),
-                    color: p.text_muted,
-                    ..Default::default()
-                },
-                NotesStyle::Strong => TextFormat {
-                    font_id: FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
-                    color: p.text_nav,
-                    ..Default::default()
-                },
-                // egui skews the glyphs rather than swapping the face: this
-                // app's font stack is Archivo weights and carries no italic
-                // one, and a real italic is not worth a fifth embedded font
-                // for a release note.
+                NotesStyle::Plain => TextFormat { font_id: body.clone(), color: p.text_nav, ..Default::default() },
+                NotesStyle::Strong => TextFormat { font_id: strong.clone(), color: p.ink, ..Default::default() },
                 NotesStyle::Emphasis => TextFormat {
-                    font_id: FontId::new(12.0, FontFamily::Proportional),
-                    color: p.text_muted,
+                    font_id: body.clone(),
+                    color: p.text_nav,
                     italics: true,
                     ..Default::default()
                 },
                 NotesStyle::Code => TextFormat {
-                    font_id: FontId::new(11.0, FontFamily::Monospace),
-                    color: p.text_nav,
+                    font_id: FontId::new(13.0, FontFamily::Monospace),
+                    color: p.ink,
                     background: p.field_bg,
                     ..Default::default()
                 },
-                // Underlined and in the page's blue, which is what a link
-                // looks like -- and now also what it does. Only a link the
-                // parser accepted is ever given this style, so the blue is a
-                // promise the click below keeps. The destination beside it
-                // is unchanged and is the honest half: the user can see and
-                // copy where these words point BEFORE following them, which
-                // a clickable link that hid its URL would not give them.
-                NotesStyle::LinkText => TextFormat {
-                    font_id: FontId::new(12.0, FontFamily::Proportional),
-                    color: p.blue,
-                    underline: egui::Stroke::new(1.0, p.blue),
-                    ..Default::default()
-                },
+                NotesStyle::LinkText => TextFormat { font_id: body.clone(), color: p.blue_deep, ..Default::default() },
                 NotesStyle::LinkUrl => TextFormat {
-                    font_id: FontId::new(11.0, FontFamily::Proportional),
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
                     color: p.text_faint,
                     ..Default::default()
                 },
@@ -5590,14 +5550,21 @@ fn notes_line(
         }
     }
 
-    // **Laid out here rather than inside `Label`, and handed to `Label`
-    // already laid out.** The widget is given the finished galley, so there
-    // is exactly ONE layout of this line: what is painted and what the hit
-    // rectangles below are measured from are the same object, not two
-    // measurements of the same text that could disagree.
     let galley = ui.painter().layout_job(job);
     ui.horizontal(|ui| {
         ui.add_space(inset);
+        if bullet {
+            // The dot sits on the first line's middle, in a column of its
+            // own, so a wrapped line starts under the text and not under it.
+            let first_row = galley.rows.first().map_or(galley.size().y, |r| r.height());
+            let (cell, _) = ui.allocate_exact_size(Vec2::new(column, first_row), Sense::hover());
+            ui.painter().circle_filled(
+                egui::pos2(cell.left() + 5.0, cell.center().y),
+                2.25,
+                crate::kit::tokens::palette(ui.ctx()).text_faint,
+            );
+            ui.spacing_mut().item_spacing.x = 0.0;
+        }
         let response = ui.add(egui::Label::new(galley.clone()));
         for (n, (range, url)) in links.iter().enumerate() {
             for (row, rect) in notes_link_rects(&galley, response.rect.min, range.clone()) {
@@ -13350,8 +13317,8 @@ mod tests {
 
         assert!(painted.contains(update_restart_button()), "got {:?}", painted.strings());
         assert!(
-            painted.strings().iter().any(|t| t.contains(update_ready_description())),
-            "the restart prompt must say what the restart will do: {:?}",
+            painted.strings().iter().any(|t| t.contains("is ready.")),
+            "the restart prompt names the version that is ready: {:?}",
             painted.strings()
         );
     }
