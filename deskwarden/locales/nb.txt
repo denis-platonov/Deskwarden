@@ -218,6 +218,7 @@ panel.hint_esc_close = Esc lukk
 generate.new_password = Nytt passord
 generate.suggested = Foreslått passord
 generate.save_to_vault = Lagre i hvelvet
+generate.use_password = Bruk dette passordet
 generate.copy = Kopier
 generate.regenerate = Generer på nytt
 generate.characters = Tegn

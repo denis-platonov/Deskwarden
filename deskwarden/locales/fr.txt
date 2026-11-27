@@ -215,6 +215,7 @@ panel.hint_esc_close = Échap fermer
 generate.new_password = Nouveau mot de passe
 generate.suggested = Mot de passe suggéré
 generate.save_to_vault = Enregistrer dans le coffre
+generate.use_password = Utiliser ce mot de passe
 generate.copy = Copier
 generate.regenerate = Régénérer
 generate.characters = Caractères

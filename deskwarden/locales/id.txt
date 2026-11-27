@@ -197,6 +197,7 @@ panel.hint_esc_close = Esc tutup
 generate.new_password = Kata sandi baru
 generate.suggested = Kata sandi yang disarankan
 generate.save_to_vault = Simpan ke brankas
+generate.use_password = Gunakan kata sandi ini
 generate.copy = Salin
 generate.regenerate = Buat ulang
 generate.characters = Karakter

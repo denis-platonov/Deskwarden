@@ -204,6 +204,7 @@ panel.hint_esc_close = Esc sulge
 generate.new_password = Uus parool
 generate.suggested = Soovitatud parool
 generate.save_to_vault = Salvesta hoidlasse
+generate.use_password = Kasuta seda parooli
 generate.copy = Kopeeri
 generate.regenerate = Loo uuesti
 generate.characters = Märgid

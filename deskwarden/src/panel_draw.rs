@@ -359,6 +359,24 @@ pub fn draw_link(hdc: HDC, rc: RECT, label: &str, font: HFONT, hot: bool, centre
     }
 }
 
+/// A text-only accent link (the Save card's `Generate`): [`crate::theme::BLUE`],
+/// [`crate::theme::BLUE_DEEP`] when `hot`, right-aligned in `rc` (DEVICE pixels).
+pub fn draw_accent_link(hdc: HDC, rc: RECT, label: &str, font: HFONT, hot: bool) {
+    unsafe {
+        let old = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(if hot { crate::theme::BLUE_DEEP } else { crate::theme::BLUE }));
+        let mut at = rc;
+        draw_text(
+            hdc,
+            label,
+            &mut at,
+            windows::Win32::Graphics::Gdi::DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        SelectObject(hdc, old);
+    }
+}
+
 /// The ✕ as two strokes. `weight` is in DEVICE pixels.
 pub fn draw_close_x(hdc: HDC, rc: RECT, weight: i32, ink: Color32) {
     unsafe {
@@ -392,6 +410,132 @@ pub fn draw_regenerate_icon(hdc: HDC, rc: RECT, ink: Color32, scale: i32) {
         let _ = MoveToEx(hdc, cx + r / 2, cy - r + px(3, scale), None);
         let _ = LineTo(hdc, cx + r - px(3, scale), cy - r + px(3, scale));
         SelectObject(hdc, old);
+        let _ = DeleteObject(pen);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The ✕ button and the icon buttons (D 1.7, D 1.8)
+// ---------------------------------------------------------------------------
+
+/// The ✕'s ink (`#8a8785`, D 1.7).
+pub const CLOSE_INK: Color32 = Color32::from_rgb(0x8a, 0x87, 0x85);
+
+/// The ✕'s hover wash (`#f1f0ee`, D 1.7).
+pub const CLOSE_HOVER: Color32 = Color32::from_rgb(0xf1, 0xf0, 0xee);
+
+/// The ✕ button's corner radius (D 1.7: 32 x 32, r10).
+pub const CLOSE_RADIUS: i32 = 10;
+
+/// The square icon button's side (D 1.8: the regenerate button is 46 x 46).
+pub const ICON_BUTTON: i32 = 46;
+
+/// The ✕ as the design's 32 x 32 button: a [`CLOSE_HOVER`] wash while `hot`,
+/// the cross in [`CLOSE_INK`]. `rc` is DEVICE pixels, `scale` the card's DPI
+/// percentage.
+pub fn draw_close_button(hdc: HDC, rc: RECT, hot: bool, scale: i32) {
+    if hot {
+        round_rect(hdc, rc, px(CLOSE_RADIUS, scale), CLOSE_HOVER, None);
+    }
+    draw_close_x(hdc, rc, px(2, scale).max(1), CLOSE_INK);
+}
+
+/// The edge and the icon ink of an icon button (D 1.8): `#e0deda` and
+/// `#4a4745` at rest, both `#1b3fa0` while `hot`, ghosted while not `live`.
+pub fn icon_button_colours(hot: bool, live: bool) -> (Color32, Color32) {
+    if !live {
+        (crate::theme::HAIRLINE, crate::theme::TEXT_GHOST)
+    } else if hot {
+        (crate::theme::BLUE, crate::theme::BLUE)
+    } else {
+        (crate::theme::BORDER, crate::theme::TEXT_SECONDARY)
+    }
+}
+
+/// An icon button's frame: a white 1 px outlined square of radius
+/// [`BUTTON_RADIUS`], and the ink its icon is to be drawn in.
+pub fn draw_icon_button_frame(hdc: HDC, rc: RECT, hot: bool, live: bool, scale: i32) -> Color32 {
+    let (edge, ink) = icon_button_colours(hot, live);
+    crate::win32_draw::aa_round_rect(
+        hdc,
+        rc,
+        px(BUTTON_RADIUS, scale),
+        rgb(crate::theme::CARD),
+        Some((rgb(edge), px(1, scale).max(1))),
+    );
+    ink
+}
+
+/// The circular arrow D 1.8's regenerate button carries: a three-quarter turn,
+/// stroked 2 px, open at the upper right with an arrowhead on the free end,
+/// centred in `rc` (DEVICE pixels).
+///
+/// Drawn as a polyline rather than with `Arc`: the arc's end points have to be
+/// given as rays, which leaves the head's position to rounding; here the arc's
+/// last point *is* the head's tip.
+pub fn draw_refresh_icon(hdc: HDC, rc: RECT, ink: Color32, scale: i32) {
+    unsafe {
+        let side = (rc.right - rc.left).min(rc.bottom - rc.top);
+        let cx = (rc.left + rc.right) / 2;
+        let cy = (rc.top + rc.bottom) / 2;
+        let r = (side * 40 / 100).max(3) as f64;
+        // Screen y grows downward, so the sine is negated to open the gap at the
+        // top right.
+        let start = 50.0_f64.to_radians();
+        let sweep = 280.0_f64.to_radians();
+        let steps = 28;
+        let point = |angle: f64| POINT {
+            x: cx + (r * angle.cos()).round() as i32,
+            y: cy - (r * angle.sin()).round() as i32,
+        };
+        let pen = CreatePen(PS_SOLID, px(2, scale).max(1), rgb(ink));
+        let old = SelectObject(hdc, pen);
+        let arc: Vec<POINT> = (0..=steps)
+            .map(|i| point(start + sweep * f64::from(i) / f64::from(steps)))
+            .collect();
+        let _ = windows::Win32::Graphics::Gdi::Polyline(hdc, &arc);
+        // The head sits on the arc's free end (the last point), its two barbs
+        // pointing back along the tangent.
+        if let Some(tip) = arc.last().copied() {
+            let head = (side * 22 / 100).max(2);
+            let barbs = [
+                POINT { x: tip.x + head, y: tip.y - head / 2 },
+                tip,
+                POINT { x: tip.x + head / 2, y: tip.y + head },
+            ];
+            let _ = windows::Win32::Graphics::Gdi::Polyline(hdc, &barbs);
+        }
+        SelectObject(hdc, old);
+        let _ = DeleteObject(pen);
+    }
+}
+
+/// The copy glyph (D 1.8's sibling of the regenerate icon): a rounded square
+/// and the L-shaped corner of the one behind it, stroked, centred in `rc`.
+pub fn draw_copy_icon(hdc: HDC, rc: RECT, ink: Color32, scale: i32) {
+    unsafe {
+        let side = (px(18, scale)).max(8);
+        let left = (rc.left + rc.right - side) / 2;
+        let top = (rc.top + rc.bottom - side) / 2;
+        // The spec's glyph on a 24 grid: `rect x9 y9 12x12 rx2` and
+        // `M5 15V5a2 2 0 0 1 2-2h10`, scaled to `side`.
+        let u = |v: i32| v * side / 24;
+        let pen = CreatePen(PS_SOLID, px(2, scale).max(1), rgb(ink));
+        let old_pen = SelectObject(hdc, pen);
+        // The front square is an antialiased ring (the card's shapes all go through
+        // `win32_draw`'s painter, never GDI's hard-edged `RoundRect`).
+        crate::win32_draw::aa_round_ring(
+            hdc,
+            RECT { left: left + u(9), top: top + u(9), right: left + u(21), bottom: top + u(21) },
+            u(4).max(2),
+            rgb(ink),
+            px(2, scale).max(1),
+        );
+        let _ = MoveToEx(hdc, left + u(5), top + u(15), None);
+        let _ = LineTo(hdc, left + u(5), top + u(5));
+        let _ = LineTo(hdc, left + u(7), top + u(3));
+        let _ = LineTo(hdc, left + u(17), top + u(3));
+        SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen);
     }
 }
@@ -1005,6 +1149,21 @@ mod tests {
         let early = check_points(0.2);
         assert_eq!(early.len(), 2);
         assert!(early[1].0 < 20.0 && early[1].0 > 9.0);
+    }
+
+    #[test]
+    fn the_close_button_and_the_icon_buttons_are_the_designs() {
+        assert_eq!((CLOSE_LARGE, CLOSE_RADIUS, ICON_BUTTON), (32, 10, 46));
+        assert_eq!(CLOSE_INK, Color32::from_rgb(0x8a, 0x87, 0x85));
+        assert_eq!(CLOSE_HOVER, Color32::from_rgb(0xf1, 0xf0, 0xee));
+        // D 1.8: hover turns the edge AND the icon `#1b3fa0`.
+        let (rest_edge, rest_ink) = icon_button_colours(false, true);
+        let (hot_edge, hot_ink) = icon_button_colours(true, true);
+        assert_eq!((hot_edge, hot_ink), (crate::theme::BLUE, crate::theme::BLUE));
+        assert_ne!(rest_edge, hot_edge);
+        assert_ne!(rest_ink, hot_ink);
+        // A dead button does not answer the pointer.
+        assert_eq!(icon_button_colours(true, false), icon_button_colours(false, false));
     }
 
     #[test]

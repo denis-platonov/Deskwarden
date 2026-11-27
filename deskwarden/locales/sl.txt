@@ -204,6 +204,7 @@ panel.hint_esc_close = Esc zapri
 generate.new_password = Novo geslo
 generate.suggested = Predlagano geslo
 generate.save_to_vault = Shrani v trezor
+generate.use_password = Uporabi to geslo
 generate.copy = Kopiraj
 generate.regenerate = Ustvari znova
 generate.characters = Znaki

@@ -204,6 +204,7 @@ panel.hint_esc_close = Esc sulje
 generate.new_password = Uusi salasana
 generate.suggested = Ehdotettu salasana
 generate.save_to_vault = Tallenna holviin
+generate.use_password = Käytä tätä salasanaa
 generate.copy = Kopioi
 generate.regenerate = Luo uudelleen
 generate.characters = Merkit

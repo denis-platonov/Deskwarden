@@ -202,6 +202,7 @@ panel.hint_esc_close = Esc 閉じる
 generate.new_password = 新しいパスワード
 generate.suggested = 推奨パスワード
 generate.save_to_vault = 保管庫に保存
+generate.use_password = このパスワードを使う
 generate.copy = コピー
 generate.regenerate = 再生成
 generate.characters = 文字

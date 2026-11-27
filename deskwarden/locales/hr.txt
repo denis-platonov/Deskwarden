@@ -202,6 +202,7 @@ panel.hint_esc_close = Esc zatvori
 generate.new_password = Nova lozinka
 generate.suggested = Predložena lozinka
 generate.save_to_vault = Spremi u trezor
+generate.use_password = Upotrijebi ovu lozinku
 generate.copy = Kopiraj
 generate.regenerate = Ponovno
 generate.characters = Znakovi

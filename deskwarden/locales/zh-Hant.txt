@@ -202,6 +202,7 @@ panel.hint_esc_close = Esc 關閉
 generate.new_password = 新密碼
 generate.suggested = 建議的密碼
 generate.save_to_vault = 儲存到密碼庫
+generate.use_password = 使用此密碼
 generate.copy = 複製
 generate.regenerate = 重新產生
 generate.characters = 字元

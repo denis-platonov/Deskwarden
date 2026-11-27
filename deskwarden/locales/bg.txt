@@ -200,6 +200,7 @@ panel.hint_esc_close = Esc затваряне
 generate.new_password = Нова парола
 generate.suggested = Предложена парола
 generate.save_to_vault = В трезора
+generate.use_password = Използвай тази парола
 generate.copy = Копиране
 generate.regenerate = Отново
 generate.characters = Знаци

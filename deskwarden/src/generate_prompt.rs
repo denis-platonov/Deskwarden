@@ -45,6 +45,21 @@
 //! `Option<Zeroizing<String>>` its one public entry point already returned when
 //! it was an egui card.
 //!
+//! # The anatomy today: design spec section 1.8 ("New password")
+//!
+//! The card is the v2 panel, 410 wide with `pad 18 / gap 14`: the lockup with the
+//! strength pill and the ✕ in its header, the `Suggested password` label, the
+//! value in 21 px monospace (two lines, broken at any character), and one row
+//! of buttons -- `Use this password`, then 46 x 46 icon buttons for
+//! *Regenerate* and *Copy*. Everything else the card has always offered (the
+//! kind run, the length slider, the four class tiles, the minimum-digits
+//! stepper, the look-alikes switch) lives in one soft well under that row, so
+//! the design's three things stay first and nothing is dropped. The header rule,
+//! the title row and the tinted footer band of the older anatomy are gone, and
+//! every button is skinned by `crate::panel_draw`. The sections below are the
+//! history of how the older anatomy was reasoned; where they disagree with this
+//! one, this one wins.
+//!
 //! # WHICH 3d THIS CARD IS: the image, not the design file
 //!
 //! **`docs/design/Deskwarden.dc.html`'s `id="3d"` is an older version of this
@@ -995,16 +1010,6 @@ fn refresh(
 /// windows.
 pub const GENERATE_PROMPT_TITLE: &str = "Deskwarden password generator";
 
-/// The card's header, and **3d's own caption**.
-///
-/// `New password` is the label 3d prints over the field the overlay is offered
-/// against. That field is the application's and is not this card's to draw (see
-/// the module doc), but its caption is what the card is FOR, so the caption is
-/// the card's title.
-pub fn generate_label() -> &'static str {
-    crate::i18n::t("generate.new_password")
-}
-
 /// 3d's eyebrow over the value: `GENERATED`, `font-size: 11px; font-weight:
 /// 700; letter-spacing: 0.1em; text-transform: uppercase`.
 ///
@@ -1014,21 +1019,15 @@ pub fn generate_caption() -> &'static str {
     crate::i18n::t("generate.suggested")
 }
 
-/// 3d's primary button.
+/// The primary button (D 1.8: `Use this password`).
 ///
-/// **It says *Save to vault*, and the design says *Fill & save to vault*.** The
-/// missing word is the honest one: `crate::app::handle_no_match` holds no
-/// injector and no `FillStats`, deliberately and by signature, so nothing on
-/// this path can type into the window behind the card. What it can do is put
-/// the password into design 3c, which saves it, and onto the clipboard, which
-/// is how it reaches the field.
-///
-/// **Re-checked against the newer image, which still says `Fill & save to
-/// vault`, and kept.** Nothing about the path changed: `handle_no_match` still
-/// holds no injector, so the missing word is still the difference between a
-/// button that describes what happens and one that does not.
+/// It says what the user is doing from where they stand -- taking the value they
+/// can see -- rather than where it ends up. What happens next is unchanged:
+/// `crate::app::handle_no_match` holds no injector, so the password goes into
+/// design 3c, which saves it, and onto the clipboard, which is how it reaches
+/// the field.
 pub fn generate_save_label() -> &'static str {
-    crate::i18n::t("generate.save_to_vault")
+    crate::i18n::t("generate.use_password")
 }
 
 /// 3d's clipboard button -- the one control here that gets the password into
@@ -1037,6 +1036,10 @@ pub fn generate_copy_label() -> &'static str {
     crate::i18n::t("generate.copy")
 }
 
+/// The regenerate icon button's name (D 1.8 draws it as a circular arrow with no
+/// word). Never painted: it is the control's window text, which is what a screen
+/// reader announces for an icon-only button.
+///
 /// 3d's regenerate control, at the right-hand end of the control row.
 ///
 /// **The older 3d drew a bare `CTRL+R NEW` monospace run and the newer image
@@ -1053,11 +1056,6 @@ pub fn generate_copy_label() -> &'static str {
 pub fn generate_regenerate_label() -> &'static str {
     crate::i18n::t("generate.regenerate")
 }
-
-/// The chord, drawn as its own boxed chip inside the *Regenerate* button
-/// through [`crate::win32_draw::draw_hint_chip`] -- the crate's one keyboard
-/// hint chip, so this card cannot draw a second-looking one.
-pub const REGENERATE_SHORTCUT: &str = "CTRL+R";
 
 /// The newer image's caption over the four class tiles.
 ///
@@ -1202,19 +1200,29 @@ const MARGIN_TOP: i32 = crate::panel_draw::PAD;
 const BODY_GAP: i32 = 12;
 const ROW_GAP: i32 = 10;
 
-/// The caption row's height, which is the strength badge's: 3d sets the badge
-/// `font-size: 11px; padding: 2px 8px`, and an 11px line box measures ~14.
+/// The strength pill's height (D 1.8: 12/700, pad 4x10 -- 22 tall).
 const BADGE_H: i32 = crate::panel_draw::PILL_H;
 
-/// The badge's width.
+/// The room the strength pill may take at the header's right, left of the ✕.
 ///
-/// **Fixed, and the same for every rating**, because `layout` is pure and has
-/// no device context to measure `Strong` with -- and because a right-aligned
-/// badge that changed width between `Good` and `Strong` would slide along the
-/// caption row every time the user pressed `Ctrl+R`. Wide enough for the
-/// longest of the four labels at 11px semibold plus `theme::PILL_PAD_X` either
-/// side, which is 3d's own `padding: 2px 8px`.
-const BADGE_W: i32 = 78;
+/// **The pill itself is fitted to its label when it is painted** (a language's
+/// "Very strong" is not another's), right-aligned in this room, because
+/// `layout` is pure and has no device context to measure with. The room is the
+/// widest any label has come out, plus [`crate::panel_draw::PILL_PAD_X`] either
+/// side.
+const BADGE_ROOM: i32 = 130;
+
+/// The gap between the pill and the ✕.
+const BADGE_GAP: i32 = 8;
+
+/// The label's line (15 px), and the card's block gap (D 1.8: `gap 14`).
+const LABEL_H: i32 = 20;
+const BLOCK_GAP: i32 = crate::panel_draw::BLOCK_GAP;
+
+/// The soft well the options sit in: the same `#f7f6f5` block the Save card
+/// sets its preview on (D 1.7: `pad 12, r14`).
+const WELL_PAD: i32 = 12;
+const WELL_RADIUS: i32 = 14;
 
 /// 3d's value: `font-size: 17px` on `line-height: 1.35`, which is 22.95.
 ///
@@ -1229,19 +1237,20 @@ const BADGE_W: i32 = 78;
 const VALUE_PX: i32 = crate::panel_draw::VALUE_PX;
 const VALUE_H: i32 = 28;
 
-/// The three kind cells' widths, in [`GeneratedKind::ALL`] order: each label at
-/// `theme::SEGMENT_TEXT_SIZE` plus `theme::SEGMENT_PADDING`, which is the
-/// crate's own segmented run and within two pixels of 3d's `padding: 5px 11px`.
+/// How many lines the value may take (D 1.8: `word-break: break-all`). Two lines
+/// of 21 px hold 58 characters; a longer value drops to [`VALUE_SMALL_PX`], and
+/// one that still does not fit in two lines ends in an ellipsis.
+const VALUE_LINES: i32 = 2;
+const VALUE_SMALL_PX: i32 = 15;
+const VALUE_SMALL_H: i32 = 20;
+
+/// The three kind cells' widths, in [`GeneratedKind::ALL`] order: the run fills
+/// the well's whole inner width (350 plus the two seams), split in about the
+/// proportion of the labels. Not uniform, for `theme::segment_widths`' reason:
+/// "Passphrase" is more than twice as wide as "PIN".
 ///
-/// Not uniform, for `theme::segment_widths`' reason: "Passphrase" is more than
-/// twice as wide as "PIN", and a run whose every cell is padded out to the
-/// longest label is a row of mostly empty boxes.
-///
-/// **Re-measured for the newer image's labels**, which are longer than the old
-/// ones: `Password` and `Passphrase` where the old run said `Words` and
-/// `Characters`. The whole run plus the *Regenerate* button has to fit one
-/// 352-pixel row, which `the_control_row_fits_the_body` is what proves.
-const KIND_W: [i32; 3] = [84, 78, 40];
+/// Checked against the well by `the_kind_run_fills_the_well`.
+const KIND_W: [i32; 3] = [124, 132, 96];
 
 /// The one-pixel overlap that puts two adjacent cells' strokes on one column.
 /// `theme::SEGMENT_SEAM`, pinned by [`the_cards_dimensions_are_the_themes`].
@@ -1250,23 +1259,9 @@ const SEGMENT_SEAM: i32 = 1;
 /// The cells' height. `theme::SEGMENT_HEIGHT`, pinned likewise.
 const SEGMENT_H: i32 = 28;
 
-/// The corner radius 3d gives both its segmented run (`border-radius: 7px`) and
-/// its two footer buttons.
-const RADIUS: i32 = 7;
-
-/// The *Regenerate* button's box, at the right-hand end of the control row.
-///
-/// Wider than the `CTRL+R NEW` run it replaces, because the newer image puts
-/// three things inside it: a refresh glyph, the word, and `CTRL+R` in a
-/// bordered chip. Measured as slack rather than tight for [`SAVE_W`]'s reason
-/// -- `layout` is pure and cannot ask a device context how wide *Regenerate*
-/// came out in the user's own rendering.
-const REGENERATE_W: i32 = 156;
-
-/// The refresh glyph's diameter inside that button, and the gap between it and
-/// the word.
-const REFRESH_GLYPH: i32 = 12;
-const REFRESH_GAP: i32 = 6;
+/// The corner radius of the well's controls: the kind run, the class tiles and
+/// the stepper (v2 rounds these to 10).
+const RADIUS: i32 = 10;
 
 /// The length row: its caption/value line, the slider under it, and the line of
 /// bounds under that.
@@ -1340,19 +1335,11 @@ const TOGGLE_H: i32 = 22;
 /// [`the_cards_dimensions_are_the_themes`].
 const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
 
-/// 3d's footer band: `padding: 12px 14px` -- this is the 12 -- over a hairline,
-/// with `gap: 8px` between its two answers.
-const FOOTER_PAD_Y: i32 = 12;
-const BUTTON_GAP: i32 = 8;
+/// The gap between the three buttons in the main row (D 1.8: `gap 8`).
+const BUTTON_GAP: i32 = crate::panel_draw::BUTTON_GAP;
 
-/// The footer buttons' widths: each label at 12px semibold, plus 3d's
-/// `padding: 0 12px`, plus (on the primary) the return glyph and the gap before
-/// it. Slack rather than tight, because `layout` is pure and cannot ask a
-/// device context how wide "Save to vault" came out in the user's own
-/// rendering -- and `win32_draw::draw_button_with_return` centres what it is
-/// given, so slack shows as padding and a shortfall shows as a clipped label.
-const SAVE_W: i32 = 200;
-const COPY_W: i32 = 100;
+/// The icon buttons' side (D 1.8: 46 x 46).
+const ICON_BUTTON: i32 = crate::panel_draw::ICON_BUTTON;
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1381,36 +1368,29 @@ impl Box2 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
-    /// The brand lockup's shield, and the wordmark beside it. **The card had
-    /// no brand at all after the port**: the egui card it replaced carried
-    /// `theme::card_header`'s shield and letterspaced DESKWARDEN, and a
+    /// The brand lockup's shield, and the wordmark beside it. **Not optional**: a
     /// frameless always-on-top window that offers to put a password into the
-    /// user's vault has to say whose window it is. The compact lockup, not the
-    /// login window's -- see [`crate::win32_draw::draw_card_lockup`].
+    /// user's vault has to say whose window it is.
     pub mark: Box2,
     pub wordmark: Box2,
-    pub title: Box2,
-    pub close_glyph: Box2,
-    /// The hairline under the header, and the one over the footer band.
-    pub header_rule: Box2,
-    pub footer_rule: Box2,
-    /// The tinted band the footer's controls sit on.
-    pub footer: Box2,
-    /// 3d's caption row: the `GENERATED` eyebrow, and the strength badge at the
-    /// far right of the same row.
-    pub caption: Box2,
+    /// The room the strength pill takes at the header's right; see [`BADGE_ROOM`].
     pub badge: Box2,
-    /// The line the password (or the working line, or the failure sentence) is
-    /// drawn on. **No box around it**: 3d sets the value as bare text on the
-    /// panel, and the well this card used to draw was the egui card's.
+    pub close_glyph: Box2,
+    /// D 1.8's `Suggested password` label.
+    pub caption: Box2,
+    /// The value's box: [`VALUE_LINES`] lines. **No box around it**: it is bare
+    /// text on the card.
     pub value: Box2,
+    /// The main row: `Use this password`, and the two icon buttons.
+    pub save: Box2,
+    pub regenerate: Box2,
+    pub copy: Box2,
+    /// The soft well every option sits in.
+    pub well: Box2,
     /// The three kind cells, in [`GeneratedKind::ALL`] order, **joined**: each
     /// after the first starts one pixel inside its neighbour so the two strokes
     /// at a seam land on one column.
     pub kinds: [Box2; 3],
-    /// The *Regenerate* button at the right-hand end of the control row: a
-    /// refresh glyph, the word, and the `CTRL+R` chip, in one outlined pill.
-    pub regenerate: Box2,
     /// The length row's caption (`Length`, or `Words`) and the value opposite
     /// it -- the two halves [`GenerateForm::size_row`] hands back.
     pub length_label: Box2,
@@ -1425,16 +1405,7 @@ pub struct Layout {
     pub slider_high: Box2,
     /// The `Characters` caption over the tiles.
     pub classes_caption: Box2,
-    /// The four class tiles, in `CharClass::ALL` order, laid out **two by two**
-    /// -- the image's grid, index 0 and 1 on the first row.
-    ///
-    /// Each tile carries a tick box, the class's
-    /// `CharClass::name` and its `CharClass::label` as the small grey sample.
-    /// **The samples are the crate's own** (`A-Z`, `a-z`, `0-9`, `!@#`) and the
-    /// image's symbols sample reads `!@#$%`; the existing spelling is kept
-    /// rather than a second one introduced, because that constant is what the
-    /// vault window's own class chips print and two spellings of one character
-    /// set is two things that have to agree about what the set is.
+    /// The four class tiles, in `CharClass::ALL` order, laid out **two by two**.
     pub tiles: [Box2; 4],
     /// The minimum-digits row: the question on the left, and the joined
     /// `- n +` stepper on the right, in `[minus, value, plus]` order.
@@ -1444,64 +1415,18 @@ pub struct Layout {
     pub avoid_label: Box2,
     pub avoid_sample: Box2,
     pub avoid_toggle: Box2,
-    pub save: Box2,
-    pub copy: Box2,
 }
 
 /// **The card's geometry. There is exactly one shape.**
 ///
-/// The card has no rows, no modes and no second step, so nothing about it
-/// varies at runtime: the value line is [`VALUE_H`] tall whether it is showing
-/// a password, a "Generating..." or a failure sentence, and the length value's
-/// text changes inside a box whose width does not. The window is sized to this
-/// content and to nothing else -- the way `picker_prompt`'s empty mode is sized
-/// to its own two offers -- rather than to a row count it does not have.
+/// Nothing about it varies at runtime: the value box is [`VALUE_LINES`] tall
+/// whether it is showing a password, a "Generating..." or a failure sentence,
+/// and the options the selected kind has no use for are drawn dead rather than
+/// hidden -- a card that grew and shrank as the user walked the kind run would
+/// be resizing a frameless always-on-top window under their pointer.
 ///
-/// **That survives the newer 3d's four extra blocks**, and it is the reason
-/// they are drawn dead rather than hidden when the selected kind has no use for
-/// them: see [`GenerateForm::classes_live`]. A card that grew and shrank as the
-/// user walked the kind run would be resizing a frameless always-on-top window
-/// under their pointer, and re-laying out its child controls while they had
-/// focus.
-///
-/// # What is 3d's, top to bottom
-///
-/// The body is 3d's panel body at `padding: 14px` with `gap: 12px`:
-///
-/// 1. The caption row ([`Layout::caption`] and [`Layout::badge`]).
-/// 2. The value ([`Layout::value`]).
-/// 3. The control row: the joined `Password / Passphrase / PIN` run, a spacer,
-///    and the *Regenerate* button at the far right.
-/// 4. The length row -- caption and value ([`Layout::length_label`]), the
-///    slider ([`Layout::slider`]), and its bounds.
-/// 5. The `Characters` caption over a two-by-two grid of class tiles.
-/// 6. The minimum-digits question and its stepper.
-/// 7. The look-alikes label, its sample, and the switch.
-///
-/// Then the footer band at `padding: 12px 14px` over its `1px solid #eae7e7`,
-/// holding the filled primary and the outlined `Copy`.
-///
-/// # The one thing 3d's panel does not have
-///
-/// **A header.** 3d's panel begins at its caption row, because in the artboard
-/// the page above it carries the context -- the `New password` label, and the
-/// field. This window has no page above it, so a headerless card would be a
-/// frameless always-on-top window with no name, no app and no way out but a key.
-/// The header is therefore 3a's panel header, which is the same family's answer
-/// to the same question and what `crate::picker_prompt` already draws: the
-/// shield, the wordmark, and the card's title under them over 3d's own
-/// `border-bottom: 1px solid #eae7e7`. The window's ✕ sits on the lockup's line.
-///
-/// # The two things it used to not have, and now does
-///
-/// The older pass argued this card had **no length control and no
-/// character-class switches**, on the reading that 3d's `20 chars` was a
-/// readout and that the generator with every dial on it was the vault window's
-/// card. The newer image settles it the other way: both are here. The struck
-/// paragraph is kept at [`GenerateForm::resize`] rather than deleted, because
-/// the half of it that was about *this surface* -- frameless, always-on-top,
-/// unscrollable, over whatever the user is doing -- is why none of the new
-/// controls opens a popup, needs a caret, or changes the card's size.
+/// Top to bottom (D 1.8, `pad 18 / gap 14`): the header, the label, the value,
+/// the button row, and the well.
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
@@ -1509,90 +1434,97 @@ pub fn layout() -> Layout {
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    // The ✕ sits on the lockup's line, which is where every card header in the
-    // design carries it.
-    let close = crate::panel_draw::CLOSE;
+    // The ✕ is the design's 32 x 32 button, sat 4 px into the card's inset so
+    // its glyph lines up with the content edge.
+    let close = crate::panel_draw::CLOSE_LARGE;
     let close_glyph = Box2 {
-        x: WIDTH - MARGIN_X - close,
+        x: WIDTH - MARGIN_X + 4 - close,
         y: mark.y + (mark.h - close) / 2,
         w: close,
         h: close,
     };
-    let title = Box2 {
-        x: MARGIN_X,
-        y: mark.bottom() + crate::panel_draw::BLOCK_GAP,
-        w: content_w - 24,
-        h: 26,
-    };
-    let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
-
-    // 3d's body: `padding: 14px`, then `gap: 12px` between each of its rows.
-    let caption = Box2 {
-        x: MARGIN_X,
-        y: header_rule.bottom() + BODY_PAD,
-        w: content_w - BADGE_W - ROW_GAP,
+    let badge = Box2 {
+        x: close_glyph.x - BADGE_GAP - BADGE_ROOM,
+        y: mark.y + (mark.h - BADGE_H) / 2,
+        w: BADGE_ROOM,
         h: BADGE_H,
     };
-    let badge = Box2 { x: MARGIN_X + content_w - BADGE_W, y: caption.y, w: BADGE_W, h: BADGE_H };
-    let value =
-        Box2 { x: MARGIN_X, y: caption.bottom() + BODY_GAP, w: content_w, h: VALUE_H };
 
-    let row_y = value.bottom() + BODY_GAP;
+    let caption = Box2 { x: MARGIN_X, y: mark.bottom() + BLOCK_GAP, w: content_w, h: LABEL_H };
+    let value = Box2 {
+        x: MARGIN_X,
+        y: caption.bottom() + BLOCK_GAP,
+        w: content_w,
+        h: VALUE_H * VALUE_LINES,
+    };
+
+    // The main row: the primary takes what the two icon buttons leave.
+    let row_y = value.bottom() + BLOCK_GAP;
+    let copy = Box2 {
+        x: MARGIN_X + content_w - ICON_BUTTON,
+        y: row_y,
+        w: ICON_BUTTON,
+        h: BUTTON_H,
+    };
+    let regenerate =
+        Box2 { x: copy.x - BUTTON_GAP - ICON_BUTTON, y: row_y, w: ICON_BUTTON, h: BUTTON_H };
+    let save = Box2 {
+        x: MARGIN_X,
+        y: row_y,
+        w: regenerate.x - BUTTON_GAP - MARGIN_X,
+        h: BUTTON_H,
+    };
+
+    // The well, and everything in it measured from its padding.
+    let well_y = save.bottom() + BLOCK_GAP;
+    let inner_x = MARGIN_X + WELL_PAD;
+    let inner_w = content_w - 2 * WELL_PAD;
+    let kinds_y = well_y + WELL_PAD;
     // **Joined, not spaced.** Each cell after the first starts `SEGMENT_SEAM`
     // inside its neighbour's right edge, which is how `theme::segmented_control`
     // lays the same run out: one control with seams, rather than three buttons
     // with gaps.
     let kinds = [
-        Box2 { x: MARGIN_X, y: row_y, w: KIND_W[0], h: SEGMENT_H },
-        Box2 { x: MARGIN_X + KIND_W[0] - SEGMENT_SEAM, y: row_y, w: KIND_W[1], h: SEGMENT_H },
+        Box2 { x: inner_x, y: kinds_y, w: KIND_W[0], h: SEGMENT_H },
+        Box2 { x: inner_x + KIND_W[0] - SEGMENT_SEAM, y: kinds_y, w: KIND_W[1], h: SEGMENT_H },
         Box2 {
-            x: MARGIN_X + KIND_W[0] + KIND_W[1] - 2 * SEGMENT_SEAM,
-            y: row_y,
+            x: inner_x + KIND_W[0] + KIND_W[1] - 2 * SEGMENT_SEAM,
+            y: kinds_y,
             w: KIND_W[2],
             h: SEGMENT_H,
         },
     ];
-    // 3d puts the re-roll behind a `flex: 1` spacer, which is the row's right
-    // edge. Laid out from that edge inwards, so the run's cells can be
-    // re-measured for a longer label without the button moving.
-    let regenerate =
-        Box2 { x: MARGIN_X + content_w - REGENERATE_W, y: row_y, w: REGENERATE_W, h: SEGMENT_H };
 
     // The length row: caption and value on one line, the slider under it, the
     // bounds under that. The three are one block, so only the block is spaced
     // from its neighbours by `BODY_GAP`.
-    let length_y = row_y + SEGMENT_H + BODY_GAP;
-    let length_label =
-        Box2 { x: MARGIN_X, y: length_y, w: content_w / 2, h: LENGTH_LABEL_H };
+    let length_y = kinds_y + SEGMENT_H + BODY_GAP;
+    let length_label = Box2 { x: inner_x, y: length_y, w: inner_w / 2, h: LENGTH_LABEL_H };
     let length_value = Box2 {
-        x: MARGIN_X + content_w / 2,
+        x: inner_x + inner_w / 2,
         y: length_y,
-        w: content_w - content_w / 2,
+        w: inner_w - inner_w / 2,
         h: LENGTH_LABEL_H,
     };
-    let slider =
-        Box2 { x: MARGIN_X, y: length_label.bottom() + 4, w: content_w, h: SLIDER_H };
-    // The bounds sit under the ENDS of the slider's travel, which is the
-    // handle's centre at each end rather than the control's own edge -- so each
-    // box is anchored on the same point the handle is.
+    let slider = Box2 { x: inner_x, y: length_label.bottom() + 4, w: inner_w, h: SLIDER_H };
+    // The bounds sit under the ENDS of the slider's travel.
     let bound_w = 32;
-    let slider_low =
-        Box2 { x: slider.x, y: slider.bottom() + 2, w: bound_w, h: BOUND_H };
+    let slider_low = Box2 { x: slider.x, y: slider.bottom() + 2, w: bound_w, h: BOUND_H };
     let slider_high =
         Box2 { x: slider.right() - bound_w, y: slider_low.y, w: bound_w, h: BOUND_H };
 
     let classes_caption = Box2 {
-        x: MARGIN_X,
+        x: inner_x,
         y: slider_low.bottom() + BODY_GAP,
-        w: content_w,
+        w: inner_w,
         h: CAPTION_H,
     };
-    // Two by two. The width is derived from the body rather than written down,
-    // so the right-hand column always ends on the body's own right margin.
-    let tile_w = (content_w - TILE_GAP) / 2;
+    // Two by two. The width is derived from the well rather than written down,
+    // so the right-hand column always ends on the well's own padding.
+    let tile_w = (inner_w - TILE_GAP) / 2;
     let tiles_y = classes_caption.bottom() + CAPTION_GAP;
     let tile = |index: usize| Box2 {
-        x: MARGIN_X + (index % 2) as i32 * (tile_w + TILE_GAP),
+        x: inner_x + (index % 2) as i32 * (tile_w + TILE_GAP),
         y: tiles_y + (index / 2) as i32 * (TILE_H + TILE_GAP),
         w: tile_w,
         h: TILE_H,
@@ -1601,23 +1533,13 @@ pub fn layout() -> Layout {
 
     let min_y = tiles[3].bottom() + BODY_GAP;
     let stepper_w = STEP_W * 2 + STEP_VALUE_W - 2 * SEGMENT_SEAM;
-    let min_label = Box2 {
-        x: MARGIN_X,
-        y: min_y,
-        w: content_w - stepper_w - ROW_GAP,
-        h: SEGMENT_H,
-    };
-    // Joined exactly as the kind run is, and for the same reason: three cells
-    // of one control rather than three buttons with gaps.
-    let stepper_x = MARGIN_X + content_w - stepper_w;
+    let min_label =
+        Box2 { x: inner_x, y: min_y, w: inner_w - stepper_w - ROW_GAP, h: SEGMENT_H };
+    // Joined exactly as the kind run is, and for the same reason.
+    let stepper_x = inner_x + inner_w - stepper_w;
     let min_stepper = [
         Box2 { x: stepper_x, y: min_y, w: STEP_W, h: SEGMENT_H },
-        Box2 {
-            x: stepper_x + STEP_W - SEGMENT_SEAM,
-            y: min_y,
-            w: STEP_VALUE_W,
-            h: SEGMENT_H,
-        },
+        Box2 { x: stepper_x + STEP_W - SEGMENT_SEAM, y: min_y, w: STEP_VALUE_W, h: SEGMENT_H },
         Box2 {
             x: stepper_x + STEP_W + STEP_VALUE_W - 2 * SEGMENT_SEAM,
             y: min_y,
@@ -1627,43 +1549,39 @@ pub fn layout() -> Layout {
     ];
 
     let avoid_y = min_y + SEGMENT_H + BODY_GAP;
-    let avoid_text_w = content_w - TOGGLE_W - ROW_GAP;
-    let avoid_label = Box2 { x: MARGIN_X, y: avoid_y, w: avoid_text_w, h: AVOID_LABEL_H };
+    let avoid_text_w = inner_w - TOGGLE_W - ROW_GAP;
+    let avoid_label = Box2 { x: inner_x, y: avoid_y, w: avoid_text_w, h: AVOID_LABEL_H };
     let avoid_sample =
-        Box2 { x: MARGIN_X, y: avoid_label.bottom(), w: avoid_text_w, h: AVOID_SAMPLE_H };
-    // Centred on the two-line text stack beside it, which is what the image's
-    // `align-items: center` on that row comes to.
+        Box2 { x: inner_x, y: avoid_label.bottom(), w: avoid_text_w, h: AVOID_SAMPLE_H };
+    // Centred on the two-line text stack beside it.
     let avoid_toggle = Box2 {
-        x: MARGIN_X + content_w - TOGGLE_W,
+        x: inner_x + inner_w - TOGGLE_W,
         y: avoid_y + (AVOID_LABEL_H + AVOID_SAMPLE_H - TOGGLE_H) / 2,
         w: TOGGLE_W,
         h: TOGGLE_H,
     };
 
-    let footer_rule = Box2 { x: 0, y: avoid_sample.bottom() + BODY_PAD, w: WIDTH, h: 1 };
-    let save =
-        Box2 { x: MARGIN_X, y: footer_rule.bottom() + FOOTER_PAD_Y, w: SAVE_W, h: BUTTON_H };
-    let copy = Box2 { x: save.right() + BUTTON_GAP, y: save.y, w: COPY_W, h: BUTTON_H };
-
-    let height = save.bottom() + FOOTER_PAD_Y;
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: height };
-    let footer =
-        Box2 { x: 0, y: footer_rule.bottom(), w: WIDTH, h: height - footer_rule.bottom() };
+    let well = Box2 {
+        x: MARGIN_X,
+        y: well_y,
+        w: content_w,
+        h: avoid_sample.bottom() + WELL_PAD - well_y,
+    };
+    let window = Box2 { x: 0, y: 0, w: WIDTH, h: well.bottom() + MARGIN_TOP };
 
     Layout {
         window,
         mark,
         wordmark,
-        title,
-        close_glyph,
-        header_rule,
-        footer_rule,
-        footer,
-        caption,
         badge,
+        close_glyph,
+        caption,
         value,
-        kinds,
+        save,
         regenerate,
+        copy,
+        well,
+        kinds,
         length_label,
         length_value,
         slider,
@@ -1676,9 +1594,29 @@ pub fn layout() -> Layout {
         avoid_label,
         avoid_sample,
         avoid_toggle,
-        save,
-        copy,
     }
+}
+
+/// **Where each line of a value breaks** (D 1.8: `word-break: break-all`): the
+/// ranges of `units`, `per_line` UTF-16 units at a time, never leaving a
+/// surrogate pair's halves on two lines.
+///
+/// Pure, and reading only unit values (never anything printable), so the secret
+/// painter and a test can share it.
+pub fn break_all(units: &[u16], per_line: usize) -> Vec<std::ops::Range<usize>> {
+    let per_line = per_line.max(1);
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < units.len() {
+        let mut end = (start + per_line).min(units.len());
+        // A high surrogate at the cut would strand its pair on the next line.
+        if end < units.len() && end > start + 1 && (0xD800..0xDC00).contains(&units[end - 1]) {
+            end -= 1;
+        }
+        lines.push(start..end);
+        start = end;
+    }
+    lines
 }
 
 /// **Where the slider's handle sits for `size`, and what a pointer at `x`
@@ -1781,23 +1719,23 @@ mod win32 {
     use super::{
         Box2, Event, GenerateForm, GenerateWindow, GeneratedKind, Generator, ValueState, APP_NAME,
         generate_avoid_label, GENERATE_AVOID_SAMPLE, generate_caption, generate_classes_caption,
-        generate_copy_label, generate_failed_text, generate_label, generate_min_number_label,
+        generate_copy_label, generate_failed_text, generate_min_number_label,
         GENERATE_PROMPT_TITLE, generate_regenerate_label, generate_save_label,
-        generate_working_text, GONE, KEPT, PENDING, REGENERATE_SHORTCUT, SECRET, VIEW,
+        generate_working_text, GONE, KEPT, PENDING, SECRET, VIEW,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::{w, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint,
-        FillRect, GetDC, GetDeviceCaps, InvalidateRect, Polyline, ReleaseDC,
+        FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-        DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-        DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
+        DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
+        DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
         LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -1809,7 +1747,7 @@ mod win32 {
         GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
         PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity,
-        SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW,
+        SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW,
         CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE,
         WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
         WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW,
@@ -1818,8 +1756,8 @@ mod win32 {
 
     use crate::vault_window::detail_edit::CharClass;
     use crate::win32_draw::{
-        draw_button_with_return, draw_hint_chip, draw_segment_cell,
-        draw_text_utf16, rgb, text_width_utf16, ButtonSkin,
+        draw_button_with_return, draw_segment_cell,
+        draw_text_utf16, rgb, text_width_utf16,
     };
 
     /// The *Regenerate* button.
@@ -1859,11 +1797,14 @@ mod win32 {
     /// about a card whose controls have quadrupled is not a thing to find by
     /// hand.
     pub(super) fn tab_order(l: &super::Layout) -> Vec<(usize, Box2)> {
-        let mut order: Vec<(usize, Box2)> = Vec::new();
+        let mut order: Vec<(usize, Box2)> = vec![
+            (ID_SAVE, l.save),
+            (ID_NEW, l.regenerate),
+            (ID_COPY, l.copy),
+        ];
         for (index, at) in l.kinds.iter().enumerate() {
             order.push((ID_KIND + index, *at));
         }
-        order.push((ID_NEW, l.regenerate));
         order.push((ID_SLIDER, l.slider));
         for (index, at) in l.tiles.iter().enumerate() {
             order.push((ID_TILE + index, *at));
@@ -1871,8 +1812,6 @@ mod win32 {
         order.push((ID_MIN_DOWN, l.min_stepper[0]));
         order.push((ID_MIN_UP, l.min_stepper[2]));
         order.push((ID_AVOID, l.avoid_toggle));
-        order.push((ID_SAVE, l.save));
-        order.push((ID_COPY, l.copy));
         order
     }
 
@@ -1893,6 +1832,9 @@ mod win32 {
 
     /// Which control the pointer is over, as a control id, or 0.
     static HOVERED: AtomicIsize = AtomicIsize::new(0);
+
+    /// Whether the pointer is on the header's ✕ (D 1.7's hover wash).
+    static CLOSE_HOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// **The size the slider's handle is being dragged to**, or `-1` when no
     /// drag is in progress.
@@ -1970,41 +1912,27 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at close.
     /// Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
-        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
-        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
-        /// in -- **and 3d's `GENERATED` eyebrow**, which is the same Archivo
-        /// Bold at the same 11px with the same 1px of tracking. One face, not
-        /// two identical ones.
+        /// The lockup's wordmark: `panel_draw::WORD_PX` in the extra-bold cut.
         brand: HFONT,
-        title: HFONT,
-        /// The password's face: monospace at 3d's `font-size: 17px`, so `l` and
-        /// `1` are distinguishable in a value the user has to read off screen.
+        /// The password's face: monospace at D 1.8's 21 px / 600, so `l` and `1`
+        /// are distinguishable in a value the user has to read off screen; and
+        /// the 15 px one a value too long for two lines drops to.
         value: HFONT,
-        /// The failure sentence and every row label on the card -- `Length`,
+        value_small: HFONT,
+        /// The failure sentence and every row label in the well -- `Length`,
         /// `Characters`, `At least this many digits`, `Avoid look-alikes`, and
-        /// each class tile's name. Prose, and never a secret. 3d's
-        /// `font-size: 12px`.
+        /// each class tile's name. Prose, and never a secret.
         prose: HFONT,
         /// The small grey runs under and beside that prose: the slider's two
         /// bounds, the class tiles' samples, and the look-alikes sample.
-        /// `theme::EYEBROW_PX`'s 11, which is the smallest size this card sets
-        /// anywhere -- a sixth type size on one card would be a card with no
-        /// type scale.
         sample: HFONT,
-        /// The strength badge: 3d's `font-size: 11px; font-weight: 600`.
+        /// The strength pill: 12/700 (D 1.8).
         badge: HFONT,
-        /// The footer's two buttons **and the three kind cells**, which 3d sets
-        /// identically: `font-size: 12px; font-weight: 600`.
+        /// The three kind cells and the stepper.
         button: HFONT,
-        /// The `CTRL+R` chip inside *Regenerate*: monospace at
-        /// `theme::CHIP_TEXT_PX`, which is the size
-        /// [`crate::win32_draw::draw_hint_chip`] lays its box out for. The old
-        /// bare `CTRL+R NEW` run was 11px because it was body text; inside a
-        /// chip it is the chip's size, or the pill would not fit the run it is
-        /// drawn around.
-        hint: HFONT,
-        /// The caption over the value (15) and the footer's two buttons (15/700).
+        /// The label over the value (15).
         caption: HFONT,
+        /// The primary button, 15/700.
         footer: HFONT,
     }
 
@@ -2013,13 +1941,12 @@ mod win32 {
             use crate::theme::{BOLD, EXTRABOLD, REGULAR, SEMIBOLD};
             Fonts {
                 brand: font(EXTRABOLD, crate::panel_draw::WORD_PX),
-                title: font(EXTRABOLD, crate::panel_draw::TITLE_PX),
                 value: mono(super::VALUE_PX, 600),
+                value_small: mono(super::VALUE_SMALL_PX, 600),
                 prose: font(REGULAR, 12),
                 sample: font(REGULAR, crate::theme::EYEBROW_PX as i32),
                 badge: font(BOLD, crate::panel_draw::PILL_PX),
                 button: font(SEMIBOLD, crate::theme::SEGMENT_TEXT_SIZE as i32),
-                hint: mono(crate::theme::CHIP_TEXT_PX as i32, 600),
                 caption: font(REGULAR, crate::panel_draw::BODY_PX),
                 footer: font(BOLD, crate::panel_draw::BUTTON_PX),
             }
@@ -2029,13 +1956,12 @@ mod win32 {
             unsafe {
                 for f in [
                     self.brand,
-                    self.title,
                     self.value,
+                    self.value_small,
                     self.prose,
                     self.sample,
                     self.badge,
                     self.button,
-                    self.hint,
                     self.caption,
                     self.footer,
                 ] {
@@ -2058,6 +1984,7 @@ mod win32 {
         register_fonts();
         GONE.store(false, Ordering::SeqCst);
         HOVERED.store(0, Ordering::SeqCst);
+        CLOSE_HOT.store(false, Ordering::SeqCst);
         // A drag left set by a card that was not closed cleanly would park the
         // new card's handle at the old card's value.
         SLIDER_DRAG.store(-1, Ordering::SeqCst);
@@ -2162,8 +2089,8 @@ mod win32 {
         // The handles are copied out and the guard dropped at the end of this
         // statement: `abandon` locks `FONTS` itself, so holding the guard across
         // the `child` calls below would deadlock the failure path.
-        let Some((hint_font, button_font)) =
-            FONTS.lock().ok().and_then(|guard| guard.as_ref().map(|f| (f.hint, f.button)))
+        let Some(button_font) =
+            FONTS.lock().ok().and_then(|guard| guard.as_ref().map(|f| f.button))
         else {
             return abandon(window);
         };
@@ -2172,15 +2099,26 @@ mod win32 {
         // `IsDialogMessageW` then tabs through them -- see `tab_order`, which
         // is that list and the one a test can check against the geometry.
         //
-        // The face is the button's for every control but the re-roll, whose
-        // `CTRL+R` chip is monospace at the chip's own size; a control's own
-        // font only matters for the runs `paint_control` measures through it.
         for (id, at) in tab_order(&l) {
-            let face = if id == ID_NEW { hint_font } else { button_font };
-            let Some(control) = child(window, at, id, face) else {
+            let Some(control) = child(window, at, id, button_font) else {
                 return abandon(window);
             };
             subclass(control);
+            // The two icon buttons paint no word, so their window text is
+            // their name for a screen reader. It is never drawn by the control
+            // (`WM_PAINT` is taken over), so it cannot become a second copy.
+            let name = if id == ID_NEW {
+                Some(generate_regenerate_label())
+            } else if id == ID_COPY {
+                Some(generate_copy_label())
+            } else {
+                None
+            };
+            if let Some(name) = name {
+                unsafe {
+                    let _ = SetWindowTextW(control, &HSTRING::from(name));
+                }
+            }
         }
 
         unsafe {
@@ -2189,7 +2127,7 @@ mod win32 {
             // property `foreground` records. A refusal leaves a topmost card on
             // screen that the user clicks once to focus.
             let _ = SetForegroundWindow(window);
-            // The keyboard starts on *Save to vault*, which is what Enter does
+            // The keyboard starts on *Use this password*, which is what Enter does
             // anyway -- so the focus ring and the default action agree.
             if let Ok(control) = GetDlgItem(window, ID_SAVE as i32) {
                 let _ = SetFocus(control);
@@ -2775,101 +2713,6 @@ mod win32 {
         );
     }
 
-    /// **The newer 3d's `Regenerate` button**: a refresh glyph, the word, and
-    /// `CTRL+R` in its own box, inside one outlined pill.
-    ///
-    /// Composed here rather than added as a flag to
-    /// [`crate::win32_draw::draw_button_with_shortcut`], because what is new is
-    /// only the glyph in front of the label: the pill is that function's, the
-    /// chip is [`crate::win32_draw::draw_hint_chip`]'s, and the lane the chip
-    /// takes is [`crate::win32_draw::hint_chip_lane`]'s. Widening the shared
-    /// painter's signature for one card's glyph would put a parameter on every
-    /// other caller that none of them uses.
-    ///
-    /// The glyph and the label are centred **as one group** in what the chip
-    /// leaves, which is what `draw_button_with_return` does with its label and
-    /// return arrow on the footer's primary -- the same idiom, the other way
-    /// round.
-    fn paint_regenerate(hdc: HDC, rc: RECT, fonts: &Fonts, skin: ButtonSkin, live: bool) {
-        crate::win32_draw::aa_round_rect(
-            hdc,
-            rc,
-            scale(super::RADIUS),
-            skin.fill,
-            skin.border.map(|colour| (colour, scale(1).max(1))),
-        );
-
-        let dpi = DPI_PERCENT.load(Ordering::SeqCst);
-        let lane = draw_hint_chip(hdc, rc, REGENERATE_SHORTCUT, fonts.hint, dpi);
-        let label_right = rc.right - lane;
-        let glyph = scale(super::REFRESH_GLYPH);
-        let gap = scale(super::REFRESH_GAP);
-        let chars: Vec<u16> = generate_regenerate_label().encode_utf16().collect();
-        let label_w = text_width_utf16(hdc, fonts.button, &chars);
-        let total = glyph + gap + label_w;
-        let left = rc.left + ((label_right - rc.left) - total) / 2;
-        let ink = if live { crate::theme::BLUE_DEEP } else { crate::theme::TEXT_GHOST };
-        paint_refresh_glyph(
-            hdc,
-            POINT { x: left + glyph / 2, y: (rc.top + rc.bottom) / 2 },
-            glyph,
-            ink,
-        );
-        text_in(
-            hdc,
-            fonts.button,
-            RECT { left: left + glyph + gap, right: label_right, ..rc },
-            generate_regenerate_label(),
-            ink,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
-    }
-
-    /// The refresh glyph: an open circle with an arrowhead on its free end.
-    ///
-    /// Drawn as a polyline rather than typed, for [`paint_close_glyph`]'s
-    /// reason -- no face this app ships carries U+21BB, and reaching for a
-    /// system symbol font would put a fifth family on the card. Kept local to
-    /// this module, as the close glyph is, because it is this card's one
-    /// pictogram; [`crate::win32_draw::draw_return_arrow`] lives in the shared
-    /// module because three cards draw it.
-    fn paint_refresh_glyph(hdc: HDC, centre: POINT, size: i32, colour: eframe::egui::Color32) {
-        let r = (size / 2).max(3);
-        // A three-quarter turn, open at the top right, which is where the
-        // arrowhead goes.
-        let start = -30.0_f64.to_radians();
-        let sweep = 280.0_f64.to_radians();
-        let steps = 20;
-        let mut points: Vec<POINT> = Vec::with_capacity(steps + 1);
-        for step in 0..=steps {
-            let angle = start + sweep * (step as f64) / (steps as f64);
-            points.push(POINT {
-                x: centre.x + (r as f64 * angle.cos()).round() as i32,
-                // Screen y grows downward, so the arc is drawn with the sine
-                // negated -- otherwise the opening would be at the bottom.
-                y: centre.y - (r as f64 * angle.sin()).round() as i32,
-            });
-        }
-        unsafe {
-            let pen = CreatePen(PS_SOLID, scale(2).max(1), rgb(colour));
-            let old = SelectObject(hdc, pen);
-            let _ = Polyline(hdc, &points);
-            // The arrowhead, on the arc's own starting point: two short strokes
-            // back along the tangent.
-            if let Some(tip) = points.first().copied() {
-                let head = (r / 2).max(2);
-                let barbs = [
-                    POINT { x: tip.x - head, y: tip.y },
-                    tip,
-                    POINT { x: tip.x, y: tip.y + head },
-                ];
-                let _ = Polyline(hdc, &barbs);
-            }
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
-        }
-    }
-
     /// One child control. It is created with **no text**: every label on this
     /// card is painted by `paint_control` from the app's own palette and type,
     /// so a control's own caption would only ever be a second, stale copy.
@@ -2956,8 +2799,22 @@ mod win32 {
             WM_MOUSEMOVE => {
                 // A pointer that left a control without entering another one is
                 // seen here rather than by the control it left.
-                if HOVERED.swap(0, Ordering::SeqCst) != 0 {
+                let left_control = HOVERED.swap(0, Ordering::SeqCst) != 0;
+                // The ✕'s hover wash; `WM_MOUSELEAVE` takes it down again when
+                // the pointer leaves the card.
+                let on_close = in_close_glyph(lparam);
+                let changed = CLOSE_HOT.swap(on_close, Ordering::SeqCst) != on_close;
+                if on_close {
+                    track_leave(window);
+                }
+                if left_control || changed {
                     repaint_all(window);
+                }
+                LRESULT(0)
+            }
+            crate::panel_draw::WM_MOUSELEAVE => {
+                if CLOSE_HOT.swap(false, Ordering::SeqCst) {
+                    repaint(window);
                 }
                 LRESULT(0)
             }
@@ -2991,6 +2848,23 @@ mod win32 {
                 LRESULT(0)
             }
             _ => DefWindowProcW(window, msg, wparam, lparam),
+        }
+    }
+
+    /// Asks Windows for a `WM_MOUSELEAVE` when the pointer leaves `window`, so
+    /// the ✕'s hover wash cannot outlive the pointer.
+    fn track_leave(window: HWND) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+        };
+        let mut request = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: window,
+            dwHoverTime: 0,
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut request);
         }
     }
 
@@ -3112,6 +2986,9 @@ mod win32 {
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                if CLOSE_HOT.swap(false, Ordering::SeqCst) {
+                    repaint(parent_of(control));
+                }
                 if HOVERED.swap(id, Ordering::SeqCst) != id {
                     repaint(control);
                 }
@@ -3249,43 +3126,44 @@ mod win32 {
             let l = super::layout();
             let form = view();
 
-            // The window IS 3d's panel, so its whole client area is
-            // `theme::CARD` -- the panel's own `background: #ffffff` -- and the
-            // `border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px
-            // 20px` round it is the frameless popup's DWM chrome. See the
-            // module doc.
+            // The window IS the card, so its whole client area is `theme::CARD`;
+            // the well the options sit in is the one soft block on it.
             fill_rect(mem, client, crate::theme::CARD);
-            // Design 1b's New password panel has no rules and no tinted footer
-            // band: the layout keeps the slots those occupied as spacing, and
-            // nothing is painted in them.
             SetBkMode(mem, TRANSPARENT);
+            rounded(mem, l.well, super::WELL_RADIUS, crate::theme::WINDOW_BG, None);
 
             if let Some(fonts) = fonts {
                 paint_lockup(mem, &l, fonts.brand);
-                text(mem, fonts.title, l.title, generate_label(), crate::theme::INK);
 
-                // The caption over the value (D 1.8): 15 in the faint ink.
+                // The label over the value (D 1.8): 15 in the faint ink.
                 text(mem, fonts.caption, l.caption, generate_caption(), crate::theme::TEXT_FAINT);
 
+                // The one-line states sit on the value's first line.
+                let first_line = Box2 { h: super::VALUE_H, ..l.value };
                 match form.state() {
                     ValueState::InFlight => text(
                         mem,
                         fonts.value,
-                        l.value,
+                        first_line,
                         generate_working_text(),
                         crate::theme::TEXT_FAINT,
                     ),
-                    ValueState::Failed(message) => {
-                        text(mem, fonts.prose, l.value, message.as_str(), crate::theme::ERROR)
-                    }
+                    ValueState::Failed(message) => text_in(
+                        mem,
+                        fonts.caption,
+                        dev(l.value),
+                        message.as_str(),
+                        crate::theme::ERROR,
+                        DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    ),
                     ValueState::Ready => {
                         // **The one place a secret is read for painting**, and
-                        // it is read ONCE: the UTF-16 copy `DrawTextW` needs
-                        // and the rating the badge shows come out of the same
-                        // lock, so the badge is not a second route to the
-                        // password. The copy is a `Zeroizing<Vec<u16>>`, so the
-                        // buffer the glyphs are rasterised from is wiped when
-                        // this block ends rather than left on the stack.
+                        // it is read ONCE: the UTF-16 copy the glyphs are
+                        // rasterised from and the rating the pill shows come out
+                        // of the same lock, so the pill is not a second route
+                        // to the password. The copy is a `Zeroizing<Vec<u16>>`,
+                        // wiped when this block ends rather than left on the
+                        // stack.
                         let candidate = SECRET.lock().ok().and_then(|slot| {
                             slot.as_ref().map(|held| {
                                 (
@@ -3295,11 +3173,10 @@ mod win32 {
                             })
                         });
                         if let Some((mut chars, rating)) = candidate {
-                            paint_value(mem, fonts.value, l.value, chars.as_mut_slice());
-                            // The badge is drawn only beside a value. 3d always
-                            // has one; a card that printed `Weak` over
-                            // "Generating..." would be rating a password that
-                            // does not exist yet.
+                            paint_value(mem, fonts, l.value, chars.as_mut_slice());
+                            // The pill is drawn only beside a value: a card that
+                            // printed `Weak` over "Generating..." would be
+                            // rating a password that does not exist yet.
                             paint_badge(mem, fonts.badge, l.badge, rating);
                         }
                     }
@@ -3308,7 +3185,7 @@ mod win32 {
                 paint_body_labels(mem, &l, fonts, &form);
             }
 
-            paint_close_glyph(mem, l.close_glyph);
+            paint_close_glyph(mem, l.close_glyph, CLOSE_HOT.load(Ordering::SeqCst));
 
             drop(guard);
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -3319,90 +3196,79 @@ mod win32 {
         }
     }
 
-    /// **3d's value line, with its tinted characters.**
+    /// **The value (D 1.8): 21 px monospace, broken at any character.**
     ///
-    /// 3d prints `tq7Rvk29mzpLx4-hd8` with four of its eighteen characters in
-    /// `#1b3fa0`. **No rule survives inspection of which four**: `R`, `9`, `L`
-    /// and `-` are tinted while the `7`, `2`, `4` and `8` in the same string
-    /// are not, so what the mock is doing is scattering colour to say "there is
-    /// more than letters in here". This says that, and says it consistently:
-    /// every character that is not a lowercase letter is tinted, which is
-    /// exactly the variety the tint exists to show and a rule that reads the
-    /// same way twice.
-    ///
-    /// **A value too wide for the line is drawn as one ellipsised run instead.**
-    /// The card is one line tall by design (see [`super::layout`]) and a
-    /// run-by-run painter has no ellipsis to offer; the tint is a reading aid
-    /// for a value the user can see, and one that overflows is not being read
-    /// character by character anyway.
-    fn paint_value(hdc: HDC, font: HFONT, at: Box2, chars: &mut [u16]) {
+    /// Two lines at most. A value that needs more at 21 px drops to
+    /// [`super::VALUE_SMALL_PX`]; one that still needs more ends its second line
+    /// in an ellipsis (it is still what *Use* and *Copy* take -- only the
+    /// preview is cut). The line length is measured off one glyph, which is
+    /// exact for the monospace face and what [`super::break_all`] is cut with.
+    fn paint_value(hdc: HDC, fonts: &Fonts, at: Box2, chars: &mut [u16]) {
         let rc = dev(at);
-        let whole = text_width_utf16(hdc, font, chars);
-        if whole == 0 || whole > rc.right - rc.left {
-            text_utf16_in(hdc, font, rc, chars, crate::theme::INK, run_format() | DT_END_ELLIPSIS);
-            return;
-        }
-        let mut start = 0usize;
-        while start < chars.len() {
-            let tinted = is_tinted(chars[start]);
-            let mut end = start + 1;
-            while end < chars.len() && is_tinted(chars[end]) == tinted {
-                end += 1;
+        let width = rc.right - rc.left;
+        let zero = [u16::from(b'0')];
+        for (font, line_h) in [(fonts.value, super::VALUE_H), (fonts.value_small, super::VALUE_SMALL_H)] {
+            let cell = text_width_utf16(hdc, font, &zero).max(1);
+            let lines = super::break_all(chars, (width / cell) as usize);
+            let last_tier = font == fonts.value_small;
+            if lines.len() as i32 <= super::VALUE_LINES || last_tier {
+                let shown = lines.len().min(super::VALUE_LINES as usize);
+                let line_h = scale(line_h);
+                let top = rc.top + ((rc.bottom - rc.top) - shown as i32 * line_h) / 2;
+                for (row, range) in lines.iter().take(shown).enumerate() {
+                    let overflow = last_tier && row + 1 == shown && shown < lines.len();
+                    let end = if overflow { chars.len() } else { range.end };
+                    let line = RECT {
+                        top: top + row as i32 * line_h,
+                        bottom: top + (row as i32 + 1) * line_h,
+                        ..rc
+                    };
+                    let format =
+                        if overflow { run_format() | DT_END_ELLIPSIS } else { run_format() };
+                    text_utf16_in(
+                        hdc,
+                        font,
+                        line,
+                        &mut chars[range.start..end],
+                        crate::theme::INK,
+                        format,
+                    );
+                }
+                return;
             }
-            // Measured on the prefix rather than accumulated, so a face that
-            // turns out not to be fixed-pitch still places every run where its
-            // own glyphs put it.
-            let offset = text_width_utf16(hdc, font, &chars[..start]);
-            let run = RECT { left: rc.left + offset, ..rc };
-            let colour = if tinted { crate::theme::BLUE } else { crate::theme::INK };
-            text_utf16_in(hdc, font, run, &mut chars[start..end], colour, run_format());
-            start = end;
         }
     }
 
-    /// Whether 3d tints this character. See [`paint_value`].
-    ///
-    /// Taken on the UTF-16 unit rather than on a `char`, because the buffer is
-    /// the `Zeroizing<Vec<u16>>` the painter already holds and decoding it back
-    /// would be a second, plain copy of the password. **No surrogate pair can
-    /// be split across two runs by this**: both halves of one are at or above
-    /// 0xD800, so both answer `true` and land in the same run.
-    pub(super) fn is_tinted(unit: u16) -> bool {
-        !(u16::from(b'a')..=u16::from(b'z')).contains(&unit)
-    }
-
-    /// 3d's strength badge, at the right-hand end of the eyebrow row.
+    /// The strength pill, at the right-hand end of the header (D 1.8): fitted to
+    /// its label (12/700, `PILL_PAD_X` each side) and right-aligned in the room
+    /// [`super::BADGE_ROOM`] leaves.
     fn paint_badge(hdc: HDC, font: HFONT, at: Box2, rating: crate::password_strength::Strength) {
         let (fill, ink) = badge_tone(rating);
-        // 3d's `border-radius: 999px` is a pill, and half the height is that
-        // pill -- `RoundRect` would clamp anything larger to the same shape.
-        rounded(hdc, at, at.h / 2, fill, None);
-        text_in(
-            hdc,
-            font,
-            dev(at),
-            rating.label(),
-            ink,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
+        let label = rating.label();
+        let units: Vec<u16> = label.encode_utf16().collect();
+        let room = dev(at);
+        let wide = crate::panel_draw::pill_width(
+            text_width_utf16(hdc, font, &units),
+            DPI_PERCENT.load(Ordering::SeqCst),
+        )
+        .min(room.right - room.left);
+        let rc = RECT { left: room.right - wide, ..room };
+        crate::panel_draw::draw_pill(hdc, rc, label, font, fill, ink);
     }
 
-    /// The badge's fill and its ink.
-    ///
-    /// **Only `Strong` gets 3d's blue.** 3d prints `Strong` in `#14307a` on
-    /// `#eef2fc` because its candidate always is one; this card's is not always
-    /// -- a six-digit PIN rates `Weak` -- and a badge that approved of every
-    /// value in the same blue would be saying nothing at all. The other three
-    /// are `CANVAS` behind `TEXT_FAINT`, which is the reading the vault
-    /// window's own copy of 3d already ships.
+    /// The pill's wash and ink for a rating. **Only `Strong` is the design's
+    /// green** (`#e8f3ec` on `#17673a`): a six-digit PIN rates `Weak`, and a pill
+    /// that approved of every value in one colour would say nothing. The other
+    /// three take the design's danger, caution and blue families.
     pub(super) fn badge_tone(
         rating: crate::password_strength::Strength,
     ) -> (eframe::egui::Color32, eframe::egui::Color32) {
-        if rating == crate::password_strength::Strength::Strong {
-            // The design's "Very strong" pill (D 1.8): the done-green pair.
-            (crate::theme::DONE_WASH, crate::theme::DONE_INK)
-        } else {
-            (crate::theme::CANVAS, crate::theme::TEXT_FAINT)
+        use crate::password_strength::Strength;
+        match rating {
+            Strength::Weak => (crate::theme::DANGER_WASH, crate::theme::ERROR),
+            Strength::Fair => (crate::theme::CAUTION_WASH, crate::theme::CAUTION_INK),
+            Strength::Good => (crate::theme::BLUE_WASH, crate::theme::BLUE_DEEP),
+            Strength::Strong => (crate::theme::DONE_WASH, crate::theme::DONE_INK),
         }
     }
 
@@ -3428,40 +3294,26 @@ mod win32 {
             let l = super::layout();
             let dpi = DPI_PERCENT.load(Ordering::SeqCst);
 
-            // The footer's two buttons sit on the band's tint, everything else
-            // on the card -- otherwise a control's rounded corners show the
-            // wrong colour through them.
-            let under = crate::theme::CARD;
+            // The main row sits on the card, every option on the well --
+            // otherwise a control's rounded corners show the wrong colour
+            // through them.
+            let under = if id == ID_SAVE || id == ID_NEW || id == ID_COPY {
+                crate::theme::CARD
+            } else {
+                crate::theme::WINDOW_BG
+            };
             fill_rect(mem, whole, under);
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
                 let live = enabled(id, &form);
                 let at = control_box(id, &l);
-                if id == ID_SAVE || id == ID_COPY {
-                    // 3d's footer: a filled primary carrying its `\u{21b5}`, and an
-                    // outlined `Copy` carrying nothing. Both `height: 30px`
-                    // (drawn at [`super::BUTTON_H`]), `padding: 0 12px`,
-                    // `border-radius: 7px`.
-                    let (label, skin, glyph) = if id == ID_SAVE {
-                        (generate_save_label(), ButtonSkin::panel_primary(), true)
-                    } else {
-                        (generate_copy_label(), ButtonSkin::panel_outline(), false)
-                    };
-                    let skin = if !live {
-                        skin.disabled()
-                    } else if hovered {
-                        skin.hovered()
-                    } else {
-                        skin
-                    };
+                if id == ID_SAVE || id == ID_NEW || id == ID_COPY {
                     // **The ring is given LOGICAL size, from `layout`.**
                     // `rounded` scales everything it is handed, and `rc` came
                     // back from `GetClientRect` in device pixels already:
                     // passing it would draw the ring at 1.5x the control at
-                    // 150%, running past the client area and being clipped --
-                    // losing exactly the rounded corners the ring exists to
-                    // draw.
+                    // 150%, running past the client area and being clipped.
                     let pill = if focused {
                         rounded(
                             mem,
@@ -3479,49 +3331,48 @@ mod win32 {
                     } else {
                         whole
                     };
-                    draw_button_with_return(
-                        mem,
-                        pill,
-                        label,
-                        fonts.footer,
-                        skin,
-                        scale(crate::panel_draw::BUTTON_RADIUS),
-                        glyph,
-                        dpi,
-                    );
-                } else if id == ID_NEW {
-                    // The newer 3d's `Regenerate` button: an outlined pill
-                    // carrying a refresh glyph, the word, and `CTRL+R` in a
-                    // chip. The focus ring is drawn the footer buttons' way --
-                    // a wash behind a pill that then shrinks by two -- because
-                    // this is a pill now, where the run it replaced was bare
-                    // text and took a halo instead.
-                    let skin = ButtonSkin::secondary();
-                    let skin = if !live {
-                        skin.disabled()
-                    } else if hovered {
-                        skin.hovered()
-                    } else {
-                        skin
-                    };
-                    let pill = if focused {
-                        rounded(
-                            mem,
-                            Box2 { x: 0, y: 0, w: at.w, h: at.h },
-                            super::RADIUS + 1,
-                            crate::theme::FOCUS_RING,
-                            None,
+                    if id == ID_SAVE {
+                        // D 1.8's primary: `#1b3fa0`, hover `#14307a`.
+                        let skin = crate::panel_draw::skin(
+                            crate::panel_draw::PanelButton::Primary,
+                            hovered && live,
                         );
-                        RECT {
-                            left: whole.left + 2,
-                            top: whole.top + 2,
-                            right: whole.right - 2,
-                            bottom: whole.bottom - 2,
-                        }
+                        let skin = if live { skin } else { skin.disabled() };
+                        draw_button_with_return(
+                            mem,
+                            pill,
+                            generate_save_label(),
+                            fonts.footer,
+                            skin,
+                            scale(crate::panel_draw::BUTTON_RADIUS),
+                            false,
+                            dpi,
+                        );
                     } else {
-                        whole
-                    };
-                    paint_regenerate(mem, pill, fonts, skin, live);
+                        // D 1.8's icon button: 46 x 46, a 1 px edge, hover turns
+                        // the edge and the icon `#1b3fa0`.
+                        let ink = crate::panel_draw::draw_icon_button_frame(
+                            mem,
+                            pill,
+                            hovered && live,
+                            live,
+                            dpi,
+                        );
+                        let side = scale(18);
+                        let cx = (pill.left + pill.right) / 2;
+                        let cy = (pill.top + pill.bottom) / 2;
+                        let icon = RECT {
+                            left: cx - side / 2,
+                            top: cy - side / 2,
+                            right: cx - side / 2 + side,
+                            bottom: cy - side / 2 + side,
+                        };
+                        if id == ID_NEW {
+                            crate::panel_draw::draw_refresh_icon(mem, icon, ink, dpi);
+                        } else {
+                            crate::panel_draw::draw_copy_icon(mem, icon, ink, dpi);
+                        }
+                    }
                 } else if id == ID_SLIDER {
                     paint_slider(mem, whole, at, &form, hovered, focused);
                 } else if id == ID_MIN_DOWN || id == ID_MIN_UP {
@@ -3694,22 +3545,9 @@ mod win32 {
         crate::panel_draw::draw_lockup(hdc, dev(l.mark), dev(l.wordmark), font);
     }
 
-    /// The header's close glyph, drawn as two strokes because no bundled face
-    /// has it at this weight.
-    fn paint_close_glyph(hdc: HDC, at: Box2) {
-        unsafe {
-            use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
-            let old = SelectObject(hdc, pen);
-            let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
-            let pad = w / 3;
-            let _ = MoveToEx(hdc, x + pad, y + pad, None);
-            let _ = LineTo(hdc, x + w - pad, y + h - pad);
-            let _ = MoveToEx(hdc, x + w - pad, y + pad, None);
-            let _ = LineTo(hdc, x + pad, y + h - pad);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
-        }
+    /// The header's ✕ (D 1.7): 32 x 32, `#8a8785`, a `#f1f0ee` wash on hover.
+    fn paint_close_glyph(hdc: HDC, at: Box2, hot: bool) {
+        crate::panel_draw::draw_close_button(hdc, dev(at), hot, DPI_PERCENT.load(Ordering::SeqCst));
     }
 
     fn fill_rect(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -4626,391 +4464,261 @@ mod tests {
     ///
     /// This window is frameless, always-on-top, unresizable and has **no scroll
     /// area anywhere**, so a control past an edge is not merely awkward -- it is
-    /// unreachable, on the surface whose *Save to vault* button is the only way
-    /// the password the user is looking at reaches their vault.
+    /// unreachable, on the surface whose *Use this password* button is the only
+    /// way the password the user is looking at reaches their vault.
     #[test]
     fn nothing_the_card_lays_out_falls_off_it() {
         let l = layout();
+        let right = l.window.right() - MARGIN_X;
 
-        // **The brand lockup**, which the port had dropped entirely and which
-        // this card now carries again. Pinned to the new truth rather than
-        // loosened: the card grew by the lockup's height plus its gap, and the
-        // window's own height assertions below are what hold that honest.
+        // The header: the lockup, then the pill's room, then the ✕.
         let lockup = crate::panel_draw::lockup();
-        assert_eq!(
-            (l.mark.x, l.mark.y),
-            (MARGIN_X, MARGIN_TOP),
-            "the lockup does not start at the card's own top-left inset"
-        );
+        assert_eq!((l.mark.x, l.mark.y), (MARGIN_X, MARGIN_TOP));
         assert_eq!(l.mark.h, lockup.mark_h);
         assert_eq!(
             l.mark.w,
             crate::win32_draw::mark_width(l.mark.h),
-            "the mark's box is not the design artboard's ratio, so the shield would be letterboxed \
-             inside it and drift away from the word beside it"
+            "the mark's box is not the design artboard's ratio, so the shield would be letterboxed"
         );
         assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
-        assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
-        assert!(l.wordmark.right() <= l.close_glyph.x, "the wordmark runs under the ✕");
-        assert!(
-            l.wordmark.bottom() <= l.title.y,
-            "the card's title runs into the brand lockup above it"
-        );
+        assert_eq!(l.wordmark.h, l.mark.h);
+        assert!(l.wordmark.right() <= l.badge.x, "the wordmark runs under the strength pill");
+        assert_eq!(l.badge.h, BADGE_H);
+        assert_eq!(l.badge.right() + BADGE_GAP, l.close_glyph.x, "the pill is not beside the ✕");
+        assert_eq!((l.close_glyph.w, l.close_glyph.h), (32, 32), "D 1.7's ✕ is 32 x 32");
+        assert!(l.close_glyph.right() <= l.window.right(), "the ✕ is off the card");
+        assert!(l.close_glyph.y >= 0);
 
-        assert!(l.title.right() <= l.close_glyph.x, "the header text runs under the ✕");
-        assert!(
-            l.close_glyph.right() <= l.window.right() - MARGIN_X,
-            "the close glyph has crossed the card's right margin"
-        );
-        assert!(l.title.bottom() <= l.header_rule.y);
+        // D 1.8's column, each block one `gap 14` under the last.
+        assert_eq!(l.caption.y - l.mark.bottom(), BLOCK_GAP);
+        assert_eq!(l.value.y - l.caption.bottom(), BLOCK_GAP);
+        assert_eq!(l.save.y - l.value.bottom(), BLOCK_GAP);
+        assert_eq!(l.well.y - l.save.bottom(), BLOCK_GAP);
+        assert_eq!(l.caption.x, MARGIN_X);
+        assert_eq!(l.value.x, MARGIN_X);
+        assert_eq!(l.value.right(), right, "the value is not the card's full width");
+        assert_eq!(l.value.h, VALUE_H * VALUE_LINES);
 
-        // 3d's body, row by row.
-        assert!(l.header_rule.bottom() <= l.caption.y);
-        assert_eq!(l.caption.y, l.badge.y, "the eyebrow and its badge are on different rows");
-        assert_eq!(l.caption.h, l.badge.h);
-        assert!(
-            l.caption.right() <= l.badge.x,
-            "the `GENERATED` eyebrow runs under the strength badge"
-        );
-        assert_eq!(
-            l.badge.right(),
-            l.window.right() - MARGIN_X,
-            "3d hangs the badge off the far right of the caption row; this one stops at {}",
-            l.badge.right()
-        );
-        assert!(l.caption.bottom() <= l.value.y);
-        assert_eq!(l.value.x, MARGIN_X, "the value does not start at the body's own inset");
-        assert_eq!(
-            l.value.right(),
-            l.window.right() - MARGIN_X,
-            "the value line is not the full width of the body it sits in, so a password would be \
-             ellipsised before it had run out of card"
-        );
-        assert!(l.value.bottom() <= l.kinds[0].y);
+        // The button row: the primary, then two 46 x 46 icon buttons, `gap 8`.
+        assert_eq!(l.save.x, MARGIN_X);
+        assert_eq!(l.regenerate.x - l.save.right(), BUTTON_GAP);
+        assert_eq!(l.copy.x - l.regenerate.right(), BUTTON_GAP);
+        assert_eq!(l.copy.right(), right);
+        for button in [l.save, l.regenerate, l.copy] {
+            assert_eq!(button.h, BUTTON_H);
+            assert_eq!(button.y, l.save.y, "the row's buttons are on different rows");
+        }
+        assert_eq!((l.regenerate.w, l.copy.w), (ICON_BUTTON, ICON_BUTTON));
+        assert!(l.save.w > 200, "the primary is too narrow for its label: {}", l.save.w);
+
+        // The well, and everything in it inside its padding.
+        assert_eq!((l.well.x, l.well.right()), (MARGIN_X, right));
+        let inner_left = l.well.x + WELL_PAD;
+        let inner_right = l.well.right() - WELL_PAD;
+        let inside = |name: &str, at: Box2| {
+            assert!(
+                at.x >= inner_left && at.right() <= inner_right,
+                "{name} {at:?} leaves the well's padding ({inner_left}..{inner_right})"
+            );
+            assert!(at.y >= l.well.y + WELL_PAD && at.bottom() <= l.well.bottom() - WELL_PAD);
+        };
 
         // **One joined run, not three chips with gaps.**
         for pair in l.kinds.windows(2) {
             assert_eq!(
                 pair[1].x,
                 pair[0].right() - SEGMENT_SEAM,
-                "two kind cells are {} apart, so the run they belong to is three separate \
-                 buttons rather than one control with seams",
+                "two kind cells are {} apart, so the run is three separate buttons",
                 pair[1].x - pair[0].right()
             );
         }
-        assert_eq!(l.kinds[0].x, MARGIN_X, "the run does not start at the body's own inset");
-        assert!(
-            l.kinds[2].right() + ROW_GAP <= l.regenerate.x,
-            "the kind run has grown into the *Regenerate* button: the run ends at {} and the \
-             button starts at {}, with 3d's `gap: 10px` to fit between them",
-            l.kinds[2].right(),
-            l.regenerate.x
-        );
-        assert_eq!(
-            l.regenerate.right(),
-            l.window.right() - MARGIN_X,
-            "3d puts the re-roll behind a spacer, at the row's right edge"
-        );
+        assert_eq!(l.kinds[0].x, inner_left);
+        assert_eq!(l.kinds[0].y, l.well.y + WELL_PAD, "the well does not open at its padding");
         for cell in l.kinds {
-            assert_eq!(cell.y, l.regenerate.y, "the run and the re-roll are on different rows");
+            inside("a kind cell", cell);
             assert_eq!(cell.h, SEGMENT_H);
-            assert_eq!(cell.h, l.regenerate.h, "the re-roll is not the control row's own height");
         }
 
         // The length row: caption opposite value, slider under both, bounds
         // under the slider's two ends.
         assert!(l.kinds[0].bottom() <= l.length_label.y);
         assert_eq!(l.length_label.y, l.length_value.y, "the caption and its value are not a row");
-        assert!(
-            l.length_label.right() <= l.length_value.x,
-            "the length caption runs under its own value"
-        );
-        assert_eq!(
-            l.length_value.right(),
-            l.window.right() - MARGIN_X,
-            "the length value is not right-aligned on the body's own margin"
-        );
+        assert!(l.length_label.right() <= l.length_value.x);
+        assert_eq!(l.length_value.right(), inner_right);
         assert!(l.length_label.bottom() <= l.slider.y);
-        assert_eq!(l.slider.x, MARGIN_X, "the slider does not start at the body's own inset");
-        assert_eq!(
-            l.slider.right(),
-            l.window.right() - MARGIN_X,
-            "the slider is not the full width of the body it sits in"
-        );
+        assert_eq!((l.slider.x, l.slider.right()), (inner_left, inner_right));
         assert!(l.slider.bottom() <= l.slider_low.y);
-        assert_eq!(l.slider_low.y, l.slider_high.y, "the two bounds are on different lines");
-        assert_eq!(l.slider_low.x, l.slider.x, "the low bound is not under the slider's left end");
-        assert_eq!(
-            l.slider_high.right(),
-            l.slider.right(),
-            "the high bound is not under the slider's right end"
-        );
-        assert!(l.slider_low.right() <= l.slider_high.x, "the two bounds overlap");
+        assert_eq!(l.slider_low.y, l.slider_high.y);
+        assert_eq!(l.slider_low.x, l.slider.x);
+        assert_eq!(l.slider_high.right(), l.slider.right());
+        assert!(l.slider_low.right() <= l.slider_high.x);
+        inside("the slider", l.slider);
+        inside("the high bound", l.slider_high);
 
-        // The class tiles: two rows of two, filling the body exactly.
+        // The class tiles: two rows of two, filling the well exactly.
         assert!(l.slider_low.bottom() <= l.classes_caption.y);
         assert!(l.classes_caption.bottom() <= l.tiles[0].y);
-        assert_eq!(l.tiles[0].x, MARGIN_X, "the tile grid does not start at the body's inset");
-        assert_eq!(l.tiles[0].y, l.tiles[1].y, "the grid's first row is not a row");
-        assert_eq!(l.tiles[2].y, l.tiles[3].y, "the grid's second row is not a row");
-        assert_eq!(l.tiles[0].x, l.tiles[2].x, "the grid's first column is not a column");
-        assert_eq!(l.tiles[1].x, l.tiles[3].x, "the grid's second column is not a column");
-        assert_eq!(
-            l.tiles[1].x - l.tiles[0].right(),
-            TILE_GAP,
-            "the two tile columns are not one gap apart"
-        );
-        assert_eq!(
-            l.tiles[3].y - l.tiles[1].bottom(),
-            TILE_GAP,
-            "the two tile rows are not one gap apart"
-        );
-        assert!(
-            l.tiles[1].right() <= l.window.right() - MARGIN_X,
-            "the right-hand tile column has crossed the card's right margin"
-        );
+        assert_eq!(l.tiles[0].x, inner_left);
+        assert_eq!(l.tiles[0].y, l.tiles[1].y);
+        assert_eq!(l.tiles[2].y, l.tiles[3].y);
+        assert_eq!(l.tiles[0].x, l.tiles[2].x);
+        assert_eq!(l.tiles[1].x, l.tiles[3].x);
+        assert_eq!(l.tiles[1].x - l.tiles[0].right(), TILE_GAP);
+        assert_eq!(l.tiles[3].y - l.tiles[1].bottom(), TILE_GAP);
         for tile in l.tiles {
             assert_eq!(tile.h, TILE_H);
-            assert!(
-                tile.w > TILE_PAD_X + TILE_BOX + TILE_TEXT_GAP,
-                "a tile is narrower than the tick box and the padding round it"
-            );
+            assert!(tile.w > TILE_PAD_X + TILE_BOX + TILE_TEXT_GAP);
+            inside("a class tile", tile);
         }
+        assert!(l.tiles[1].right() <= inner_right);
 
         // The minimum-digits row, and its joined stepper.
         assert!(l.tiles[3].bottom() <= l.min_label.y);
         for pair in l.min_stepper.windows(2) {
-            assert_eq!(
-                pair[1].x,
-                pair[0].right() - SEGMENT_SEAM,
-                "the stepper's cells are {} apart, so it is three buttons rather than one \
-                 control with seams",
-                pair[1].x - pair[0].right()
-            );
+            assert_eq!(pair[1].x, pair[0].right() - SEGMENT_SEAM);
         }
-        assert!(
-            l.min_label.right() + ROW_GAP <= l.min_stepper[0].x,
-            "the minimum-digits question runs into its own stepper"
-        );
-        assert_eq!(
-            l.min_stepper[2].right(),
-            l.window.right() - MARGIN_X,
-            "the stepper is not right-aligned on the body's own margin"
-        );
+        assert!(l.min_label.right() + ROW_GAP <= l.min_stepper[0].x);
+        assert_eq!(l.min_stepper[2].right(), inner_right);
         for cell in l.min_stepper {
-            assert_eq!(cell.y, l.min_label.y, "the stepper and its question are on different rows");
-            assert_eq!(cell.h, SEGMENT_H, "the stepper is not 3e's segmented-control height");
+            assert_eq!(cell.y, l.min_label.y);
+            assert_eq!(cell.h, SEGMENT_H);
+            inside("a stepper cell", cell);
         }
 
         // The look-alikes row: label over sample, switch beside both.
         assert!(l.min_stepper[0].bottom() <= l.avoid_label.y);
-        assert_eq!(l.avoid_label.x, MARGIN_X);
-        assert_eq!(
-            l.avoid_sample.y,
-            l.avoid_label.bottom(),
-            "the sample is not directly under the label it belongs to"
-        );
-        assert!(
-            l.avoid_label.right() <= l.avoid_toggle.x,
-            "the look-alikes label runs under its own switch"
-        );
-        assert!(l.avoid_sample.right() <= l.avoid_toggle.x, "the sample runs under the switch");
-        assert_eq!(
-            l.avoid_toggle.right(),
-            l.window.right() - MARGIN_X,
-            "the switch is not right-aligned on the body's own margin"
-        );
+        assert_eq!(l.avoid_sample.y, l.avoid_label.bottom());
+        assert!(l.avoid_label.right() <= l.avoid_toggle.x);
+        assert!(l.avoid_sample.right() <= l.avoid_toggle.x);
+        assert_eq!(l.avoid_toggle.right(), inner_right);
         assert!(
             l.avoid_toggle.y >= l.avoid_label.y
-                && l.avoid_toggle.bottom() <= l.avoid_sample.bottom(),
-            "the switch is not vertically inside the two-line stack it is centred on"
+                && l.avoid_toggle.bottom() <= l.avoid_sample.bottom()
         );
 
-        assert!(l.avoid_sample.bottom() <= l.footer_rule.y);
+        // The well closes at its padding, and the card at its own.
+        assert_eq!(l.well.bottom() - l.avoid_sample.bottom(), WELL_PAD);
         assert_eq!(
-            l.footer.y,
-            l.footer_rule.bottom(),
-            "the footer's tint does not start at its rule"
-        );
-        assert_eq!(
-            l.footer.bottom(),
-            l.window.bottom(),
-            "the footer's tint stops short of the card's bottom edge, leaving a band of the \
-             card's own colour under it"
-        );
-        assert!(l.footer_rule.bottom() <= l.save.y);
-        assert!(l.save.right() < l.copy.x, "the two footer buttons overlap");
-        assert_eq!(
-            l.copy.x - l.save.right(),
-            BUTTON_GAP,
-            "3d sets `gap: 8px` between the footer's two answers"
-        );
-        assert!(
-            l.copy.right() <= l.window.right() - MARGIN_X,
-            "the footer's buttons have crossed the card's right margin"
-        );
-        for button in [l.save, l.copy] {
-            assert_eq!(button.h, BUTTON_H);
-            assert_eq!(button.y, l.save.y, "the footer's buttons are on different rows");
-        }
-
-        // **The footer band is 3d's `padding: 12px 14px`, symmetrically.** A
-        // band that was 12 above its buttons and something else below them is
-        // the arithmetic slip this card has to be measured for rather than
-        // eyeballed.
-        assert_eq!(
-            l.save.y - l.footer_rule.bottom(),
-            FOOTER_PAD_Y,
-            "the footer band's top padding is not 3d's 12"
-        );
-        assert_eq!(
-            l.save.bottom() + FOOTER_PAD_Y,
-            l.window.bottom(),
-            "the card is not sized to its own footer: it asks the OS for a {} px window whose \
-             last control ends at {} px. This card has one shape and no rows, so a window taller \
-             than its content is a band of bare `theme::CARD_TINT` under the buttons -- and one \
-             shorter is a *Save to vault* the user cannot reach",
+            l.window.bottom() - l.well.bottom(),
+            MARGIN_TOP,
+            "the card is not sized to its own content: it asks the OS for a {} px window whose \
+             last block ends at {} px",
             l.window.h,
-            l.save.bottom()
+            l.well.bottom()
         );
         assert_eq!(l.window.w, WIDTH);
-        assert_eq!(l.window.x, 0);
-        assert_eq!(l.window.y, 0);
+        assert_eq!((l.window.x, l.window.y), (0, 0));
     }
 
-    /// **The body is 3d's panel body, at 3d's own numbers.**
-    ///
-    /// `padding: 14px` round it, `gap: 12px` between its three rows, and a
-    /// value line of `font-size: 17px` on `line-height: 1.35`. Read off the
-    /// markup rather than eyeballed, and asserted here because the alternative
-    /// is a screenshot nobody takes twice.
+    /// **The card is design section 1.8's anatomy**, at its numbers: 410 wide,
+    /// `pad 18 / gap 14`, a 21 px value, 46 px buttons at `gap 8`, a 22 px pill.
     #[test]
-    fn the_body_is_3ds_panel_body() {
-        let l = layout();
-        assert_eq!(BODY_PAD, 18, "design 1b's New password card is `pad 18`");
-        assert_eq!(MARGIN_X, BODY_PAD, "the body's inset and the footer band's are not one edge");
-        assert_eq!(BODY_GAP, 12, "3d's panel body is `gap: 12px`");
-        assert_eq!(ROW_GAP, 10, "3d's control row is `gap: 10px`");
-        assert_eq!(VALUE_PX, 21, "design 1b's value is 21 px monospace");
+    fn the_card_is_design_1_8s_anatomy() {
+        assert_eq!(WIDTH, 410);
+        assert_eq!(MARGIN_X, 18);
+        assert_eq!(MARGIN_TOP, 18);
+        assert_eq!(BLOCK_GAP, 14);
+        assert_eq!(BUTTON_GAP, 8);
+        assert_eq!((BUTTON_H, ICON_BUTTON), (46, 46));
+        assert_eq!(VALUE_PX, 21, "design 1.8's value is 21 px monospace");
         assert_eq!(
             VALUE_H,
             (f64::from(VALUE_PX) * 1.35).round() as i32,
-            "the value's line box is not 3d's `line-height: 1.35`"
+            "the value's line box is not the design's `line-height: 1.35`"
         );
-        assert_eq!(BADGE_H, 22, "design 1b's strength pill is 22 px tall");
-        assert_eq!(RADIUS, 7, "3d gives its run and its footer buttons `border-radius: 7px`");
+        assert_eq!(BADGE_H, 22, "design 1.8's strength pill is 22 px tall");
+        assert_eq!((WELL_PAD, WELL_RADIUS), (12, 14), "the well is the Save card's preview block");
+        assert_eq!(BODY_GAP, 12, "the well's blocks are one `gap 12` apart");
+        assert_eq!(RADIUS, 10);
 
-        assert_eq!(
-            l.caption.y - l.header_rule.bottom(),
-            BODY_PAD,
-            "the body does not open at 3d's own padding"
-        );
-        assert_eq!(l.value.y - l.caption.bottom(), BODY_GAP);
-        assert_eq!(l.kinds[0].y - l.value.bottom(), BODY_GAP);
-        // The newer 3d's four extra blocks are spaced by the same `gap: 12px`,
-        // each measured from the bottom of the block above it rather than from
-        // the last line inside it -- so the length row's three lines are one
-        // block, and so are the look-alikes label and its sample.
+        let l = layout();
+        // Inside the well, every block is a `BODY_GAP` under the last.
         assert_eq!(l.length_label.y - l.kinds[0].bottom(), BODY_GAP);
         assert_eq!(l.classes_caption.y - l.slider_low.bottom(), BODY_GAP);
         assert_eq!(l.min_label.y - l.tiles[3].bottom(), BODY_GAP);
         assert_eq!(l.avoid_label.y - l.min_stepper[0].bottom(), BODY_GAP);
-        assert_eq!(
-            l.footer_rule.y - l.avoid_sample.bottom(),
-            BODY_PAD,
-            "the body does not close at 3d's own padding"
-        );
     }
 
     /// **The card's dimensions are the theme's**, so a redesign there cannot
     /// leave this card drawing controls of its own invented height.
     #[test]
     fn the_cards_dimensions_are_the_themes() {
-        assert_eq!(
-            BUTTON_H, crate::panel_draw::BUTTON_H,
-            "the footer's buttons are not design 1b's 46 px"
-        );
+        assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H, "the buttons are not design 1.8's 46 px");
         assert_eq!(
             WIDTH,
             crate::panel_draw::CARD_W,
-            "the daemon's two Win32 cards are different widths, which reads as two different \
+            "the daemon's Win32 cards are different widths, which reads as two different \
              programs answering the same hotkey"
         );
-        assert_eq!(
-            SEGMENT_H,
-            crate::theme::SEGMENT_HEIGHT as i32,
-            "the kind run is not the app's segmented-control height"
-        );
-        assert_eq!(
-            SEGMENT_SEAM,
-            crate::theme::SEGMENT_SEAM as i32,
-            "the run's cells are joined by an overlap the design system does not name"
-        );
-        // Each cell is its own label plus the run's padding, which is what
-        // `theme::segment_widths` does with the same two numbers. Checked as a
-        // floor rather than an equality because `layout` is pure and cannot
-        // measure a label: what must hold is that no cell is narrower than its
-        // padding alone.
+        assert_eq!(SEGMENT_H, crate::theme::SEGMENT_HEIGHT as i32);
+        assert_eq!(SEGMENT_SEAM, crate::theme::SEGMENT_SEAM as i32);
         for width in KIND_W {
             assert!(
                 width > crate::theme::SEGMENT_PADDING as i32,
                 "a kind cell is {width} wide, which is not even the run's own padding"
             );
         }
-        assert_eq!(
-            BADGE_W,
-            2 * crate::panel_draw::PILL_PAD_X + 58,
-            "the badge is not its widest label inside design 1b's pill padding"
-        );
+        const {
+            assert!(
+                BADGE_ROOM >= 2 * crate::panel_draw::PILL_PAD_X + 58,
+                "the pill's room is narrower than its widest label inside design 1.8's padding"
+            );
+        }
         assert_eq!(
             (TOGGLE_W, TOGGLE_H),
             (crate::theme::TOGGLE_W as i32, crate::theme::TOGGLE_H as i32),
-            "the look-alikes switch is not the app's own 40x22 -- `theme::toggle_pill` draws the \
-             egui copy of this control and the two have to be one switch"
+            "the look-alikes switch is not the app's own 40x22"
         );
         assert_eq!(
             SLIDER_HANDLE_R * 2,
             SLIDER_H,
-            "the slider's row is not exactly its handle's diameter, so the handle is either \
-             clipped by its own control or floating in dead space"
+            "the slider's row is not exactly its handle's diameter"
         );
     }
 
-    /// **The control row fits the body.**
-    ///
-    /// The newer image's labels are longer than the older one's -- `Password`
-    /// and `Passphrase` where it said `Words` and `Characters` -- and the
-    /// re-roll beside them grew from a bare run into a button with a glyph and
-    /// a chip in it. `layout` is pure and cannot measure a label, so
-    /// [`KIND_W`] and [`REGENERATE_W`] are chosen numbers; this is what keeps
-    /// the row from silently overflowing a card that cannot scroll.
+    /// **The kind run fills the well.** `layout` is pure and cannot measure a
+    /// label, so [`KIND_W`] are chosen numbers; this is what keeps the run the
+    /// well's own width, and not a short run stranded on the left of it.
     #[test]
-    fn the_control_row_fits_the_body() {
+    fn the_kind_run_fills_the_well() {
         let l = layout();
-        let body = WIDTH - 2 * MARGIN_X;
+        let inner = WIDTH - 2 * MARGIN_X - 2 * WELL_PAD;
         let run: i32 = KIND_W.iter().sum::<i32>() - 2 * SEGMENT_SEAM;
-        assert_eq!(
-            l.kinds[2].right() - l.kinds[0].x,
-            run,
-            "control: the run's drawn width is not the sum of its cells"
-        );
-        assert!(
-            run + ROW_GAP + REGENERATE_W <= body,
-            "the kind run ({run}) and the *Regenerate* button ({REGENERATE_W}) with 3d's \
-             `gap: 10px` between them need {} of a {body}-pixel body",
-            run + ROW_GAP + REGENERATE_W
-        );
-        // The button has to hold its three parts: the glyph, the word, and the
-        // `CTRL+R` chip. Slack, because none of the three can be measured here
-        // -- but a button narrower than the chip alone would clip the chip the
-        // shared painter clamps rather than the label.
-        let chip = 2 * crate::theme::CHIP_PAD_X as i32
-            + REGENERATE_SHORTCUT.len() as i32 * crate::theme::CHIP_TEXT_PX as i32;
-        assert!(
-            REGENERATE_W > REFRESH_GLYPH + REFRESH_GAP + chip,
-            "the *Regenerate* button is {REGENERATE_W} wide, which leaves nothing for its label \
-             beside a refresh glyph and a `{REGENERATE_SHORTCUT}` chip"
-        );
+        assert_eq!(run, inner, "the run is not the well's inner width");
+        assert_eq!(l.kinds[2].right() - l.kinds[0].x, run);
+    }
+
+    /// **A value breaks at any character, in whole characters, and covers all
+    /// of itself** (D 1.8: `word-break: break-all`).
+    #[test]
+    fn a_value_breaks_at_any_character_and_covers_every_unit() {
+        // Contiguous and complete, at every width.
+        for len in [0usize, 1, 17, 18, 20, 29, 30, 58, 64] {
+            let units = vec![u16::from(b'x'); len];
+            for per_line in [1usize, 7, 29, 41, 1000] {
+                let lines = break_all(&units, per_line);
+                let mut at = 0;
+                for line in &lines {
+                    assert_eq!(line.start, at, "a gap or an overlap at {at}");
+                    assert!(line.len() <= per_line.max(1) && !line.is_empty());
+                    at = line.end;
+                }
+                assert_eq!(at, len, "{len} units at {per_line} a line left some off the card");
+            }
+        }
+        // The default 20 characters is one line at the 21 px card; 64 is three
+        // at 29 a line, which is why such a value drops to the small face.
+        assert_eq!(break_all(&[u16::from(b'x'); 20], 29).len(), 1);
+        assert_eq!(break_all(&[u16::from(b'x'); 64], 29).len(), 3);
+        assert_eq!(break_all(&[u16::from(b'x'); 64], 41).len(), 2);
+        // No surrogate pair is split between two lines.
+        let pair: Vec<u16> = "ab\u{1F600}cd".encode_utf16().collect();
+        for per_line in 1..6 {
+            for line in break_all(&pair, per_line) {
+                let end_high = line.end < pair.len() && (0xD800..0xDC00).contains(&pair[line.end - 1]);
+                assert!(!end_high || line.len() == 1, "a surrogate pair was cut at {line:?}");
+            }
+        }
     }
 
     /// **The slider's handle and the pointer read the same scale.**
@@ -5177,20 +4885,17 @@ mod tests {
     /// reason a test can read them at all on a surface no test may open.
     #[test]
     fn the_cards_words_are_the_ones_it_promises() {
-        assert_eq!(generate_label(), "New password", "3d's caption over the field");
-        assert_eq!(generate_caption(), "Suggested password", "design 1b's label over the value");
+        assert_eq!(generate_caption(), "Suggested password", "design 1.8's label over the value");
         assert_eq!(
-            generate_save_label(), "Save to vault",
-            "the primary button says *Fill*, on a path that holds no injector and cannot type \
-             into the window behind the card"
+            generate_save_label(), "Use this password",
+            "design 1.8's primary; the card holds no injector and cannot type into the window \
+             behind it, so what it does next is hand the password to design 3c"
         );
         assert_eq!(generate_copy_label(), "Copy");
         assert_eq!(
             generate_regenerate_label(), "Regenerate",
-            "the newer 3d draws a *Regenerate* button where the older one drew a bare `CTRL+R \
-             NEW` run; the composed run this used to assert is gone with it"
+            "the icon button's accessible name"
         );
-        assert_eq!(REGENERATE_SHORTCUT, "CTRL+R");
         assert_eq!(generate_classes_caption(), "Characters");
         assert_eq!(generate_min_number_label(), "At least this many digits");
         assert_eq!(generate_avoid_label(), "Avoid look-alikes");
@@ -5238,67 +4943,33 @@ mod tests {
 
     // ---- what the window draws ---------------------------------------------
 
-    /// **The value's tint is a rule and not a scattering.**
-    ///
-    /// 3d tints four of its eighteen characters -- `R`, `9`, `L` and `-` -- and
-    /// leaves the `7`, `2`, `4` and `8` in the same string plain, which is not
-    /// a rule anything can implement. What the card does instead is tint every
-    /// character that is not a lowercase letter, which is the variety the tint
-    /// is there to show; this is that claim, taken on the classifier the
-    /// painter itself calls, since the painting needs a device context and this
-    /// does not.
+    /// **The strength pill's washes**: `Strong` is the design's green
+    /// (`#e8f3ec` on `#17673a`), the other three have their own, and no two
+    /// ratings share one -- a pill that approved of every value in one colour
+    /// would say nothing.
     #[test]
-    fn the_value_tints_every_character_that_is_not_a_lowercase_letter() {
-        for plain in "abcdefghijklmnopqrstuvwxyz".encode_utf16() {
-            assert!(!win32::is_tinted(plain), "a lowercase letter was tinted");
-        }
-        for tinted in "ABCXYZ0123456789-_!@#$%^&*".encode_utf16() {
-            assert!(
-                win32::is_tinted(tinted),
-                "a character that is not a lowercase letter was left plain, so the tint says \
-                 nothing about the value's variety"
-            );
-        }
-        // **No surrogate pair can be split between two runs**, which would
-        // rasterise as two replacement glyphs. Both halves are at or above
-        // 0xD800 and therefore both tinted, so they stay in one run.
-        for unit in [0xD800u16, 0xDBFF, 0xDC00, 0xDFFF] {
-            assert!(win32::is_tinted(unit), "half of a surrogate pair classified on its own");
-        }
-    }
-
-    /// **Only `Strong` wears 3d's blue badge.**
-    ///
-    /// 3d prints `Strong` in `#14307a` on `#eef2fc` because its candidate
-    /// always is one. This card's is not: `PIN` at its default size is six
-    /// digits, which `password_strength::rate` calls `Weak`, and a badge that
-    /// approved of that in the same blue would be a badge that says nothing.
-    #[test]
-    fn the_strength_badge_is_only_green_when_the_rating_earns_it() {
+    fn the_strength_pill_has_a_wash_for_every_rating() {
         use crate::password_strength::Strength;
+        let all = [Strength::Weak, Strength::Fair, Strength::Good, Strength::Strong];
         assert_eq!(
             win32::badge_tone(Strength::Strong),
             (crate::theme::DONE_WASH, crate::theme::DONE_INK),
-            "design 1b's green pill is not what a strong password gets"
+            "design 1.8's green pill is not what a strong password gets"
         );
-        for lesser in [Strength::Weak, Strength::Fair, Strength::Good] {
-            let tone = win32::badge_tone(lesser);
-            assert_ne!(
-                tone,
-                win32::badge_tone(Strength::Strong),
-                "{lesser:?} is dressed as `Strong`"
-            );
-            assert_eq!(tone, (crate::theme::CANVAS, crate::theme::TEXT_FAINT));
+        assert_eq!(
+            win32::badge_tone(Strength::Weak),
+            (crate::theme::DANGER_WASH, crate::theme::ERROR)
+        );
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(win32::badge_tone(*a), win32::badge_tone(*b), "{a:?} and {b:?}");
+            }
         }
-        // The card really can show a rating that is not `Strong`, which is what
-        // makes the branch above worth having rather than dead.
+        // The card really can show a rating that is not `Strong`.
         assert_ne!(
-            crate::password_strength::rate(&"0".repeat(
-                GeneratedKind::Pin.default_size() as usize
-            )),
+            crate::password_strength::rate(&"0".repeat(GeneratedKind::Pin.default_size() as usize)),
             Strength::Strong,
-            "control: a PIN at this card's own default size rates `Strong`, so nothing here \
-             would ever take the second tone"
+            "control: a PIN at this card's own default size rates `Strong`"
         );
     }
 
@@ -5391,6 +5062,36 @@ mod tests {
             .map(|line| line.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// **Nothing of the older anatomy survives**: no header or footer rule, no
+    /// tinted footer band, and none of the v1 button skins -- every button is
+    /// `panel_draw::skin`'s. Needles are split so this test does not match
+    /// itself.
+    #[test]
+    fn the_older_anatomy_is_gone() {
+        let (production, discarded) = production();
+        assert!(discarded > 0, "control: nothing was cut out of the file");
+        let code = code(&production);
+        assert!(
+            code.contains("panel_draw::skin("),
+            "control: the primary is not skinned by panel_draw"
+        );
+        for gone in [
+            concat!("panel_", "primary()"),
+            concat!("panel_", "outline()"),
+            concat!("ButtonSkin::", "secondary"),
+            concat!("header", "_rule"),
+            concat!("footer", "_rule"),
+            concat!("FOOTER_", "PAD_Y"),
+            concat!("draw_hint", "_chip"),
+        ] {
+            assert!(
+                !code.contains(gone),
+                "`{gone}` is back in generate_prompt.rs: the old header rule / footer band \
+                 anatomy is meant to be gone"
+            );
+        }
     }
 
     #[test]

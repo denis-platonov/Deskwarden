@@ -266,9 +266,6 @@ pub fn row_captions() -> [&'static str; 2] {
     [crate::i18n::t("save_login.caption_username"), crate::i18n::t("save_login.caption_password")]
 }
 
-/// The `Enter` chip drawn inside *Save*.
-pub const SAVE_SHORTCUT: &str = "ENTER";
-
 /// The window handle [`run_with`] deals in.
 ///
 /// A bare `isize` newtype, not an `HWND`, for the same reason
@@ -649,7 +646,7 @@ mod win32 {
     use super::{
         field_child, Box2, Event, SaveLoginForm, SaveWindow, APP_NAME, folder_row_text, GONE,
         never_label, not_now_label, password_hint, PENDING, row_captions, save_generate_label,
-        save_label, SAVE_LOGIN_CARD_TITLE, save_login_label, SAVE_SHORTCUT, username_hint,
+        save_label, SAVE_LOGIN_CARD_TITLE, save_login_label, username_hint,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -718,6 +715,9 @@ mod win32 {
     /// Which control the pointer is over, as a control id, or 0.
     static HOVERED: AtomicIsize = AtomicIsize::new(0);
 
+    /// Whether the pointer is on the header's ✕ (D 1.7: its hover wash).
+    static CLOSE_HOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     /// The subclassed `BUTTON`s' original procedure. One slot for all of them:
     /// every button here is the same `BUTTON` class registered by the same
     /// comctl32, so the procedure it replaces is the same pointer.
@@ -763,27 +763,12 @@ mod win32 {
         }
     }
 
-    fn mono(px: i32) -> HFONT {
-        unsafe {
-            let mut lf = LOGFONTW {
-                lfHeight: -scale(px),
-                lfWeight: FW_NORMAL.0 as i32,
-                lfQuality: CLEARTYPE_QUALITY,
-                ..Default::default()
-            };
-            for (i, ch) in crate::theme::GDI_MONO_FACE.encode_utf16().take(31).enumerate() {
-                lf.lfFaceName[i] = ch;
-            }
-            CreateFontIndirectW(&lf)
-        }
-    }
-
     /// Every face the card paints with, created at open and destroyed at close.
     /// Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
         /// The title beside the shield, 17/800.
         title: HFONT,
-        /// A field's caption, 13/600; also the *Generate* control's label.
+        /// A field's caption, 13/600.
         caption: HFONT,
         /// The preview's bold line (16/700), its faint one (14) and the tile's
         /// initials (14/700).
@@ -792,11 +777,12 @@ mod win32 {
         avatar: HFONT,
         /// The two `EDIT`s' face: the same size as the design's field text.
         field: HFONT,
-        /// The footer buttons, 15/700, and the keyboard chip inside *Save*.
+        /// The footer buttons, 15/700.
         button: HFONT,
-        hint: HFONT,
         /// The *Never for this app* link, 14/600.
         link: HFONT,
+        /// The *Generate* link, 13/700.
+        accent: HFONT,
     }
 
     impl Fonts {
@@ -810,8 +796,8 @@ mod win32 {
                 avatar: font(BOLD, crate::panel_draw::ROW_SUB_PX),
                 field: font(REGULAR, crate::panel_draw::BODY_PX),
                 button: font(BOLD, crate::panel_draw::BUTTON_PX),
-                hint: mono(crate::theme::CHIP_TEXT_PX as i32),
                 link: font(SEMIBOLD, 14),
+                accent: font(BOLD, 13),
             }
         }
 
@@ -825,8 +811,8 @@ mod win32 {
                     self.avatar,
                     self.field,
                     self.button,
-                    self.hint,
                     self.link,
+                    self.accent,
                 ] {
                     let _ = DeleteObject(f);
                 }
@@ -850,6 +836,7 @@ mod win32 {
         register_fonts();
         GONE.store(false, Ordering::SeqCst);
         HOVERED.store(0, Ordering::SeqCst);
+        CLOSE_HOT.store(false, Ordering::SeqCst);
         if let Ok(mut slot) = APP_NAME.lock() {
             slot.clear();
             slot.push_str(&form.app_name);
@@ -990,7 +977,7 @@ mod win32 {
         }
 
         let buttons: [(usize, Box2, HFONT); 4] = [
-            (ID_GENERATE, l.generate, field_font),
+            (ID_GENERATE, l.generate, button_font),
             (ID_SAVE, l.save, button_font),
             (ID_NOT_NOW, l.not_now, button_font),
             (ID_NEVER, l.never, button_font),
@@ -1437,8 +1424,22 @@ mod win32 {
             WM_MOUSEMOVE => {
                 // A pointer that left a control without entering another one is
                 // seen here rather than by the control it left.
-                if HOVERED.swap(0, Ordering::SeqCst) != 0 {
+                let left_control = HOVERED.swap(0, Ordering::SeqCst) != 0;
+                // The ✕'s hover wash. `WM_MOUSELEAVE` (asked for below) takes
+                // it down again when the pointer leaves the card.
+                let on_close = in_close_glyph(lparam);
+                let changed = CLOSE_HOT.swap(on_close, Ordering::SeqCst) != on_close;
+                if on_close {
+                    track_leave(window);
+                }
+                if left_control || changed {
                     repaint_all(window);
+                }
+                LRESULT(0)
+            }
+            crate::panel_draw::WM_MOUSELEAVE => {
+                if CLOSE_HOT.swap(false, Ordering::SeqCst) {
+                    repaint(window);
                 }
                 LRESULT(0)
             }
@@ -1479,6 +1480,23 @@ mod win32 {
         }
     }
 
+    /// Asks Windows for a `WM_MOUSELEAVE` when the pointer leaves `window`, so
+    /// the ✕'s hover wash cannot outlive the pointer.
+    fn track_leave(window: HWND) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+        };
+        let mut request = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: window,
+            dwHoverTime: 0,
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut request);
+        }
+    }
+
     /// **What a click on control `id` means, and the three answers stay three.**
     ///
     /// Each of the footer's buttons posts its own event. There is no shared
@@ -1511,6 +1529,13 @@ mod win32 {
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                if CLOSE_HOT.swap(false, Ordering::SeqCst) {
+                    if let Ok(parent) =
+                        windows::Win32::UI::WindowsAndMessaging::GetParent(control)
+                    {
+                        repaint(parent);
+                    }
+                }
                 if HOVERED.swap(id, Ordering::SeqCst) != id {
                     repaint(control);
                 }
@@ -1688,7 +1713,7 @@ mod win32 {
                 text(mem, fonts.sub, l.folder_value, folder_row_text(), crate::theme::TEXT_FAINT);
             }
 
-            paint_close_glyph(mem, l.close_glyph);
+            paint_close_glyph(mem, l.close_glyph, CLOSE_HOT.load(Ordering::SeqCst));
 
             drop(guard);
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -1726,7 +1751,18 @@ mod win32 {
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
-                if id == ID_NEVER {
+                if id == ID_GENERATE {
+                    // **A text link in the Password caption's row** (D 1.7 has
+                    // no slot for the 3d hand-off; this is the Ruling): the
+                    // card's one accent-coloured word.
+                    crate::panel_draw::draw_accent_link(
+                        mem,
+                        whole,
+                        save_generate_label(),
+                        fonts.accent,
+                        hovered || focused,
+                    );
+                } else if id == ID_NEVER {
                     // **A text link, not a button** (D 1.7): the one control on
                     // the card that writes to `settings.json` gets the least
                     // weight. Keyboard focus lights it like a hover.
@@ -1739,11 +1775,9 @@ mod win32 {
                         true,
                     );
                 } else {
-                    let (label, hint, skin, face, box2) = control_skin(id, &l, fonts);
+                    let (label, skin, face, box2) = control_skin(id, &l, fonts);
                     let skin = if hovered { skin.hovered() } else { skin };
-                    let hint = hint.map(|text| (text, fonts.hint));
-                    let radius =
-                        if id == ID_GENERATE { 8 } else { crate::panel_draw::BUTTON_RADIUS };
+                    let radius = crate::panel_draw::BUTTON_RADIUS;
                     if focused {
                         // **The ring is given LOGICAL size, from `layout`.**
                         // `rounded` scales everything it is handed, and `rc`
@@ -1763,11 +1797,11 @@ mod win32 {
                             bottom: whole.bottom - 2,
                         };
                         draw_button_with_shortcut(
-                            mem, inner, &label, face, skin, scale(radius), hint, dpi,
+                            mem, inner, &label, face, skin, scale(radius), None, dpi,
                         );
                     } else {
                         draw_button_with_shortcut(
-                            mem, whole, &label, face, skin, scale(radius), hint, dpi,
+                            mem, whole, &label, face, skin, scale(radius), None, dpi,
                         );
                     }
                 }
@@ -1785,47 +1819,37 @@ mod win32 {
     /// What button `id` says, how it is drawn, and the logical box it occupies.
     ///
     /// **Only *Save* is primary.** *Not now* is outlined, and *Never for this
-    /// app* is not a button at all (see `paint_control`).
+    /// app* and *Generate* are links, not buttons (see `paint_control`).
     fn control_skin(
         id: usize,
         l: &super::Layout,
         fonts: &Fonts,
-    ) -> (String, Option<&'static str>, ButtonSkin, HFONT, Box2) {
+    ) -> (String, ButtonSkin, HFONT, Box2) {
         match id {
             ID_SAVE => (
                 save_label().to_string(),
-                Some(SAVE_SHORTCUT),
                 crate::panel_draw::skin(PanelButton::Primary, false),
                 fonts.button,
                 l.save,
             ),
-            ID_NOT_NOW => (
+            _ => (
                 not_now_label().to_string(),
-                None,
                 crate::panel_draw::skin(PanelButton::Outline, false),
                 fonts.button,
                 l.not_now,
             ),
-            _ => (
-                save_generate_label().to_string(),
-                None,
-                crate::panel_draw::skin(PanelButton::Outline, false),
-                fonts.caption,
-                l.generate,
-            ),
         }
     }
 
-    /// The header's close glyph, drawn as two strokes because no bundled face
-    /// has it at this weight.
-    fn paint_close_glyph(hdc: HDC, at: Box2) {
+    /// The header's ✕ (D 1.7): 32 x 32, `#8a8785`, a `#f1f0ee` wash on hover.
+    fn paint_close_glyph(hdc: HDC, at: Box2, hot: bool) {
         let rc = RECT {
             left: scale(at.x),
             top: scale(at.y),
             right: scale(at.right()),
             bottom: scale(at.bottom()),
         };
-        crate::panel_draw::draw_close_x(hdc, rc, scale(1).max(1), crate::theme::TEXT_GHOST);
+        crate::panel_draw::draw_close_button(hdc, rc, hot, DPI_PERCENT.load(Ordering::SeqCst));
     }
 
     fn fill_rect(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -2411,7 +2435,7 @@ mod tests {
         );
         assert!(
             code.contains("VK_RETURN.0"),
-            "Enter is no longer read in the pump, and the footer's ENTER chip promises it"
+            "Enter is no longer read in the pump, and Enter is how a keyboard user saves"
         );
     }
 

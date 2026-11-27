@@ -200,6 +200,7 @@ panel.hint_esc_close = Esc bezárás
 generate.new_password = Új jelszó
 generate.suggested = Javasolt jelszó
 generate.save_to_vault = Mentés a széfbe
+generate.use_password = Jelszó használata
 generate.copy = Másolás
 generate.regenerate = Új generálása
 generate.characters = Karakterek

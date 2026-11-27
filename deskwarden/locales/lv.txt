@@ -206,6 +206,7 @@ panel.hint_esc_close = Esc aizvērt
 generate.new_password = Jauna parole
 generate.suggested = Ieteiktā parole
 generate.save_to_vault = Saglabāt glabātuvē
+generate.use_password = Izmantot šo paroli
 generate.copy = Kopēt
 generate.regenerate = Ģenerēt vēlreiz
 generate.characters = Rakstzīmes

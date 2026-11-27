@@ -204,6 +204,7 @@ panel.hint_esc_close = Esc zamknij
 generate.new_password = Nowe hasło
 generate.suggested = Proponowane hasło
 generate.save_to_vault = Zapisz w sejfie
+generate.use_password = Użyj tego hasła
 generate.copy = Kopiuj
 generate.regenerate = Ponownie
 generate.characters = Znaki

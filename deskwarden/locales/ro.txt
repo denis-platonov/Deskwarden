@@ -201,6 +201,7 @@ panel.hint_esc_close = Esc închide
 generate.new_password = Parolă nouă
 generate.suggested = Parolă sugerată
 generate.save_to_vault = Salvează în seif
+generate.use_password = Folosește această parolă
 generate.copy = Copiază
 generate.regenerate = Regenerează
 generate.characters = Caractere

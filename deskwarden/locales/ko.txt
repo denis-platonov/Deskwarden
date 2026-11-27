@@ -202,6 +202,7 @@ panel.hint_esc_close = Esc 닫기
 generate.new_password = 새 비밀번호
 generate.suggested = 추천 비밀번호
 generate.save_to_vault = 보관함에 저장
+generate.use_password = 이 비밀번호 사용
 generate.copy = 복사
 generate.regenerate = 다시 생성
 generate.characters = 문자

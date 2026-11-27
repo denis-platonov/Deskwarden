@@ -206,6 +206,7 @@ panel.hint_esc_close = Esc uždaryti
 generate.new_password = Naujas slaptažodis
 generate.suggested = Siūlomas slaptažodis
 generate.save_to_vault = Išsaugoti saugykloje
+generate.use_password = Naudoti šį slaptažodį
 generate.copy = Kopijuoti
 generate.regenerate = Iš naujo
 generate.characters = Simboliai

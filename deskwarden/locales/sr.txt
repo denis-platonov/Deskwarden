@@ -202,6 +202,7 @@ panel.hint_esc_close = Esc затвори
 generate.new_password = Нова лозинка
 generate.suggested = Предложена лозинка
 generate.save_to_vault = Сачувај у сеф
+generate.use_password = Користи ову лозинку
 generate.copy = Копирај
 generate.regenerate = Поново
 generate.characters = Знакови

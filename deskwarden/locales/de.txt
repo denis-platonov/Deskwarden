@@ -213,6 +213,7 @@ panel.hint_esc_close = Esc schließen
 generate.new_password = Neues Passwort
 generate.suggested = Vorgeschlagenes Passwort
 generate.save_to_vault = Im Tresor speichern
+generate.use_password = Dieses Passwort verwenden
 generate.copy = Kopieren
 generate.regenerate = Neu erzeugen
 generate.characters = Zeichen

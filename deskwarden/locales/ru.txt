@@ -204,6 +204,7 @@ panel.hint_esc_close = Esc закрыть
 generate.new_password = Новый пароль
 generate.suggested = Предлагаемый пароль
 generate.save_to_vault = В хранилище
+generate.use_password = Использовать этот пароль
 generate.copy = Копировать
 generate.regenerate = Заново
 generate.characters = Символы

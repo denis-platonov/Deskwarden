@@ -232,6 +232,7 @@ panel.hint_esc_close = Esc close
 generate.new_password = New password
 generate.suggested = Suggested password
 generate.save_to_vault = Save to vault
+generate.use_password = Use this password
 generate.copy = Copy
 generate.regenerate = Regenerate
 generate.characters = Characters

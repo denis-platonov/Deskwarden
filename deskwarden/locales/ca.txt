@@ -201,6 +201,7 @@ panel.hint_esc_close = Esc tanca
 generate.new_password = Contrasenya nova
 generate.suggested = Contrasenya suggerida
 generate.save_to_vault = Desa a la caixa forta
+generate.use_password = Utilitza aquesta contrasenya
 generate.copy = Copia
 generate.regenerate = Regenera
 generate.characters = Caràcters

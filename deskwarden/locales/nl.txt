@@ -213,6 +213,7 @@ panel.hint_esc_close = Esc sluiten
 generate.new_password = Nieuw wachtwoord
 generate.suggested = Voorgesteld wachtwoord
 generate.save_to_vault = Opslaan in kluis
+generate.use_password = Dit wachtwoord gebruiken
 generate.copy = Kopiëren
 generate.regenerate = Opnieuw
 generate.characters = Tekens

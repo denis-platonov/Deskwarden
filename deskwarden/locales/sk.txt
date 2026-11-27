@@ -202,6 +202,7 @@ panel.hint_esc_close = Esc zavrieť
 generate.new_password = Nové heslo
 generate.suggested = Navrhnuté heslo
 generate.save_to_vault = Uložiť do trezora
+generate.use_password = Použiť toto heslo
 generate.copy = Kopírovať
 generate.regenerate = Znova
 generate.characters = Znaky

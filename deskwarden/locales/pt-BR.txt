@@ -215,6 +215,7 @@ panel.hint_esc_close = Esc fechar
 generate.new_password = Nova senha
 generate.suggested = Senha sugerida
 generate.save_to_vault = Salvar no cofre
+generate.use_password = Usar esta senha
 generate.copy = Copiar
 generate.regenerate = Gerar de novo
 generate.characters = Caracteres

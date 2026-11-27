@@ -197,6 +197,7 @@ panel.hint_esc_close = Esc tutup
 generate.new_password = Kata laluan baharu
 generate.suggested = Kata laluan dicadangkan
 generate.save_to_vault = Simpan ke peti besi
+generate.use_password = Guna kata laluan ini
 generate.copy = Salin
 generate.regenerate = Jana semula
 generate.characters = Aksara

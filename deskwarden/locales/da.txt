@@ -204,6 +204,7 @@ panel.hint_esc_close = Esc luk
 generate.new_password = Ny adgangskode
 generate.suggested = Foreslået adgangskode
 generate.save_to_vault = Gem i boks
+generate.use_password = Brug denne adgangskode
 generate.copy = Kopiér
 generate.regenerate = Generer igen
 generate.characters = Tegn

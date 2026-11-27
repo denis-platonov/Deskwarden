@@ -197,6 +197,7 @@ panel.hint_esc_close = Esc đóng
 generate.new_password = Mật khẩu mới
 generate.suggested = Mật khẩu đề xuất
 generate.save_to_vault = Lưu vào kho
+generate.use_password = Dùng mật khẩu này
 generate.copy = Sao chép
 generate.regenerate = Tạo lại
 generate.characters = Ký tự
