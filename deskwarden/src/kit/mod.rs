@@ -18,6 +18,7 @@ pub mod logos;
 pub mod menu;
 pub mod modal;
 pub mod motion;
+pub mod rows;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod tips;

@@ -2162,6 +2162,7 @@ pub(crate) enum BlockMark {
 /// **One block of the SHARING card**: 6b's `.cblock` -- the stacked label
 /// with its mark, then whatever `add` draws, then the rule under the block.
 pub(crate) fn sharing_block(ui: &mut egui::Ui, mark: BlockMark, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let width = (content_width(ui) - f32::from(BLOCK_PAD_X) * 2.0).max(0.0);
     egui::Frame::new()
         .inner_margin(egui::Margin { left: BLOCK_PAD_X, right: BLOCK_PAD_X, top: BLOCK_PAD_TOP, bottom: BLOCK_PAD_BOTTOM })
@@ -2174,23 +2175,23 @@ pub(crate) fn sharing_block(ui: &mut egui::Ui, mark: BlockMark, label: &str, add
                 egui::Vec2::splat(BLOCK_MARK),
             );
             match mark {
-                BlockMark::Person => theme::paint_person_mark(ui.painter(), at, theme::TEXT_FAINT),
-                BlockMark::Plane => theme::paint_send_plane(ui.painter(), at, theme::TEXT_FAINT),
+                BlockMark::Person => theme::paint_person_mark(ui.painter(), at, p.text_faint),
+                BlockMark::Plane => theme::paint_send_plane(ui.painter(), at, p.text_faint),
             }
             let galley = ui.painter().layout_no_wrap(
                 label.to_string(),
                 egui::FontId::proportional(BLOCK_LABEL_SIZE),
-                theme::TEXT_FAINT,
+                p.text_faint,
             );
             let top = band.center().y - galley.size().y / 2.0;
-            ui.painter().galley(egui::pos2(at.right() + BLOCK_MARK_GAP, top), galley, theme::TEXT_FAINT);
+            ui.painter().galley(egui::pos2(at.right() + BLOCK_MARK_GAP, top), galley, p.text_faint);
             ui.add_space(BLOCK_LABEL_GAP);
             add(ui);
         });
     crate::kit::card::row_rule(ui);
 }
 
-/// The room a row of [`theme::row_button`]s takes, `.cctl`'s gap between
+/// The room a row of `the v2 row button`s takes, `.cctl`'s gap between
 /// them -- measured off the galleys the buttons will lay, never estimated.
 pub(crate) fn controls_room(ui: &egui::Ui, labels: &[&str]) -> f32 {
     let gaps = CONTROL_GAP * labels.len().saturating_sub(1) as f32;
@@ -2217,39 +2218,40 @@ pub(crate) enum EntryPill<'a> {
 impl EntryPill<'_> {
     fn width(self, painter: &egui::Painter) -> f32 {
         match self {
-            Self::Share(kind) => theme::share_pill_width(painter, kind),
-            Self::Send(tone, label) => theme::state_pill_width(painter, tone, label),
+            Self::Share(kind) => crate::kit::rows::share_pill_width(painter, kind),
+            Self::Send(tone, label) => crate::kit::rows::state_pill_width(painter, tone, label),
         }
     }
 
     fn paint(self, painter: &egui::Painter, left_center: egui::Pos2) {
         match self {
             Self::Share(kind) => {
-                theme::share_pill(painter, left_center, kind);
+                crate::kit::rows::share_pill(painter, left_center, kind);
             }
             Self::Send(tone, label) => {
-                theme::state_pill(painter, left_center, tone, label);
+                crate::kit::rows::state_pill(painter, left_center, tone, label);
             }
         }
     }
 }
 
 fn paint_entry_tile(painter: &egui::Painter, rect: egui::Rect, tile: EntryTile<'_>) {
+    let p = crate::kit::tokens::palette(painter.ctx());
     match tile {
         EntryTile::Person(email) => {
             // Inside the 28 points, as the mock's `border: 1px` is.
-            painter.circle(rect.center(), ENTRY_TILE / 2.0 - 0.5, theme::CARD, egui::Stroke::new(1.0, theme::HAIRLINE));
+            painter.circle(rect.center(), ENTRY_TILE / 2.0 - 0.5, p.card, egui::Stroke::new(1.0, p.hairline));
             let initial: String = email.trim().chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
             let font = egui::FontId::new(AVATAR_INITIAL_SIZE, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-            let galley = painter.layout_no_wrap(initial, font, theme::TEXT_MUTED);
-            painter.galley(rect.center() - galley.size() / 2.0, galley, theme::TEXT_MUTED);
+            let galley = painter.layout_no_wrap(initial, font, p.text_muted);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, p.text_muted);
         }
         EntryTile::Send => {
             let corners = egui::CornerRadius::same(TILE_RADIUS);
-            painter.rect_filled(rect, corners, theme::CARD);
-            painter.rect_stroke(rect, corners, egui::Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            painter.rect_filled(rect, corners, p.card);
+            painter.rect_stroke(rect, corners, egui::Stroke::new(1.0, p.hairline), egui::StrokeKind::Inside);
             let plane = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(TILE_PLANE));
-            theme::paint_send_plane(painter, plane, theme::TEXT_MUTED);
+            theme::paint_send_plane(painter, plane, p.text_muted);
         }
     }
 }
@@ -2313,6 +2315,7 @@ pub(crate) fn sharing_entry(
 /// An entry's first line: the name at 14px, cut short with an ellipsis
 /// before it can push the pill after it off the entry, then the pill.
 pub(crate) fn entry_title(ui: &mut egui::Ui, title: &str, pill: EntryPill<'_>) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let width = ui.available_width();
     let pill_width = pill.width(ui.painter());
     let row = egui::Layout::left_to_right(egui::Align::Center);
@@ -2320,7 +2323,7 @@ pub(crate) fn entry_title(ui: &mut egui::Ui, title: &str, pill: EntryPill<'_>) {
         ui.spacing_mut().item_spacing = egui::vec2(TITLE_PILL_GAP, 0.0);
         let room = (width - pill_width - TITLE_PILL_GAP).max(0.0);
         ui.allocate_ui_with_layout(egui::vec2(room, theme::PILL_HEIGHT), row, |ui| {
-            ui.add(egui::Label::new(egui::RichText::new(title).size(TITLE_SIZE).color(theme::INK)).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(title).size(TITLE_SIZE).color(p.ink)).truncate());
         });
         let (slot, _) = ui.allocate_exact_size(egui::vec2(pill_width, theme::PILL_HEIGHT), egui::Sense::hover());
         pill.paint(ui.painter(), egui::pos2(slot.left(), slot.center().y));
@@ -2331,6 +2334,7 @@ pub(crate) fn entry_title(ui: &mut egui::Ui, title: &str, pill: EntryPill<'_>) {
 /// a middle dot -- a link, `(label, pressable)`. Answers whether the link was
 /// pressed. The words give way to the link, not the other way round.
 pub(crate) fn entry_line(ui: &mut egui::Ui, line: &str, link: Option<(&str, bool)>) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let width = ui.available_width();
     let mut pressed = false;
     let row = egui::Layout::left_to_right(egui::Align::Center);
@@ -2339,20 +2343,20 @@ pub(crate) fn entry_line(ui: &mut egui::Ui, line: &str, link: Option<(&str, bool
         ui.spacing_mut().item_spacing = egui::vec2(LINE_GAP, 0.0);
         let link_room = link.map_or(0.0, |(label, _)| {
             let measure = |text: &str, family: egui::FontFamily| {
-                ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(LINE_SIZE, family), theme::TEXT_FAINT).size().x
+                ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(LINE_SIZE, family), p.text_faint).size().x
             };
             measure("\u{b7}", egui::FontFamily::Proportional)
                 + measure(label, egui::FontFamily::Name(theme::SEMIBOLD.into()))
                 + LINE_GAP * 2.0
         });
         ui.allocate_ui_with_layout(egui::vec2((width - link_room).max(0.0), WHO_LINE_2), row, |ui| {
-            ui.add(egui::Label::new(egui::RichText::new(line).size(LINE_SIZE).color(theme::TEXT_FAINT)).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(line).size(LINE_SIZE).color(p.text_faint)).truncate());
         });
         if let Some((label, pressable)) = link {
-            ui.label(egui::RichText::new("\u{b7}").size(LINE_SIZE).color(theme::TEXT_FAINT));
+            ui.label(egui::RichText::new("\u{b7}").size(LINE_SIZE).color(p.text_faint));
             // `.link`: 600 weight in the deep blue; greyed when it cannot be
             // pressed, and then it takes no click at all.
-            let ink = if pressable { theme::BLUE_DEEP } else { theme::TEXT_GHOST };
+            let ink = if pressable { p.blue_deep } else { p.text_ghost };
             let sense = if pressable { egui::Sense::click() } else { egui::Sense::hover() };
             let response = ui.add(egui::Label::new(theme::semibold(label, LINE_SIZE).color(ink)).sense(sense));
             if pressable && response.hovered() {
@@ -2413,6 +2417,7 @@ fn person_entry(
     people: &super::detail::PeopleSharing<'_>,
     action: &mut super::detail::DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     use super::detail::DetailAction;
     let email = person.email.as_str();
     let names_them = |who: Option<&str>| who.is_some_and(|who| same_person(who, email));
@@ -2451,7 +2456,7 @@ fn person_entry(
             if stopping {
                 // No widget of any kind while the stop runs: the Send's
                 // revoke rule, for the same reason.
-                ui.label(egui::RichText::new(stopping_label()).size(12.0).color(theme::TEXT_MUTED));
+                ui.label(egui::RichText::new(stopping_label()).size(12.0).color(p.text_muted));
                 return;
             }
             if confirming {
@@ -2489,9 +2494,9 @@ fn person_entry(
     }
     if confirming {
         entry_extra(ui, |ui| {
-            ui.add(egui::Label::new(theme::semibold(stop_question(record, email), 14.0).color(theme::ERROR)).wrap());
+            ui.add(egui::Label::new(theme::semibold(stop_question(record, email), 14.0).color(p.error)).wrap());
             ui.add_space(QUESTION_HINT_GAP);
-            ui.add(egui::Label::new(egui::RichText::new(stop_hint()).size(11.0).color(theme::TEXT_FAINT)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(stop_hint()).size(11.0).color(p.text_faint)).wrap());
             ui.add_space(QUESTION_BUTTON_GAP);
             // Cancel wins an ambiguous frame, as on the Send's revoke: the
             // safe answer to one on a destructive control is not to destroy.
@@ -2513,19 +2518,20 @@ fn person_entry(
 /// 6b's `.fp`: the eyebrow with its Hide, the five words, and what to compare
 /// them with. Answers whether Hide was pressed.
 fn fingerprint_box(ui: &mut egui::Ui, phrase: &str, note: &str) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut hide = false;
     egui::Frame::new()
-        .fill(theme::BLUE_WASH)
-        .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
+        .fill(p.blue_wash)
+        .stroke(egui::Stroke::new(1.0, p.blue_edge))
         .corner_radius(egui::CornerRadius::same(FP_RADIUS))
         .inner_margin(egui::Margin::symmetric(FP_PAD_X, FP_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = egui::vec2(0.0, FP_GAP);
             ui.horizontal(|ui| {
-                ui.label(theme::letterspaced(fingerprint_eyebrow(), FP_SMALL_SIZE, theme::BOLD, FP_EYEBROW_TRACKING, theme::BLUE_DEEP));
+                ui.label(theme::letterspaced(fingerprint_eyebrow(), FP_SMALL_SIZE, theme::BOLD, FP_EYEBROW_TRACKING, p.blue_deep));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let link = egui::Label::new(theme::semibold(hide_short(), FP_SMALL_SIZE).color(theme::BLUE_DEEP)).sense(egui::Sense::click());
+                    let link = egui::Label::new(theme::semibold(hide_short(), FP_SMALL_SIZE).color(p.blue_deep)).sense(egui::Sense::click());
                     let response = ui.add(link);
                     if response.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2536,9 +2542,9 @@ fn fingerprint_box(ui: &mut egui::Ui, phrase: &str, note: &str) -> bool {
             let words = egui::RichText::new(phrase)
                 .size(FP_WORDS_SIZE)
                 .family(egui::FontFamily::Name(theme::MONO_BOLD.into()))
-                .color(theme::BLUE_DEEP);
+                .color(p.blue_deep);
             ui.add(egui::Label::new(words).wrap());
-            ui.add(egui::Label::new(egui::RichText::new(note).size(FP_SMALL_SIZE).color(theme::BLUE_DEEP)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(note).size(FP_SMALL_SIZE).color(p.blue_deep)).wrap());
         });
     hide
 }
@@ -2552,6 +2558,7 @@ fn fingerprint_box(ui: &mut egui::Ui, phrase: &str, note: &str) -> bool {
 /// the head for `detail::sharing_card`'s reason: a sentence arriving while
 /// the pointer is on a row must not push that row away.
 pub(crate) fn draw_card_note(ui: &mut egui::Ui, notice: Option<&str>, note: Option<&str>) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     if notice.is_none() && note.is_none() {
         return;
     }
@@ -2562,7 +2569,7 @@ pub(crate) fn draw_card_note(ui: &mut egui::Ui, notice: Option<&str>, note: Opti
             ui.set_width(width);
             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
             if let Some(notice) = notice {
-                ui.add(egui::Label::new(egui::RichText::new(notice).size(NOTICE_SIZE).color(theme::ERROR)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(notice).size(NOTICE_SIZE).color(p.error)).wrap());
                 if note.is_some() {
                     ui.add_space(NOTICE_GAP);
                 }
@@ -2571,7 +2578,7 @@ pub(crate) fn draw_card_note(ui: &mut egui::Ui, notice: Option<&str>, note: Opti
                 let text = egui::RichText::new(note)
                     .size(NOTE_SIZE)
                     .line_height(Some(NOTE_LINE_HEIGHT))
-                    .color(theme::TEXT_GHOST);
+                    .color(p.text_ghost);
                 ui.add(egui::Label::new(text).wrap());
             }
         });
@@ -2597,11 +2604,12 @@ pub(crate) fn draw_card_note(ui: &mut egui::Ui, notice: Option<&str>, note: Opti
 /// share the corner, so this one stands [`TOAST_STACK_GAP`] above it rather
 /// than on top of it (`detail::live_copy_toast_rect`).
 pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, clear_of: Option<egui::Rect>, pane: &SharingPane) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let Some((text, _)) = &pane.toast else {
         return;
     };
     let wrap = (pane_rect.width() - TOAST_INSET * 2.0 - TOAST_PAD.x * 2.0).max(1.0);
-    let galley = ui.painter().layout(text.clone(), egui::FontId::proportional(TOAST_TEXT_SIZE), theme::CARD, wrap);
+    let galley = ui.painter().layout(text.clone(), egui::FontId::proportional(TOAST_TEXT_SIZE), p.card, wrap);
     let size = galley.size() + TOAST_PAD * 2.0;
     let bottom = clear_of.map_or(pane_rect.bottom() - TOAST_INSET, |copy| copy.top() - TOAST_STACK_GAP);
     let at = egui::pos2(
@@ -2610,8 +2618,8 @@ pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, clear_of: O
     );
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("share-toast")));
     let rect = egui::Rect::from_min_size(at, size);
-    painter.rect_filled(rect, egui::CornerRadius::same(TOAST_RADIUS), theme::INK);
-    painter.galley(rect.min + TOAST_PAD, galley, theme::CARD);
+    painter.rect_filled(rect, egui::CornerRadius::same(TOAST_RADIUS), p.ink);
+    painter.galley(rect.min + TOAST_PAD, galley, p.card);
 }
 
 // ---- Sent: one row per record and person (mock 6c) -------------------------------------
@@ -3069,6 +3077,7 @@ fn one_line(painter: &egui::Painter, text: &str, font: egui::FontId, color: egui
 /// with "still running". A press is reported as [`PeopleAsk::AcceptLink`];
 /// the window takes the box's text and sends it.
 pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<'_>, width: f32) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     if let Some(buffer) = people.paste.as_mut() {
         let (row, _) = ui.allocate_exact_size(egui::vec2(width, PASTE_ROW_HEIGHT), egui::Sense::hover());
         use crate::kit::controls::{self, ButtonKind};
@@ -3096,11 +3105,11 @@ pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<
             &painter,
             &waiting_line(&waiting_from(entry)),
             egui::FontId::new(WAITING_LINE_SIZE, egui::FontFamily::Proportional),
-            theme::TEXT_FAINT,
+            p.text_faint,
             width - GROUP_EYEBROW_INSET * 2.0,
         );
         let y = rect.center().y - galley.size().y / 2.0;
-        painter.galley(egui::pos2(rect.left() + GROUP_EYEBROW_INSET, y), galley, theme::TEXT_FAINT);
+        painter.galley(egui::pos2(rect.left() + GROUP_EYEBROW_INSET, y), galley, p.text_faint);
         // The spec's own words for why, wherever "unverified" is said (fix
         // round 1, m7).
         if !entry.verified {

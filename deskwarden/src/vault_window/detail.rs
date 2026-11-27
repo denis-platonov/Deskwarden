@@ -1554,7 +1554,7 @@ fn password_age_date<'a>(
 ///
 /// **This is a fact, not a warning.** No colour of its own, no threshold, no
 /// "your password is old": the palette reserves red for secrets and amber for
-/// caution, and an age is neither. It is painted in [`theme::TEXT_FAINT`]
+/// caution, and an age is neither. It is painted in `palette.text_faint`
 /// with the rest of the strip because it is the same kind of thing as
 /// "Filled 41 times". The reader decides what four years means to them.
 ///
@@ -1698,7 +1698,7 @@ pub fn strip_segment(status: BreachStatus) -> Option<String> {
 /// reads perfectly well as a fifth `\u{b7}`-separated segment among them.
 ///
 /// **`Breached` is the only one that is a warning with an instruction
-/// attached**, and it is the only one painted in [`theme::ERROR`]. Flowed
+/// attached**, and it is the only one painted in `palette.error`. Flowed
 /// into the same run it wrapped wherever the pane happened to run out of
 /// width -- the reported screenshot broke it after "Found in a" -- so the
 /// most urgent thing on the pane was placed by an accident of the column's
@@ -1748,11 +1748,11 @@ pub fn segment_is_urgent(status: BreachStatus) -> bool {
 /// A function rather than an `if` at the paint site so the colour is a
 /// decision a test can reach; the test asserts the *painted* ink as well, so
 /// this and the renderer cannot disagree.
-pub fn segment_color(status: BreachStatus) -> egui::Color32 {
+pub fn segment_color(status: BreachStatus, p: &crate::kit::tokens::Palette) -> egui::Color32 {
     if segment_is_urgent(status) {
-        theme::ERROR
+        p.error
     } else {
-        theme::TEXT_FAINT
+        p.text_faint
     }
 }
 
@@ -1778,7 +1778,7 @@ fn breach_segment(
     }
     let status = breaches.status(ctx, password);
     strip_segment(status)
-        .map(|text| (text, segment_color(status), segment_placement(status)))
+        .map(|text| (text, segment_color(status, &crate::kit::tokens::palette(ctx)), segment_placement(status)))
 }
 
 /// What the detail pane says about an item that is in the Trash or the
@@ -1843,11 +1843,12 @@ pub fn draw_out_of_vault_read(
     // door the read pane uses.
     icon: Option<&egui::TextureHandle>,
 ) -> DetailAction {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = DetailAction::None;
     let (heading, body) = out_of_vault_text(out);
     let pane = ui.clip_rect();
     ui.painter()
-        .rect_filled(pane, CornerRadius::ZERO, theme::WINDOW_BG);
+        .rect_filled(pane, CornerRadius::ZERO, p.window_bg);
     let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(pane));
     let ui = &mut pane_ui;
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
@@ -1928,9 +1929,9 @@ pub fn draw_out_of_vault_read(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::Frame::new()
-                .fill(theme::CARD)
+                .fill(p.card)
                 .corner_radius(CornerRadius::same(10))
-                .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                .stroke(Stroke::new(1.0, p.hairline))
                 .inner_margin(Margin::same(CARD_PAD_X))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1939,9 +1940,9 @@ pub fn draw_out_of_vault_read(
                     // says where the item is and what that means, in that
                     // order, and the subtitle above is free to say what the
                     // read pane's says.
-                    ui.label(theme::bold(heading, 13.0).color(theme::INK));
+                    ui.label(theme::bold(heading, 13.0).color(p.ink));
                     ui.add_space(6.0);
-                    ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
+                    ui.label(RichText::new(body).size(13.0).color(p.text_faint));
                 });
         });
     action
@@ -2590,11 +2591,12 @@ fn shortcut_hint(ui: &mut egui::Ui, hint: Option<CopyShortcut>) {
 /// chords beside it rather than being a second treatment of the same idea --
 /// which is what made it discoverable at all.
 fn chord_hint(ui: &mut egui::Ui, chord: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.label(
         RichText::new(chord)
             .size(CHORD_HINT_SIZE)
             .family(egui::FontFamily::Monospace)
-            .color(theme::TEXT_GHOST),
+            .color(p.text_ghost),
     );
 }
 
@@ -2613,11 +2615,12 @@ const CHORD_HINT_SIZE: f32 = 10.0;
 /// of the card's notes. Measured through the same galley rather than
 /// estimated, so the reservation and the drawing cannot disagree.
 fn chord_hint_width(ui: &egui::Ui, chord: &str) -> f32 {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.painter()
         .layout_no_wrap(
             chord.to_string(),
             egui::FontId::new(CHORD_HINT_SIZE, egui::FontFamily::Monospace),
-            theme::TEXT_GHOST,
+            p.text_ghost,
         )
         .size()
         .x
@@ -3131,6 +3134,7 @@ pub fn draw_detail_read(
     // vault, which names the bank from its domain alone.
     vault: &[VaultItem],
 ) -> DetailAction {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = DetailAction::None;
     // **First, before anything is drawn or any chord is resolved.** A copy
     // made later in THIS frame belongs to the item being drawn now, so it
@@ -3263,7 +3267,7 @@ pub fn draw_detail_read(
     // which is what lets the tests pin absolute geometry.
     let pane = ui.clip_rect();
     ui.painter()
-        .rect_filled(pane, CornerRadius::ZERO, theme::WINDOW_BG);
+        .rect_filled(pane, CornerRadius::ZERO, p.window_bg);
     let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(pane));
     let ui = &mut pane_ui;
     // Every gap in the strip and the body below is stated, not inherited.
@@ -3282,10 +3286,10 @@ pub fn draw_detail_read(
     // everything below keeps laying itself out exactly where it did.
     //
     // The RIGHT padding is 0 here because the scroll bar below is given that
-    // lane instead -- `theme::scrollbar_in_gutter` reserves exactly
+    // lane instead -- `crate::kit::rows::scrollbar_in_gutter` reserves exactly
     // `BODY_PAD_X` for itself, so the cards still end at
     // `pane.right() - BODY_PAD_X` as they always did, and the bar takes the
-    // OUTERMOST `theme::SCROLLBAR_WIDTH` of that padding -- flush to the pane's
+    // OUTERMOST `crate::kit::rows::SCROLLBAR_WIDTH` of that padding -- flush to the pane's
     // edge, where the platform's own bars sit, so every point of the lane's
     // slack falls between the bar and the cards (18pt of the 24) rather than
     // half of it behind the bar (9pt and 9pt, which is what this pane shipped).
@@ -3322,7 +3326,7 @@ pub fn draw_detail_read(
     // Horizontal scrolling is not offered, deliberately -- the rows already
     // elide long values (see `value_text`), and a horizontal bar would be the
     // regression rather than the fix.
-    theme::scrollbar_in_gutter(&mut body_ui, f32::from(BODY_PAD_X));
+    crate::kit::rows::scrollbar_in_gutter(&mut body_ui, f32::from(BODY_PAD_X));
     // ... and the bar is hidden outright when there is nothing to scroll.
     // The lane stays reserved either way -- that is what `AlwaysVisible`
     // below is for, and why the cards keep ONE width whether or not the bar
@@ -3336,7 +3340,7 @@ pub fn draw_detail_read(
     // is needed for longer than that -- and a first-ever frame, which has no
     // reading, shows it. That is the safe direction.
     if !body_overflowed(ui.ctx()) {
-        theme::hide_scrollbar(&mut body_ui);
+        crate::kit::rows::hide_scrollbar(&mut body_ui);
     }
     let scrolled = egui::ScrollArea::vertical()
         // The area takes the full width and height of the body rect: the
@@ -3650,7 +3654,7 @@ pub fn draw_detail_read(
                     // **The red is on the WORDS and nothing else**, and that
                     // rule now lives in one place for both menus rather than
                     // being restated here. This entry used to carry
-                    // `.fill(theme::CARD)`, which is the background the
+                    // `.fill(palette.card)`, which is the background the
                     // header strip's Delete button sat on before the entry
                     // moved in here -- and inside a menu it did two things,
                     // neither of them wanted. `Button::fill` is documented to
@@ -3666,7 +3670,7 @@ pub fn draw_detail_read(
                     // **So this is now the row menu's own renderer**, given a
                     // `MenuCommand` for the very command the click reports.
                     // `item_list::menu_command_button` paints an entry whose
-                    // `RowCommand::is_destructive` is true in `theme::ERROR`
+                    // `RowCommand::is_destructive` is true in `palette.error`
                     // and touches nothing else -- no fill, so the hover
                     // survives, which is the whole of what the paragraph
                     // above defends. The reason to route through it rather
@@ -4024,7 +4028,7 @@ pub fn draw_detail_read(
                 password_age_days,
             ))
             .size(ROW_LABEL_SIZE)
-            .color(theme::TEXT_FAINT);
+            .color(p.text_faint);
             match segment {
                 // **The untouched path**, and deliberately the same call this
                 // card made before the badge existed rather than the pair
@@ -5045,6 +5049,7 @@ fn app_match_card(
     removable: bool,
     action: &mut DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let m = match app_card_body(app_match, field_present) {
         AppCardBody::Bound(m) => m,
         AppCardBody::Unbound => {
@@ -5052,7 +5057,7 @@ fn app_match_card(
                 ui,
                 RichText::new(app_match_empty_notice())
                     .size(ROW_LABEL_SIZE)
-                    .color(theme::TEXT_FAINT),
+                    .color(p.text_faint),
             );
             return;
         }
@@ -5084,7 +5089,7 @@ fn app_match_card(
                     ui.label(
                         RichText::new(&app_row.value)
                             .size(ROW_VALUE_SIZE)
-                            .color(theme::TEXT_FAINT),
+                            .color(p.text_faint),
                     );
                 },
                 |_ui| {},
@@ -5198,6 +5203,7 @@ fn app_name_row(
     open: Option<&DetailAction>,
     action: &mut DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // Measured on the card's own `Ui`, before `copy_row` builds the band --
     // the same fixed point `app_value_row` measures on, and for the same
     // reason: inside the band `available_width` is derived from a `max_rect`
@@ -5234,14 +5240,14 @@ fn app_name_row(
             let mut job = egui::text::LayoutJob::simple(
                 app_row.value.clone(),
                 egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
-                if open.is_some() { theme::BLUE } else { theme::INK },
+                if open.is_some() { p.blue } else { p.ink },
                 name_width,
             );
             job.wrap.break_anywhere = true;
             let galley = ui.painter().layout_job(job);
             match open {
                 Some(_) => {
-                    opened = theme::link_galley(ui, galley)
+                    opened = crate::kit::rows::link_galley(ui, galley)
                         .on_hover_text(crate::i18n::tf("detail.open_app_chord", &[("hover", app_open_hover()), ("chord", OPEN_APP_CHORD.2)]))
                         .clicked();
                 }
@@ -5318,6 +5324,7 @@ fn app_value_row(
     copy: &str,
     action: &mut DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // **Measured on the card's own `Ui`, before `copy_row` builds the row's
     // band.** Inside the band `ui.available_width()` is derived from a
     // `max_rect` the `ScrollArea` grew to fit LAST frame's widest child --
@@ -5338,7 +5345,7 @@ fn app_value_row(
             let mut job = egui::text::LayoutJob::simple(
                 value.to_string(),
                 egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
-                theme::INK,
+                p.ink,
                 wrap_width,
             );
             job.wrap.break_anywhere = true;
@@ -5430,6 +5437,7 @@ fn app_card_footer(
     removable: bool,
     action: &mut DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // The same column the rows above wrap into -- a note left to
     // `available_width` runs off the card exactly as the `Program file` path
     // did (`Show the overlay when this app is focused.` reached x = 394.3 on
@@ -5451,7 +5459,7 @@ fn app_card_footer(
                 ui.label(
                     RichText::new(*note)
                         .size(ROW_HINT_SIZE)
-                        .color(theme::TEXT_GHOST),
+                        .color(p.text_ghost),
                 );
             }
         });
@@ -5657,6 +5665,7 @@ fn sharing_card(
     now: &dyn crate::send::SendClock,
     action: &mut DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     use super::share_ui::{EntryPill, EntryTile};
     let send = shared.send;
     let state = crate::send::send_state(send, now);
@@ -5687,7 +5696,7 @@ fn sharing_card(
                     ui.label(
                         RichText::new(send_ui::deleting_label())
                             .size(ROW_LABEL_SIZE)
-                            .color(theme::TEXT_MUTED),
+                            .color(p.text_muted),
                     );
                     return;
                 }
@@ -5721,7 +5730,7 @@ fn sharing_card(
         if shared.confirming && !shared.revoking {
             super::share_ui::entry_extra(ui, |ui| {
                 ui.add(egui::Label::new(
-                    theme::semibold(send_ui::confirm_prompt(), ROW_VALUE_SIZE).color(theme::ERROR),
+                    theme::semibold(send_ui::confirm_prompt(), ROW_VALUE_SIZE).color(p.error),
                 ).wrap());
                 ui.add_space(10.0);
                 // Cancel wins an ambiguous frame: the safe answer to one on a
@@ -5820,12 +5829,13 @@ fn app_notice_with_remove(ui: &mut egui::Ui, notice: &'static str, removable: bo
 /// unknown type, and an SSH key), because they differ only in their words --
 /// which is what [`detail_body_for`] decides, and what the tests read.
 fn unsupported_card(ui: &mut egui::Ui, pane: &UnsupportedPane) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     card(ui, pane.heading, |ui| {
         card_text(
             ui,
             RichText::new(pane.message.as_str())
                 .size(ROW_LABEL_SIZE)
-                .color(theme::TEXT_FAINT),
+                .color(p.text_faint),
         );
     });
 }
@@ -5859,6 +5869,7 @@ fn card_with_side(
     side: Option<&str>,
     contents: impl FnOnce(&mut egui::Ui),
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     crate::kit::tokens::card_frame(&crate::kit::tokens::palette(ui.ctx()), crate::kit::tokens::R_CARD)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -5890,7 +5901,7 @@ fn card_with_side(
                         CARD_HEADING_SIZE,
                         theme::BOLD,
                         CARD_HEADING_TRACKING,
-                        theme::TEXT_MUTED,
+                        p.text_muted,
                     ))
                     .rect
                 });
@@ -5900,7 +5911,7 @@ fn card_with_side(
                 let galley = ui.painter().layout_no_wrap(
                     side.to_string(),
                     egui::FontId::proportional(CARD_SIDE_SIZE),
-                    theme::TEXT_GHOST,
+                    p.text_ghost,
                 );
                 // Box-centred in the band: the note is mixed case, so the
                 // capitals' optical drop is not its to take.
@@ -5909,7 +5920,7 @@ fn card_with_side(
                     band.center().y - galley.size().y / 2.0,
                 );
                 if at.x >= caption.right() + CARD_SIDE_GAP {
-                    ui.painter().galley(at, galley, theme::TEXT_GHOST);
+                    ui.painter().galley(at, galley, p.text_ghost);
                 }
             }
             // The heading's `border-bottom`, which is the card's own `#eae7e7`
@@ -5950,7 +5961,7 @@ enum RowShape {
 /// which is precisely where the reveal eye was being right-aligned to.
 ///
 /// The clip rect is the viewport, and on this pane it already stops at the
-/// cards' edge: `theme::scrollbar_in_gutter` hands the outermost
+/// cards' edge: `crate::kit::rows::scrollbar_in_gutter` hands the outermost
 /// [`BODY_PAD_X`] to the scroll lane, so the `ScrollArea` clips its content
 /// at `pane.right() - BODY_PAD_X` whether or not a bar is showing. Nothing
 /// drawn inside a row can move it.
@@ -6093,6 +6104,7 @@ fn row_impl(
     sense: egui::Sense,
     shape: RowShape,
 ) -> egui::Response {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let clickable = sense == egui::Sense::click();
     let scope = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
         // The hover tint's slot, reserved BEFORE anything paints into this
@@ -6116,7 +6128,7 @@ fn row_impl(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().set(
             scope.inner,
-            egui::Shape::rect_filled(response.rect, CornerRadius::ZERO, theme::CARD_TINT),
+            egui::Shape::rect_filled(response.rect, CornerRadius::ZERO, p.list_bg),
         );
     }
     response
@@ -6255,10 +6267,11 @@ enum LabelFit {
 /// `column` is the width the text is WRAPPED in; `fit` says whether the cell
 /// then takes that width or only its glyphs'. See [`LabelFit`].
 fn label_cell(ui: &mut egui::Ui, label: &str, column: f32, fit: LabelFit) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let galley = ui.painter().layout(
         label.to_string(),
         egui::FontId::new(ROW_LABEL_SIZE, egui::FontFamily::Proportional),
-        theme::TEXT_FAINT,
+        p.text_faint,
         column,
     );
     let width = match fit {
@@ -6268,7 +6281,7 @@ fn label_cell(ui: &mut egui::Ui, label: &str, column: f32, fit: LabelFit) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(width, galley.size().y), egui::Sense::hover());
     let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
-    ui.painter().galley(pos, galley, theme::TEXT_FAINT);
+    ui.painter().galley(pos, galley, p.text_faint);
 }
 
 /// A card whose body is a paragraph rather than rows -- the notes card, the
@@ -6325,6 +6338,7 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
 /// The frame, the margin and the width are [`card_text`]'s, so the note still
 /// sits on the same left edge as every row label on the pane.
 fn notes_body(ui: &mut egui::Ui, item_id: &str, notes: &str, action: &mut DetailAction) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let scope = ui.scope_builder(
         egui::UiBuilder::new().sense(egui::Sense::click()),
         |ui| {
@@ -6358,7 +6372,7 @@ fn notes_body(ui: &mut egui::Ui, item_id: &str, notes: &str, action: &mut Detail
                             ROW_VALUE_SIZE,
                             egui::FontFamily::Proportional,
                         ))
-                        .text_color(theme::INK)
+                        .text_color(p.ink)
                         .show(ui)
                         .response
                 })
@@ -6375,7 +6389,7 @@ fn notes_body(ui: &mut egui::Ui, item_id: &str, notes: &str, action: &mut Detail
     if tile.hovered() || text.hovered() {
         ui.painter().set(
             tint,
-            egui::Shape::rect_filled(tile.rect, CornerRadius::ZERO, theme::CARD_TINT),
+            egui::Shape::rect_filled(tile.rect, CornerRadius::ZERO, p.list_bg),
         );
     }
     // **`clicked()` on both, and `dragged()` on neither.** See the doc above:
@@ -6538,8 +6552,8 @@ fn card_text_stacked(ui: &mut egui::Ui, first: RichText, second: RichText) {
 /// three rows are one typography" would then live in the call sites rather
 /// than anywhere a reader could find it. This function IS the rule, and both
 /// row kinds are defined in terms of it.
-fn digits_job(text: &str) -> egui::text::LayoutJob {
-    theme::letterspaced_mono(text, MASKED_SIZE, MASKED_TRACKING, theme::INK)
+fn digits_job(text: &str, ink: egui::Color32) -> egui::text::LayoutJob {
+    theme::letterspaced_mono(text, MASKED_SIZE, MASKED_TRACKING, ink)
 }
 
 /// The first text baseline in a galley, measured **down from the top of the
@@ -6604,13 +6618,14 @@ fn digits_baseline_drop(digits: &egui::Galley, ordinary: &egui::Galley) -> f32 {
 /// single digit rather than the caller's text, and no caller has to think
 /// about it.
 fn ordinary_value_galley(ui: &egui::Ui) -> std::sync::Arc<egui::Galley> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut job = egui::text::LayoutJob::default();
     job.append(
         "0",
         0.0,
         egui::TextFormat {
             font_id: egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
-            color: theme::INK,
+            color: p.ink,
             ..Default::default()
         },
     );
@@ -6757,7 +6772,7 @@ fn digits_fit(
 /// gives: two measurements of one run that disagree are worse than either.
 fn legible_digits_line(ui: &egui::Ui) -> f32 {
     ui.painter()
-        .layout_job(digits_job(&"\u{2022}".repeat(MASKED_BULLETS)))
+        .layout_job(digits_job(&"\u{2022}".repeat(MASKED_BULLETS), crate::kit::tokens::palette(ui.ctx()).ink))
         .size()
         .x
 }
@@ -6774,7 +6789,8 @@ fn legible_digits_line(ui: &egui::Ui) -> f32 {
 /// allocate it, which keeps the row's height and the controls' right-alignment
 /// exactly as they were, and only the paint position moves.
 fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
-    let mut job = digits_job(text);
+    let p = crate::kit::tokens::palette(ui.ctx());
+    let mut job = digits_job(text, p.ink);
     job.wrap.max_width = room;
     // **`break_anywhere`, for the reason the `Program file` path row gives**:
     // egui breaks at word boundaries, and neither a bullet run nor a card
@@ -6817,7 +6833,7 @@ fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
     // and an ellipsis on the end of one would make it invisible to all three
     // while they went on passing for the wrong reason.
     job.wrap.max_rows = 1;
-    paint_on_the_value_baseline(ui, job, theme::INK);
+    paint_on_the_value_baseline(ui, job, p.ink);
 }
 
 /// Allocate a run's box the way `Label` would and paint it on the baseline
@@ -6831,8 +6847,8 @@ fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
 /// which is the thing three rows on this pane now share.
 ///
 /// The colour is a parameter because the runs that need this are no longer
-/// all [`theme::INK`]: the countdown beside the code is
-/// [`theme::TEXT_FAINT`], and a helper that repainted it in the value colour
+/// all `palette.ink`: the countdown beside the code is
+/// `palette.text_faint`, and a helper that repainted it in the value colour
 /// would be a placement fix that also changed the design.
 fn paint_on_the_value_baseline(
     ui: &mut egui::Ui,
@@ -6881,7 +6897,7 @@ fn paint_on_the_value_baseline(
 /// all, and a value column too narrow for a single bullet is a pane already
 /// past its own minimum width.
 fn fit_mask(ui: &egui::Ui, mask: &str, room: f32) -> String {
-    let width_of = |text: &str| ui.painter().layout_job(digits_job(text)).size().x;
+    let width_of = |text: &str| ui.painter().layout_job(digits_job(text, crate::kit::tokens::palette(ui.ctx()).ink)).size().x;
     let natural = width_of(mask);
     if natural <= room {
         return mask.to_string();
@@ -6906,11 +6922,12 @@ fn credential_row(
     action: &mut DetailAction,
     on_copy: DetailAction,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     copy_row(
         ui,
         label,
         |ui| {
-            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(theme::INK));
+            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(p.ink));
         },
         |_ui| {},
         on_copy,
@@ -7149,7 +7166,7 @@ fn masked_row(
     // lane and nothing else. Two mutation runs agree: with the eight added,
     // all 597 tests in this module pass unchanged, which is the definition
     // of a change nobody can see.
-    let controls_width = theme::EYE_TOGGLE_SIZE
+    let controls_width = crate::kit::rows::EYE_TOGGLE_SIZE
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
         })
@@ -7158,7 +7175,7 @@ fn masked_row(
         });
     // Laid out unwrapped, which is the question being asked: how wide does
     // this value WANT to be?
-    let natural = ui.painter().layout_job(digits_job(&shown)).size().x;
+    let natural = ui.painter().layout_job(digits_job(&shown, crate::kit::tokens::palette(ui.ctx()).ink)).size().x;
     // The same decision, in the same words, as the expiry beside it makes --
     // see [`digits_fit`], which skips the legibility floor while this row is
     // masked: a cut mask says exactly what an uncut one does.
@@ -7211,13 +7228,13 @@ fn masked_row(
             // AN EYE, not the words "Reveal"/"Hide". The state it shows is
             // the ACTION, the way every password manager spells it: an open
             // eye while the value is masked, struck through while it is
-            // showing. Drawn rather than typed -- see `theme::eye_toggle` and
+            // showing. Drawn rather than typed -- see `crate::kit::rows::eye_toggle` and
             // the font measurement its module header cites.
             //
             // The row around it copies on click; this does not. Registered
             // after the tile's own background widget, so egui gives it the
             // click instead -- see `copy_row`.
-            if theme::eye_toggle(ui, *revealed)
+            if crate::kit::rows::eye_toggle(ui, *revealed)
                 .on_hover_text(if *revealed { crate::i18n::t("detail.hide") } else { crate::i18n::t("detail.reveal") })
                 .clicked()
             {
@@ -7245,11 +7262,12 @@ fn masked_row(
 /// with nothing in it. Reachable for real: the spec's rule is that a `type: 3`
 /// carrying no `card` object is an *empty card*, not an unsupported item.
 fn empty_pane_note(ui: &mut egui::Ui, text: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     card_text(
         ui,
         RichText::new(text)
             .size(ROW_LABEL_SIZE)
-            .color(theme::TEXT_FAINT),
+            .color(p.text_faint),
     );
 }
 
@@ -8170,6 +8188,7 @@ fn ssh_key_rows(
 /// instead, so there is no `identity` here to reach for and a nineteenth field
 /// has to go through [`identity_groups`] to reach the pane.
 fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut DetailAction) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let groups = groups.unwrap_or_default();
     if groups.is_empty() {
         empty_pane_note(ui, crate::i18n::t("detail.no_identity"));
@@ -8192,7 +8211,7 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
             .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_HEADING_PAD_Y))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(theme::semibold(*group_name, ROW_LABEL_SIZE).color(theme::TEXT_SECONDARY));
+                ui.label(theme::semibold(*group_name, ROW_LABEL_SIZE).color(p.text_nav));
             });
         for (row_index, (label, value)) in rows.iter().enumerate() {
             if row_index > 0 {
@@ -8438,11 +8457,12 @@ fn custom_fields_card_rows(
 /// A row that shows a value and copies nothing -- a boolean's Yes/No, or what
 /// a linked field stands for. Neither is a value anyone pastes.
 fn plain_value_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     row(
         ui,
         label,
         |ui| {
-            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(theme::INK));
+            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(p.ink));
         },
         |_ui| {},
     );
@@ -8636,13 +8656,14 @@ fn add_2fa_row(ui: &mut egui::Ui, action: &mut DetailAction) {
 }
 
 fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     row(
         ui,
         copy_shortcut_label(CopyShortcut::Totp),
         |ui| {
             let status = RichText::new(status)
                 .size(ROW_VALUE_SIZE)
-                .color(theme::TEXT_SECONDARY);
+                .color(p.text_nav);
             // **A row with ONE line does not go through the stack, and that
             // is the whole of the "Fetching… sits too high" repair.**
             //
@@ -8695,7 +8716,7 @@ fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
                 ui.label(
                     RichText::new(hint)
                         .size(ROW_HINT_SIZE)
-                        .color(theme::TEXT_GHOST),
+                        .color(p.text_ghost),
                 );
             });
         },
@@ -9909,7 +9930,7 @@ mod tests {
             found[0].clone()
         }
 
-        /// The header's white strip: every [`theme::CARD`] fill that starts
+        /// The header's white strip: every `palette.card` fill that starts
         /// at the very top of the pane, unioned.
         ///
         /// The union rather than one rect because the strip is a `Frame`
@@ -10434,7 +10455,7 @@ mod tests {
             let open = pane.open_kebab(&item, &TotpState::NoSecret);
             assert_eq!(
                 open.text_colour_of("Delete"),
-                theme::ERROR,
+                crate::kit::tokens::Palette::LIGHT.error,
                 "{kind:?}: the kebab's Delete is painted {:?}",
                 open.text_colour_of("Delete")
             );
@@ -10452,7 +10473,7 @@ mod tests {
                 let sibling = crate::vault_window::item_list::move_to_folder_label();
                 assert_ne!(
                     open.text_colour_of(sibling),
-                    theme::ERROR,
+                    crate::kit::tokens::Palette::LIGHT.error,
                     "{kind:?}: {sibling:?} is painted in the alarm colour too, so the menu \
                      is uniformly red and says nothing about Delete"
                 );
@@ -12055,7 +12076,7 @@ mod tests {
         // the glyphs, copies too. Without this the change would pass while
         // only the text were clickable, which is not what the surrounding
         // rows do.
-        let card = laid_out.filled_box_around(text, theme::CARD);
+        let card = laid_out.filled_box_around(text, crate::kit::tokens::Palette::LIGHT.card);
         let padding = egui::pos2(text.center().x, card.bottom() - 4.0);
         assert!(
             !text.contains(padding),
@@ -12543,8 +12564,8 @@ mod tests {
         // its bottom edge and the card that follows it. `CARD_GAP` is not that
         // gap on its own -- the cards also carry the scroll area's item
         // spacing -- which is why this is read and not stated.
-        let card = with.filled_box_around(with.rect_of(app_card_heading()), theme::CARD);
-        let next = with.filled_box_around(with.rect_of("NOTES"), theme::CARD);
+        let card = with.filled_box_around(with.rect_of(app_card_heading()), crate::kit::tokens::Palette::LIGHT.card);
+        let next = with.filled_box_around(with.rect_of("NOTES"), crate::kit::tokens::Palette::LIGHT.card);
         let expected = card.height() + (next.top() - card.bottom());
         assert!(
             expected > card.height(),
@@ -14398,7 +14419,7 @@ mod tests {
         let between = rects
             .iter()
             .filter(|(r, fill)| {
-                (*fill == theme::HAIRLINE || *fill == crate::kit::tokens::Palette::LIGHT.hairline)
+                (*fill == crate::kit::tokens::Palette::LIGHT.hairline || *fill == crate::kit::tokens::Palette::LIGHT.hairline)
                     && r.height() <= 1.5
                     && r.top() >= contact.bottom()
                     && r.bottom() <= government.top()
@@ -14591,7 +14612,7 @@ mod tests {
 
     // `the_header_primary_button_is_the_designs_34px_filled_control` stood
     // here and is DELETED. Every one of its assertions was about the header's
-    // "Fill in app" button -- that a 34px `theme::BLUE`-filled rect existed,
+    // "Fill in app" button -- that a 34px `palette.blue`-filled rect existed,
     // that the label was 13px, that a `CTRL+SHIFT+F` hint sat beside it at
     // 10px monospace. The button was removed at the user's request, so there
     // is no subject left: the test could only be made to pass by asserting
@@ -15770,7 +15791,7 @@ mod tests {
     /// into -- 8a gives them a card of their own and the EDIT pane always
     /// has. The owner: "TOTP should be separate tile and not with password".
     fn totp_card(frame: &Frame) -> egui::Rect {
-        frame.filled_box_around(frame.rect_of(totp_card_heading()), theme::CARD)
+        frame.filled_box_around(frame.rect_of(totp_card_heading()), crate::kit::tokens::Palette::LIGHT.card)
     }
 
     /// The reveal eye nearest `row_y` -- the one belonging to the row whose
@@ -20131,7 +20152,7 @@ mod read_pane_scroll_tests {
                     fill.a() > 0
                         && rect.left() >= lane - 0.5
                         && rect.width() > 0.0
-                        && rect.width() <= theme::SCROLLBAR_WIDTH + 0.5
+                        && rect.width() <= crate::kit::rows::SCROLLBAR_WIDTH + 0.5
                 })
                 .count()
         };
@@ -20148,7 +20169,7 @@ mod read_pane_scroll_tests {
             shot.rects.iter().any(|(rect, fill)| fill.a() > 0
                 && rect.left() >= lane - 0.5
                 && rect.width() > 0.0
-                && rect.width() <= theme::SCROLLBAR_WIDTH + 0.5),
+                && rect.width() <= crate::kit::rows::SCROLLBAR_WIDTH + 0.5),
             "the very first frame paints no bar at all"
         );
 
@@ -20170,8 +20191,8 @@ mod read_pane_scroll_tests {
     /// default `VisibleWhenNeeded` the bar reserves its lane only while it is
     /// shown, so the content's right edge jumps by the lane's width as the
     /// content crosses the overflow threshold -- a 10pt jump the user
-    /// noticed. Here `AlwaysVisible` plus `theme::scrollbar_in_gutter` makes
-    /// the reservation unconditional and `theme::hide_scrollbar` merely stops
+    /// noticed. Here `AlwaysVisible` plus `crate::kit::rows::scrollbar_in_gutter` makes
+    /// the reservation unconditional and `crate::kit::rows::hide_scrollbar` merely stops
     /// painting the bar, so nothing moves.
     ///
     /// The same ITEM on two pane HEIGHTS is the comparison: one short enough
@@ -20195,7 +20216,7 @@ mod read_pane_scroll_tests {
             let card = shot
                 .rects
                 .iter()
-                .filter(|(rect, fill)| *fill == theme::CARD && rect.contains_rect(heading))
+                .filter(|(rect, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && rect.contains_rect(heading))
                 .map(|(rect, _)| *rect)
                 .reduce(egui::Rect::union)
                 .expect("the identity card has no white surface");
@@ -20349,7 +20370,7 @@ mod read_pane_scroll_tests {
     ///
     /// * **Is this a bar?** -- the width ceiling is the LANE's width, not the
     ///   bar's, deliberately. egui's floating default is a 2pt sliver, and
-    ///   a ceiling set at [`theme::SCROLLBAR_WIDTH`] would quietly accept it
+    ///   a ceiling set at [`crate::kit::rows::SCROLLBAR_WIDTH`] would quietly accept it
     ///   as a well-formed bar. What a sliver fails is the assertion, not the
     ///   search. The height floor drops the hairlines and row separators
     ///   that the overflowing card paints across the lane at [`NARROW`].
@@ -20382,7 +20403,7 @@ mod read_pane_scroll_tests {
     /// a bar centred in its 24pt lane left 9pt of clear space between the
     /// cards and the bar and 9pt of dead gap behind it, against the pane's
     /// own edge where nothing is compared to it. `72c0fea` moved the rule
-    /// into `theme::scrollbar_in_gutter` -- the bar takes the OUTERMOST
+    /// into `crate::kit::rows::scrollbar_in_gutter` -- the bar takes the OUTERMOST
     /// `SCROLLBAR_WIDTH` of the lane -- which gives this pane 18pt of clear
     /// space and nothing behind the bar. Measured on a 298pt pane: the lane
     /// is x = 274..298, the cards end at 274, and the bar's two rects (the
@@ -20439,14 +20460,14 @@ mod read_pane_scroll_tests {
              scroll lane, so nothing tells the reader there is more below"
         );
         // The outermost `SCROLLBAR_WIDTH` of the lane, absolute: 292..298.
-        let bar_left = pane.x - theme::SCROLLBAR_WIDTH;
+        let bar_left = pane.x - crate::kit::rows::SCROLLBAR_WIDTH;
         for bar in &bars {
             assert!(
-                (bar.width() - theme::SCROLLBAR_WIDTH).abs() <= 0.5,
+                (bar.width() - crate::kit::rows::SCROLLBAR_WIDTH).abs() <= 0.5,
                 "the scroll bar is {}pt wide, not {}pt -- this is egui's floating default \
                  painted over the card, not a bar in the reserved lane. Bars: {bars:?}",
                 bar.width(),
-                theme::SCROLLBAR_WIDTH
+                crate::kit::rows::SCROLLBAR_WIDTH
             );
             // Three separate assertions, because they fail for three
             // different reasons and a reader who sees one must not be told
@@ -20470,7 +20491,7 @@ mod read_pane_scroll_tests {
                  which is the report this lane exists to answer. Bars: {bars:?}",
                 bar.left(),
                 bar.right(),
-                theme::SCROLLBAR_WIDTH,
+                crate::kit::rows::SCROLLBAR_WIDTH,
                 pane.x,
                 pane.x - bar.right(),
                 bar.left() - lane_left(pane)
@@ -20528,7 +20549,7 @@ mod read_pane_scroll_tests {
              leaving {}pt of clear space and not the 18 the lane is meant to give \
              ({BODY_PAD_X}pt lane less a {}pt bar flush to the outer edge): {found:?}",
             nearest - edge,
-            theme::SCROLLBAR_WIDTH
+            crate::kit::rows::SCROLLBAR_WIDTH
         );
 
         // Not scrolling: the whole lane is clear.
@@ -21403,7 +21424,7 @@ mod breach_badge_tests {
             let (left, right) = self
                 .fills
                 .iter()
-                .filter(|(rect, fill)| *fill == theme::CARD && rect.bottom() <= run.ink.top())
+                .filter(|(rect, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && rect.bottom() <= run.ink.top())
                 .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, r), (rect, _)| (l.min(rect.left()), r.max(rect.right())));
             assert!(left.is_finite(), "no card above {:?}, so the column is unknown", run.text);
             let bottom = self
@@ -21747,7 +21768,7 @@ mod breach_badge_tests {
         // not against a copy of the wording written out here.
         let strip = off.only(&strip_text());
         assert_eq!(strip.text, metadata_line(None, 3, PASSWORD, None));
-        assert_eq!(strip.color, theme::TEXT_FAINT);
+        assert_eq!(strip.color, crate::kit::tokens::Palette::LIGHT.text_faint);
         assert!(strip.color.a() > 0, "the strip is painted at alpha 0");
 
         // And nothing else in the frame says anything about a breach, in any
@@ -21805,7 +21826,7 @@ mod breach_badge_tests {
         // checked" is not a verdict in either direction.
         assert!(!seg.rendered.is_empty(), "the unavailable badge laid out no glyphs");
         assert!(seg.color.a() > 0, "the unavailable badge is painted at alpha 0");
-        assert_eq!(seg.color, theme::TEXT_FAINT);
+        assert_eq!(seg.color, crate::kit::tokens::Palette::LIGHT.text_faint);
         assert!(!segment_is_urgent(BreachStatus::Unavailable));
     }
 
@@ -21896,17 +21917,17 @@ mod breach_badge_tests {
         // the `RichText` this file built.
         assert_eq!(
             seg.color,
-            theme::ERROR,
+            crate::kit::tokens::Palette::LIGHT.error,
             "the breach warning is not the palette's red; it is {:?}",
             seg.color
         );
         assert_eq!(seg.color.a(), 255, "an alarm at alpha {} is not an alarm", seg.color.a());
-        assert_ne!(seg.color, theme::TEXT_FAINT);
+        assert_ne!(seg.color, crate::kit::tokens::Palette::LIGHT.text_faint);
 
         // The strip beside it stays faint, so the assertion above is about
         // the segment and not about a card that turned red wholesale.
         let strip = frame.only(&strip_text());
-        assert_eq!(strip.color, theme::TEXT_FAINT);
+        assert_eq!(strip.color, crate::kit::tokens::Palette::LIGHT.text_faint);
 
         // The advice does not soften for a small number and does not escalate
         // for a large one -- `breach_phrase` owns that and this is the badge
@@ -21918,7 +21939,7 @@ mod breach_badge_tests {
                 "{count}: {text:?}"
             );
             assert!(segment_is_urgent(BreachStatus::Breached(count)));
-            assert_eq!(segment_color(BreachStatus::Breached(count)), theme::ERROR);
+            assert_eq!(segment_color(BreachStatus::Breached(count)), crate::kit::tokens::Palette::LIGHT.error);
         }
     }
 
@@ -22078,13 +22099,13 @@ mod breach_badge_tests {
                 // `RichText` this file built.
                 if own_line {
                     assert_eq!(
-                        seg.color, theme::ERROR,
+                        seg.color, crate::kit::tokens::Palette::LIGHT.error,
                         "{label}: the warning on its own line is not the palette's red"
                     );
                     assert_eq!(seg.color.a(), 255, "{label}: an alarm at alpha {}", seg.color.a());
                 } else {
                     assert_eq!(
-                        seg.color, theme::TEXT_FAINT,
+                        seg.color, crate::kit::tokens::Palette::LIGHT.text_faint,
                         "{label}/{status:?}: a report in the run is painted as a warning"
                     );
                 }
@@ -22092,10 +22113,10 @@ mod breach_badge_tests {
                 // of the four cases -- so the assertion above is about the
                 // segment and not about a card that turned red wholesale.
                 assert_eq!(
-                    strip.color, theme::TEXT_FAINT,
+                    strip.color, crate::kit::tokens::Palette::LIGHT.text_faint,
                     "{label}/{status:?}: the neutral facts changed colour"
                 );
-                assert_ne!(strip.color, theme::ERROR);
+                assert_ne!(strip.color, crate::kit::tokens::Palette::LIGHT.error);
 
                 // The warning starts a line, so it carries no separator --
                 // a "\u{b7}" with nothing in front of it is the defect this
