@@ -15620,13 +15620,25 @@ fn ensure_icon_loaded(
         }
         _ => None,
     };
+    // **An old copy is drawn and asked about again behind it.** Past
+    // `favicon::ICON_CACHE_MAX_AGE` the cached picture still goes up at once,
+    // but the fetch below runs too -- for the FIRST site only, so a later
+    // site can never displace the icon the owner ranked first. A fetched icon
+    // replaces the texture and the file; no answer leaves the old one.
+    let mut revalidate = false;
     if let Some(cached_bytes) = cached {
         if let Some((w, h, rgba)) = crate::favicon::decode_rgba(&cached_bytes) {
             let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             let tex = ctx.load_texture(item.id.clone(), image, egui::TextureOptions::default());
             icons.textures.insert(item.id.clone(), tex);
             log::debug!("icon: this item was served from the on-disk cache");
-            return;
+            match sites.first() {
+                Some(first) if crate::favicon::cached_icon_is_stale(icon_cache_dir, first) => {
+                    log::debug!("icon: the cached copy of {first} is old; asking again behind it");
+                    revalidate = true;
+                }
+                _ => return,
+            }
         }
         // Corrupt/unreadable cache entry -- fall through and re-fetch as if
         // it were a miss, rather than permanently failing this domain.
@@ -15695,14 +15707,17 @@ fn ensure_icon_loaded(
         // warning that names only an item id cannot be read against the site
         // it tried -- the owner's `prod.beeline.com` was a monogram for a
         // whole session with nothing in the log to say which address failed.
+        let asked = if revalidate { &sites[..1] } else { &sites[..] };
         let pixels = chosen.or_else(|| {
-            first_icon_among(&sites, freshness, &cache_dir, |site| {
+            first_icon_among(asked, freshness, &cache_dir, |site| {
                 let source =
                     crate::favicon::icon_source_for(site, server_url.as_deref(), direct, freshness);
                 crate::favicon::fetch_icon_for(&source)
             })
         });
-        if pixels.is_none() {
+        // A revalidation that got nothing keeps the old picture, so it is
+        // not the monogram this warning is about.
+        if pixels.is_none() && !revalidate {
             // `warn`, not `debug`: this is the state the user is looking at
             // -- an item wearing a monogram when they expected a picture --
             // and the lines above it in the log say which candidate failed

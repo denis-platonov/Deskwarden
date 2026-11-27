@@ -1925,6 +1925,27 @@ pub fn read_cached_icon(cache_dir: &Path, domain: &str) -> Option<Vec<u8>> {
         .filter(|bytes| !is_icon_service_globe(bytes))
 }
 
+/// How long an on-disk icon is shown without asking about it again.
+///
+/// Past this age the cached copy is still drawn at once, and the icon is
+/// asked for again behind it; a fresh answer replaces both the picture and
+/// the file, and no answer keeps the old one. Without it a cache entry was
+/// that domain's icon for the life of the installation: the owner's
+/// `gitlab.com` kept an opaque 180 px touch icon (a dark square) months after
+/// the server had started answering with the transparent favicon.
+pub const ICON_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Whether `domain`'s on-disk icon is older than [`ICON_CACHE_MAX_AGE`].
+/// `false` when there is no file or its age cannot be read: a missing file
+/// is a miss already, and an unreadable clock is no reason to re-fetch.
+pub fn cached_icon_is_stale(cache_dir: &Path, domain: &str) -> bool {
+    std::fs::metadata(icon_cache_path(cache_dir, domain))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age > ICON_CACHE_MAX_AGE)
+}
+
 /// Writes `png_bytes` to the on-disk cache for `domain`. Best-effort: a
 /// failure to persist (permissions, disk full, whatever) just means this
 /// domain gets re-fetched next time rather than being treated as fatal --
@@ -4494,5 +4515,28 @@ mod tls_leniency_tests {
              the rule and the thing it scopes",
             at - guarded_at
         );
+    }
+}
+
+
+#[cfg(test)]
+mod icon_cache_age_tests {
+    use super::*;
+
+    #[test]
+    fn an_icon_older_than_the_limit_is_stale_and_a_new_or_missing_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("deskwarden-test-icon-age-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!cached_icon_is_stale(&dir, "gitlab.com"), "a missing file is a miss, not stale");
+        write_cached_icon(&dir, "gitlab.com", b"png");
+        assert!(!cached_icon_is_stale(&dir, "gitlab.com"), "a file written just now is fresh");
+        let old = std::time::SystemTime::now() - ICON_CACHE_MAX_AGE - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(icon_cache_path(&dir, "gitlab.com"))
+            .and_then(|f| f.set_modified(old))
+            .expect("age the file");
+        assert!(cached_icon_is_stale(&dir, "gitlab.com"), "a file past the limit is stale");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
