@@ -20,6 +20,7 @@
 //! cargo run --example ui_preview -- --backend-choice --screenshot # the self-hosted backend choice
 //! cargo run --example ui_preview -- --vault --screenshot        # the Vault page, both clients
 //! cargo run --example ui_preview -- --sends --screenshot        # design 5b's Sends screen, six states
+//! cargo run --example ui_preview -- --pickers --screenshot      # the Add app pickers and their empty states
 //! cargo run --example ui_preview -- --totp --screenshot         # designs 6a/6c/6d, the add-a-code card, seven states
 //! cargo run --example ui_preview -- --edit --screenshot         # design 8a's Edit login form, five states
 //! cargo run --example ui_preview -- --kit --screenshot          # the v2 kit sheet (1.0 redesign)
@@ -804,6 +805,25 @@ enum Surface {
     /// spinner and one line of prose look deliberate in a 1240x740 window
     /// rather than lost in it, and whether the control that closes it is
     /// visibly there.
+    /// **The "Choose a vault item" picker**, first step of the tray's Add
+    /// app: the window's own body at its own size, one login selected.
+    PickerItems,
+    /// The same picker with a search that matches nothing.
+    PickerItemsNoMatch,
+    /// **The "Add app to Deskwarden" picker**, one process selected, backend
+    /// ready.
+    PickerApps,
+    /// The same window with `bw serve` unanswered: the note and its Retry.
+    PickerAppsBackendDown,
+    /// The same window with a Store-app host process selected, which Save
+    /// refuses and says why.
+    PickerAppsRefused,
+    /// **The picker's empty states**, which were message boxes: an empty vault,
+    /// a vault with no logins, an unreachable backend, a locked vault.
+    PickerNoticeEmpty,
+    PickerNoticeNoLogins,
+    PickerNoticeUnreachable,
+    PickerNoticeLocked,
     VaultSetupSpinner,
     /// **Design turn 7's first window, loading.** The body the recovery
     /// window opens on, at the vault window's own size, with a live close
@@ -1100,6 +1120,15 @@ const ALL: &[Surface] = &[
     Surface::SendsPeople,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
+    Surface::PickerItems,
+    Surface::PickerItemsNoMatch,
+    Surface::PickerApps,
+    Surface::PickerAppsBackendDown,
+    Surface::PickerAppsRefused,
+    Surface::PickerNoticeEmpty,
+    Surface::PickerNoticeNoLogins,
+    Surface::PickerNoticeUnreachable,
+    Surface::PickerNoticeLocked,
     Surface::FirstWindowLoading,
     Surface::FirstWindowSlow,
     Surface::FirstWindowSlowLocalCopy,
@@ -1265,6 +1294,15 @@ impl Surface {
             Surface::SendsPeople => "sends_people",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
+            Surface::PickerItems => "picker_items",
+            Surface::PickerItemsNoMatch => "picker_items_no_match",
+            Surface::PickerApps => "picker_apps",
+            Surface::PickerAppsBackendDown => "picker_apps_backend_down",
+            Surface::PickerAppsRefused => "picker_apps_refused",
+            Surface::PickerNoticeEmpty => "picker_notice_empty",
+            Surface::PickerNoticeNoLogins => "picker_notice_no_logins",
+            Surface::PickerNoticeUnreachable => "picker_notice_unreachable",
+            Surface::PickerNoticeLocked => "picker_notice_locked",
             Surface::FirstWindowLoading => "first_window_loading",
             Surface::FirstWindowSlow => "first_window_slow",
             Surface::FirstWindowSlowLocalCopy => "first_window_slow_local_copy",
@@ -1550,6 +1588,15 @@ impl Surface {
             // spinner window used, this picture would answer a question about
             // a window nobody opens any more.
             Surface::VaultSetupSpinner => egui::vec2(1240.0, 740.0),
+            // The pickers' own windows, at the sizes `picker_ui` opens them in.
+            Surface::PickerItems | Surface::PickerItemsNoMatch => egui::vec2(480.0, 620.0),
+            Surface::PickerApps | Surface::PickerAppsBackendDown | Surface::PickerAppsRefused => {
+                egui::vec2(480.0, 680.0)
+            }
+            Surface::PickerNoticeEmpty
+            | Surface::PickerNoticeNoLogins
+            | Surface::PickerNoticeUnreachable
+            | Surface::PickerNoticeLocked => egui::vec2(480.0, 400.0),
             // **The vault window's own size, for all four**, which is the
             // whole of design turn 7: the frame is decided once and only the
             // body changes. Rendered at four different sizes these pictures
@@ -1645,6 +1692,9 @@ fn main() -> eframe::Result {
     // flag for the six, exactly as `--vault` is one flag for a pair and
     // `--kinds` is one for a trio -- what is under review is the set.
     let sends = arg("--sends");
+    // The "Add app" pickers and their empty states (nine states of two windows),
+    // and the chrome / loading / rehearsal screens repainted with them.
+    let pickers = arg("--pickers");
     // Designs 6a, 6c and 6d -- the add-a-code card, which had NO preview at
     // all until this flag and could only be looked at by running the app and
     // typing into it. One flag for the seven states for `--sends`' reason,
@@ -1743,6 +1793,26 @@ fn main() -> eframe::Result {
         vec![Surface::VaultRail]
     } else if health {
         vec![Surface::VaultHealth]
+    } else if pickers {
+        vec![
+            Surface::PickerItems,
+            Surface::PickerItemsNoMatch,
+            Surface::PickerApps,
+            Surface::PickerAppsBackendDown,
+            Surface::PickerAppsRefused,
+            Surface::PickerNoticeEmpty,
+            Surface::PickerNoticeNoLogins,
+            Surface::PickerNoticeUnreachable,
+            Surface::PickerNoticeLocked,
+            // The other screens this slice repainted: the shared window chrome
+            // (sign-in, the vault-sized spinner and first window) and the
+            // rehearsal window.
+            Surface::LoginSignin,
+            Surface::VaultSetupSpinner,
+            Surface::FirstWindowLoading,
+            Surface::FirstWindowUnreachable,
+            Surface::Rehearsal,
+        ]
     } else if sends {
         vec![
             Surface::SendsSelected,
@@ -1850,6 +1920,8 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_vault_rail.png")
     } else if health {
         target_dir().join("ui_preview_vault_password_health.png")
+    } else if pickers {
+        target_dir().join("ui_preview_pickers")
     } else if sends {
         // A DIRECTORY, for `--vault`'s and `--kinds`' reason: this flag
         // renders six states of one screen and the whole value of it is that
@@ -1876,7 +1948,7 @@ fn main() -> eframe::Result {
                 corners: deskwarden::window_host::CornerMask::new(),
                 queue,
                 at: 0,
-                directory: all || vault || kinds || sends || totp || edit || shell,
+                directory: all || vault || kinds || sends || pickers || totp || edit || shell,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -2560,6 +2632,15 @@ impl eframe::App for Preview {
             | Surface::SendsNarrow => self.draw_sends(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
+            Surface::PickerItems
+            | Surface::PickerItemsNoMatch
+            | Surface::PickerApps
+            | Surface::PickerAppsBackendDown
+            | Surface::PickerAppsRefused
+            | Surface::PickerNoticeEmpty
+            | Surface::PickerNoticeNoLogins
+            | Surface::PickerNoticeUnreachable
+            | Surface::PickerNoticeLocked => self.draw_picker(root, self.current()),
             Surface::FirstWindowLoading
             | Surface::FirstWindowSlow
             | Surface::FirstWindowUnreachable
@@ -3401,6 +3482,83 @@ impl Preview {
             root,
             "Setting up your vault...",
             login_ui::CloseControl::Active,
+        );
+    }
+
+    /// **The two "Add app" pickers and their empty states**, through the same
+    /// `picker_ui::draw_*` bodies the windows paint, so these PNGs are what the
+    /// tray's Add app shows.
+    fn draw_picker(&mut self, root: &mut egui::Ui, surface: Surface) {
+        use deskwarden::picker_ui::{self, AppPickerView, BackendReadiness, PickerNotice};
+        use deskwarden::window_list::WindowInfo;
+        let notice = match surface {
+            Surface::PickerNoticeEmpty => Some(PickerNotice::EmptyVault),
+            Surface::PickerNoticeNoLogins => Some(PickerNotice::NoLogins),
+            Surface::PickerNoticeUnreachable => Some(PickerNotice::Unreachable(
+                "connection refused (os error 10061)".to_string(),
+            )),
+            Surface::PickerNoticeLocked => Some(PickerNotice::Locked),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            let _ = picker_ui::draw_picker_notice(root, &notice);
+            return;
+        }
+        if matches!(surface, Surface::PickerItems | Surface::PickerItemsNoMatch) {
+            let logins = items(
+                r#"[
+                {"id":"i1","name":"Ledgerline","type":1,"fields":[],"login":{"username":"a.novak@ledgerline.com"}},
+                {"id":"i2","name":"SAP GUI for Windows","type":1,"fields":[],"login":{"username":"anovak"}},
+                {"id":"i3","name":"Git Host","type":1,"fields":[],"login":{"username":"anovak"}},
+                {"id":"i4","name":"Postgres admin","type":1,"fields":[],"login":{"username":"postgres"}},
+                {"id":"i5","name":"Remote Desktop Gateway","type":1,"fields":[],"login":{"username":"anovak"}},
+                {"id":"i6","name":"Payroll portal","type":1,"fields":[],"login":{"username":"alex.n"}}
+            ]"#,
+            );
+            let mut filter =
+                if surface == Surface::PickerItemsNoMatch { "zzzz".to_string() } else { String::new() };
+            let mut selected = Some("i2".to_string());
+            let _ = picker_ui::draw_item_picker(root, &logins, &mut filter, &mut selected);
+            return;
+        }
+        let row = |title: &str, exe: &str, hwnd: isize| WindowInfo {
+            hwnd,
+            pid: 4100 + hwnd as u32,
+            exe_path: format!("C:\\Program Files\\{exe}"),
+            exe_name: exe.to_string(),
+            title: title.to_string(),
+            hosted: false,
+        };
+        let windows = vec![
+            row("SAP Logon 760", "saplogon.exe", 1),
+            row("Remote Desktop Connection", "mstsc.exe", 2),
+            row("Ledgerline Desktop", "ledgerline.exe", 3),
+            row("Postgres admin", "pgadmin4.exe", 4),
+            row("Calculator", "ApplicationFrameHost.exe", 5),
+            row("Notepad", "notepad.exe", 6),
+        ];
+        let backend = if surface == Surface::PickerAppsBackendDown {
+            BackendReadiness::Unavailable("connection refused (os error 10061)".to_string())
+        } else {
+            BackendReadiness::Ready
+        };
+        let mut filter = String::new();
+        let mut selected = Some(if surface == Surface::PickerAppsRefused { 5 } else { 3 });
+        let mut icons = picker_ui::IconCache::new();
+        let _ = picker_ui::draw_app_picker(
+            root,
+            &AppPickerView {
+                target_name: "SAP GUI for Windows",
+                windows: &windows,
+                backend: &backend,
+                existing_host_match: None,
+                save_error: None,
+                save_notice: None,
+                already_saved: false,
+            },
+            &mut filter,
+            &mut selected,
+            &mut icons,
         );
     }
 

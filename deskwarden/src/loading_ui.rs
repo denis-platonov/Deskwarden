@@ -56,7 +56,7 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// (abandon quietly, treat as a failure, etc.) rather than that decision
 /// being made for it by a crash.
 /// The wait itself: **this app's window heading**, and under it design turn
-/// 7's sliding bar and one line of prose, centred on a flat [`theme::CANVAS`]
+/// 7's sliding bar and one line of prose, centred on a flat window-background
 /// panel that fills whatever is left.
 ///
 /// The heading is the same [`draw_window_chrome_with_extra`] every other window
@@ -106,13 +106,14 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// [`draw_spinner_body`] stays for the small standalone spinner window, which
 /// is too small for the splash.
 pub fn draw_working_body(ui: &mut egui::Ui, line: &str, close: CloseControl) -> ChromeAction {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let saved_item_spacing_y = ui.spacing().item_spacing.y;
     ui.spacing_mut().item_spacing.y = 0.0;
     let action = draw_window_chrome_with_extra(ui, WINDOW_TITLE, HEADING, false, close, |_ui| {});
     ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
     let full = ui.max_rect();
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(theme::CANVAS))
+        .frame(egui::Frame::new().fill(p.window_bg))
         .show(ui, |_ui| {});
     crate::vault_window::splash::paint_line(ui.ctx(), full, line, 0.0);
     ui.ctx().request_repaint();
@@ -126,6 +127,7 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
     // after -- the same dance, for the same reason, as `vault_window`'s own
     // chrome call. Restored immediately, so this does not silently become the
     // ambient spacing of whatever the host draws next.
+    let p = crate::kit::tokens::palette(ui.ctx());
     let saved_item_spacing_y = ui.spacing().item_spacing.y;
     ui.spacing_mut().item_spacing.y = 0.0;
     let action = draw_window_chrome_with_extra(ui, WINDOW_TITLE, HEADING, false, close, |_ui| {});
@@ -134,7 +136,7 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
-                .fill(theme::CANVAS)
+                .fill(p.window_bg)
                 .inner_margin(Margin::same(24)),
         )
         .show(ui, |ui| {
@@ -198,12 +200,13 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
 /// optional because the handover screen has nothing to add to the heading
 /// that the screen one second earlier has not already said.
 pub fn waiting_stack(ui: &mut egui::Ui, bar: f32, heading: &str, sub: Option<&str>) {
-    theme::progress_bar(ui, bar);
+    let p = crate::kit::tokens::palette(ui.ctx());
+    crate::kit::auth::progress(ui, bar, false);
     ui.add_space(BAR_TO_LABEL);
-    ui.label(theme::bold(heading, TITLE_SIZE).color(theme::INK));
+    ui.label(theme::bold(heading, TITLE_SIZE).color(p.ink));
     if let Some(sub) = sub {
         ui.add_space(TITLE_TO_SUB);
-        ui.label(theme::regular(sub, SUB_SIZE).color(theme::TEXT_FAINT));
+        ui.label(theme::regular(sub, SUB_SIZE).color(p.text_faint));
     }
 }
 
@@ -226,6 +229,9 @@ const HEADING: ChromeMetrics = ChromeMetrics::VAULT;
 /// margin either side, so it takes the narrow one. Neither is invented here --
 /// they are the two the design already uses.
 const WIDE_BAR: f32 = 260.0;
+
+/// The track's height: `kit::auth::progress` draws it 4 tall (spec C 5.4).
+const BAR_HEIGHT: f32 = 4.0;
 const NARROW_BAR: f32 = 200.0;
 
 /// The gap between the bar and the text under it -- design 7a's own 22px, and
@@ -244,7 +250,7 @@ const BAR_TO_LABEL: f32 = 22.0;
 /// size times egui's default line height for this face; being a pixel or two
 /// out is invisible in a centring, whereas the top-anchored version this
 /// replaces was out by hundreds.
-const CONTENT_HEIGHT: f32 = theme::BAR_HEIGHT + BAR_TO_LABEL + TITLE_SIZE * 1.4;
+const CONTENT_HEIGHT: f32 = BAR_HEIGHT + BAR_TO_LABEL + TITLE_SIZE * 1.4;
 
 /// This window GREW when the heading arrived: 320×150 had exactly enough room
 /// for a mark, a 22px spinner and a line of text, and none at all for a 46px bar
@@ -648,14 +654,11 @@ const FOOTER_HEIGHT: f32 = 40.0;
 /// in an area the footer is painted across.
 const BODY_MARGIN: i8 = 24;
 
-/// Amber, from design 7b's own failure badge (`#fef6e7` on `#f2d99b`, mark in
-/// `#8a5a06`). Module-local rather than in [`theme`], for the reason
-/// `scratch_window` keeps its own two: these three appear on exactly one
-/// screen, and a token in the shared palette is a claim that the rest of the
-/// app has a warning treatment to match.
-const WARN_FILL: egui::Color32 = egui::Color32::from_rgb(0xfe, 0xf6, 0xe7);
-const WARN_EDGE: egui::Color32 = egui::Color32::from_rgb(0xf2, 0xd9, 0x9b);
-const WARN_INK: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x5a, 0x06);
+// Amber, from design 7b's own failure badge (`#fef6e7` on `#f2d99b`, mark in
+// `#8a5a06`). Module-local rather than in [`theme`], for the reason
+// `scratch_window` keeps its own two: these three appear on exactly one
+// screen, and a token in the shared palette is a claim that the rest of the
+// app has a warning treatment to match.
 
 const BADGE_SIZE: f32 = 38.0;
 
@@ -728,6 +731,7 @@ pub fn draw_first_window_body(
 ) -> FirstWindowOutcome {
     // The same eager-cursor dance `draw_spinner_body` does, for the same
     // reason: the chrome bakes `item_spacing.y` into the cursor it leaves.
+    let p = crate::kit::tokens::palette(ui.ctx());
     let saved_item_spacing_y = ui.spacing().item_spacing.y;
     ui.spacing_mut().item_spacing.y = 0.0;
     let chrome = draw_window_chrome_with_extra(ui, WINDOW_TITLE, HEADING, false, close, |_ui| {});
@@ -747,7 +751,7 @@ pub fn draw_first_window_body(
     }
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
+        .frame(egui::Frame::new().fill(p.window_bg).inner_margin(Margin {
             left: BODY_MARGIN,
             right: BODY_MARGIN,
             top: BODY_MARGIN,
@@ -782,7 +786,7 @@ pub fn draw_first_window_body(
                     // the thing to do. The bar above is still moving.
                     if let LocalCopy::Here { synced } = local {
                         ui.add_space(TITLE_TO_SUB);
-                        ui.label(theme::regular(offline_line(synced), SUB_SIZE).color(theme::TEXT_GHOST));
+                        ui.label(theme::regular(offline_line(synced), SUB_SIZE).color(p.text_ghost));
                         ui.add_space(BLOCK_GAP);
                         open_local_copy |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, open_local_label(), None).clicked();
                     }
@@ -790,7 +794,7 @@ pub fn draw_first_window_body(
                 FirstWindowBody::Unreachable { retry: offer, local } => {
                     draw_warning_badge(ui);
                     ui.add_space(BADGE_TO_LABEL);
-                    ui.label(theme::bold(unreachable_title(), TITLE_SIZE).color(theme::INK));
+                    ui.label(theme::bold(unreachable_title(), TITLE_SIZE).color(p.ink));
                     ui.add_space(TITLE_TO_SUB);
                     let copy = match offer {
                         RetryOffer::Offered => unreachable_offered(),
@@ -803,14 +807,14 @@ pub fn draw_first_window_body(
                         egui::vec2(COPY_WIDTH, 0.0),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            ui.label(theme::regular(copy, SUB_SIZE).color(theme::TEXT_FAINT));
+                            ui.label(theme::regular(copy, SUB_SIZE).color(p.text_faint));
                         },
                     );
                     if let LocalCopy::Here { synced } = local {
                         ui.add_space(TITLE_TO_SUB);
                         ui.label(
                             theme::regular(offline_line(synced), SUB_SIZE)
-                                .color(theme::TEXT_GHOST),
+                                .color(p.text_ghost),
                         );
                     }
                     if offer == RetryOffer::Offered {
@@ -867,7 +871,7 @@ fn content_height(body: FirstWindowBody) -> f32 {
     // Head and gap together, because the bar and the badge differ in both:
     // 3px over 22px of air, or 38px over 16px.
     let head = match body {
-        FirstWindowBody::Loading | FirstWindowBody::Slow { .. } => theme::BAR_HEIGHT + BAR_TO_LABEL,
+        FirstWindowBody::Loading | FirstWindowBody::Slow { .. } => BAR_HEIGHT + BAR_TO_LABEL,
         FirstWindowBody::Unreachable { .. } => BADGE_SIZE + BADGE_TO_LABEL,
     };
     let mut height = head + TITLE_SIZE * 1.4 + TITLE_TO_SUB + SUB_SIZE * 1.4;
@@ -901,15 +905,16 @@ fn content_height(body: FirstWindowBody) -> f32 {
 
 /// Design 7b's amber badge: a filled disc with a hairline edge and one mark.
 fn draw_warning_badge(ui: &mut egui::Ui) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(BADGE_SIZE, BADGE_SIZE), egui::Sense::hover());
     ui.painter().circle(
         rect.center(),
         BADGE_SIZE / 2.0,
-        WARN_FILL,
-        egui::Stroke::new(1.0, WARN_EDGE),
+        p.caution_wash,
+        egui::Stroke::new(1.0, p.caution_edge),
     );
-    ui.put(rect, egui::Label::new(theme::bold("!", 18.0).color(WARN_INK)));
+    ui.put(rect, egui::Label::new(theme::bold("!", 18.0).color(p.caution_mark)));
 }
 
 /// The strip along the bottom: who is signed in, and what the shortcut is
@@ -920,14 +925,15 @@ fn draw_warning_badge(ui: &mut egui::Ui) {
 /// top of the frame. That is what makes "the footer does not move when the
 /// body does" a fact about the code and not a coincidence between three arms.
 fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'_>) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let strip =
         egui::Rect::from_min_max(egui::pos2(full.min.x, full.max.y - FOOTER_HEIGHT), full.max);
     let painter = ui.painter().clone();
-    painter.rect_filled(strip, egui::CornerRadius::ZERO, theme::CARD);
+    painter.rect_filled(strip, egui::CornerRadius::ZERO, p.card);
     painter.hline(
         strip.x_range(),
         strip.min.y,
-        egui::Stroke::new(1.0, theme::HAIRLINE),
+        egui::Stroke::new(1.0, p.hairline),
     );
 
     let inner = strip.shrink2(egui::vec2(16.0, 0.0));
@@ -938,7 +944,7 @@ fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         left.label(
-            theme::regular(crate::i18n::tf("loading.signed_in_as", &[("account", account)]), FOOT_SIZE).color(theme::TEXT_FAINT),
+            theme::regular(crate::i18n::tf("loading.signed_in_as", &[("account", account)]), FOOT_SIZE).color(p.text_faint),
         );
     }
 
@@ -949,7 +955,7 @@ fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'
     );
     right.label(
         theme::regular(hotkey_footnote(footer.hotkey, footer.hotkey_chord), FOOT_SIZE)
-            .color(theme::TEXT_GHOST),
+            .color(p.text_ghost),
     );
 }
 
@@ -1062,6 +1068,7 @@ mod spinner_body_tests {
     #[test]
     fn the_waiting_heading_is_drawn_in_exactly_one_place() {
         let needle = concat!("theme::progress", "_bar(");
+        let kit_bar = concat!("auth::pro", "gress(");
         // Every module in this crate that draws the design's track.
         let sources: [(&str, &str); 3] = [
             ("loading_ui", include_str!("loading_ui.rs")),
@@ -1075,12 +1082,17 @@ mod spinner_body_tests {
             match name {
                 // The three inside the widget itself: `waiting_stack`'s own,
                 // and the two the unreachable body's siblings draw.
-                "loading_ui" => assert_eq!(
-                    drawn.len(),
-                    1,
-                    "the waiting stack draws the track {} times, not once: {drawn:?}",
-                    drawn.len()
-                ),
+                "loading_ui" => {
+                    assert!(drawn.is_empty(), "the v1 track is back: {drawn:?}");
+                    let kit: Vec<&str> =
+                        production.lines().filter(|line| line.contains(kit_bar)).collect();
+                    assert_eq!(
+                        kit.len(),
+                        1,
+                        "the waiting stack draws the track {} times, not once: {kit:?}",
+                        kit.len()
+                    );
+                }
                 // **The sign-in screen's own bar** is a different screen: it is
                 // waiting on an AUTHENTICATION and has no vault to name. It is
                 // `kit::auth::progress` now (blue on the white half, white on
@@ -1166,7 +1178,7 @@ mod spinner_body_tests {
         );
         for line in &emphasised {
             assert!(
-                line.contains("TITLE_SIZE") || line.contains("WARN_INK"),
+                line.contains("TITLE_SIZE") || line.contains("caution_mark"),
                 "`{}` is emphasised but is neither a heading nor the warning badge -- `theme` \
                  reserves the named cuts for buttons, row titles and field emphasis, and a \
                  sentence is none of those",
@@ -1322,8 +1334,8 @@ mod spinner_body_tests {
         let output = frame("Setting up your vault...");
         let rects = filled_rects(&output);
         assert!(
-            rects.iter().any(|(_, fill)| *fill == crate::theme::CANVAS),
-            "nothing in the spinner is filled with `theme::CANVAS`, so the window behind the \
+            rects.iter().any(|(_, fill)| *fill == crate::kit::tokens::Palette::LIGHT.window_bg),
+            "nothing in the spinner is filled with the palette's `window_bg`, so the window behind the \
              spinner is whatever egui defaults to: {rects:?}"
         );
         // Positive control: the walker really found shapes, so the `any`
@@ -1822,14 +1834,14 @@ mod first_window_body_tests {
     /// The chrome draws its ✕ and — as LINE SEGMENTS, not glyphs (see
     /// `login_ui`: "glyphs are drawn, not typed, so they can't fall through to
     /// a fallback font"), and a live control is stroked in
-    /// [`theme::TEXT_FAINT`] where a ghosted one is [`theme::TEXT_GHOST`]. So
+    /// `text_icon` where a ghosted one is `text_ghost`. So
     /// counting live-stroked segments inside the heading bar is what
     /// "the way out is really there" means on this screen.
     fn live_control_segments(output: &egui::FullOutput) -> usize {
         fn walk(shape: &egui::Shape, out: &mut usize) {
             match shape {
                 egui::Shape::LineSegment { points, stroke } => {
-                    if stroke.color == theme::TEXT_FAINT
+                    if stroke.color == crate::kit::tokens::Palette::LIGHT.text_icon
                         && points.iter().all(|p| p.y < HEADING.bar_height)
                     {
                         *out += 1;
@@ -2184,7 +2196,9 @@ mod first_window_body_tests {
         ] {
             let ctx = styled_ctx();
             let input = egui::RawInput {
-                time: Some(f64::from(crate::theme::BAR_PERIOD) / 4.0),
+                // Half a second in: `kit::motion::line` has the knob wholly
+                // inside the track here, where at the start it is wholly outside.
+                time: Some(0.5),
                 ..raw_input()
             };
             let output = ctx.run_ui(input, |ui| {
@@ -2204,17 +2218,18 @@ mod first_window_body_tests {
                 filled.iter().any(|(rect, colour): &(egui::Rect, egui::Color32)| {
                     *colour == fill
                         && (rect.width() - want_w).abs() < 0.6
-                        && (rect.height() - crate::theme::BAR_HEIGHT).abs() < 0.6
+                        && (rect.height() - BAR_HEIGHT).abs() < 0.6
                 })
             };
+            let p = crate::kit::tokens::Palette::LIGHT;
             assert!(
-                bar(WIDE_BAR, crate::theme::HAIRLINE),
+                bar(WIDE_BAR, p.meter_track),
                 "{body:?} paints no {WIDE_BAR}x{}px hairline track, so the design's rail is not \
                  on screen: {filled:?}",
-                crate::theme::BAR_HEIGHT
+                BAR_HEIGHT
             );
             assert!(
-                bar(WIDE_BAR * 0.32, crate::theme::BLUE),
+                bar(WIDE_BAR * 0.34, p.blue),
                 "{body:?} paints no blue knob a third of the track wide, so what is moving in \
                  the middle of this window is not design 7's bar: {filled:?}"
             );
@@ -2234,8 +2249,8 @@ mod first_window_body_tests {
         });
         let filled = filled_rects(&output);
         assert!(
-            !filled.iter().any(|(rect, colour)| *colour == crate::theme::HAIRLINE
-                && (rect.height() - crate::theme::BAR_HEIGHT).abs() < 0.6
+            !filled.iter().any(|(rect, colour)| *colour == crate::kit::tokens::Palette::LIGHT.meter_track
+                && (rect.height() - BAR_HEIGHT).abs() < 0.6
                 && rect.width() > 100.0),
             "the unreachable body draws a progress track under a message that says the app has \
              given up: {filled:?}"

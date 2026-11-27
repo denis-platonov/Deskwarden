@@ -961,7 +961,7 @@ pub enum CloseControl {
     /// Clickable, and reports [`ChromeAction::Close`]. Every window whose ✕
     /// means something.
     Active,
-    /// Drawn ghosted in [`theme::TEXT_GHOST`] -- the same treatment the ▢ gets
+    /// Drawn ghosted in the palette's `text_ghost` -- the same treatment the ▢ gets
     /// on a fixed-size window -- with no hover and no interaction registered
     /// at all, so it cannot report a close for a host to have to refuse.
     Disabled,
@@ -982,9 +982,29 @@ pub struct ChromeMetrics {
     pub title_font_size: f32,
     /// [`theme::SEMIBOLD`] or [`theme::BOLD`].
     pub title_family: &'static str,
-    pub title_color: Color32,
+    /// Which palette ink the title is set in; resolved per frame so the bar
+    /// follows the dark theme.
+    pub title_ink: TitleInk,
     /// Width of each of the three ✕/▢/— control zones.
     pub control_width: f32,
+}
+
+/// The palette ink a chrome title is set in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleInk {
+    /// `palette().text_nav` (the sign-in window's title).
+    Nav,
+    /// `palette().ink` (the vault window's title).
+    Ink,
+}
+
+impl TitleInk {
+    fn colour(self, p: &crate::kit::tokens::Palette) -> Color32 {
+        match self {
+            TitleInk::Nav => p.text_nav,
+            TitleInk::Ink => p.ink,
+        }
+    }
 }
 
 impl ChromeMetrics {
@@ -996,7 +1016,7 @@ impl ChromeMetrics {
         mark_size: Vec2::new(15.0, 17.0),
         title_font_size: 12.0,
         title_family: theme::SEMIBOLD,
-        title_color: theme::TEXT_SECONDARY,
+        title_ink: TitleInk::Nav,
         control_width: 40.0,
     };
 
@@ -1015,7 +1035,7 @@ impl ChromeMetrics {
         mark_size: Vec2::new(22.0, 22.0),
         title_font_size: 14.0,
         title_family: theme::EXTRABOLD,
-        title_color: theme::INK,
+        title_ink: TitleInk::Ink,
         control_width: 42.0,
     };
 }
@@ -1079,23 +1099,24 @@ pub fn draw_window_chrome_with_extra(
     // follow the window's own radius (0 while maximized), so the bar's top
     // corners and the border agree with the cut `window_host::CornerMask`
     // makes over the top of everything.
+    let p = crate::kit::tokens::palette(ui.ctx());
     let radius = theme::window_corner_radius(ui.ctx());
     ui.painter()
-        .rect_filled(full, CornerRadius::same(radius), theme::WINDOW_BG);
+        .rect_filled(full, CornerRadius::same(radius), p.window_bg);
     ui.painter().rect_filled(
         bar,
         CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 },
-        theme::CARD,
+        p.card,
     );
     ui.painter().rect_filled(
         egui::Rect::from_min_max(egui::Pos2::new(bar.min.x, bar.max.y - 1.0), bar.max),
         CornerRadius::ZERO,
-        theme::HAIRLINE,
+        p.hairline,
     );
     ui.painter().rect_stroke(
         full,
         CornerRadius::same(radius),
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0, p.border),
         egui::StrokeKind::Inside,
     );
 
@@ -1107,7 +1128,11 @@ pub fn draw_window_chrome_with_extra(
         ),
         metrics.mark_size,
     );
-    theme::paint_mark(ui.painter(), mark_rect);
+    theme::paint_mark_colours(
+        ui.painter(),
+        mark_rect,
+        [p.blue_deep, p.blue_bright, p.blue_soft, p.blue],
+    );
     ui.painter().text(
         egui::Pos2::new(mark_rect.right() + 10.0, bar.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1116,7 +1141,7 @@ pub fn draw_window_chrome_with_extra(
             metrics.title_font_size,
             egui::FontFamily::Name(metrics.title_family.into()),
         ),
-        metrics.title_color,
+        metrics.title_ink.colour(&p),
     );
 
     // Right: the three control zones (40px login, 42px vault). Glyphs are
@@ -1129,7 +1154,7 @@ pub fn draw_window_chrome_with_extra(
         )
     };
     let controls_left = control(2).min.x;
-    let glyph_stroke = Stroke::new(1.2, theme::TEXT_FAINT);
+    let glyph_stroke = Stroke::new(1.2, p.text_icon);
 
     // Between the title and the control zones: `extra_content`'s reserved
     // area, right-to-left so it packs against the controls rather than
@@ -1174,7 +1199,7 @@ pub fn draw_window_chrome_with_extra(
                 ui.painter().rect_filled(
                     close_rect,
                     CornerRadius { nw: 0, ne: radius.saturating_sub(1), sw: 0, se: 0 },
-                    theme::CANVAS,
+                    p.hover,
                 );
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -1183,7 +1208,7 @@ pub fn draw_window_chrome_with_extra(
             }
             glyph_stroke
         }
-        CloseControl::Disabled => Stroke::new(1.2, theme::TEXT_GHOST),
+        CloseControl::Disabled => Stroke::new(1.2, p.text_ghost),
     };
     let c = close_rect.center();
     ui.painter().line_segment(
@@ -1210,7 +1235,7 @@ pub fn draw_window_chrome_with_extra(
         let maximize = ui.interact(max_rect, ui.id().with("chrome-max"), Sense::click());
         if maximize.hovered() {
             ui.painter()
-                .rect_filled(max_rect, CornerRadius::ZERO, theme::CANVAS);
+                .rect_filled(max_rect, CornerRadius::ZERO, p.hover);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         ui.painter().rect_stroke(
@@ -1229,7 +1254,7 @@ pub fn draw_window_chrome_with_extra(
         ui.painter().rect_stroke(
             egui::Rect::from_center_size(max_rect.center(), egui::Vec2::splat(9.0)),
             CornerRadius::ZERO,
-            Stroke::new(1.2, theme::TEXT_GHOST),
+            Stroke::new(1.2, p.text_ghost),
             egui::StrokeKind::Middle,
         );
     }
@@ -1239,7 +1264,7 @@ pub fn draw_window_chrome_with_extra(
     let minimize = ui.interact(min_rect, ui.id().with("chrome-min"), Sense::click());
     if minimize.hovered() {
         ui.painter()
-            .rect_filled(min_rect, CornerRadius::ZERO, theme::CANVAS);
+            .rect_filled(min_rect, CornerRadius::ZERO, p.hover);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let m = min_rect.center();
@@ -4838,8 +4863,8 @@ mod close_control_tests {
             "control: no ✕ glyph was painted at all, so its colour proves nothing"
         );
         assert!(
-            ghosted.iter().all(|color| *color == theme::TEXT_GHOST),
-            "the disabled ✕ is painted in {ghosted:?} rather than `theme::TEXT_GHOST` -- it \
+            ghosted.iter().all(|color| *color == crate::kit::tokens::Palette::LIGHT.text_ghost),
+            "the disabled ✕ is painted in {ghosted:?} rather than the palette's `text_ghost` -- it \
              looks exactly like a working close button and does nothing"
         );
 
@@ -4847,9 +4872,9 @@ mod close_control_tests {
         // about `CloseControl` rather than about a ✕ that is always grey.
         let live = diagonal_colors(&painted(CloseControl::Active));
         assert!(
-            live.iter().all(|color| *color == theme::TEXT_FAINT),
+            live.iter().all(|color| *color == crate::kit::tokens::Palette::LIGHT.text_icon),
             "control: the live ✕ is painted in {live:?}, not the chrome's usual \
-             `theme::TEXT_FAINT`"
+             `text_icon`"
         );
 
         // And the disabling is aimed at the ✕ alone: minimising a window whose
@@ -4857,7 +4882,7 @@ mod close_control_tests {
         for close in [CloseControl::Active, CloseControl::Disabled] {
             let flat = horizontal_colors(&painted(close));
             assert!(
-                flat.contains(&theme::TEXT_FAINT),
+                flat.contains(&crate::kit::tokens::Palette::LIGHT.text_icon),
                 "{close:?} ghosted the — control as well: {flat:?}"
             );
         }

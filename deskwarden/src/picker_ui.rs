@@ -1,23 +1,23 @@
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::bw_serve::{readiness_schedule, wait_for_vault_ready, BACKEND_OP_TIMEOUT};
 use crate::icon;
+use crate::kit::controls::{self, ButtonKind};
+use crate::kit::{avatar, input, tokens};
 use crate::loading_ui;
 use crate::theme;
 use crate::vault_bridge::{ItemKind, VaultError, VaultItem};
 use crate::vault_cache::{AppMatchWrite, PopulateOutcome, VaultCache, VaultEra, VaultUnavailable};
 use crate::window_list::{self, WindowInfo};
 use crate::window_watch;
-use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
+use eframe::egui::{self, CornerRadius, Margin, Sense, Stroke};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
-use windows::core::HSTRING;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, SystemParametersInfoW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPI_GETWORKAREA,
+    SystemParametersInfoW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPI_GETWORKAREA,
 };
 
 /// The position for a picker window's top-left corner that centers it on the
@@ -88,9 +88,64 @@ pub fn name_matches_filter(name: &str, filter_lower: &str) -> bool {
     name.to_lowercase().contains(filter_lower)
 }
 
-/// A design-2a list row: icon (or, absent one, an initials avatar), primary
-/// line, muted secondary line, blue-washed when selected. Returns true when
-/// clicked.
+/// Named rather than inlined at the `run_ui_native` calls, because
+/// `foreground::raise_window` finds each window BY its title -- one
+/// declaration apiece means the two cannot drift apart.
+const PICK_ITEM_TITLE: &str = "Choose a vault item";
+const ADD_APP_TITLE: &str = "Add app to Deskwarden";
+
+/// The windows' inner sizes: the item picker, the app picker, and the empty /
+/// error state either of them can open as.
+const ITEM_WINDOW: [f32; 2] = [480.0, 620.0];
+const APP_WINDOW: [f32; 2] = [480.0, 680.0];
+const NOTICE_WINDOW: [f32; 2] = [480.0, 400.0];
+
+// ---------------------------------------------------------------------------
+// THE v2 BODIES
+//
+// Both pickers, and the empty/error states that used to be message boxes, are
+// drawn here as plain functions of their state, so `examples/ui_preview.rs`
+// can render every one of them and the windows below only wire the results to
+// the vault. The look is the command palette's (spec B 4) on the list pane's
+// rows (spec A 3.1): a white card holding a title, a search field and a list on
+// the list ground, with the answers underneath on the window ground.
+//
+// The windows keep the OS's own frame -- `window_host` records why: they have
+// nothing to round -- so this draws the BODY only.
+// ---------------------------------------------------------------------------
+
+/// One row: a 40 tile and two lines.
+const ROW_H: f32 = 60.0;
+/// The gap between rows.
+const ROW_GAP: f32 = 2.0;
+/// The tile's side and radius (spec A 3.1's 44/12, a size down for a window
+/// this small).
+const TILE: f32 = 40.0;
+const TILE_RADIUS: u8 = 12;
+/// The window's side margin, and what the footer keeps under the buttons.
+const SIDE: i8 = 20;
+
+/// The textures the app picker has already loaded for each exe's icon.
+pub type IconCache = HashMap<String, Option<egui::TextureHandle>>;
+
+/// `text` laid out on one line, ending in an ellipsis where it does not fit.
+fn one_line(
+    ui: &egui::Ui,
+    role: tokens::Role,
+    text: &str,
+    colour: egui::Color32,
+    width: f32,
+) -> Arc<egui::Galley> {
+    let mut job = tokens::job(role, text, colour);
+    job.wrap.max_width = width.max(1.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// A list row: the item's or window's tile, its name over a muted second line.
+/// Selected, it is white with the 2 pt blue ring; hovered, the palette's wash.
+/// Returns true when clicked.
 fn list_row(
     ui: &mut egui::Ui,
     primary: &str,
@@ -98,111 +153,552 @@ fn list_row(
     selected: bool,
     icon: Option<&egui::TextureHandle>,
 ) -> bool {
-    let frame = egui::Frame::new()
-        .fill(if selected {
-            theme::BLUE_WASH
-        } else {
-            theme::CARD
-        })
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                match icon {
-                    Some(tex) => {
-                        ui.add(
-                            egui::Image::new((tex.id(), tex.size_vec2()))
-                                .fit_to_exact_size(egui::Vec2::splat(28.0)),
-                        );
-                    }
-                    None => theme::avatar(ui, &theme::initials(primary), 28.0, selected),
-                }
-                ui.add_space(2.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(theme::semibold(primary, 13.0).color(if selected {
-                        theme::BLUE_DEEP
-                    } else {
-                        theme::INK
-                    }));
-                    if !secondary.is_empty() {
-                        ui.label(RichText::new(secondary).size(11.0).color(theme::TEXT_FAINT));
-                    }
-                });
-            });
-        });
-    let response = frame.response.interact(Sense::click());
+    let p = tokens::palette(ui.ctx());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
+    let radius = CornerRadius::same(14);
+    if selected {
+        ui.painter()
+            .rect(rect, radius, p.card, Stroke::new(2.0, p.blue), egui::StrokeKind::Inside);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, radius, p.blue_wash);
+    }
+    let tile = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 12.0, rect.center().y - TILE / 2.0),
+        egui::Vec2::splat(TILE),
+    );
+    let look = match icon {
+        Some(texture) => avatar::Look::Favicon(texture.clone()),
+        None => {
+            let (bg, fg) = avatar::initials_colours(primary);
+            avatar::Look::Initials { text: theme::initials(primary), bg, fg }
+        }
+    };
+    avatar::paint(ui.painter(), tile, &look, TILE_RADIUS);
+
+    let text_x = tile.right() + 14.0;
+    let width = rect.right() - 12.0 - text_x;
+    let title = one_line(ui, tokens::ROW_TITLE, primary, p.ink, width);
+    if secondary.is_empty() {
+        let at = egui::pos2(text_x, rect.center().y - title.size().y / 2.0);
+        ui.painter().galley(at, title, p.ink);
+    } else {
+        let sub = one_line(ui, tokens::SUBTITLE, secondary, p.text_faint, width);
+        let gap = 3.0;
+        let top = rect.center().y - (title.size().y + gap + sub.size().y) / 2.0;
+        let sub_at = egui::pos2(text_x, top + title.size().y + gap);
+        ui.painter().galley(egui::pos2(text_x, top), title, p.ink);
+        ui.painter().galley(sub_at, sub, p.text_faint);
+    }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response.clicked()
 }
 
-/// The window's title block: a small heading with a muted one-line
-/// explanation underneath, matching the design's card headers.
-fn title_block(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(theme::bold(title, 16.0).color(theme::INK));
-    ui.label(RichText::new(subtitle).size(12.0).color(theme::TEXT_FAINT));
+/// A 1 pt rule across the card.
+fn card_rule(ui: &mut egui::Ui, colour: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, colour);
 }
 
-/// A full-width search field with the design's placeholder treatment.
-fn search_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {
-    // Text width, not box width: the margin sits outside `desired_width`,
-    // so f32::INFINITY would overflow the parent by the margin (see
-    // theme::text_field).
-    let width = (ui.available_width() - 20.0).max(40.0);
-    ui.add(
-        egui::TextEdit::singleline(filter)
-            .hint_text(RichText::new(hint).color(theme::TEXT_GHOST))
-            .desired_width(width)
-            .margin(Margin::symmetric(10, 8)),
-    );
+/// What the picker card says: the small label over its title, the line under
+/// that, and the search field's placeholder.
+struct CardText<'a> {
+    kicker: &'a str,
+    title: &'a str,
+    subtitle: &'a str,
+    hint: &'a str,
 }
 
-/// Estimated height (content + the 2px inter-row gap) of one [`list_row`].
-/// Only needs to be close, not exact -- it drives [`egui::ScrollArea::show_rows`]'s
-/// scroll-geometry estimate, not the rows' actual layout.
-const LIST_ROW_HEIGHT: f32 = 48.0;
-
-/// Named rather than inlined at the `run_ui_native` calls, because
-/// `foreground::raise_window` finds each window BY its title -- one
-/// declaration apiece means the two cannot drift apart.
-const PICK_ITEM_TITLE: &str = "Choose a vault item";
-const ADD_APP_TITLE: &str = "Add app to Deskwarden";
-
-/// The white, hairline-bordered card that scrollable lists live in, showing
-/// only the rows within the visible scroll range rather than laying out
-/// and painting `row_count` rows on every repaint.
-///
-/// egui repaints on every keystroke *and* every mouse move over the window
-/// (hover detection), so an unvirtualized list re-lays-out and re-paints
-/// every one of its rows that often. That's fine for a few dozen rows; for a
-/// vault with thousands of items it was the actual cause of the picker
-/// feeling laggy while typing or moving the mouse over the list.
-fn list_card(
+/// The card both pickers share: `title` over `subtitle`, the search field, and
+/// a list of `row_count` rows drawn through `add_row` -- only the rows in view,
+/// so a vault in the thousands is not laid out on every keystroke. Fills the
+/// room it is given.
+fn picker_card(
     ui: &mut egui::Ui,
-    height: f32,
+    text: CardText<'_>,
+    filter: &mut String,
     row_count: usize,
     mut add_row: impl FnMut(&mut egui::Ui, usize),
 ) {
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::BORDER))
-        .inner_margin(Margin::same(6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            egui::ScrollArea::vertical()
-                .max_height(height)
-                .auto_shrink([false, false])
-                .show_rows(ui, LIST_ROW_HEIGHT, row_count, |ui, row_range| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for row in row_range {
-                        add_row(ui, row);
+    let p = tokens::palette(ui.ctx());
+    let fill_height = ui.available_height();
+    tokens::card_frame(&p, tokens::R_CARD).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_height((fill_height - 2.0).max(0.0));
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+
+        egui::Frame::new()
+            .inner_margin(Margin { left: 24, right: 24, top: 22, bottom: 16 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(tokens::job(tokens::SECTION, text.kicker, p.text_ghost));
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(tokens::job(tokens::WORDMARK, text.title, p.ink)).wrap());
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(tokens::job(tokens::SUBTITLE, text.subtitle, p.text_faint)).wrap());
+            });
+        egui::Frame::new()
+            .inner_margin(Margin { left: 20, right: 20, top: 0, bottom: 16 })
+            .show(ui, |ui| {
+                let width = ui.available_width();
+                input::text(ui, egui::Id::new("picker-search"), filter, text.hint, false, width);
+            });
+        card_rule(ui, p.hairline);
+
+        let list_height = ui.available_height();
+        egui::Frame::new()
+            .fill(p.list_bg)
+            .corner_radius(CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: tokens::R_CARD.saturating_sub(1),
+                se: tokens::R_CARD.saturating_sub(1),
+            })
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_height((list_height - 16.0).max(0.0));
+                if row_count == 0 {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(tokens::job(
+                            tokens::Role { size: 17.0, face: theme::BOLD, tracking_em: 0.0 },
+                            crate::i18n::t("list.nothing_matches"),
+                            p.ink,
+                        ));
+                        ui.add_space(8.0);
+                        ui.label(tokens::job(
+                            tokens::BODY,
+                            crate::i18n::t("list.nothing_matches_detail"),
+                            p.text_faint,
+                        ));
+                    });
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, ROW_H, row_count, |ui, row_range| {
+                        ui.spacing_mut().item_spacing.y = ROW_GAP;
+                        for row in row_range {
+                            add_row(ui, row);
+                        }
+                    });
+            });
+    });
+}
+
+/// The window's two panels: `footer` pinned under the card on the window
+/// ground, `body` filling the rest.
+fn picker_panels(
+    ui: &mut egui::Ui,
+    footer: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let p = tokens::palette(ui.ctx());
+    egui::Panel::bottom("picker-footer")
+        .show_separator_line(false)
+        .resizable(false)
+        .frame(
+            egui::Frame::new()
+                .fill(p.window_bg)
+                .inner_margin(Margin { left: SIDE, right: SIDE, top: 14, bottom: SIDE }),
+        )
+        .show(ui, footer);
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(p.window_bg)
+                .inner_margin(Margin { left: SIDE, right: SIDE, top: SIDE, bottom: 0 }),
+        )
+        .show(ui, body);
+}
+
+/// A line of small print under the card.
+fn footer_line(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
+    ui.add(egui::Label::new(tokens::job(tokens::SUBTITLE, text, colour)).wrap());
+    ui.add_space(8.0);
+}
+
+/// What the vault-item picker asked for this frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ItemPickerEvents {
+    /// Next was pressed: the selected item is the answer.
+    pub next: bool,
+    /// Cancel was pressed.
+    pub cancel: bool,
+}
+
+/// **The vault-item picker's body** ("Which vault item should this app fill
+/// from?"): the logins whose names contain `filter`, one selectable, and the
+/// Next and Cancel answers. Next is unclickable until an item is selected --
+/// see [`can_pick_next`].
+pub fn draw_item_picker(
+    ui: &mut egui::Ui,
+    items: &[VaultItem],
+    filter: &mut String,
+    selected_id: &mut Option<String>,
+) -> ItemPickerEvents {
+    let mut events = ItemPickerEvents::default();
+    let can_next = can_pick_next(selected_id);
+    picker_panels(
+        ui,
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                // Review 11's Minor: unclickable with nothing selected, rather
+                // than a silent no-op -- the same "enabled with nothing to do"
+                // shape `run_picker`'s own Save gate (`can_save_app_match`)
+                // exists to avoid, one window earlier in the same "Add app..."
+                // flow.
+                events.next = ui
+                    .add_enabled_ui(can_next, |ui| {
+                        controls::button(
+                            ui,
+                            ButtonKind::Primary,
+                            controls::LARGE,
+                            crate::i18n::t("picker_ui.next"),
+                            None,
+                        )
+                    })
+                    .inner
+                    .clicked();
+                events.cancel = controls::button(
+                    ui,
+                    ButtonKind::Outline,
+                    controls::LARGE,
+                    crate::i18n::t("picker_ui.cancel"),
+                    None,
+                )
+                .clicked();
+            });
+        },
+        |ui| {
+            // Filter lowered once per frame, not once per item inside
+            // item_matches_filter (see its doc comment) -- this scan is still
+            // O(items), but a cheap one now.
+            let filter_lower = filter.to_lowercase();
+            let filtered: Vec<usize> = (0..items.len())
+                .filter(|&i| item_matches_filter(&items[i], &filter_lower))
+                .collect();
+            picker_card(
+                ui,
+                CardText {
+                    kicker: crate::i18n::t("picker_ui.add_app"),
+                    title: crate::i18n::t("picker_ui.which_item"),
+                    subtitle: crate::i18n::t("picker_ui.create_item"),
+                    hint: crate::i18n::t("picker_ui.search_vault"),
+                },
+                filter,
+                filtered.len(),
+                |ui, row| {
+                    let item = &items[filtered[row]];
+                    let selected = selected_id.as_deref() == Some(item.id.as_str());
+                    let username = item
+                        .login
+                        .as_ref()
+                        .and_then(|l| l.username.clone())
+                        .unwrap_or_default();
+                    if list_row(ui, &item.name, &username, selected, None) {
+                        *selected_id = Some(item.id.clone());
                     }
+                },
+            );
+        },
+    );
+    events
+}
+
+/// Why the picker has no list to show. These were four message boxes; they are
+/// this window's own state now, with the same words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerNotice {
+    /// The vault has no items at all.
+    EmptyVault,
+    /// It has items but none are logins.
+    NoLogins,
+    /// The backend did not answer; carries the reason it gave.
+    Unreachable(String),
+    /// The vault locked while the list was loading.
+    Locked,
+}
+
+impl PickerNotice {
+    fn title(&self) -> &'static str {
+        match self {
+            PickerNotice::EmptyVault => crate::i18n::t("picker_ui.empty_vault_title"),
+            PickerNotice::NoLogins => crate::i18n::t("picker_ui.no_logins_title"),
+            PickerNotice::Unreachable(_) => crate::i18n::t("picker_ui.unreachable_title"),
+            PickerNotice::Locked => crate::i18n::t("picker_ui.locked_title"),
+        }
+    }
+
+    fn body(&self) -> String {
+        match self {
+            PickerNotice::EmptyVault => crate::i18n::t("picker_ui.empty_vault_body").to_string(),
+            PickerNotice::NoLogins => crate::i18n::t("picker_ui.no_logins_body").to_string(),
+            PickerNotice::Unreachable(reason) => {
+                crate::i18n::tf("picker_ui.unreachable_body", &[("reason", reason)])
+            }
+            PickerNotice::Locked => crate::i18n::t("picker_ui.locked_body").to_string(),
+        }
+    }
+}
+
+/// **The picker's empty and error states**: a caution tile, the title, the
+/// explanation and a Close button. Returns true when Close was pressed.
+pub fn draw_picker_notice(ui: &mut egui::Ui, notice: &PickerNotice) -> bool {
+    let p = tokens::palette(ui.ctx());
+    let mut close = false;
+    picker_panels(
+        ui,
+        |ui| {
+            close = controls::button(
+                ui,
+                ButtonKind::Primary,
+                controls::LARGE,
+                crate::i18n::t("picker_ui.close"),
+                None,
+            )
+            .clicked();
+        },
+        |ui| {
+            let fill_height = ui.available_height();
+            tokens::card_frame(&p, tokens::R_CARD)
+                .inner_margin(Margin::same(28))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_height((fill_height - 58.0).max(0.0));
+                    let (tile, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(52.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(tile, CornerRadius::same(16), p.caution_wash);
+                    crate::kit::icon::stroke(
+                        ui.painter(),
+                        tile.shrink(14.0),
+                        crate::kit::modal::WARNING_GLYPH,
+                        2.0,
+                        p.caution_mark,
+                    );
+                    ui.add_space(18.0);
+                    ui.add(
+                        egui::Label::new(tokens::job(tokens::LIST_HEADER, notice.title(), p.ink))
+                            .wrap(),
+                    );
+                    ui.add_space(10.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(tokens::job(tokens::BODY, &notice.body(), p.text_faint))
+                                .wrap(),
+                        );
+                    });
                 });
-        });
+        },
+    );
+    close
+}
+
+/// What the app picker has to show besides its list, and what gates Save.
+pub struct AppPickerView<'a> {
+    /// The vault item the process is being matched to.
+    pub target_name: &'a str,
+    /// The open windows offered.
+    pub windows: &'a [WindowInfo],
+    /// Whether `bw serve` can be written to yet.
+    pub backend: &'a BackendReadiness,
+    /// A bad match the item already carries, naming its process.
+    pub existing_host_match: Option<&'a str>,
+    /// The last save's failure, if it failed.
+    pub save_error: Option<&'a str>,
+    /// The note a save that landed only on the server leaves.
+    pub save_notice: Option<&'a str>,
+    /// Whether a save has already landed in this window.
+    pub already_saved: bool,
+}
+
+/// What the app picker asked for this frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AppPickerEvents {
+    /// A different row was chosen.
+    pub selection_changed: bool,
+    /// Save was pressed.
+    pub save: bool,
+    /// Retry was pressed under an unanswered backend.
+    pub retry: bool,
+    /// Cancel (or, after a save, Close) was pressed.
+    pub dismiss: bool,
+}
+
+/// **The "Add app to Deskwarden" body**: the open windows, one selectable, the
+/// backend's state, the reasons Save may be refused, and Save / Cancel.
+pub fn draw_app_picker(
+    ui: &mut egui::Ui,
+    view: &AppPickerView<'_>,
+    filter: &mut String,
+    selected_hwnd: &mut Option<isize>,
+    icons: &mut IconCache,
+) -> AppPickerEvents {
+    let p = tokens::palette(ui.ctx());
+    let mut events = AppPickerEvents::default();
+    let mut selection_changed = false;
+    // The selection is carried as a window handle, but every gate below is about
+    // the process NAME (see `can_save_app_match`), so it is resolved once, here,
+    // through the same `selected_window` the save itself uses, so the row this
+    // answers for and the row that gets written can never be two different rows.
+    let selected_process = selected_window(view.windows, *selected_hwnd).map(|w| w.exe_name.as_str());
+    picker_panels(
+        ui,
+        |ui| {
+            // Exhaustively matched (no catch-all), same discipline as
+            // `TotpState`'s render: `Ready` needs no caption of its own (the
+            // button's enabled state already says everything), so that arm is
+            // deliberately empty rather than missing.
+            match view.backend {
+                BackendReadiness::Preparing => {
+                    footer_line(ui, crate::i18n::t("picker_ui.preparing_backend"), p.text_faint);
+                    crate::kit::auth::progress(ui, 160.0, false);
+                    ui.add_space(12.0);
+                }
+                BackendReadiness::Unavailable(reason) => {
+                    // Review 11's Minor: the old wording pointed at "Sync from
+                    // the tray menu", which this very flow has disabled (see
+                    // `main`'s `tray.add_app_id` handler) and which the user
+                    // couldn't reach anyway -- this window blocks the main loop
+                    // like every other blocking window in this app. "Retry"
+                    // below is the actual way forward.
+                    crate::kit::modal::note(
+                        ui,
+                        crate::kit::modal::Tone::Danger,
+                        &format!(
+                            "Deskwarden\u{2019}s Bitwarden backend hasn\u{2019}t answered yet, \
+                             so Save is unavailable right now. It may still be starting up \
+                             \u{2014} click Retry to keep waiting, or Cancel and use \u{201c}Add \
+                             app\u{2026}\u{201d} again in a moment.\n\n{reason}"
+                        ),
+                    );
+                    ui.add_space(8.0);
+                    if controls::row_button(ui, crate::i18n::t("picker_ui.retry")).clicked() {
+                        events.retry = true;
+                    }
+                    ui.add_space(12.0);
+                }
+                BackendReadiness::Ready => {}
+            }
+
+            // The refusal, said out loud. `can_save_app_match` disables Save for
+            // a host process; without this the button would simply be grey for
+            // no stated reason, which is the "silent no-op" shape reviews 10 and
+            // 11 both removed from this window.
+            if let Some(refusal) = selected_process.and_then(host_process_refusal) {
+                footer_line(ui, &refusal, p.error);
+            }
+            // The item's PRE-EXISTING bad match, if it has one. Shown until
+            // something else is saved over it -- it is not about this window's
+            // own attempt, so it is not cleared by a selection or an error like
+            // `save_error` is.
+            if let Some(process) = view.existing_host_match {
+                footer_line(ui, &existing_host_match_notice(view.target_name, process), p.text_faint);
+            }
+            if let Some(error) = view.save_error {
+                footer_line(ui, error, p.error);
+            }
+            // Same slot, same idiom, deliberately NOT the error colour: the
+            // save worked, and colouring it as a failure would send the user to
+            // re-do something that is already in their vault.
+            if let Some(notice) = view.save_notice {
+                footer_line(ui, notice, p.text_faint);
+            }
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                // Item 1 (review 10's Important 1) and item 3 (Important 2/3)
+                // both collapse into this one gate: unclickable with nothing
+                // selected, and unclickable until the backend is confirmed to
+                // actually be answering -- never both true is what let either
+                // bug happen before.
+                let can_save =
+                    can_save_app_match_now(selected_process, view.backend, view.already_saved);
+                events.save = ui
+                    .add_enabled_ui(can_save, |ui| {
+                        controls::button(
+                            ui,
+                            ButtonKind::Primary,
+                            controls::LARGE,
+                            crate::i18n::t("picker_ui.save"),
+                            None,
+                        )
+                    })
+                    .inner
+                    .clicked();
+                // "Close", not "Cancel", once a save has landed: the window's
+                // result is already set, so this button no longer cancels
+                // anything and labelling it as though it did would suggest
+                // clicking it undoes the save.
+                let dismiss = if view.save_notice.is_some() {
+                    crate::i18n::t("picker_ui.close")
+                } else {
+                    crate::i18n::t("picker_ui.cancel")
+                };
+                events.dismiss =
+                    controls::button(ui, ButtonKind::Outline, controls::LARGE, dismiss, None)
+                        .clicked();
+            });
+        },
+        |ui| {
+            let filter_lower = filter.to_lowercase();
+            let filtered: Vec<usize> = (0..view.windows.len())
+                .filter(|&i| {
+                    let w = &view.windows[i];
+                    w.title.to_lowercase().contains(&filter_lower)
+                        || w.exe_name.to_lowercase().contains(&filter_lower)
+                })
+                .collect();
+            picker_card(
+                ui,
+                CardText {
+                    kicker: crate::i18n::t("picker_ui.add_app"),
+                    title: &crate::i18n::tf("picker_ui.match_process", &[("name", view.target_name)]),
+                    subtitle: crate::i18n::t("picker_ui.process_sub"),
+                    hint: crate::i18n::t("picker_ui.search_windows"),
+                },
+                filter,
+                filtered.len(),
+                |ui, row| {
+                    let w = &view.windows[filtered[row]];
+                    let selected = *selected_hwnd == Some(w.hwnd);
+                    let secondary = format!("({} \u{b7} {})", w.exe_name, w.pid);
+                    let texture = icons
+                        .entry(w.exe_path.clone())
+                        .or_insert_with(|| {
+                            icon::extract_small_icon(&w.exe_path).map(|rgba| {
+                                let image = egui::ColorImage::from_rgba_unmultiplied(
+                                    [rgba.width as usize, rgba.height as usize],
+                                    &rgba.rgba,
+                                );
+                                ui.ctx().load_texture(
+                                    w.exe_path.clone(),
+                                    image,
+                                    egui::TextureOptions::default(),
+                                )
+                            })
+                        })
+                        .as_ref();
+                    if list_row(ui, &w.title, &secondary, selected, texture) {
+                        *selected_hwnd = Some(w.hwnd);
+                        selection_changed = true;
+                    }
+                },
+            );
+        },
+    );
+    events.selection_changed = selection_changed;
+    if selection_changed {
+        // The gates above read the selection before the row that changed it was
+        // drawn; one more frame settles them.
+        ui.ctx().request_repaint();
+    }
+    events
 }
 
 /// The outcome of loading the picker's item list, kept as three distinct
@@ -250,7 +746,7 @@ enum PickerItemsResult {
     /// their whole duration, so no `clear` can interleave with the picker's
     /// worker at all. Even if a leftover detached worker from an abandoned
     /// picker did produce this, its `rx` is already dropped, so the value
-    /// never reaches the `MessageBoxW` in `pick_vault_item`. The typing is
+    /// never reaches the notice `pick_vault_item` opens. The typing is
     /// still the right call: the planned encrypted disk cache adds exactly
     /// the background-thread callers that make this reachable, and a future
     /// session should not credit it as verified-live before then.
@@ -519,69 +1015,35 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
         return None;
     };
 
-    let items = match result {
-        PickerItemsResult::Items(items) => items,
+    // What the window shows: the list, or, where there is no list, why not.
+    // The four "why not" cases were `MessageBoxW`s; they are this window's own
+    // state now ([`PickerNotice`]), in the same words.
+    enum Content {
+        Items(Vec<VaultItem>),
+        Notice(PickerNotice),
+    }
+    let content = match result {
+        PickerItemsResult::Items(items) => Content::Items(items),
         PickerItemsResult::EmptyVault => {
             log::warn!("vault has no items to attach an app match to");
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &HSTRING::from(
-                        crate::i18n::t("picker_ui.empty_vault_body"),
-                    ),
-                    &HSTRING::from(crate::i18n::t("picker_ui.empty_vault_title")),
-                    MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
-                );
-            }
-            return None;
+            Content::Notice(PickerNotice::EmptyVault)
         }
         // Deliberately NOT folded into `EmptyVault` above -- see `NoLogins`'s
         // own doc. This user's vault is full; it just has nothing that can
         // usefully fill an application, and the message says which.
         PickerItemsResult::NoLogins => {
             log::warn!("vault has items but no logins to attach an app match to");
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &HSTRING::from(
-                        crate::i18n::t("picker_ui.no_logins_body"),
-                    ),
-                    &HSTRING::from(crate::i18n::t("picker_ui.no_logins_title")),
-                    MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
-                );
-            }
-            return None;
+            Content::Notice(PickerNotice::NoLogins)
         }
         PickerItemsResult::BackendUnreachable(reason) => {
             log::warn!("could not load vault items for the picker: {reason}");
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &HSTRING::from(crate::i18n::tf(
-                        "picker_ui.unreachable_body",
-                        &[("reason", &reason)],
-                    )),
-                    &HSTRING::from(crate::i18n::t("picker_ui.unreachable_title")),
-                    MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
-                );
-            }
-            return None;
+            Content::Notice(PickerNotice::Unreachable(reason))
         }
         // Unreachable as the app is wired today -- see `VaultLocked`'s own
         // doc for why, and for why the arm exists anyway.
         PickerItemsResult::VaultLocked => {
             log::warn!("the vault locked while loading items for the picker");
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &HSTRING::from(
-                        crate::i18n::t("picker_ui.locked_body"),
-                    ),
-                    &HSTRING::from(crate::i18n::t("picker_ui.locked_title")),
-                    MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
-                );
-            }
-            return None;
+            Content::Notice(PickerNotice::Locked)
         }
     };
 
@@ -596,10 +1058,14 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
     let mut styled = false;
     let mut window_reveal = crate::window_host::Reveal::hidden();
 
+    let size = match &content {
+        Content::Items(_) => ITEM_WINDOW,
+        Content::Notice(_) => NOTICE_WINDOW,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([440.0, 540.0])
-            .with_position(centered_position(440.0, 540.0))
+            .with_inner_size(size)
+            .with_position(centered_position(size[0], size[1]))
             // **Created hidden, shown once it has drawn a list.** Between
             // creating a window and egui's first frame Windows shows the
             // window's own background, which is the white box the user reported
@@ -621,7 +1087,11 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
-            theme::paint_window_background(ui);
+            ui.painter().rect_filled(
+                ui.max_rect(),
+                CornerRadius::ZERO,
+                tokens::palette(ui.ctx()).window_bg,
+            );
             theme::apply(ui.ctx());
             styled = true;
             ui.ctx().request_repaint();
@@ -638,85 +1108,32 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             crate::foreground::raise_window(PICK_ITEM_TITLE);
         }
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(20, 18)),
-            )
-            .show(ui, |ui| {
-                let mut done = false;
-
-                theme::card_header(ui, crate::i18n::t("picker_ui.add_app"));
-                ui.add_space(10.0);
-                title_block(
-                    ui,
-                    crate::i18n::t("picker_ui.which_item"),
-                    crate::i18n::t("picker_ui.create_item"),
-                );
-                ui.add_space(8.0);
-                search_field(ui, &mut filter, crate::i18n::t("picker_ui.search_vault"));
-                ui.add_space(8.0);
-
-                // Filter lowered once per frame, not once per item inside
-                // item_matches_filter (see its doc comment) -- this scan is
-                // still O(items), but a cheap one now.
-                let filter_lower = filter.to_lowercase();
-                let filtered: Vec<usize> = (0..items.len())
-                    .filter(|&i| item_matches_filter(&items[i], &filter_lower))
-                    .collect();
-
-                // Clamped: the subtrahend is the space reserved for the
-                // buttons below, and a window resized smaller than that would
-                // otherwise ask for a negative scroll-area height.
-                list_card(
-                    ui,
-                    (ui.available_height() - 56.0).max(0.0),
-                    filtered.len(),
-                    |ui, row| {
-                        let item = &items[filtered[row]];
-                        let selected = selected_id.as_deref() == Some(item.id.as_str());
-                        let username = item
-                            .login
-                            .as_ref()
-                            .and_then(|l| l.username.clone())
-                            .unwrap_or_default();
-                        if list_row(ui, &item.name, &username, selected, None) {
-                            selected_id = Some(item.id.clone());
-                        }
-                    },
-                );
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    // Review 11's Minor: unclickable with nothing selected,
-                    // rather than a silent no-op -- the same "enabled with
-                    // nothing to do" shape `run_picker`'s own Save gate
-                    // (`can_save_app_match`) exists to avoid, one window
-                    // earlier in the same "Add app..." flow.
-                    let next_clicked = ui
-                        .add_enabled_ui(can_pick_next(&selected_id), |ui| {
-                            theme::primary_button(ui, crate::i18n::t("picker_ui.next"), None)
-                        })
-                        .inner
-                        .clicked();
-                    if next_clicked {
-                        if let Some(id) = &selected_id {
-                            if let Some(item) = items.iter().find(|i| &i.id == id) {
-                                *result_for_closure.borrow_mut() = Some(item.clone());
-                                done = true;
-                            }
+        let mut done = false;
+        match &content {
+            Content::Items(items) => {
+                let events = draw_item_picker(ui, items, &mut filter, &mut selected_id);
+                if events.next {
+                    if let Some(id) = &selected_id {
+                        if let Some(item) = items.iter().find(|i| &i.id == id) {
+                            *result_for_closure.borrow_mut() = Some(item.clone());
+                            done = true;
                         }
                     }
-                    if theme::secondary_button(ui, crate::i18n::t("picker_ui.cancel")).clicked() {
-                        done = true;
-                    }
-                });
-
-                if done {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-            });
+                if events.cancel {
+                    done = true;
+                }
+            }
+            Content::Notice(notice) => {
+                if draw_picker_notice(ui, notice) {
+                    done = true;
+                }
+            }
+        }
+
+        if done {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     });
 
     let chosen = result.borrow_mut().take();
@@ -750,7 +1167,7 @@ const RETAINED_TRIGGER: TriggerMode = TriggerMode::Prompt;
 /// (a Node cold start, routinely several seconds) has bound the port yet
 /// (review 10's Important 2).
 #[derive(Debug, Clone, PartialEq)]
-enum BackendReadiness {
+pub enum BackendReadiness {
     /// `bw serve` is being started (or was already up and is being
     /// confirmed) and hasn't yet answered a real vault query.
     Preparing,
@@ -1194,8 +1611,8 @@ pub fn run_picker(
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([440.0, 560.0])
-            .with_position(centered_position(440.0, 560.0))
+            .with_inner_size(APP_WINDOW)
+            .with_position(centered_position(APP_WINDOW[0], APP_WINDOW[1]))
             // Hidden until it has drawn something, for the reason the item
             // picker above gives -- and this window needs it more than that
             // one does: its first frame registers fonts and paints NOTHING at
@@ -1253,290 +1670,136 @@ pub fn run_picker(
             ui.ctx().request_repaint_after(Duration::from_millis(150));
         }
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(20, 18)),
-            )
-            .show(ui, |ui| {
-                let mut done = false;
-
-                theme::card_header(ui, crate::i18n::t("picker_ui.add_app"));
-                ui.add_space(10.0);
-                title_block(
-                    ui,
-                    &crate::i18n::tf("picker_ui.match_process", &[("name", &target_item.name)]),
-                    crate::i18n::t("picker_ui.process_sub"),
-                );
-                ui.add_space(8.0);
-                search_field(ui, &mut filter, crate::i18n::t("picker_ui.search_windows"));
-                ui.add_space(8.0);
-
-                // Matches against the window title (what's shown as the
-                // primary line) as well as the exe name, so searching either
-                // "epic" or "epicgameslauncher" finds the same row.
-                let filter_lower = filter.to_lowercase();
-                let filtered: Vec<usize> = (0..windows.len())
-                    .filter(|&i| {
-                        let w = &windows[i];
-                        w.title.to_lowercase().contains(&filter_lower)
-                            || w.exe_name.to_lowercase().contains(&filter_lower)
-                    })
-                    .collect();
-
-                list_card(
-                    ui,
-                    (ui.available_height() - 148.0).max(0.0),
-                    filtered.len(),
-                    |ui, row| {
-                        let w = &windows[filtered[row]];
-                        let selected = selected_hwnd == Some(w.hwnd);
-                        let secondary = format!("({} \u{b7} {})", w.exe_name, w.pid);
-                        let texture = icon_cache
-                            .entry(w.exe_path.clone())
-                            .or_insert_with(|| {
-                                icon::extract_small_icon(&w.exe_path).map(|rgba| {
-                                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                                        [rgba.width as usize, rgba.height as usize],
-                                        &rgba.rgba,
-                                    );
-                                    ui.ctx().load_texture(
-                                        w.exe_path.clone(),
-                                        image,
-                                        egui::TextureOptions::default(),
-                                    )
-                                })
-                            })
-                            .as_ref();
-                        if list_row(ui, &w.title, &secondary, selected, texture) {
-                            selected_hwnd = Some(w.hwnd);
-                            // Review 11's Minor: a previous attempt's failure
-                            // message otherwise persisted even after the
-                            // user picked a different process, reading like
-                            // it was still about *this* choice.
-                            save_error = None;
-                        }
-                    },
-                );
-
-                ui.add_space(10.0);
-                // Exhaustively matched (no catch-all), same discipline as
-                // `TotpState`'s render: `Ready` needs no caption of its own
-                // (the button's enabled state already says everything), so
-                // that arm is deliberately empty rather than missing.
-                match &backend_ready {
-                    BackendReadiness::Preparing => {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().size(12.0).color(theme::TEXT_FAINT));
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(crate::i18n::t("picker_ui.preparing_backend"))
-                                    .size(11.0)
-                                    .color(theme::TEXT_FAINT),
-                            );
+        let events = draw_app_picker(
+            ui,
+            &AppPickerView {
+                target_name: &target_item.name,
+                windows: &windows,
+                backend: &backend_ready,
+                existing_host_match: existing_host_match.as_deref(),
+                save_error: save_error.as_deref(),
+                save_notice: save_notice.as_deref(),
+                already_saved,
+            },
+            &mut filter,
+            &mut selected_hwnd,
+            &mut icon_cache,
+        );
+        let mut done = false;
+        if events.selection_changed {
+            // Review 11's Minor: a previous attempt's failure message otherwise
+            // persisted even after the user picked a different process, reading
+            // like it was still about *this* choice.
+            save_error = None;
+        }
+        if events.retry {
+            // Not terminal (review 11's Important 2): a save-memory start can
+            // still land after this probe's own deadline, so give the user a way
+            // to wait again rather than making this window permanently unusable
+            // until Cancel.
+            ready_rx = Some(spawn_readiness_probe(&cache));
+            backend_ready = BackendReadiness::Preparing;
+        }
+        if events.save {
+            // `can_save` already guarantees this, but matching
+            // defensively rather than `.unwrap()`ing costs nothing
+            // and means a future change to the gate can't turn
+            // this into a panic.
+            if let Some(w) = selected_window(&windows, selected_hwnd) {
+                let m = app_match_for(w);
+                match cache.set_app_match(&target_item, &m) {
+                    Ok(written) => {
+                        // Matched exhaustively rather than
+                        // ignored: review 26's Minor 2 is
+                        // that this used to be `Ok(())` for
+                        // BOTH of these, and the second one
+                        // means the match is saved in the
+                        // vault but absent from the snapshot
+                        // `main` immediately rebuilds the
+                        // engine from -- so the match the
+                        // user just spent two windows on
+                        // does nothing until the next full
+                        // sync. Save still SUCCEEDED (the
+                        // server has it), so this window
+                        // still closes with `Some(m)`:
+                        // returning `None` would tell `main`
+                        // the user cancelled, which is a
+                        // different and false statement. See
+                        // the ledger for the `main.rs` half
+                        // this cannot reach from here.
+                        // Set BEFORE the arms below, because
+                        // the `ServerOnly` arm deliberately
+                        // does not close the window: whatever
+                        // closes it afterwards (Cancel, the
+                        // title-bar X) must still hand this
+                        // match back, since the save really
+                        // did happen.
+                        *result_for_closure.borrow_mut() = Some(SavedAppMatch {
+                            app_match: m,
+                            write: written,
                         });
-                        ui.add_space(6.0);
-                    }
-                    BackendReadiness::Unavailable(reason) => {
-                        // Review 11's Minor: the old wording pointed at
-                        // "Sync from the tray menu", which this very flow
-                        // has disabled (see `main`'s `tray.add_app_id`
-                        // handler) and which the user couldn't reach anyway
-                        // -- this window blocks the main loop like every
-                        // other blocking window in this app. "Retry" below
-                        // is the actual way forward.
-                        ui.label(
-                            RichText::new(format!(
-                                "Deskwarden\u{2019}s Bitwarden backend hasn\u{2019}t answered yet, \
-                                 so Save is unavailable right now. It may still be starting up \
-                                 \u{2014} click Retry to keep waiting, or Cancel and use \u{201c}Add \
-                                 app\u{2026}\u{201d} again in a moment.\n\n{reason}"
-                            ))
-                            .size(11.0)
-                            .color(theme::ERROR),
-                        );
-                        ui.add_space(4.0);
-                        if theme::secondary_button(ui, crate::i18n::t("picker_ui.retry")).clicked() {
-                            // Not terminal (review 11's Important 2): a
-                            // save-memory start can still land after this
-                            // probe's own deadline, so give the user a way
-                            // to wait again rather than making this window
-                            // permanently unusable until Cancel.
-                            ready_rx = Some(spawn_readiness_probe(&cache));
-                            backend_ready = BackendReadiness::Preparing;
-                        }
-                        ui.add_space(6.0);
-                    }
-                    BackendReadiness::Ready => {}
-                }
-                // The selection is carried as a window handle, but every gate
-                // below is about the process NAME (see `can_save_app_match`),
-                // so it is resolved once, here, through the same list -- and
-                // through the same `selected_window` the save itself uses, so
-                // the row this answers for and the row that gets written can
-                // never be two different rows.
-                let selected_process =
-                    selected_window(&windows, selected_hwnd).map(|w| w.exe_name.as_str());
-
-                // The refusal, said out loud. `can_save_app_match` disables
-                // Save for a host process; without this the button would
-                // simply be grey for no stated reason, which is the "silent
-                // no-op" shape reviews 10 and 11 both removed from this
-                // window.
-                if let Some(refusal) = selected_process.and_then(host_process_refusal) {
-                    ui.label(RichText::new(refusal).size(11.0).color(theme::ERROR));
-                    ui.add_space(6.0);
-                }
-
-                // The item's PRE-EXISTING bad match, if it has one. Shown
-                // until something else is saved over it -- it is not about
-                // this window's own attempt, so it is not cleared by a
-                // selection or an error like `save_error` is.
-                if let Some(process) = &existing_host_match {
-                    ui.label(
-                        RichText::new(existing_host_match_notice(&target_item.name, process))
-                            .size(11.0)
-                            .color(theme::TEXT_FAINT),
-                    );
-                    ui.add_space(6.0);
-                }
-
-                if let Some(error) = &save_error {
-                    ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
-                    ui.add_space(6.0);
-                }
-                // Same slot, same idiom, deliberately NOT `theme::ERROR`: the
-                // save worked, and colouring it as a failure would send the
-                // user to re-do something that is already in their vault.
-                if let Some(notice) = &save_notice {
-                    ui.label(RichText::new(notice).size(11.0).color(theme::TEXT_FAINT));
-                    ui.add_space(6.0);
-                }
-
-                ui.horizontal(|ui| {
-                    // Item 1 (review 10's Important 1) and item 3 (Important
-                    // 2/3) both collapse into this one gate: unclickable
-                    // with nothing selected, and unclickable until the
-                    // backend is confirmed to actually be answering --
-                    // never both true is what let either bug happen before.
-                    let can_save =
-                        can_save_app_match_now(selected_process, &backend_ready, already_saved);
-                    let save_clicked = ui
-                        .add_enabled_ui(can_save, |ui| theme::primary_button(ui, crate::i18n::t("picker_ui.save"), None))
-                        .inner
-                        .clicked();
-                    if save_clicked {
-                        // `can_save` already guarantees this, but matching
-                        // defensively rather than `.unwrap()`ing costs nothing
-                        // and means a future change to the gate can't turn
-                        // this into a panic.
-                        if let Some(w) = selected_window(&windows, selected_hwnd) {
-                            let m = app_match_for(w);
-                            match cache.set_app_match(&target_item, &m) {
-                                Ok(written) => {
-                                    // Matched exhaustively rather than
-                                    // ignored: review 26's Minor 2 is
-                                    // that this used to be `Ok(())` for
-                                    // BOTH of these, and the second one
-                                    // means the match is saved in the
-                                    // vault but absent from the snapshot
-                                    // `main` immediately rebuilds the
-                                    // engine from -- so the match the
-                                    // user just spent two windows on
-                                    // does nothing until the next full
-                                    // sync. Save still SUCCEEDED (the
-                                    // server has it), so this window
-                                    // still closes with `Some(m)`:
-                                    // returning `None` would tell `main`
-                                    // the user cancelled, which is a
-                                    // different and false statement. See
-                                    // the ledger for the `main.rs` half
-                                    // this cannot reach from here.
-                                    // Set BEFORE the arms below, because
-                                    // the `ServerOnly` arm deliberately
-                                    // does not close the window: whatever
-                                    // closes it afterwards (Cancel, the
-                                    // title-bar X) must still hand this
-                                    // match back, since the save really
-                                    // did happen.
-                                    *result_for_closure.borrow_mut() = Some(SavedAppMatch {
-                                        app_match: m,
-                                        write: written,
-                                    });
-                                    match written {
-                                        AppMatchWrite::WroteThrough => {
-                                            already_saved = true;
-                                            done = true;
-                                        }
-                                        AppMatchWrite::ServerOnly => {
-                                            already_saved = true;
-                                            log::warn!(
-                                                "saved the app match for vault item {} to the \
-                                                 server, but the cache's snapshot does not \
-                                                 hold that item, so a match engine rebuilt \
-                                                 from the cache alone would NOT have it",
-                                                target_item.id
-                                            );
-                                            // Review 28's Important 2:
-                                            // this used to close exactly
-                                            // like a fully live save, so
-                                            // the ONE state where the
-                                            // user has to do something
-                                            // looked identical to the
-                                            // state where they do not.
-                                            // Staying open is what makes
-                                            // the notice visible at all;
-                                            // `can_save` above goes false
-                                            // the moment it is set, so
-                                            // Cancel (relabelled below)
-                                            // is the only way on.
-                                            save_error = None;
-                                            save_notice =
-                                                Some(server_only_notice(&target_item.name));
-                                        }
-                                    }
-                                }
-                                // Item 2 (review 10's Important 1): stay
-                                // open with the item and process choice
-                                // both still intact -- `selected_hwnd`,
-                                // `filter`, and `trigger` are untouched
-                                // above -- instead of discarding two
-                                // windows of user effort the way an
-                                // unconditional `done = true` used to.
-                                // `save_error` renders inline above; the
-                                // user retries by clicking Save again
-                                // (still enabled, since the backend
-                                // itself is fine -- this one write just
-                                // failed) or gives up via Cancel.
-                                Err(e) => {
-                                    log::error!(
-                                        "failed to save app match onto vault item {}: {e:?}",
-                                        target_item.id
-                                    );
-                                    save_error = Some(save_error_message(&e));
-                                }
+                        match written {
+                            AppMatchWrite::WroteThrough => {
+                                already_saved = true;
+                                done = true;
+                            }
+                            AppMatchWrite::ServerOnly => {
+                                already_saved = true;
+                                log::warn!(
+                                    "saved the app match for vault item {} to the \
+                                     server, but the cache's snapshot does not \
+                                     hold that item, so a match engine rebuilt \
+                                     from the cache alone would NOT have it",
+                                    target_item.id
+                                );
+                                // Review 28's Important 2:
+                                // this used to close exactly
+                                // like a fully live save, so
+                                // the ONE state where the
+                                // user has to do something
+                                // looked identical to the
+                                // state where they do not.
+                                // Staying open is what makes
+                                // the notice visible at all;
+                                // `can_save` above goes false
+                                // the moment it is set, so
+                                // Cancel (relabelled below)
+                                // is the only way on.
+                                save_error = None;
+                                save_notice =
+                                    Some(server_only_notice(&target_item.name));
                             }
                         }
                     }
-                    // "Close", not "Cancel", once a save has landed: the
-                    // window's result is already set, so this button no
-                    // longer cancels anything and labelling it as though it
-                    // did would suggest clicking it undoes the save.
-                    let dismiss = if save_notice.is_some() {
-                        crate::i18n::t("picker_ui.close")
-                    } else {
-                        crate::i18n::t("picker_ui.cancel")
-                    };
-                    if theme::secondary_button(ui, dismiss).clicked() {
-                        done = true;
+                    // Item 2 (review 10's Important 1): stay
+                    // open with the item and process choice
+                    // both still intact -- `selected_hwnd`,
+                    // `filter`, and `trigger` are untouched
+                    // above -- instead of discarding two
+                    // windows of user effort the way an
+                    // unconditional `done = true` used to.
+                    // `save_error` renders inline above; the
+                    // user retries by clicking Save again
+                    // (still enabled, since the backend
+                    // itself is fine -- this one write just
+                    // failed) or gives up via Cancel.
+                    Err(e) => {
+                        log::error!(
+                            "failed to save app match onto vault item {}: {e:?}",
+                            target_item.id
+                        );
+                        save_error = Some(save_error_message(&e));
                     }
-                });
-
-                if done {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-            });
+            }
+        }
+        if events.dismiss {
+            done = true;
+        }
+
+        if done {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     });
 
     let saved = result.borrow_mut().take();
