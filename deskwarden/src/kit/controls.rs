@@ -198,6 +198,86 @@ pub fn row_button_width(ui: &Ui, label: &str) -> f32 {
     button_width(ui.ctx(), ButtonKind::Outline, SMALL, label, false)
 }
 
+/// A text link: `size` pt semibold in the deep blue, the pointing hand under
+/// the cursor ("More options", the Send composer's quiet links).
+pub fn link(ui: &mut Ui, text: &str, size: f32) -> Response {
+    let p = palette(ui.ctx());
+    let role = Role { size, face: SEMIBOLD, tracking_em: 0.0 };
+    // Laid here, no-wrap, and handed over finished: a `Label` that lays its own
+    // text inside a `horizontal_wrapped` row takes the rest of the line as its
+    // box, and two links side by side would both answer a click on either.
+    let mut job = tokens::job(role, text, p.blue_deep);
+    job.wrap = egui::text::TextWrapping::no_max_width();
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let response = ui.add(egui::Label::new(galley).selectable(false).sense(Sense::click()));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The small caption chips of the key-sequence editor (`<`, `>`, `x`, and the
+/// palette's field and key names): the outline button one step under
+/// [`SMALL`].
+pub const CHIP: ButtonSize = ButtonSize { height: 30.0, pad_x: 10.0, radius: 9, font_px: 13.0 };
+
+/// An outline [`CHIP`] button.
+pub fn chip_button(ui: &mut Ui, label: &str) -> Response {
+    button(ui, ButtonKind::Outline, CHIP, label, None)
+}
+
+/// The height of [`dashed_button`] (spec B 1.4 F's "+ Add field").
+pub const DASHED_HEIGHT: f32 = 44.0;
+
+/// How wide [`dashed_button`] draws `label`.
+pub fn dashed_button_width(ctx: &egui::Context, label: &str) -> f32 {
+    let p = palette(ctx);
+    let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
+    let text = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, label, p.text_nav)).size().x);
+    text + 32.0
+}
+
+/// The "add one more" button (spec B 1.4 F): [`DASHED_HEIGHT`] high at radius
+/// 12 with a 1 pt dashed edge, 15/600 type; the edge and the type turn blue
+/// under the pointer.
+pub fn dashed_button(ui: &mut Ui, label: &str) -> Response {
+    let p = palette(ui.ctx());
+    let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
+    let width = dashed_button_width(ui.ctx(), label);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, DASHED_HEIGHT), Sense::click());
+    let hovered = response.hovered();
+    let ink = if hovered { p.blue } else { p.text_nav };
+    let edge = if hovered { p.blue } else { p.border.lerp_to_gamma(p.text_ghost, 0.5) };
+    let painter = ui.painter();
+    for shape in egui::Shape::dashed_line(&dash_path(rect.shrink(0.5), 12.0), Stroke::new(1.0, edge), 5.0, 4.0) {
+        painter.add(shape);
+    }
+    let galley = ui.fonts_mut(|f| f.layout_job(tokens::job(role, label, ink)));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, ink);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A rounded rectangle walked as a closed polyline, for the dashes.
+fn dash_path(rect: Rect, radius: f32) -> Vec<egui::Pos2> {
+    const STEPS: usize = 6;
+    let radius = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let corners = [
+        (egui::pos2(rect.left() + radius, rect.top() + radius), 2.0 * quarter),
+        (egui::pos2(rect.right() - radius, rect.top() + radius), 3.0 * quarter),
+        (egui::pos2(rect.right() - radius, rect.bottom() - radius), 0.0),
+        (egui::pos2(rect.left() + radius, rect.bottom() - radius), quarter),
+    ];
+    let mut path = Vec::with_capacity(4 * (STEPS + 1) + 1);
+    for (centre, from) in corners {
+        for step in 0..=STEPS {
+            let angle = from + quarter * step as f32 / STEPS as f32;
+            path.push(egui::pos2(centre.x + radius * angle.cos(), centre.y + radius * angle.sin()));
+        }
+    }
+    if let Some(&first) = path.first() {
+        path.push(first);
+    }
+    path
+}
+
 /// A button as wide as the room it is given, its label centred (the modals'
 /// `flex: 1` pairs: Back and Save code).
 pub fn button_filling(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str) -> Response {
@@ -421,5 +501,47 @@ mod tests {
         });
         assert_eq!(big.size(), Vec2::splat(42.0));
         assert_eq!(small.size(), Vec2::splat(38.0));
+    }
+
+    #[test]
+    fn a_dashed_button_is_forty_four_high_and_turns_blue_under_the_pointer() {
+        let ctx = crate::kit::testing::ctx();
+        let mut drawn = Rect::NOTHING;
+        let idle = frame(&ctx, 0.0, SCREEN, vec![], |ui| drawn = dashed_button(ui, "+ Add field").rect);
+        assert_eq!(drawn.height(), DASHED_HEIGHT);
+        assert_eq!(drawn.width(), dashed_button_width(&ctx, "+ Add field"));
+        assert_eq!(idle.text("+ Add field").unwrap().1, P.text_nav);
+        frame(&ctx, 0.1, SCREEN, crate::kit::testing::hover_at(drawn.center()), |ui| {
+            dashed_button(ui, "+ Add field");
+        });
+        let hover = frame(&ctx, 0.2, SCREEN, vec![], |ui| {
+            dashed_button(ui, "+ Add field");
+        })
+        .text("+ Add field")
+        .unwrap()
+        .1;
+        assert_eq!(hover, P.blue);
+    }
+
+    #[test]
+    fn a_chip_button_is_an_outline_button_thirty_high_and_answers_a_click() {
+        let ctx = crate::kit::testing::ctx();
+        let mut drawn = Rect::NOTHING;
+        frame(&ctx, 0.0, SCREEN, vec![], |ui| drawn = chip_button(ui, "<").rect);
+        assert_eq!(drawn.height(), CHIP.height);
+        let mut clicked = false;
+        frame(&ctx, 0.1, SCREEN, click_at(drawn.center()), |ui| clicked = chip_button(ui, "<").clicked());
+        assert!(clicked);
+    }
+
+    #[test]
+    fn a_link_is_deep_blue_text_that_answers_a_click() {
+        let ctx = crate::kit::testing::ctx();
+        let mut at = Rect::NOTHING;
+        let p = frame(&ctx, 0.0, SCREEN, vec![], |ui| at = link(ui, "More options", 14.0).rect);
+        assert_eq!(p.text("More options").unwrap().1, P.blue_deep);
+        let mut clicked = false;
+        frame(&ctx, 0.1, SCREEN, click_at(at.center()), |ui| clicked = link(ui, "More options", 14.0).clicked());
+        assert!(clicked);
     }
 }

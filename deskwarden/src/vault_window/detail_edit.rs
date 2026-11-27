@@ -5114,7 +5114,7 @@ fn row_with_chip<R>(
         label,
         |ui| {
             if let Some(caption) = chip {
-                clicked = ui.add(small_chip_button(caption)).clicked();
+                clicked = crate::kit::controls::chip_button(ui, caption).clicked();
             }
         },
         add,
@@ -5516,7 +5516,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
         // dead field; in the label column it is one row among eight and the
         // grey box carries the whole message.
         theme::section_row(ui, website_label_text(), |ui| {
-            theme::section_disabled_text_field(ui, website_create_notice());
+            crate::kit::input::field_disabled_fill(ui, website_create_notice());
         });
         return;
     }
@@ -5559,7 +5559,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
                         website_row_trailing(),
                         TARGET_FIELD_FLOOR,
                         |ui, room| {
-                            theme::section_text_field_within(ui, uri, false, room);
+                            crate::kit::input::field(ui, uri, room);
                         },
                         |ui| {
                             website_match_combo(ui, row_id, choice);
@@ -5848,7 +5848,7 @@ fn custom_fields_block(
                 // Named by whatever the field calls itself, so the row is
                 // identifiable; a nameless one says so rather than drawing a
                 // blank label.
-                theme::field_label(
+                crate::kit::card::field_label(
                     ui,
                     if field.name.is_empty() { crate::i18n::t("detail.unnamed_field") } else { &field.name },
                 );
@@ -5859,7 +5859,7 @@ fn custom_fields_block(
             }
             FieldRole::Text | FieldRole::Hidden => {
                 let hidden = field.role == FieldRole::Hidden;
-                theme::field_label(ui, field_name_label());
+                crate::kit::card::field_label(ui, field_name_label());
                 // A scope of its own, because every row draws the same
                 // widgets: two boxes and a button. Without one egui gives all
                 // of them one id and the focus jumps between rows as the user
@@ -5884,7 +5884,7 @@ fn custom_fields_block(
                     egui::UiBuilder::new()
                         .id(egui::Id::new(("custom-field", field.row_id()))),
                     |ui| {
-                        theme::section_text_field(ui, &mut field.name, false);
+                        crate::kit::input::field_fill(ui, &mut field.name);
                         // A card has its own PIN box; a custom field the
                         // user names `PIN` would be read back as that box
                         // and overwritten by it. Said here, under the name
@@ -5897,7 +5897,7 @@ fn custom_fields_block(
                             );
                         }
                         ui.add_space(4.0);
-                        theme::field_label(
+                        crate::kit::card::field_label(
                             ui,
                             if hidden { field_hidden_value_label() } else { field_value_label() },
                         );
@@ -5907,9 +5907,9 @@ fn custom_fields_block(
                         // screen for anyone standing behind the user, which is
                         // most of what "hidden" buys them.
                         if hidden {
-                            theme::section_password_field(ui, &mut field.value, &mut field.reveal);
+                            crate::kit::input::field_secret_fill(ui, &mut field.value, &mut field.reveal);
                         } else {
-                            theme::section_text_field(ui, &mut field.value, false);
+                            crate::kit::input::field_fill(ui, &mut field.value);
                         }
                         ui.add_space(4.0);
                         if crate::kit::controls::row_button(ui, field_remove_button()).clicked() {
@@ -6073,7 +6073,7 @@ const APP_EXE_CHIP_GAP: f32 = 8.0;
 /// after it, and `the_app_row_names_the_app_and_its_executable` measures the
 /// two against each other rather than against this -- so a drift shows up as
 /// an overlap rather than as a silently wrong constant.
-const APP_FIELD_INSET: f32 = 10.0;
+const APP_FIELD_INSET: f32 = crate::kit::input::FIELD_INSET;
 
 /// The grey word between the unbound row's two links.
 fn app_add_or() -> &'static str {
@@ -7790,11 +7790,10 @@ fn picker_row(
                 // the one row that says it cannot name the app at all.
                 match icon.filter(|_| refusal.is_none()) {
                     Some(texture) => {
-                        let tile = theme::avatar_artwork_tile(ui, PICKER_TILE, selected);
-                        theme::avatar_image(ui, tile, texture, selected);
+                        crate::kit::avatar::tile(ui, PICKER_TILE, &row.title, Some(texture), selected);
                     }
                     None => {
-                        theme::avatar(ui, &theme::initials(&row.title), PICKER_TILE, selected)
+                        crate::kit::avatar::tile(ui, PICKER_TILE, &row.title, None, selected);
                     }
                 }
                 // The trailing chip is measured BEFORE the label column is
@@ -8134,29 +8133,29 @@ fn brand_combo(ui: &mut egui::Ui, card: &mut CardDraft) -> f32 {
 fn expires_row(ui: &mut egui::Ui, card: &mut CardDraft, creating: bool, ink: egui::Color32) {
     row_with_buttons(ui, &[], |ui, _room| {
         let gap = ui.spacing().item_spacing.x;
-        let month = digits_box_width(ui, 2, theme::FIELD_PAD_RIGHT);
-        theme::section_text_field_within(ui, &mut card.exp_month, false, month);
+        let month = digits_box_width(ui, 2, DIGITS_PAD_RIGHT);
+        crate::kit::input::field(ui, &mut card.exp_month, month);
         // Each caption goes to the next line WITH the box it names: a `Code`
         // left at the end of one line over a box at the start of the next is
         // a caption naming nothing.
-        let year = digits_box_width(ui, 4, theme::FIELD_PAD_RIGHT);
+        let year = digits_box_width(ui, 4, DIGITS_PAD_RIGHT);
         keep_together(ui, caption_width(ui, EXPIRY_JOIN) + gap + year);
         inline_caption(ui, EXPIRY_JOIN, ink);
-        theme::section_text_field_within(ui, &mut card.exp_year, false, year);
-        let code = digits_box_width(ui, 4, theme::REVEAL_FIELD_PAD_RIGHT);
+        crate::kit::input::field(ui, &mut card.exp_year, year);
+        let code = digits_box_width(ui, 4, DIGITS_REVEAL_PAD_RIGHT);
         keep_together(ui, caption_width(ui, card_code_label()) + gap + code);
         inline_caption(ui, card_code_label(), ink);
-        theme::section_password_field_within(ui, &mut card.code, &mut card.reveal_code, code);
+        crate::kit::input::field_secret(ui, &mut card.code, &mut card.reveal_code, code);
 
         keep_together(ui, caption_width(ui, CARD_PIN_LABEL) + gap + PIN_FLOOR);
         inline_caption(ui, CARD_PIN_LABEL, ink);
         let room = ui.available_size_before_wrap().x.max(PIN_FLOOR);
         if creating {
-            let rect = theme::section_disabled_text_field_within(ui, card_field_create_notice(), room);
+            let rect = crate::kit::input::field_disabled(ui, card_field_create_notice(), room, 0.0);
             ui.interact(rect, ui.id().with("card-pin-create"), egui::Sense::hover())
                 .on_hover_text(card_field_create_notice());
         } else {
-            theme::section_password_field_within(ui, &mut card.pin, &mut card.reveal_pin, room);
+            crate::kit::input::field_secret(ui, &mut card.pin, &mut card.reveal_pin, room);
         }
     });
 }
@@ -8176,16 +8175,22 @@ fn keep_together(ui: &mut egui::Ui, width: f32) {
 
 /// How wide a row box must be to show `digits` digits -- or as many mask
 /// bullets, whichever is wider -- without scrolling: the run, the box's
-/// 10-point left inset, its right inset, and two points for the caret egui
-/// draws at the end of the run.
+/// left inset ([`crate::kit::input::FIELD_INSET`]), its right inset, and two
+/// points for the caret egui draws at the end of the run.
 fn digits_box_width(ui: &egui::Ui, digits: usize, inset_right: f32) -> f32 {
-    let font = egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional);
+    let font = egui::FontId::proportional(16.0);
     let run = |text: String| {
         ui.painter().layout_no_wrap(text, font.clone(), egui::Color32::PLACEHOLDER).size().x
     };
     let ink = run("0".repeat(digits)).max(run("\u{2022}".repeat(digits)));
-    ink + 10.0 + inset_right + 2.0
+    ink + crate::kit::input::FIELD_INSET + inset_right + 2.0
 }
+
+/// A kit field's right inset with nothing in it.
+const DIGITS_PAD_RIGHT: f32 = crate::kit::input::FIELD_INSET;
+/// A kit secret field's right inset: the eye (8 from the edge, 36 wide) and
+/// the 4-point gap the text keeps from it.
+const DIGITS_REVEAL_PAD_RIGHT: f32 = 48.0;
 
 /// The type an inline caption on the `Expires` row is set in: the label
 /// column's own 12 points.
@@ -8297,7 +8302,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
         card.bank_picking = false;
     }
     ui.add_space(6.0);
-    theme::section_text_field(ui, &mut card.bank_filter, false);
+    crate::kit::input::field_fill(ui, &mut card.bank_filter);
     ui.add_space(4.0);
 
     let filter = card.bank_filter.to_lowercase();
@@ -8314,7 +8319,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
                 if !filter.is_empty() && !text.to_lowercase().contains(&filter) {
                     continue;
                 }
-                if ui.add(egui::Button::new(text).wrap()).clicked() {
+                if crate::kit::controls::row_button(ui, &text).clicked() {
                     chosen = Some(index);
                 }
             }
@@ -8417,7 +8422,7 @@ fn badge_ink(row: &StepRow) -> egui::Color32 {
 /// captions are still `<`, `>` and `x` and still sit to the RIGHT of the row's
 /// label, because that is the geometry `control_beside` in the tests reads --
 /// and because an arrow glyph the app's Latin text face has no coverage for
-/// draws as a box (see [`small_chip_button`]).
+/// draws as a box (see [`crate::kit::controls::chip_button`]).
 ///
 /// `editable` is false in the template view, where the list is the read-out of
 /// what the string became rather than the thing being edited.
@@ -8486,16 +8491,17 @@ pub(crate) fn sequence_steps(
                     }
                     if editable {
                         let index = row.number - 1;
-                        if ui.add_enabled(index > 0, small_chip_button("<")).clicked() {
+                        if ui.add_enabled_ui(index > 0, |ui| crate::kit::controls::chip_button(ui, "<")).inner.clicked() {
                             edit = Some(ChipEdit::Back(index));
                         }
                         if ui
-                            .add_enabled(row.number < rows.len(), small_chip_button(">"))
+                            .add_enabled_ui(row.number < rows.len(), |ui| crate::kit::controls::chip_button(ui, ">"))
+                            .inner
                             .clicked()
                         {
                             edit = Some(ChipEdit::Forward(index));
                         }
-                        if ui.add(small_chip_button("x")).clicked() {
+                        if crate::kit::controls::chip_button(ui, "x").clicked() {
                             edit = Some(ChipEdit::Remove(index));
                         }
                     }
@@ -8598,21 +8604,9 @@ pub(crate) fn sequence_unknown_tip() -> &'static str {
     crate::i18n::t("edit.sequence_unknown_tip")
 }
 
-/// The move/remove controls. ASCII captions on purpose: the app's own font is
-/// a Latin text face, and an arrow glyph it has no coverage for is a control
-/// that draws as a box.
-pub(crate) fn small_chip_button(caption: &str) -> egui::Button<'static> {
-    egui::Button::new(
-        theme::semibold(caption.to_string(), SMALL_CHIP_PX).color(theme::TEXT_FAINT),
-    )
-    .fill(theme::CARD)
-    .stroke(Stroke::new(1.0, theme::BORDER))
-    .corner_radius(CornerRadius::same(5))
-}
-
-/// [`small_chip_button`]'s caption size.
-const SMALL_CHIP_PX: f32 = 11.0;
-
+/// [`crate::kit::controls::chip_button`]'s captions are ASCII on purpose: the
+/// app's own font is a Latin text face, and an arrow glyph it has no coverage
+/// for is a control that draws as a box.
 /// The resolved preview. Draws and drops -- see [`PreviewPart`].
 fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
     ui.horizontal_wrapped(|ui| {
@@ -8730,7 +8724,7 @@ fn app_sequence_block(
         return opened;
     }
 
-    theme::field_label(ui, app_sequence_label());
+    crate::kit::card::field_label(ui, app_sequence_label());
 
     ui.label(RichText::new(app_sequence_hint()).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(6.0);
@@ -8804,7 +8798,7 @@ fn app_sequence_block(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for field in palette {
-            if ui.add(palette_button(&field.label())).clicked() {
+            if crate::kit::controls::chip_button(ui, &field.label()).clicked() {
                 app.sequence = sequence_with(&app.sequence, Token::Field(field.clone()));
             }
         }
@@ -8822,7 +8816,7 @@ fn app_sequence_block(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-            if ui.add(palette_button(key.name())).clicked() {
+            if crate::kit::controls::chip_button(ui, key.name()).clicked() {
                 app.sequence = sequence_with(&app.sequence, Token::Key(key));
             }
         }
@@ -8833,7 +8827,7 @@ fn app_sequence_block(
     ui.label(RichText::new(crate::i18n::t("edit.add_text")).size(11.0).color(theme::TEXT_FAINT));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        ui.add(egui::TextEdit::singleline(&mut app.literal_draft).desired_width(120.0));
+        crate::kit::input::field(ui, &mut app.literal_draft, 160.0);
         let add = crate::kit::controls::row_button(ui, crate::i18n::t("edit.add_text"));
         if add.clicked() {
             // Escaping is this app's job, not the user's: they typed a `+`,
@@ -8852,12 +8846,16 @@ fn app_sequence_block(
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         // Only a number goes in -- `key_sequence::only_a_number`, the same
         // rule 4a's own wait box keeps.
-        if ui.add(egui::TextEdit::singleline(&mut app.wait_draft).desired_width(48.0)).changed() {
+        if crate::kit::input::field(ui, &mut app.wait_draft, 72.0).changed() {
             app.wait_draft = key_sequence::only_a_number(&app.wait_draft);
         }
         ui.label(RichText::new(crate::i18n::t("seq.wait_unit")).size(11.0).color(theme::TEXT_FAINT));
         let addable = key_sequence::wait_ms_from_seconds(&app.wait_draft).is_some();
-        if ui.add_enabled(addable, egui::Button::new(crate::i18n::t("edit.add_wait_button"))).clicked() {
+        if ui
+            .add_enabled_ui(addable, |ui| crate::kit::controls::row_button(ui, crate::i18n::t("edit.add_wait_button")))
+            .inner
+            .clicked()
+        {
             if let Some(next) = sequence_with_wait(&app.sequence, &app.wait_draft) {
                 app.sequence = next;
             }
@@ -9626,14 +9624,6 @@ fn wait_refusal() -> &'static str {
     crate::i18n::t("edit.wait_refusal")
 }
 
-pub(crate) fn palette_button(label: &str) -> egui::Button<'static> {
-    egui::Button::new(theme::semibold(label.to_string(), 12.0).color(theme::INK))
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
-        .corner_radius(CornerRadius::same(7))
-        .wrap()
-}
-
 /// The app block's other state: **the item is bound to nothing yet**.
 ///
 /// Returns `true` on the frame the user asks for a binding. The caller then
@@ -9716,11 +9706,11 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
         // pane, and a run that cannot fall to a second line pushes the card
         // out instead (`aae9429`).
         ui.horizontal_wrapped(|ui| {
-            if theme::action_link(ui, app_pick_link(), TARGET_LINK_PX).clicked() {
+            if crate::kit::controls::link(ui, app_pick_link(), TARGET_LINK_PX).clicked() {
                 chose = Some(AppAddChoice::Pick);
             }
             link_row_note(ui, app_add_or());
-            if theme::action_link(ui, app_add_path_link(), TARGET_LINK_PX).clicked() {
+            if crate::kit::controls::link(ui, app_add_path_link(), TARGET_LINK_PX).clicked() {
                 chose = Some(AppAddChoice::Path);
             }
         });
@@ -9851,17 +9841,12 @@ fn app_fresh_note(app: &AppMatchDraft) -> String {
 /// the name and a long one pushes it to the inset and no further.
 fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
     if exe.is_empty() {
-        theme::section_disabled_text_field_within(ui, name, room);
+        crate::kit::input::field_disabled(ui, name, room, 0.0);
         return;
     }
     let galley = picker_chip_galley_mono(ui, exe);
     let width = galley.size().x + PICKER_CHIP_PAD_X * 2.0;
-    let rect = theme::section_disabled_text_field_reserving(
-        ui,
-        name,
-        room,
-        APP_EXE_CHIP_GAP + width,
-    );
+    let rect = crate::kit::input::field_disabled(ui, name, room, APP_EXE_CHIP_GAP + width);
     // What `disabled_field_box` really had for the name, and therefore how
     // wide the run it painted can be.
     let text_room = (rect.width() - 2.0 * APP_FIELD_INSET - APP_EXE_CHIP_GAP - width).max(0.0);
@@ -9936,8 +9921,8 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
 fn app_name_run(ui: &egui::Ui, name: &str) -> std::sync::Arc<egui::Galley> {
     ui.painter().layout_no_wrap(
         name.to_string(),
-        egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional),
-        theme::TEXT_GHOST,
+        egui::FontId::proportional(16.0),
+        crate::kit::tokens::palette(ui.ctx()).text_faint,
     )
 }
 
@@ -10049,10 +10034,11 @@ fn app_target_row(
                 // `theme::avatar_artwork_tile`.
                 match icon {
                     Some(texture) => {
-                        let tile = theme::avatar_artwork_tile(ui, APP_TILE, fresh);
-                        theme::avatar_image(ui, tile, texture, fresh);
+                        crate::kit::avatar::tile(ui, APP_TILE, name, Some(texture), fresh);
                     }
-                    None => theme::avatar(ui, &theme::initials(name), APP_TILE, fresh),
+                    None => {
+                        crate::kit::avatar::tile(ui, APP_TILE, name, None, fresh);
+                    }
                 }
                 // The tile is outside the row proper, exactly as 8a draws it,
                 // so what `target_row` divides up is what is left after it.
@@ -10261,7 +10247,7 @@ fn app_block(
             // identify a suspended Store app. Typing over it would be typing a new
             // identity for something that is not there to check it against.
             theme::section_row(ui, app_window_label(), |ui| {
-                theme::section_disabled_text_field(ui, &app.title);
+                crate::kit::input::field_disabled_fill(ui, &app.title);
             });
         }
 
@@ -10298,7 +10284,7 @@ fn app_block(
                     // rather than pushing the card past the pane -- which is the
                     // narrow case the old comment was really about.
                     row_with_buttons(ui, &[app_browse_button()], |ui, room| {
-                        if theme::section_text_field_within(ui, &mut app.path, false, room).changed() {
+                        if crate::kit::input::field(ui, &mut app.path, room).changed() {
                             // `process` is re-derived on every keystroke, which is
                             // what keeps `launchable_path`'s file-name tie-back
                             // satisfiable -- see `AppMatchDraft::set_path`.
@@ -10320,7 +10306,7 @@ fn app_block(
                     // than drawn greyed, which is what the `add_enabled_ui` it
                     // replaces did. A row whose only control is inert is a row
                     // with no control.
-                    theme::section_disabled_text_field(ui, text);
+                    crate::kit::input::field_disabled_fill(ui, text);
                 }
             }
         });
@@ -10332,13 +10318,13 @@ fn app_block(
 
         theme::section_row(ui, app_args_label(), |ui| match path_row {
             AppPathRow::Editable => {
-                theme::section_text_field(ui, &mut app.args, false);
+                crate::kit::input::field_fill(ui, &mut app.args);
             }
             // A Store app is not started by path, so there is no command line to
             // give it. Disabled for the same reason the path box is, and saying so
             // in the same words.
             AppPathRow::NotApplicable(_) => {
-                theme::section_disabled_text_field(ui, app_args_store_app());
+                crate::kit::input::field_disabled_fill(ui, app_args_store_app());
             }
         });
     }
@@ -10368,7 +10354,7 @@ fn app_block(
         // fall onto two lines on a 298-point pane rather than push the card
         // out (`aae9429`).
         ui.horizontal_wrapped(|ui| {
-            pick = theme::action_link(ui, app_pick_link(), TARGET_LINK_PX).clicked();
+            pick = crate::kit::controls::link(ui, app_pick_link(), TARGET_LINK_PX).clicked();
             link_row_note(ui, app_pick_hint());
         });
     });
@@ -10573,7 +10559,7 @@ fn last_class_hint() -> &'static str {
 fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
     if generator.passphrase {
-        theme::field_label(ui, crate::i18n::t("edit.gen_between_words"));
+        crate::kit::card::field_label(ui, crate::i18n::t("edit.gen_between_words"));
         ui.horizontal_wrapped(|ui| {
             let choices: Vec<crate::kit::menu::Choice<'_>> = Separator::ALL
                 .iter()
@@ -10602,7 +10588,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
         return;
     }
 
-    theme::field_label(ui, crate::i18n::t("edit.gen_use_characters"));
+    crate::kit::card::field_label(ui, crate::i18n::t("edit.gen_use_characters"));
     ui.horizontal_wrapped(|ui| {
         for class in CharClass::ALL {
             let on = generator.classes.is_on(class);
@@ -11285,7 +11271,7 @@ fn unfile_refusal() -> &'static str {
 /// the read-only state has a reason on it rather than being a greyed field
 /// the user pokes at.
 fn owner_field(ui: &mut egui::Ui, owner: &str, hint: &str) {
-    let rect = theme::section_disabled_text_field(ui, owner);
+    let rect = crate::kit::input::field_disabled_fill(ui, owner);
     ui.interact(rect, ui.id().with("owner"), egui::Sense::hover())
         .on_hover_text(hint);
 }
@@ -11828,7 +11814,7 @@ pub fn draw_detail_edit(
                 .inner;
             // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the
             // read pane closes its own -- and now in the same place.
-            theme::hairline(ui);
+            crate::kit::card::hairline(ui);
             from_badge
         })
         .inner;
@@ -12254,7 +12240,7 @@ pub fn draw_detail_edit(
                                 owner_field(ui, &owner, &owner_hint);
                             });
                             theme::section_grid_cell(&mut cols[2], item_type_label(), |ui| {
-                                theme::section_disabled_text_field(ui, kind_noun(kind));
+                                crate::kit::input::field_disabled_fill(ui, kind_noun(kind));
                             });
                         });
                     });
@@ -12285,7 +12271,7 @@ pub fn draw_detail_edit(
                     owner_field(ui, &owner, &owner_hint);
                 });
                 theme::section_row(ui, item_type_label(), |ui| {
-                    theme::section_disabled_text_field(ui, kind_noun(kind));
+                    crate::kit::input::field_disabled_fill(ui, kind_noun(kind));
                 });
             });
 
@@ -12315,12 +12301,7 @@ pub fn draw_detail_edit(
                         // box takes `available_width` and the Copy is pushed
                         // off the card. See `row_with_buttons`.
                         row_with_buttons(ui, &[copy_label()], |ui, room| {
-                            theme::section_text_field_within(
-                                ui,
-                                &mut draft.username,
-                                false,
-                                room,
-                            );
+                            crate::kit::input::field(ui, &mut draft.username, room);
                             if crate::kit::controls::row_button(ui, copy_label()).clicked() {
                                 action = EditAction::CopyUsername;
                             }
@@ -12543,17 +12524,12 @@ pub fn draw_detail_edit(
                         theme::section_row(ui, Slot::CardholderName.label(), |ui| {
                             if removable(Slot::CardholderName) {
                                 if field_with_remove(ui, |ui, room| {
-                                    theme::section_text_field_within(
-                                        ui,
-                                        &mut card.cardholder_name,
-                                        false,
-                                        room,
-                                    );
+                                    crate::kit::input::field(ui, &mut card.cardholder_name, room);
                                 }) {
                                     hide = Some(Slot::CardholderName);
                                 }
                             } else {
-                                theme::section_text_field(ui, &mut card.cardholder_name, false);
+                                crate::kit::input::field_fill(ui, &mut card.cardholder_name);
                             }
                         });
                     }
@@ -12595,12 +12571,7 @@ pub fn draw_detail_edit(
                                 ui.end_row();
                                 room
                             };
-                            theme::section_password_field_within(
-                                ui,
-                                &mut card.number,
-                                &mut card.reveal_number,
-                                number_room,
-                            );
+                            crate::kit::input::field_secret(ui, &mut card.number, &mut card.reveal_number, number_room);
                             if offers_clear
                                 && crate::kit::controls::row_button_danger(ui, slot_remove_button()).clicked()
                             {
@@ -12632,18 +12603,13 @@ pub fn draw_detail_edit(
                     if showing(Slot::CardBillingZip) {
                         theme::section_row(ui, Slot::CardBillingZip.label(), |ui| {
                             if creating {
-                                theme::section_disabled_text_field(ui, card_field_create_notice());
+                                crate::kit::input::field_disabled_fill(ui, card_field_create_notice());
                             } else if field_with_remove(ui, |ui, room| {
                                 // Free text, unlike the bank: a postcode has
                                 // no closed set to pick from, and a wrong one
                                 // fails in front of the user on the payment
                                 // form rather than silently here.
-                                theme::section_text_field_within(
-                                    ui,
-                                    &mut card.billing_zip,
-                                    false,
-                                    room,
-                                );
+                                crate::kit::input::field(ui, &mut card.billing_zip, room);
                             }) {
                                 hide = Some(Slot::CardBillingZip);
                             }
@@ -12659,7 +12625,7 @@ pub fn draw_detail_edit(
                     if showing(Slot::CardBank) {
                         theme::section_row(ui, Slot::CardBank.label(), |ui| {
                             if creating {
-                                theme::section_disabled_text_field(ui, card_field_create_notice());
+                                crate::kit::input::field_disabled_fill(ui, card_field_create_notice());
                             } else if bank_domain_row(ui, card) {
                                 hide = Some(Slot::CardBank);
                             }
@@ -12683,7 +12649,7 @@ pub fn draw_detail_edit(
                             continue;
                         }
                         if slot_row(ui, field.label(), removable(slot), |ui| {
-                            theme::section_text_field(ui, value, false);
+                            crate::kit::input::field_fill(ui, value);
                         }) {
                             hide = Some(slot);
                         }
@@ -12701,7 +12667,7 @@ pub fn draw_detail_edit(
                     // left of the only thing on the card. §8a has no note card
                     // to copy; what it does do everywhere is give the control
                     // the width its content needs, and here that is all of it.
-                    theme::field_label(ui, Slot::Note.label());
+                    crate::kit::card::field_label(ui, Slot::Note.label());
                     ui.add_space(theme::EYEBROW_GAP);
                     // A multiline box rather than `theme::text_field`: a
                     // secure note's body is the whole item and is routinely
@@ -12717,7 +12683,7 @@ pub fn draw_detail_edit(
                     // `border: 1px solid #d7d3d3; border-radius: 8px; padding:
                     // 10px 11px`, which is the design's field box eight rows
                     // tall, and `text_area` is that box.
-                    theme::text_area(ui, &mut draft.note_body, "", 8);
+                    theme::text_area_v2(ui, &mut draft.note_body, "", 8.0 * 22.0, 14);
                     }
                 FormBody::SshKey => {
                     let ssh = &mut draft.ssh_key;
@@ -12738,19 +12704,15 @@ pub fn draw_detail_edit(
                         // reveal. Multiline would suit a PEM block better, but
                         // `theme` has no masked multiline box and an unmasked
                         // one would show the key by default.
-                        theme::section_password_field(
-                            ui,
-                            &mut ssh.private_key,
-                            &mut ssh.reveal_private_key,
-                        );
+                        crate::kit::input::field_secret_fill(ui, &mut ssh.private_key, &mut ssh.reveal_private_key);
                     });
     
                     slot_row(ui, Slot::SshPublicKey.label(), false, |ui| {
-                        theme::section_text_field(ui, &mut ssh.public_key, false);
+                        crate::kit::input::field_fill(ui, &mut ssh.public_key);
                     });
     
                     slot_row(ui, Slot::SshFingerprint.label(), false, |ui| {
-                        theme::section_text_field(ui, &mut ssh.key_fingerprint, false);
+                        crate::kit::input::field_fill(ui, &mut ssh.key_fingerprint);
                     });
                     }
                 FormBody::UneditableNotice => {
@@ -12844,7 +12806,7 @@ pub fn draw_detail_edit(
                         }
                         theme::section_row(ui, Slot::Totp.label(), |ui| {
                             if creating {
-                                theme::section_disabled_text_field(ui, totp_create_notice());
+                                crate::kit::input::field_disabled_fill(ui, totp_create_notice());
                             } else if !has_seed {
                                 // **The empty state is ONE BUTTON**, and the
                                 // owner has now cut it down twice: first from
@@ -12915,12 +12877,7 @@ pub fn draw_detail_edit(
                                 let room = (ui.available_width() - reserved).max(FIELD_FLOOR);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
-                                    theme::section_password_field_within(
-                                        ui,
-                                        &mut draft.totp,
-                                        &mut draft.reveal_totp,
-                                        room,
-                                    );
+                                    crate::kit::input::field_secret(ui, &mut draft.totp, &mut draft.reveal_totp, room);
                                     if controls::button(ui, ButtonKind::Outline, controls::SMALL, totp_replace_button(), None).clicked() {
                                         action = EditAction::AddTotp;
                                     }
@@ -21873,10 +21830,10 @@ mod sequence_builder_tests {
         for tile in &tiles {
             assert_eq!(
                 tile.radius,
-                theme::avatar_corner_radius(PICKER_TILE),
+                egui::CornerRadius::same(7),
                 "the tile is not 8b's 7-point radius"
             );
-            assert_eq!(tile.stroke, theme::HAIRLINE, "an unselected tile is edged #eae7e7");
+            assert_eq!(tile.stroke, egui::Color32::TRANSPARENT, "an unselected kit tile has no edge");
         }
         let tile = tiles[0];
 
@@ -23555,7 +23512,7 @@ mod edit_pane_layout_tests {
         let mut found: Vec<Rect> = painted
             .rects
             .iter()
-            .filter(|(r, c)| *c == theme::CANVAS && r.height() < 2.0)
+            .filter(|(r, c)| (*c == theme::CANVAS || *c == crate::kit::tokens::Palette::LIGHT.row_rule) && r.height() < 2.0)
             .map(|(r, _)| *r)
             .collect();
         found.sort_by(|a, b| a.top().total_cmp(&b.top()));
@@ -28531,7 +28488,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, fill)| {
-                *fill == theme::HAIRLINE && full_width(r) && r.top() >= strip.bottom() - 0.5
+                (*fill == theme::HAIRLINE || *fill == crate::kit::tokens::Palette::LIGHT.hairline) && full_width(r) && r.top() >= strip.bottom() - 0.5
             })
             .map(|(r, _)| *r)
             .min_by(|a, b| a.top().total_cmp(&b.top()))
@@ -29557,7 +29514,7 @@ mod edit_pane_layout_tests {
             let rule = painted
                 .rects
                 .iter()
-                .filter(|(r, fill)| *fill == theme::HAIRLINE && r.height() <= 1.5)
+                .filter(|(r, fill)| (*fill == theme::HAIRLINE || *fill == crate::kit::tokens::Palette::LIGHT.hairline) && r.height() <= 1.5)
                 .map(|(r, _)| *r)
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .expect("the strip is closed by a hairline");

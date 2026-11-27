@@ -1320,7 +1320,7 @@ fn destination_band(
                 }
             }
         });
-    theme::hairline(ui);
+    crate::kit::card::hairline(ui);
 }
 
 /// Where the app subject's chips go. See [`destination_band`].
@@ -1513,11 +1513,10 @@ impl BandSubject<'_> {
                     ui.spacing_mut().item_spacing.x = BAND_TILE_GAP;
                     match self.icon {
                         Some(texture) => {
-                            let tile = theme::avatar_artwork_tile(ui, BAND_TILE, self.accent);
-                            theme::avatar_image(ui, tile, texture, self.accent);
+                            crate::kit::avatar::tile(ui, BAND_TILE, self.name, Some(texture), self.accent);
                         }
                         None => {
-                            theme::avatar(ui, &theme::initials(self.name), BAND_TILE, self.accent)
+                            crate::kit::avatar::tile(ui, BAND_TILE, self.name, None, self.accent);
                         }
                     }
                     ui.allocate_ui_with_layout(
@@ -1908,7 +1907,7 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
                 });
             });
         });
-    theme::hairline(ui);
+    crate::kit::card::hairline(ui);
     wants
 }
 
@@ -2703,7 +2702,7 @@ fn add_step_row(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRe
 /// step is fields and literals in a row -- and because 4a's `+ Text` is the
 /// one button that leads to both.
 fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRef]) {
-    let button = theme::dashed_button(ui, add_text_label());
+    let button = crate::kit::controls::dashed_button(ui, add_text_label());
     // **Not the default close-on-click**: this menu holds a text box, and a
     // menu that shut on the first click into its own field could never be
     // typed into.
@@ -2767,12 +2766,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     let room = ui.available_width();
-                                    box_response = Some(theme::section_text_field_within(
-                                        ui,
-                                        &mut draft.literal_draft,
-                                        false,
-                                        room,
-                                    ));
+                                    box_response = Some(crate::kit::input::field(ui, &mut draft.literal_draft, room));
                                 },
                             );
                             add
@@ -2799,7 +2793,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
 
 /// `+ Key`: the keys this app knows how to send.
 fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
-    let button = theme::dashed_button(ui, add_key_label());
+    let button = crate::kit::controls::dashed_button(ui, add_key_label());
     crate::kit::menu::popover(&button, egui::PopupCloseBehavior::CloseOnClick, crate::kit::menu::MENU.fit(), |ui| {
         menu_body(ui, Some(ADD_MENU_WIDTH), |ui| {
             menu_caption(ui, add_key_caption());
@@ -2820,7 +2814,7 @@ fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
 /// `+ Wait`: a number of seconds, which is what the owner asked waits be set
 /// in -- the sequence stores the milliseconds.
 fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
-    let button = theme::dashed_button(ui, add_wait_label());
+    let button = crate::kit::controls::dashed_button(ui, add_wait_label());
     crate::kit::menu::popover(
         &button,
         egui::PopupCloseBehavior::CloseOnClickOutside,
@@ -2829,12 +2823,7 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
             menu_body(ui, None, |ui| {
                 menu_caption(ui, add_wait_caption());
                 ui.horizontal(|ui| {
-                    let box_response = theme::section_text_field_within(
-                        ui,
-                        &mut draft.wait_draft,
-                        false,
-                        WAIT_BOX_WIDTH,
-                    );
+                    let box_response = crate::kit::input::field(ui, &mut draft.wait_draft, WAIT_BOX_WIDTH);
                     // **Only a number goes in**: see
                     // `key_sequence::only_a_number`, and the owner's "only
                     // allow numbers". Applied to what the box now holds
@@ -4192,7 +4181,7 @@ mod tests {
             .rects
             .iter()
             .filter(|r| {
-                r.fill == theme::HAIRLINE
+                (r.fill == theme::HAIRLINE || r.fill == crate::kit::tokens::Palette::LIGHT.hairline)
                     && (r.rect.height() - 1.0).abs() < 0.1
                     && (r.rect.width() - tint.width()).abs() < 0.1
             })

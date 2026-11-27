@@ -2187,14 +2187,14 @@ pub(crate) fn sharing_block(ui: &mut egui::Ui, mark: BlockMark, label: &str, add
             ui.add_space(BLOCK_LABEL_GAP);
             add(ui);
         });
-    theme::row_rule(ui);
+    crate::kit::card::row_rule(ui);
 }
 
 /// The room a row of [`theme::row_button`]s takes, `.cctl`'s gap between
 /// them -- measured off the galleys the buttons will lay, never estimated.
 pub(crate) fn controls_room(ui: &egui::Ui, labels: &[&str]) -> f32 {
     let gaps = CONTROL_GAP * labels.len().saturating_sub(1) as f32;
-    labels.iter().map(|label| theme::row_button_width(ui, label)).sum::<f32>() + gaps
+    labels.iter().map(|label| crate::kit::controls::row_button_width(ui, label)).sum::<f32>() + gaps
 }
 
 /// An entry's leading mark.
@@ -2392,7 +2392,7 @@ pub(crate) fn draw_people_block(
         for (index, person) in people.people.iter().enumerate() {
             // `.pe + .pe`: a rule between two people, none over the first.
             if index > 0 {
-                theme::row_rule(ui);
+                crate::kit::card::row_rule(ui);
             }
             person_entry(ui, record, person, people, action);
         }
@@ -2455,26 +2455,26 @@ fn person_entry(
                 return;
             }
             if confirming {
-                if theme::row_button(ui, cancel_button()).clicked() {
+                if crate::kit::controls::row_button(ui, cancel_button()).clicked() {
                     *action = DetailAction::CancelStopSharing;
                 }
                 return;
             }
-            if theme::row_button_danger(ui, stop_label())
+            if crate::kit::controls::row_button_danger(ui, stop_label())
                 .on_hover_text(stop_hover())
                 .clicked()
             {
                 *action = DetailAction::StopSharing(email.to_string());
             }
             if person.reinvite()
-                && theme::row_button(ui, reinvite_label()).on_hover_text(crate::i18n::t("share.reinvite_hover")).clicked()
+                && crate::kit::controls::row_button(ui, reinvite_label()).on_hover_text(crate::i18n::t("share.reinvite_hover")).clicked()
             {
                 *action = DetailAction::Reinvite(email.to_string());
             }
             if person.share_anyway() {
                 let ready = shown.is_some();
                 let pressed = ui
-                    .add_enabled_ui(ready, |ui| theme::row_button(ui, share_anyway_label()))
+                    .add_enabled_ui(ready, |ui| crate::kit::controls::row_button(ui, share_anyway_label()))
                     .inner
                     .on_disabled_hover_text(share_anyway_hover())
                     .clicked();
@@ -2495,7 +2495,7 @@ fn person_entry(
             ui.add_space(QUESTION_BUTTON_GAP);
             // Cancel wins an ambiguous frame, as on the Send's revoke: the
             // safe answer to one on a destructive control is not to destroy.
-            if theme::destructive_button(ui, remove_label()).clicked() && *action != DetailAction::CancelStopSharing {
+            if crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Danger, crate::kit::controls::SMALL, remove_label(), None).clicked() && *action != DetailAction::CancelStopSharing {
                 *action = DetailAction::ConfirmStopSharing(email.to_string());
             }
         });

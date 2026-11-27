@@ -891,7 +891,10 @@ pub(crate) fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                theme::avatar(ui, &theme::initials(item_name), 40.0, true);
+                let (tile, _) = ui.allocate_exact_size(egui::Vec2::splat(40.0), egui::Sense::hover());
+                let (bg, fg) = crate::kit::avatar::initials_colours(item_name);
+                let look = crate::kit::avatar::Look::Initials { text: super::item_list::initials(item_name), bg, fg };
+                crate::kit::avatar::paint(ui.painter(), tile, &look, 12);
                 ui.add_space(12.0);
                 // **Two lines, which is §5a's own shape.** The name, and
                 // under it what the record IS and where it lives -- `Login ·
@@ -1553,7 +1556,7 @@ pub fn draw_share_form(
 
     // 0.15's access block (a password, a date, a view cap) and the
     // recipient row, folded under one link: nothing 0.15 offered is gone.
-    if theme::action_link(ui, more_options(), 14.0).clicked() {
+    if crate::kit::controls::link(ui, more_options(), 14.0).clicked() {
         state.more = !state.more;
     }
     let draft = &mut state.draft;
