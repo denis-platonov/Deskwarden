@@ -11,6 +11,7 @@ pub mod avatar;
 pub mod card;
 pub mod controls;
 pub mod field;
+pub mod form;
 pub mod icon;
 pub mod input;
 pub mod logo_paths;
