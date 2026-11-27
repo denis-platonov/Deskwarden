@@ -855,7 +855,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 16] = [
+    const OPENS_WINDOWS: [&str; 15] = [
         "app_window",
         // The autofill notice: a refused or abandoned fill, said on a card in
         // the account picker's style rather than in the system message box it
@@ -872,13 +872,6 @@ mod tests {
         // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
         // holds its raise.
         "generate_prompt",
-        // Design 3b's locked-vault card. The FIFTH bare-Win32 window in this
-        // crate, and 2a's sibling in every respect: same width, same anchor,
-        // same reason. It is also the surface with the most to get wrong --
-        // it is shown for a vault this process CANNOT READ, so anything it
-        // claimed about the vault's contents would be a claim it has no
-        // standing to make. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
-        "locked_card",
         "loading_ui",
         "login_ui",
         "picker_ui",
@@ -1119,24 +1112,16 @@ mod tests {
     /// gone with the title: this card opens under `PROMPT_CARD_TITLE`, and it
     /// holds its own `HWND` and never needs to find one by name.
     ///
-    /// **`locked_card` is 2a's sibling and follows it exactly.** It appears in
-    /// the same circumstance -- a password field was focused -- and answers
-    /// with a keyboard the same way: Esc dismisses it, and Enter presses the
-    /// *Unlock* button that is the one offer this state can honour. What its
-    /// capture exclusion protects is neither a password nor an account list
-    /// but the name of the app this user is signing into.
-    ///
     /// **`notice_card` takes the foreground the way `MB_SETFOREGROUND` did for
     /// the message box it replaced**: once, on open, because it advertises
     /// Enter and Esc. It never retakes it, so a user who clicks back into
     /// their app keeps it. Its capture exclusion covers a refusal's wording,
     /// which can name an item's custom fields.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 8] = [
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 7] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
         ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
-        ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
         ("save_login_card", include_str!("save_login_card.rs"), "SAVE_LOGIN_CARD_TITLE"),
         ("notice_card", include_str!("notice_card.rs"), "NOTICE_CARD_TITLE"),
         ("tray_popup", include_str!("tray_popup.rs"), "TRAY_POPUP_TITLE"),
@@ -2195,7 +2180,6 @@ mod tests {
             crate::picker_prompt::PICKER_PROMPT_TITLE,
             crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
             crate::generate_prompt::GENERATE_PROMPT_TITLE,
-            crate::locked_card::LOCKED_CARD_TITLE,
         ] {
             assert_ne!(crate::tray_popup::TRAY_POPUP_TITLE, other);
         }

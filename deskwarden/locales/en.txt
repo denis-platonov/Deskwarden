@@ -185,7 +185,6 @@ loading.signed_in_as = Signed in as {account}
 
 # ---- locked_card.rs (the locked-vault card) ----
 locked_card.pill = Locked
-locked_card.unlock = Unlock
 locked_card.title = Deskwarden is locked
 locked_card.body = Unlock to check the vault for {app_name}.
 
@@ -229,9 +228,7 @@ panel.hint_enter_fill = Enter fill
 panel.hint_esc_close = Esc close
 
 # ---- generate_prompt.rs (the password-generator card) ----
-generate.new_password = New password
 generate.suggested = Suggested password
-generate.save_to_vault = Save to vault
 generate.use_password = Use this password
 generate.copy = Copy
 generate.regenerate = Regenerate

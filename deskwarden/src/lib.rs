@@ -114,7 +114,6 @@ pub mod local_time;
 pub mod lock_reason;
 pub mod logging;
 /// Design 3b: the locked-vault card, in bare Win32.
-pub mod locked_card;
 pub mod login_ui;
 pub mod match_engine;
 /// The autofill notice: a refused or abandoned fill, on Deskwarden's own card

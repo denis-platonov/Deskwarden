@@ -109,7 +109,6 @@ mod tests {
         for (name, code) in [
             ("picker_prompt", include_str!("picker_prompt.rs")),
             ("prompt_card", include_str!("prompt_card.rs")),
-            ("locked_card", include_str!("locked_card.rs")),
             ("notice_card", include_str!("notice_card.rs")),
             ("save_login_card", include_str!("save_login_card.rs")),
             ("unlock_prompt", include_str!("unlock_prompt.rs")),

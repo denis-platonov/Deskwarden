@@ -2304,7 +2304,6 @@ mod tests {
         assert!(!SAVE_LOGIN_CARD_TITLE.is_empty());
         assert_ne!(SAVE_LOGIN_CARD_TITLE, "Deskwarden");
         assert_ne!(SAVE_LOGIN_CARD_TITLE, crate::prompt_card::PROMPT_CARD_TITLE);
-        assert_ne!(SAVE_LOGIN_CARD_TITLE, crate::locked_card::LOCKED_CARD_TITLE);
         assert_ne!(SAVE_LOGIN_CARD_TITLE, crate::picker_prompt::PICKER_PROMPT_TITLE);
         assert_ne!(SAVE_LOGIN_CARD_TITLE, crate::unlock_prompt::UNLOCK_PROMPT_TITLE);
         assert_ne!(SAVE_LOGIN_CARD_TITLE, crate::generate_prompt::GENERATE_PROMPT_TITLE);

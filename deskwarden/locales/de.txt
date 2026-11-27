@@ -171,7 +171,6 @@ loading.slow = Dauert länger als üblich — {seconds} s
 loading.signed_in_as = Angemeldet als {account}
 
 locked_card.pill = Gesperrt
-locked_card.unlock = Entsperren
 locked_card.title = Deskwarden ist gesperrt
 locked_card.body = Entsperre, um den Tresor nach {app_name} zu durchsuchen.
 
@@ -210,9 +209,7 @@ panel.hint_choose_account = ↑ ↓ Konto wählen
 panel.hint_enter_fill = Eingabe ausfüllen
 panel.hint_esc_close = Esc schließen
 
-generate.new_password = Neues Passwort
 generate.suggested = Vorgeschlagenes Passwort
-generate.save_to_vault = Im Tresor speichern
 generate.use_password = Dieses Passwort verwenden
 generate.copy = Kopieren
 generate.regenerate = Neu erzeugen

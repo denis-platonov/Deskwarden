@@ -34289,7 +34289,7 @@ mod tests {
         /// rather than assumed.
         fn asks_to_unlock(window: &window_watch::ForegroundEvent) -> NoMatchFollowUp {
             LOCKED_SHOWN.with(|s| s.borrow_mut().push((window.exe_name.clone(), window.hwnd)));
-            deskwarden::app::locked_follow_up(deskwarden::locked_card::LockedAnswer::Unlock)
+            deskwarden::app::locked_follow_up(deskwarden::unlock_prompt::LockedAnswer::Unlock)
         }
 
         /// The master-password prompt, answered correctly. Stands in for

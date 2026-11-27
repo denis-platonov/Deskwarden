@@ -1949,7 +1949,6 @@ mod tests {
             ("panel_draw", include_str!("panel_draw.rs")),
             ("picker_prompt", include_str!("picker_prompt.rs")),
             ("prompt_card", include_str!("prompt_card.rs")),
-            ("locked_card", include_str!("locked_card.rs")),
             ("notice_card", include_str!("notice_card.rs")),
             ("save_login_card", include_str!("save_login_card.rs")),
             ("unlock_prompt", include_str!("unlock_prompt.rs")),
@@ -2166,7 +2165,6 @@ mod tests {
             "unlock_prompt.rs",
             "generate_prompt.rs",
             "prompt_card.rs",
-            "locked_card.rs",
             "save_login_card.rs",
             // The autofill notice, which replaced a system message box and
             // is the seventh again.

@@ -2513,7 +2513,6 @@ mod tests {
     #[test]
     fn the_window_opens_under_a_title_nothing_else_uses() {
         assert_eq!(TRAY_POPUP_TITLE, "Deskwarden quick access");
-        assert_ne!(TRAY_POPUP_TITLE, crate::locked_card::LOCKED_CARD_TITLE);
         assert_ne!(TRAY_POPUP_TITLE, crate::generate_prompt::GENERATE_PROMPT_TITLE);
     }
 }

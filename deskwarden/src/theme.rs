@@ -12048,12 +12048,11 @@ mod tests {
             b("panel.hint_enter_fill", "Archivo-Regular", 14, 202),
             b("panel.hint_esc_close", "Archivo-Regular", 14, 202),
             b("panel.enter_label", "Archivo-Bold", 13, 60),
-            // locked_card: 410 - 2*18 = 374; the pill is 64; the button
-            // loses its ENTER chip lane (~46).
+            // locked_card keys (the unlock prompt's pill and lines): 410 - 2*18
+            // = 374; the pill is 64.
             b("locked_card.pill", "Archivo-Bold", 12, 64),
             b("locked_card.title", "Archivo-ExtraBold", 19, 374),
             b("locked_card.body", "Archivo-Regular", 15, 374),
-            b("locked_card.unlock", "Archivo-Bold", 16, 324),
             // prompt_card: a row's text lane is 384 - 3 - 65 = 316 (246 once
             // the Enter badge is on it).
             b("prompt_card.saved_credentials", "Archivo-Regular", 14, 246),
@@ -12105,7 +12104,6 @@ mod tests {
             b("picker.save_new_login", "Archivo-Bold", 15, 163),
             b("picker.search_vault", "Archivo-Bold", 15, 163),
             // generate_prompt: 410 - 36 = 374; see the painter for each cell.
-            b("generate.new_password", "Archivo-ExtraBold", 19, 350),
             b("generate.suggested", "Archivo-Regular", 15, 286),
             b("generate.failed", "Archivo-Regular", 12, 374),
             b("generate.length", "Archivo-Regular", 12, 187),
@@ -12116,7 +12114,7 @@ mod tests {
             b("generate.kind_password", "Archivo-SemiBold", 12, 78),
             b("generate.kind_passphrase", "Archivo-SemiBold", 12, 72),
             b("generate.regenerate", "Archivo-SemiBold", 12, 87),
-            b("generate.save_to_vault", "Archivo-Bold", 15, 186),
+            b("generate.use_password", "Archivo-Bold", 15, 246),
             b("generate.copy", "Archivo-Bold", 15, 94),
             // unlock_prompt: 470 - 52 = 418; label 386; buttons 108 / 88.
             Budget { key: "unlock_prompt.tagline", family: "Archivo-Bold", px: 10, width: 367, tracking: 2 },

@@ -171,7 +171,6 @@ loading.slow = Duurt langer dan normaal — {seconds} s
 loading.signed_in_as = Ingelogd als {account}
 
 locked_card.pill = Op slot
-locked_card.unlock = Ontgrendelen
 locked_card.title = Deskwarden is vergrendeld
 locked_card.body = Ontgrendel om de kluis te doorzoeken voor {app_name}.
 
@@ -210,9 +209,7 @@ panel.hint_choose_account = ↑ ↓ kies een account
 panel.hint_enter_fill = Enter invullen
 panel.hint_esc_close = Esc sluiten
 
-generate.new_password = Nieuw wachtwoord
 generate.suggested = Voorgesteld wachtwoord
-generate.save_to_vault = Opslaan in kluis
 generate.use_password = Dit wachtwoord gebruiken
 generate.copy = Kopiëren
 generate.regenerate = Opnieuw

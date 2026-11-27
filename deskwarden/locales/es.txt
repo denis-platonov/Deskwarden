@@ -173,7 +173,6 @@ loading.slow = Tarda más de lo normal — {seconds} s
 loading.signed_in_as = Sesión iniciada como {account}
 
 locked_card.pill = Bloqueado
-locked_card.unlock = Desbloquear
 locked_card.title = Deskwarden está bloqueado
 locked_card.body = Desbloquea para buscar en la caja fuerte datos de {app_name}.
 
@@ -212,9 +211,7 @@ panel.hint_choose_account = ↑ ↓ elegir cuenta
 panel.hint_enter_fill = Intro rellenar
 panel.hint_esc_close = Esc cerrar
 
-generate.new_password = Nueva contraseña
 generate.suggested = Contraseña sugerida
-generate.save_to_vault = Guardar en la caja fuerte
 generate.use_password = Usar esta contraseña
 generate.copy = Copiar
 generate.regenerate = Regenerar

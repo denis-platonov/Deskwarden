@@ -600,7 +600,7 @@ pub fn empty_rows() -> Vec<EmptyAction> {
 /// `locked_card::the_card_offers_only_the_unlock_it_can_honour` reads that
 /// card's painted runs rather than trusting the argument.
 ///
-/// A constant for the reason [`crate::locked_card::LOCKED_LABEL`] is one: it is
+/// A constant for the reason `LOCKED_LABEL` (the retired locked card's button) is one: it is
 /// the string a test finds in the painted output rather than one it re-spells.
 /// **It lived in `overlay_ui` until that module was deleted**; it is here now
 /// because this is the card that offers it.

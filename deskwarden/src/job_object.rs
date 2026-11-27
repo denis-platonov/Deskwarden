@@ -3686,7 +3686,6 @@ mod tests {
                 "examples/field_locator_probe.rs",
                 "examples/generate_preview.rs",
                 "examples/icon_probe.rs",
-                "examples/locked_preview.rs",
                 // Renders the message card (notice and confirm) for a look.
                 "examples/notice_preview.rs",
                 // Times the region overlay's window build and this process's

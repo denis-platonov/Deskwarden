@@ -326,6 +326,53 @@ pub fn ask(data_dir: Option<std::path::PathBuf>) -> Outcome {
     outcome
 }
 
+/// What the locked-vault card answers: nothing, or "open the master-password
+/// prompt".
+///
+/// A two-variant enum rather than a `bool` because the call site in
+/// `crate::app::locked_arm` reads as the two states it is and cannot be
+/// silently inverted by a `!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockedAnswer {
+    /// Nothing follows, and in particular nothing is armed.
+    #[default]
+    Dismissed,
+    /// Put this prompt on screen for the window, and if it answers with a
+    /// session token, resume the fill the locked card interrupted.
+    Unlock,
+}
+
+/// The number of `crate::app::overlay_height` choice-row pitches the
+/// caller's placement is computed from.
+///
+/// It is the argument `crate::app::locked_arm` hands the presenter's
+/// `position`, and that arithmetic is the caller's, not this prompt's: the
+/// prompt's own clamp is against its own height, so the number here is an
+/// approximation the window then corrects rather than a size anything is
+/// drawn at.
+pub const LOCKED_ROWS: usize = 1;
+
+/// The status pill in the header: the state, in one word.
+pub fn locked_pill() -> &'static str {
+    crate::i18n::t("locked_card.pill")
+}
+
+/// The two lines of the card's body.
+///
+/// **Neither says whether the vault has a login for `app_name`**: the process
+/// cannot know while locked, so it says what it can know instead -- that it is
+/// locked, and that unlocking is what answers the question.
+///
+/// `app_name` is `crate::app::window_label`'s answer, so it is user-controlled
+/// -- which is why the line it lands on is drawn with `DT_END_ELLIPSIS` into a
+/// fixed box rather than being allowed to grow a card that cannot scroll.
+pub fn locked_text(app_name: &str) -> (String, String) {
+    (
+        crate::i18n::t("locked_card.title").to_string(),
+        crate::i18n::tf("locked_card.body", &[("app_name", app_name)]),
+    )
+}
+
 /// **The locked card, answered with this prompt.** Design 1b's Locked panel
 /// is the card a user gets over a locked vault, and the card is where the
 /// password goes: there is no second window between pressing Ctrl+Alt+B and
@@ -336,11 +383,11 @@ pub fn ask(data_dir: Option<std::path::PathBuf>) -> Outcome {
 pub fn for_locked_window(
     app_name: &str,
     anchor: Option<(f32, f32)>,
-) -> crate::locked_card::LockedAnswer {
+) -> LockedAnswer {
     if let Ok(mut slot) = LOCKED_WINDOW.lock() {
         *slot = Some((app_name.to_string(), anchor, std::time::Instant::now()));
     }
-    crate::locked_card::LockedAnswer::Unlock
+    LockedAnswer::Unlock
 }
 
 /// What [`for_locked_window`] recorded, for the [`ask`] that follows it.
@@ -370,7 +417,7 @@ fn forget_locked_window() {
 /// Unlock) it says what an unlock gives back.
 pub fn prompt_text(app_name: Option<&str>) -> (String, String) {
     match app_name {
-        Some(name) => crate::locked_card::locked_text(name),
+        Some(name) => locked_text(name),
         None => (
             crate::i18n::t("locked_card.title").to_string(),
             crate::i18n::t("unlock_prompt.subtitle").to_string(),
@@ -1527,7 +1574,7 @@ mod win32 {
 
             if let Some(fonts) = fonts {
                 crate::panel_draw::draw_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.wordmark);
-                let word = crate::locked_card::locked_pill();
+                let word = crate::unlock_prompt::locked_pill();
                 crate::panel_draw::draw_pill(
                     mem,
                     fitted_pill(mem, fonts.pill, dev(l.pill), word),
@@ -2272,7 +2319,7 @@ mod tests {
     fn the_locked_path_opens_this_prompt_for_its_app() {
         assert_eq!(
             for_locked_window("Ledgerline Desktop", Some((10.0, 20.0))),
-            crate::locked_card::LockedAnswer::Unlock
+            LockedAnswer::Unlock
         );
         assert_eq!(locked_window(), Some(("Ledgerline Desktop".to_string(), Some((10.0, 20.0)))));
         let (_, body) = prompt_text(Some("Ledgerline Desktop"));

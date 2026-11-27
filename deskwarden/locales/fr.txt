@@ -173,7 +173,6 @@ loading.slow = Plus long que d'habitude — {seconds} s
 loading.signed_in_as = Connecté en tant que {account}
 
 locked_card.pill = Verrouillé
-locked_card.unlock = Déverrouiller
 locked_card.title = Deskwarden est verrouillé
 locked_card.body = Déverrouillez pour chercher dans le coffre des identifiants pour {app_name}.
 
@@ -212,9 +211,7 @@ panel.hint_choose_account = ↑ ↓ choisir un compte
 panel.hint_enter_fill = Entrée remplir
 panel.hint_esc_close = Échap fermer
 
-generate.new_password = Nouveau mot de passe
 generate.suggested = Mot de passe suggéré
-generate.save_to_vault = Enregistrer dans le coffre
 generate.use_password = Utiliser ce mot de passe
 generate.copy = Copier
 generate.regenerate = Régénérer

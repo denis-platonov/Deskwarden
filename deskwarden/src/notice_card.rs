@@ -2028,7 +2028,6 @@ mod tests {
             crate::picker_prompt::PICKER_PROMPT_TITLE,
             crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
             crate::generate_prompt::GENERATE_PROMPT_TITLE,
-            crate::locked_card::LOCKED_CARD_TITLE,
             crate::save_login_card::SAVE_LOGIN_CARD_TITLE,
             crate::vault_window::WINDOW_TITLE,
         ] {

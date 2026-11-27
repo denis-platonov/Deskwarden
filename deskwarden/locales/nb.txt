@@ -176,7 +176,6 @@ loading.slow = Det tar lengre tid enn vanlig — {seconds} s
 loading.signed_in_as = Innlogget som {account}
 
 locked_card.pill = Låst
-locked_card.unlock = Lås opp
 locked_card.title = Deskwarden er låst
 locked_card.body = Lås opp for å sjekke hvelvet for {app_name}.
 
@@ -215,9 +214,7 @@ panel.hint_choose_account = ↑ ↓ velg en konto
 panel.hint_enter_fill = Enter fyll ut
 panel.hint_esc_close = Esc lukk
 
-generate.new_password = Nytt passord
 generate.suggested = Foreslått passord
-generate.save_to_vault = Lagre i hvelvet
 generate.use_password = Bruk dette passordet
 generate.copy = Kopier
 generate.regenerate = Generer på nytt
