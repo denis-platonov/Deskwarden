@@ -3687,6 +3687,8 @@ mod tests {
                 "examples/generate_preview.rs",
                 "examples/icon_probe.rs",
                 "examples/locked_preview.rs",
+                // Renders the message card (notice and confirm) for a look.
+                "examples/notice_preview.rs",
                 // Times the region overlay's window build and this process's
                 // own-window lookups from inside a running `eframe` frame,
                 // which no test process can do: a test never holds a GL

@@ -205,16 +205,11 @@ fn main() {
             continue;
         }
         match (&shots, &only) {
-            // Every variant to a PNG: one process each, because the shot's
-            // path is set once per process.
-            (Some(dir), None) => {
-                let exe = std::env::current_exe().expect("own path");
-                let status = std::process::Command::new(exe)
-                    .args(["--variant", name, "--shots"])
-                    .arg(dir)
-                    .status()
-                    .expect("spawn the variant");
-                assert!(status.success());
+            // The shot's path is set once per process, so a PNG needs one
+            // run per variant -- and this crate starts no child process
+            // outside `job_object::spawn_in_job`, examples included.
+            (Some(_), None) => {
+                eprintln!("--shots needs --variant {name} (one run per variant)");
             }
             (Some(dir), Some(_)) => {
                 let _ = SHOT.set(dir.join(format!("{name}.png")));
