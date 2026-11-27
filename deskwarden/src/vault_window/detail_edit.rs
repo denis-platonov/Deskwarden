@@ -8,6 +8,7 @@ use crate::app_match::{AppMatch, TriggerMode};
 use crate::card_brand::{brand_for_number, CARD_BRANDS};
 use crate::key_sequence::{self, FieldRef, PreviewPart, ResolveSource, Token};
 use crate::password_strength;
+use crate::kit::form;
 use crate::theme;
 use crate::vault_bridge::{
     CardData, Folder, GenerateRequest, IdentityData, ItemKind, NewItem, PassphraseRecipe,
@@ -4813,7 +4814,7 @@ pub fn website_add_button() -> &'static str {
 /// **It used to be a chip with these words ON it, in the row's label cell,
 /// and 8a puts a `\u{2715}` at the far right of the row instead.** The
 /// sentence survives the move because the mark cannot carry it:
-/// `theme::close_glyph_titled` paints two line segments and no glyph, so
+/// `form::close_glyph_titled` paints two line segments and no glyph, so
 /// there is nothing for a reader to read, and a ✕ that deletes something the
 /// user typed is the last control that should be unlabelled.
 ///
@@ -5049,7 +5050,7 @@ pub fn slot_add_hint() -> &'static str {
 ///
 /// In the row's LABEL CELL rather than under its box, so revealing a field
 /// costs no extra height at all -- an identity has eighteen of them. See
-/// [`slot_row`] for where in the cell, and [`theme::section_row_aside`] for
+/// [`slot_row`] for where in the cell, and [`form::section_row_aside`] for
 /// why it is the theme that decides.
 ///
 /// **Drawn only on a row [`Slot::always_shown`] is false for.** A login with
@@ -5072,11 +5073,11 @@ pub fn slot_remove_button() -> &'static str {
 /// This replaces `slot_label`, which drew a caption and a chip and left the
 /// CONTROL to the caller on the next line. That was the whole of the form's
 /// remaining inconsistency: `Item` and `Login credentials` were built out of
-/// [`theme::section_row`] and read as §8a; Identity, Card, SSH and the
+/// [`form::section_row`] and read as §8a; Identity, Card, SSH and the
 /// one-time code stacked label-above-field and read as the flat column the
 /// redraw was supposed to have replaced -- and the reason they did was this
 /// function, because a caption with a chip beside it does not fit a 130-point
-/// label column. [`theme::section_row_aside`] is the row that holds one, and
+/// label column. [`form::section_row_aside`] is the row that holds one, and
 /// every card on the form is now the same kind of row.
 ///
 /// **Non-removable rows go through the same call**, with `removable` false
@@ -5109,7 +5110,7 @@ fn row_with_chip<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> bool {
     let mut clicked = false;
-    theme::section_row_aside(
+    form::section_row_aside(
         ui,
         label,
         |ui| {
@@ -5165,6 +5166,7 @@ fn has_its_own_door(slot: Slot) -> bool {
 /// already on screen gets nothing rather than a control that opens onto an
 /// empty list.
 fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Option<Slot> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     if addable.is_empty() {
         return None;
     }
@@ -5177,7 +5179,7 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
     }
     if *open {
         ui.add_space(6.0);
-        ui.label(RichText::new(slot_add_hint()).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(slot_add_hint()).size(11.0).color(p.text_faint));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
@@ -5228,7 +5230,7 @@ pub fn history_button(count: usize) -> String {
 ///
 /// So there is no second list any more. The rows are
 /// [`detail::history_rows`] -- the read pane's own renderer, its own per-row
-/// eye, its own `Copy` -- drawn through [`theme::section_row_bleed`], which
+/// eye, its own `Copy` -- drawn through [`form::section_row_bleed`], which
 /// is what lets a band-shaped row live inside this card's padded body. See
 /// that function for the two paddings it cancels and the measurement.
 ///
@@ -5270,15 +5272,16 @@ pub fn history_button(count: usize) -> String {
 /// old arrangement got for free: a link painted into a rect narrower than
 /// itself would run back over the rating.
 fn history_link(ui: &mut egui::Ui, count: usize) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // 8a's own three values for this run -- `font-size: 12px; font-weight:
     // 600; color: #14307a` -- rather than `link_label`'s body-weight
-    // `BLUE`. `#14307a` is `theme::BLUE_DEEP`, which is what the password
+    // `BLUE`. `#14307a` is `palette.blue_deep`, which is what the password
     // box's own `Show` was set in, so the card's clickable runs match. The
     // owner: "Password history is a link not as per design".
     let galley = ui.painter().layout_no_wrap(
         history_button(count),
         egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        theme::BLUE_DEEP,
+        p.blue_deep,
     );
     let room = ui.available_width();
     if room < galley.size().x {
@@ -5294,7 +5297,7 @@ fn history_link(ui: &mut egui::Ui, count: usize) -> bool {
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    ui.painter().galley(at, galley, theme::BLUE_DEEP);
+    ui.painter().galley(at, galley, p.blue_deep);
     response.clicked()
 }
 
@@ -5364,7 +5367,7 @@ const TARGET_LINK_PX: f32 = 12.0;
 /// 8a's own `gap: 14px` on that row.
 ///
 /// **Written down because this card's rows have NO horizontal spacing of their
-/// own.** `theme::section_card` zeroes `item_spacing` so its bands stack flush,
+/// own.** `form::section_card` zeroes `item_spacing` so its bands stack flush,
 /// and `section_card_body_at` restores only the `y`; every row that puts two
 /// things side by side sets its own `x` (`row_with_buttons` uses
 /// `ROW_BUTTON_GAP`, `target_row` uses `TARGET_ROW_GAP`). The link rows did
@@ -5387,8 +5390,9 @@ const TARGET_LINK_GAP: f32 = 14.0;
 /// its job honestly: it fits beside the link or it goes to the next line
 /// whole, which is what the design draws either way.
 fn link_row_note(ui: &mut egui::Ui, text: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.add(
-        egui::Label::new(RichText::new(text).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT))
+        egui::Label::new(RichText::new(text).size(TARGET_NOTE_PX).color(p.text_faint))
             .wrap_mode(egui::TextWrapMode::Extend),
     );
 }
@@ -5434,7 +5438,7 @@ fn target_field_room(full: f32, trailing: f32, floor: f32) -> f32 {
 /// field that has just taken the whole line is nothing. Measured on a 298pt
 /// pane with three websites on the card: the first row's dropdown painted no
 /// text at all, and the row it did claim pushed the card body out far enough
-/// that the SECOND row saw `theme::section_rows_fit` answer differently from
+/// that the SECOND row saw `form::section_rows_fit` answer differently from
 /// the first -- one card, two layouts, and by the third row the ✕ was painted
 /// at x = 557 on a 298-point pane.
 ///
@@ -5477,7 +5481,7 @@ fn target_row<R>(
 /// Derived rather than written as a number so the wrap point moves with the
 /// controls; see [`target_field_room`].
 fn website_row_trailing() -> f32 {
-    MATCH_COMBO_WIDTH + theme::CLOSE_MARK_HIT + TARGET_ROW_GAP * 2.0 + TARGET_ROW_SLACK
+    MATCH_COMBO_WIDTH + form::CLOSE_HIT + TARGET_ROW_GAP * 2.0 + TARGET_ROW_SLACK
 }
 
 /// 8a's match dropdown for one website row.
@@ -5505,8 +5509,9 @@ fn website_match_combo(ui: &mut egui::Ui, row_id: u64, choice: &mut UriMatchChoi
 }
 
 fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut String, creating: bool) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     if creating {
-        // Through `theme::section_row`, with the caption in the label column
+        // Through `form::section_row`, with the caption in the label column
         // at its ordinary weight and only the BOX greyed -- which is exactly
         // what the `Item` card's `Type` row already does two cards up, and for
         // the same reason: the row is real, the caption names a real thing,
@@ -5515,7 +5520,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
         // caption sitting alone above a grey box read as a live label over a
         // dead field; in the label column it is one row among eight and the
         // grey box carries the whole message.
-        theme::section_row(ui, website_label_text(), |ui| {
+        form::section_row(ui, website_label_text(), |ui| {
             crate::kit::input::field_disabled_fill(ui, website_create_notice());
         });
         return;
@@ -5542,12 +5547,12 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
                 // under the word that names the row, on the left, where the
                 // eye reads captions.
                 //
-                // Through `theme::section_row` like every other card, because
+                // Through `form::section_row` like every other card, because
                 // that is where the caption's treatment lives -- see
                 // `row_with_chip`'s doc for the argument, which is unchanged;
                 // what has gone is the chip it used to put in the cell.
                 let row_id = entry.row_id();
-                theme::section_row(ui, &website_label(i), |ui| {
+                form::section_row(ui, &website_label(i), |ui| {
                     // Through `target_row`, which is where the row decides
                     // whether the dropdown and the mark can share the line
                     // with the box or have to drop under it. See that
@@ -5563,7 +5568,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
                         },
                         |ui| {
                             website_match_combo(ui, row_id, choice);
-                            if theme::close_glyph_with_id(ui, website_remove_id(row_id), website_remove_button())
+                            if form::close_glyph_with_id(ui, website_remove_id(row_id), website_remove_button())
                                 .clicked()
                             {
                                 remove = Some(i);
@@ -5582,13 +5587,13 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
     // noise; over three it is the only thing on screen that says which box
     // the rest of the app acts on.
     if uris.len() > 1 {
-        ui.label(RichText::new(website_first_note()).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(website_first_note()).size(TARGET_NOTE_PX).color(p.text_faint));
         ui.add_space(6.0);
     }
     // **8a's link, in 8a's place: under the rows, left-aligned to the FIELD
     // column rather than to the card's edge.**
     //
-    // Through [`field_column_row`] and not `theme::section_row`: the design
+    // Through [`field_column_row`] and not `form::section_row`: the design
     // has this link INSIDE the websites cell, `gap: 8px` under the last box,
     // and a row of the card rules itself off from the row above and pays the
     // card's padding either side of that rule. Measured, as a link 30 points
@@ -5605,7 +5610,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut Strin
     let typed_id = fills_in_add_id();
     let mut add = false;
     // Content, not a row: the app row after it still owes its rule.
-    theme::section_row_seen(ui);
+    form::section_row_seen(ui);
     ui.horizontal(|ui| {
         let size = crate::kit::controls::ROW;
         let button = crate::kit::controls::button_width(
@@ -5653,14 +5658,14 @@ fn avatar_menu(
         let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
         let _ = ui.interact(rect, avatar_row_id(which), egui::Sense::hover());
         if response.hovered() {
-            let wash = if which == AvatarRow::Remove { theme::DANGER_WASH } else { egui::Color32::from_rgb(0xf3, 0xf2, 0xf0) };
+            let wash = if which == AvatarRow::Remove { p.danger_wash } else { egui::Color32::from_rgb(0xf3, 0xf2, 0xf0) };
             ui.painter().rect_filled(rect, egui::CornerRadius::same(12), wash);
         }
         let tile_rect = egui::Rect::from_min_size(rect.left_center() + egui::vec2(12.0, -17.0), egui::Vec2::splat(34.0));
         ui.painter().rect_filled(tile_rect, egui::CornerRadius::same(10), tile);
         crate::kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(tile_rect.center(), egui::Vec2::splat(17.0)), glyph, 2.0, ink);
         let x = tile_rect.right() + 12.0;
-        let title_ink = if which == AvatarRow::Remove { theme::ERROR } else { p.ink };
+        let title_ink = if which == AvatarRow::Remove { p.error } else { p.ink };
         let font = egui::FontId::new(15.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
         match sub {
             Some(sub) => {
@@ -5678,7 +5683,7 @@ fn avatar_menu(
     {
         picked = Some(AvatarRow::Refresh);
     }
-    if row(ui, AvatarRow::Upload, avatar_upload(), Some(avatar_upload_sub()), crate::kit::icon::glyph::CAMERA, theme::BLUE_WASH, theme::BLUE) {
+    if row(ui, AvatarRow::Upload, avatar_upload(), Some(avatar_upload_sub()), crate::kit::icon::glyph::CAMERA, p.blue_wash, p.blue) {
         picked = Some(AvatarRow::Upload);
     }
     let from = app.map(|name| crate::i18n::tf("edit.avatar_from", &[("name", name)]));
@@ -5699,7 +5704,7 @@ fn avatar_menu(
             let _ = ui.interact(rect, avatar_row_id(AvatarRow::Swatch(index)), egui::Sense::hover());
             let selected = colour.is_some_and(|(c, _)| c == bg);
             if selected {
-                ui.painter().circle_stroke(rect.center(), 16.0, egui::Stroke::new(2.0, theme::BLUE));
+                ui.painter().circle_stroke(rect.center(), 16.0, egui::Stroke::new(2.0, p.blue));
             }
             let r = if response.hovered() { 15.5 } else { 14.0 };
             ui.painter().circle_filled(rect.center(), r, bg);
@@ -5713,7 +5718,7 @@ fn avatar_menu(
     if removable {
         let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
         ui.painter().rect_filled(line.shrink2(egui::vec2(4.0, 0.0)), 0.0, egui::Color32::from_rgb(0xf1, 0xef, 0xec));
-        if row(ui, AvatarRow::Remove, avatar_remove(), None, crate::kit::icon::glyph::TRASH, theme::DANGER_WASH, theme::ERROR) {
+        if row(ui, AvatarRow::Remove, avatar_remove(), None, crate::kit::icon::glyph::TRASH, p.danger_wash, p.error) {
             picked = Some(AvatarRow::Remove);
         }
     }
@@ -5723,9 +5728,10 @@ fn avatar_menu(
 /// Spec B 1.4 I's button: 50 high, radius 14, a red outline and red type,
 /// the whole column wide.
 fn move_to_trash_button(ui: &mut egui::Ui) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 50.0), egui::Sense::click());
     let _ = ui.interact(rect, move_to_trash_id(), egui::Sense::hover());
-    let fill = if response.hovered() { theme::DANGER_WASH } else { theme::CARD };
+    let fill = if response.hovered() { p.danger_wash } else { p.card };
     ui.painter().rect(
         rect,
         egui::CornerRadius::same(14),
@@ -5738,7 +5744,7 @@ fn move_to_trash_button(ui: &mut egui::Ui) -> bool {
         egui::Align2::CENTER_CENTER,
         move_to_trash(),
         egui::FontId::new(16.0, egui::FontFamily::Name(theme::BOLD.into())),
-        theme::ERROR,
+        p.error,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
@@ -5788,7 +5794,7 @@ fn live_code_line(ui: &mut egui::Ui, code: &str, seconds_left: u8, period: u16) 
 /// * The card body is about 264 points at `settings::MIN_VAULT_WINDOW_SIZE`.
 ///   118 for the name plus a chip, a mark, three gaps and a value box leaves
 ///   the value around 90 points -- which is `LGL-4471` and nothing longer.
-///   `theme::section_row` has a fit rule for exactly this problem, but that
+///   `form::section_row` has a fit rule for exactly this problem, but that
 ///   rule stacks a LABEL over a control; here both halves are controls and
 ///   there is no arm in which the row still reads as a row.
 /// * `boolean` and `linked` are not offered because this form cannot edit
@@ -5810,6 +5816,7 @@ fn custom_fields_block(
     // [`FieldDraft::claims_card_pin`].
     card: bool,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // **No rule and no heading here any more.** Design 8a gives this block a
     // card of its own, whose title band already says `Custom fields` in the
     // design's own treatment -- see `Section::title`. A `field_label` under a
@@ -5818,7 +5825,7 @@ fn custom_fields_block(
     // one. [`FIELDS_BLOCK_HEADING`] is still the string the card is titled
     // with, so nothing that looked for those words has lost them.
     if creating {
-        ui.label(RichText::new(fields_create_notice()).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(fields_create_notice()).size(11.0).color(p.text_faint));
         return;
     }
 
@@ -5826,7 +5833,7 @@ fn custom_fields_block(
     // here -- see those variants -- so "has no fields" is about the rows the
     // user can see, not about the vector's length.
     if !fields.iter().any(|f| !matches!(f.role, FieldRole::Internal | FieldRole::CardPin)) {
-        ui.label(RichText::new(fields_none_notice()).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(fields_none_notice()).size(11.0).color(p.text_faint));
         ui.add_space(6.0);
     }
 
@@ -5853,7 +5860,7 @@ fn custom_fields_block(
                     if field.name.is_empty() { crate::i18n::t("detail.unnamed_field") } else { &field.name },
                 );
                 ui.label(
-                    RichText::new(field_preserved_notice()).size(11.0).color(theme::TEXT_FAINT),
+                    RichText::new(field_preserved_notice()).size(11.0).color(p.text_faint),
                 );
                 ui.add_space(10.0);
             }
@@ -5893,7 +5900,7 @@ fn custom_fields_block(
                         if card && field.claims_card_pin() {
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new(pin_name_refusal()).size(12.0).color(theme::ERROR),
+                                RichText::new(pin_name_refusal()).size(12.0).color(p.error),
                             );
                         }
                         ui.add_space(4.0);
@@ -6025,7 +6032,7 @@ pub fn app_pick_hint() -> &'static str {
 /// until Save, so Cancel puts the binding back exactly as it was. What changed is where it sits -- 8a puts the mark at the far right
 /// of the row it removes, where the websites above it now carry theirs --
 /// and that it is a mark rather than a caption, which is why the sentence
-/// has to survive as the hover text (`theme::close_glyph_titled` paints two
+/// has to survive as the hover text (`form::close_glyph_titled` paints two
 /// line segments and no glyph).
 pub fn app_remove_button() -> &'static str {
     crate::i18n::t("edit.app_remove_button")
@@ -6287,31 +6294,31 @@ const STEP_CHIP_TOTAL_INSET: f32 = 4.0;
 
 /// The face a chip of this tone is set in, and the three colours it wears:
 /// its fill, its edge, and its ink.
-fn chip_palette(tone: ChipTone) -> (egui::FontFamily, egui::Color32, egui::Color32, egui::Color32) {
+fn chip_palette(tone: ChipTone, p: &crate::kit::tokens::Palette) -> (egui::FontFamily, egui::Color32, egui::Color32, egui::Color32) {
     match tone {
         ChipTone::Key => (
             egui::FontFamily::Monospace,
-            theme::CARD,
-            theme::BORDER_STRONG,
-            theme::INK,
+            p.card,
+            p.border,
+            p.ink,
         ),
         ChipTone::Wait => (
             egui::FontFamily::Monospace,
-            theme::CANVAS,
-            theme::HAIRLINE,
-            theme::TEXT_FAINT,
+            p.field_bg,
+            p.hairline,
+            p.text_faint,
         ),
         ChipTone::Field => (
             egui::FontFamily::Name(theme::SEMIBOLD.into()),
-            theme::BLUE_WASH,
-            theme::BLUE_EDGE,
-            theme::BLUE_DEEP,
+            p.blue_wash,
+            p.blue_edge,
+            p.blue_deep,
         ),
         ChipTone::Secret => (
             egui::FontFamily::Name(theme::BOLD.into()),
-            theme::DANGER_WASH,
-            theme::DANGER_EDGE,
-            theme::DANGER_INK,
+            p.danger_wash,
+            p.danger_edge,
+            p.danger_ink,
         ),
     }
 }
@@ -6327,7 +6334,7 @@ fn chip_height(ui: &egui::Ui) -> f32 {
     let tallest = ui.ctx().fonts_mut(|f| {
         faces
             .iter()
-            .map(|tone| f.row_height(&egui::FontId::new(STEP_CHIP_PX, chip_palette(*tone).0)))
+            .map(|tone| f.row_height(&egui::FontId::new(STEP_CHIP_PX, chip_palette(*tone, &crate::kit::tokens::palette(ui.ctx())).0)))
             .fold(0.0_f32, f32::max)
     });
     tallest + STEP_CHIP_PAD_Y * 2.0
@@ -6335,7 +6342,7 @@ fn chip_height(ui: &egui::Ui) -> f32 {
 
 /// One of 8a's chips, at the row's shared [`chip_height`].
 pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, height: f32) {
-    let (family, fill, edge, ink) = chip_palette(tone);
+    let (family, fill, edge, ink) = chip_palette(tone, &crate::kit::tokens::palette(ui.ctx()));
     let font = egui::FontId::new(STEP_CHIP_PX, family);
     let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), ink);
     let size = egui::vec2(galley.size().x + STEP_CHIP_PAD_X * 2.0, height);
@@ -6375,6 +6382,7 @@ pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, heigh
 
 /// 8a's readout: the sequence as chips, and what it costs in time after them.
 fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'_>) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let height = chip_height(ui);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(STEP_CHIP_GAP, 4.0);
@@ -6425,7 +6433,7 @@ fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'
                 egui::Label::new(
                     RichText::new(duration_label(total))
                         .size(STEP_CHIP_TOTAL_PX)
-                        .color(theme::TEXT_GHOST),
+                        .color(p.text_ghost),
                 )
                 .wrap_mode(egui::TextWrapMode::Extend),
             );
@@ -7658,9 +7666,10 @@ fn app_window_picker(
 /// dismiss mark, because the card had no \u{2715} at all ("no X button") and
 /// the header's right-hand end is where every other card in this app puts one.
 fn picker_header(ui: &mut egui::Ui) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     egui::Frame::new().inner_margin(Margin { left: 30, right: 70, top: 28, bottom: 20 }).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(theme::extrabold(picker_title(), 26.0).color(theme::INK));
+        ui.label(theme::extrabold(picker_title(), 26.0).color(p.ink));
     });
 }
 
@@ -7669,14 +7678,16 @@ fn picker_header(ui: &mut egui::Ui) {
 /// Allocated rather than painted over the band above it, so the bands stack
 /// by layout and nothing has to know where the previous one ended.
 fn picker_rule(ui: &mut egui::Ui) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::HAIRLINE);
+    ui.painter().rect_filled(rect, 0.0, p.hairline);
 }
 
 /// 8b's list band. Writes the staged row straight onto the draft; nothing
 /// here binds anything.
 fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft, apps: &mut AppIdentityCache) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // **Every row's icon, asked for BEFORE the band is laid out and copied
     // out of the cache**, so the borrow of `apps` is over before the rows
     // take `app` -- and so that one `request_repaint_after` covers the whole
@@ -7735,7 +7746,7 @@ fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft, apps: &mut AppIdentit
                 }
                 if app.windows.is_empty() {
                     ui.label(
-                        RichText::new(picker_empty()).size(PICKER_COUNT_PX).color(theme::TEXT_FAINT),
+                        RichText::new(picker_empty()).size(PICKER_COUNT_PX).color(p.text_faint),
                     );
                 }
             });
@@ -7758,6 +7769,7 @@ fn picker_row(
     taken: bool,
     icon: Option<&egui::TextureHandle>,
 ) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let refusal = window_row_refusal(row);
     // 8b's `opacity: 0.5` on a row that cannot be taken, applied to every ink
     // and edge the row draws rather than to the words alone: a full-strength
@@ -7770,13 +7782,13 @@ fn picker_row(
         }
     };
     let framed = egui::Frame::new()
-        .fill(if selected { theme::BLUE_WASH } else { theme::CARD })
+        .fill(if selected { p.blue_wash } else { p.card })
         // 8b gives only the washed row a border, and a border that appears on
         // selection would move every row below it by two points. Transparent
         // on the others is the same box, drawn or not.
         .stroke(Stroke::new(
             PICKER_BORDER,
-            if selected { theme::BLUE_EDGE } else { egui::Color32::TRANSPARENT },
+            if selected { p.blue_edge } else { egui::Color32::TRANSPARENT },
         ))
         .corner_radius(CornerRadius::same(PICKER_ROW_RADIUS))
         .inner_margin(Margin::symmetric(PICKER_ROW_PAD_X, PICKER_ROW_PAD_Y))
@@ -7820,7 +7832,7 @@ fn picker_row(
                 let title = theme::truncated_galley(
                     ui,
                     theme::semibold(row.title.clone(), PICKER_NAME_PX)
-                        .color(dim(if selected { theme::BLUE_DEEP } else { theme::INK })),
+                        .color(dim(if selected { p.blue_deep } else { p.ink })),
                     room,
                     egui::TextStyle::Body,
                 );
@@ -7830,9 +7842,9 @@ fn picker_row(
                         .size(PICKER_SUB_PX)
                         .family(egui::FontFamily::Monospace)
                         .color(dim(if selected {
-                            theme::TEXT_SECONDARY
+                            p.text_nav
                         } else {
-                            theme::TEXT_GHOST
+                            p.text_ghost
                         })),
                     room,
                     egui::TextStyle::Body,
@@ -7853,11 +7865,11 @@ fn picker_row(
                             egui::vec2(trailing, theme::CHIP_HEIGHT),
                             egui::Sense::hover(),
                         );
-                        theme::paint_return_keycap(ui.painter(), rect);
+                        form::paint_return_keycap(ui.painter(), rect, &p);
                     });
                 } else if taken {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        picker_chip(ui, picker_taken_chip(), dim(theme::TEXT_FAINT));
+                        picker_chip(ui, picker_taken_chip(), dim(p.text_faint));
                     });
                 }
             });
@@ -7901,12 +7913,13 @@ fn picker_subtitle(row: &AppWindowRow, refused: bool) -> String {
 /// U+21B5 is carried by neither Archivo nor egui's fallback stack (which is
 /// why `theme::paint_return_keycap` DRAWS it).
 fn picker_keycap_width(ui: &egui::Ui) -> f32 {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let cell = ui
         .painter()
         .layout_no_wrap(
             "0".to_string(),
             egui::FontId::new(theme::CHIP_TEXT_PX, egui::FontFamily::Monospace),
-            theme::TEXT_FAINT,
+            p.text_faint,
         )
         .size()
         .x;
@@ -7915,7 +7928,8 @@ fn picker_keycap_width(ui: &egui::Ui) -> f32 {
 
 /// The width 8b's text chip will occupy.
 fn picker_chip_width(ui: &egui::Ui, text: &str) -> f32 {
-    picker_chip_galley(ui, text, theme::TEXT_FAINT).size().x + PICKER_CHIP_PAD_X * 2.0
+    let p = crate::kit::tokens::palette(ui.ctx());
+    picker_chip_galley(ui, text, p.text_faint).size().x + PICKER_CHIP_PAD_X * 2.0
 }
 
 fn picker_chip_galley(
@@ -7935,13 +7949,14 @@ fn picker_chip_galley(
 /// this one is 11px proportional at radius 5 and padding `2px 7px`. A chip
 /// that says `already a target` is a label, not a key.
 fn picker_chip(ui: &mut egui::Ui, text: &str, ink: egui::Color32) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let galley = picker_chip_galley(ui, text, ink);
     let size = egui::vec2(
         galley.size().x + PICKER_CHIP_PAD_X * 2.0,
         galley.size().y + PICKER_CHIP_PAD_Y * 2.0,
     );
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(PICKER_CHIP_RADIUS), theme::CANVAS);
+    ui.painter().rect_filled(rect, CornerRadius::same(PICKER_CHIP_RADIUS), p.field_bg);
     ui.painter().galley(
         egui::pos2(rect.min.x + PICKER_CHIP_PAD_X, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -7953,9 +7968,10 @@ fn picker_chip(ui: &mut egui::Ui, text: &str, ink: egui::Color32) {
 /// will actually be matched by. See the departures above for why it draws no
 /// radio.
 fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let picked = app.picked_row().cloned();
     egui::Frame::new()
-        .fill(theme::CARD_TINT)
+        .fill(p.list_bg)
         .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_BAND_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -7965,13 +7981,13 @@ fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
                 PICKER_MATCH_CAPTION_PX,
                 theme::BOLD,
                 PICKER_MATCH_CAPTION_TRACKING,
-                theme::TEXT_GHOST,
+                p.text_ghost,
             ));
             let Some(row) = picked else {
                 ui.label(
                     RichText::new(picker_match_none())
                         .size(PICKER_NAME_PX)
-                        .color(theme::TEXT_GHOST),
+                        .color(p.text_ghost),
                 );
                 return;
             };
@@ -7984,14 +8000,14 @@ fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
             // not shrink to fit and pushes the card past the pane (`aae9429`).
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = PICKER_MATCH_GAP_X;
-                ui.label(theme::semibold(rule, PICKER_NAME_PX).color(theme::INK));
+                ui.label(theme::semibold(rule, PICKER_NAME_PX).color(p.ink));
                 ui.label(
                     RichText::new(value)
                         .size(PICKER_SUB_PX)
                         .family(egui::FontFamily::Monospace)
-                        .color(theme::TEXT_FAINT),
+                        .color(p.text_faint),
                 );
-                ui.label(RichText::new(note).size(PICKER_SUB_PX).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(note).size(PICKER_SUB_PX).color(p.text_faint));
             });
         });
 }
@@ -8274,6 +8290,7 @@ fn bank_choice_text(card: &CardDraft, index: usize) -> String {
 /// window fills in; an empty list is drawn as a sentence naming its cause
 /// rather than as a picker with nothing in it.
 fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut cleared = false;
     row_with_buttons(ui, &[bank_clear()], |ui, room| {
         let name = card.bank_label();
@@ -8324,7 +8341,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
                 }
             }
             if card.bank_choices.is_empty() {
-                ui.label(RichText::new(bank_no_choices()).size(12.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(bank_no_choices()).size(12.0).color(p.text_faint));
             }
         });
     // After the loop, so the immutable borrow of `bank_choices` is over
@@ -8356,12 +8373,12 @@ pub(crate) enum ChipEdit {
 
 /// **The secret step's tint, edge and ink -- 4a's and 4c's `#fdf3f2`,
 /// `#e8a9a2` and `#8c3c33` -- now [`theme::secret_band`] and
-/// [`theme::SECRET_INK`].**
+/// [`palette.danger_ink`].**
 ///
 /// 4e names this the one deliberate departure from the palette in the whole
 /// product: "The product is blue. Secrets are the only thing rendered in red
 /// ... so the hatched password step cannot be mistaken for ordinary UI." What
-/// this list drew instead was [`theme::CARD_TINT`] -- `#fbfaf9`, a near-white
+/// this list drew instead was [`palette.list_bg`] -- `#fbfaf9`, a near-white
 /// that is one step off the card behind it -- so the step that types a
 /// password read as the same kind of thing as the Tab above it.
 ///
@@ -8401,16 +8418,16 @@ const SECRET_STEP_RADIUS: u8 = 10;
 /// The badge's ink. One accent hue and one exception: the understood kinds
 /// wear the blue, the two that are carried rather than acted on wear the faint
 /// ink -- the same distinction the chips drew, said in colour rather than in
-/// fill -- and a step that types a secret wears [`theme::ERROR`], which is
+/// fill -- and a step that types a secret wears [`palette.error`], which is
 /// 4a's own `#b42318` badge.
-fn badge_ink(row: &StepRow) -> egui::Color32 {
+fn badge_ink(row: &StepRow, p: &crate::kit::tokens::Palette) -> egui::Color32 {
     match row.kind {
-        _ if !row.understood => theme::TEXT_FAINT,
+        _ if !row.understood => p.text_faint,
         // Before the two arms below, because a secret step is a `Text` step
         // and would otherwise take the blue with everything else.
-        _ if row.secret => theme::ERROR,
-        StepKind::Rate | StepKind::Raw => theme::TEXT_MUTED,
-        _ => theme::BLUE,
+        _ if row.secret => p.error,
+        StepKind::Rate | StepKind::Raw => p.text_muted,
+        _ => p.blue,
     }
 }
 
@@ -8434,15 +8451,16 @@ pub(crate) fn sequence_steps(
     rows: &[StepRow],
     editable: bool,
 ) -> Option<ChipEdit> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut edit = None;
     for row in rows {
         // The one branch, and the whole of it: a secret step wears the band,
         // an ordinary one wears the card. Neither arm names a colour here --
         // see `SECRET_STEP_RADIUS` for why the shape stays and the hexes went.
         let ground = if row.secret {
-            theme::secret_band()
+            form::secret_band(&crate::kit::tokens::Palette::LIGHT)
         } else {
-            egui::Frame::new().fill(theme::CARD).stroke(Stroke::new(1.0, theme::HAIRLINE))
+            egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.hairline))
         };
         ground
             .corner_radius(CornerRadius::same(SECRET_STEP_RADIUS))
@@ -8462,18 +8480,18 @@ pub(crate) fn sequence_steps(
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
                     ui.label(
-                        RichText::new(row.number.to_string()).size(11.0).color(theme::TEXT_GHOST),
+                        RichText::new(row.number.to_string()).size(11.0).color(p.text_ghost),
                     );
-                    ui.label(theme::semibold(row.kind.badge(), 10.0).color(badge_ink(row)));
+                    ui.label(theme::semibold(row.kind.badge(), 10.0).color(badge_ink(row, &p)));
                     let label = ui.label(
                         theme::semibold(row.label.clone(), 12.0).color(match row.kind {
-                            _ if !row.understood => theme::TEXT_FAINT,
+                            _ if !row.understood => p.text_faint,
                             // 4a sets the word "Password" in white on the red
                             // chip; on a tint this pale the design's own
                             // `#8c3c33` is what stays legible, and it is the
                             // ink 4c gives the same chip.
-                            _ if row.secret => theme::SECRET_INK,
-                            _ => theme::INK,
+                            _ if row.secret => p.danger_ink,
+                            _ => p.ink,
                         }),
                     );
                     if !row.understood {
@@ -8486,7 +8504,7 @@ pub(crate) fn sequence_steps(
                         // row's own red instead -- it is part of the one thing
                         // on this list that is not ordinary UI, not a value.
                         ui.label(RichText::new(row.payload.clone()).size(12.0).color(
-                            if row.secret { theme::SECRET_INK } else { theme::BLUE },
+                            if row.secret { p.danger_ink } else { p.blue },
                         ));
                     }
                     if editable {
@@ -8506,7 +8524,7 @@ pub(crate) fn sequence_steps(
                         }
                     }
                 });
-                ui.label(RichText::new(row.footnote()).size(11.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(row.footnote()).size(11.0).color(p.text_faint));
                 });
             });
         ui.add_space(4.0);
@@ -8564,7 +8582,7 @@ pub(crate) fn view_toggle_compact_height(ui: &egui::Ui) -> f32 {
 
 /// The view toggle's cells over the kit's segmented control (a grey track with
 /// the chosen cell lifted onto white), as every other choice row is drawn.
-fn kit_segments(ui: &mut egui::Ui, cells: &[theme::Segment<'_>], style: crate::kit::controls::SegmentStyle) -> Option<usize> {
+fn kit_segments(ui: &mut egui::Ui, cells: &[form::Segment<'_>], style: crate::kit::controls::SegmentStyle) -> Option<usize> {
     let labels: Vec<&str> = cells.iter().map(|c| c.label).collect();
     let selected = cells.iter().position(|c| c.selected).unwrap_or(0);
     crate::kit::controls::segmented(ui, &labels, selected, style)
@@ -8581,11 +8599,11 @@ pub(crate) fn view_toggle_compact(ui: &mut egui::Ui, template_view: bool) -> Opt
 fn view_toggle_run(
     ui: &mut egui::Ui,
     template_view: bool,
-    run: impl Fn(&mut egui::Ui, &[theme::Segment<'_>]) -> Option<usize>,
+    run: impl Fn(&mut egui::Ui, &[form::Segment<'_>]) -> Option<usize>,
 ) -> Option<bool> {
     let cells = [
-        theme::Segment { label: view_steps(), selected: !template_view },
-        theme::Segment { label: view_template(), selected: template_view },
+        form::Segment { label: view_steps(), selected: !template_view },
+        form::Segment { label: view_template(), selected: template_view },
     ];
     // **A press on the cell already in force is reported and then dropped.**
     // `segmented_control` hands back every press, including the one that asks
@@ -8609,20 +8627,21 @@ pub(crate) fn sequence_unknown_tip() -> &'static str {
 /// for is a control that draws as a box.
 /// The resolved preview. Draws and drops -- see [`PreviewPart`].
 fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(2.0, 3.0);
         for part in parts {
             let (text, color) = match part {
-                PreviewPart::Text(t) => (t.clone(), theme::INK),
-                PreviewPart::Value(v) => (v.clone(), theme::BLUE),
+                PreviewPart::Text(t) => (t.clone(), p.ink),
+                PreviewPart::Value(v) => (v.clone(), p.blue),
                 // In brackets, so a key cannot be misread as the characters
                 // of its own name sitting in the typed text.
-                PreviewPart::Key(symbol) => (format!("[{symbol}]"), theme::TEXT_FAINT),
-                PreviewPart::Wait(ms) => (format!("[{}]", key_sequence::wait_label(*ms)), theme::TEXT_FAINT),
-                PreviewPart::Rate(ms) => (format!("[{}]", key_sequence::rate_per_key(*ms)), theme::TEXT_FAINT),
-                PreviewPart::Unresolved(why) => (why.clone(), theme::ERROR),
-                PreviewPart::Pending => (crate::i18n::t("edit.fetching_code").to_string(), theme::TEXT_FAINT),
-                PreviewPart::Opaque(raw) => (raw.clone(), theme::TEXT_FAINT),
+                PreviewPart::Key(symbol) => (format!("[{symbol}]"), p.text_faint),
+                PreviewPart::Wait(ms) => (format!("[{}]", key_sequence::wait_label(*ms)), p.text_faint),
+                PreviewPart::Rate(ms) => (format!("[{}]", key_sequence::rate_per_key(*ms)), p.text_faint),
+                PreviewPart::Unresolved(why) => (why.clone(), p.error),
+                PreviewPart::Pending => (crate::i18n::t("edit.fetching_code").to_string(), p.text_faint),
+                PreviewPart::Opaque(raw) => (raw.clone(), p.text_faint),
             };
             ui.label(RichText::new(text).size(12.0).color(color));
         }
@@ -8641,6 +8660,7 @@ fn app_sequence_block(
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
 ) -> Option<EditAction> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut opened = None;
     let view = sequence_view(&app.sequence);
 
@@ -8649,11 +8669,11 @@ fn app_sequence_block(
     // fact that this binding does nothing at all, and the builder is SHUT by
     // default. Drawn here it is on screen in both states, so the user who
     // never opens the block still finds out before the fill silently does
-    // nothing. `theme::ERROR`, the same ink the form's own "Name is required."
+    // nothing. `palette.error`, the same ink the form's own "Name is required."
     // wears, because it is the same kind of statement: this will not work, and
     // here is the thing to change.
     if let Some(warning) = sequence_warning(&app.sequence, source) {
-        ui.label(RichText::new(warning).size(11.0).color(theme::ERROR));
+        ui.label(RichText::new(warning).size(11.0).color(p.error));
         ui.add_space(4.0);
     }
 
@@ -8685,7 +8705,7 @@ fn app_sequence_block(
         return opened;
     }
     if !app.sequence_open {
-        theme::section_row(ui, sequence_row_label(), |ui| {
+        form::section_row(ui, sequence_row_label(), |ui| {
             row_with_buttons(ui, &[sequence_edit_button()], |ui, room| {
                 // **`set_width`, not `set_max_width`.** `row_with_buttons`
                 // measures the button, hands the field what is left, and
@@ -8726,12 +8746,12 @@ fn app_sequence_block(
 
     crate::kit::card::field_label(ui, app_sequence_label());
 
-    ui.label(RichText::new(app_sequence_hint()).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(app_sequence_hint()).size(11.0).color(p.text_faint));
     ui.add_space(6.0);
 
     if view.is_default {
         ui.label(
-            RichText::new(app_sequence_default_notice()).size(11.0).color(theme::TEXT_FAINT),
+            RichText::new(app_sequence_default_notice()).size(11.0).color(p.text_faint),
         );
         ui.add_space(4.0);
     }
@@ -8746,7 +8766,7 @@ fn app_sequence_block(
             Some(tally) => tally_label(&tally),
             None => tally_refused().to_string(),
         };
-        ui.label(theme::semibold(summary, 11.0).color(theme::TEXT_SECONDARY));
+        ui.label(theme::semibold(summary, 11.0).color(p.text_nav));
         if let Some(wants_template) = view_toggle(ui, app.template_view) {
             // **Seeded verbatim, every time the view is entered.** Not
             // `render`ed, not normalised: the box holds the bytes the item
@@ -8770,7 +8790,7 @@ fn app_sequence_block(
     ui.add_space(8.0);
 
     if let Some(tally) = sequence_tally(&app.sequence, source) {
-        ui.label(RichText::new(budget_label(&tally)).size(11.0).color(theme::TEXT_GHOST));
+        ui.label(RichText::new(budget_label(&tally)).size(11.0).color(p.text_ghost));
         ui.add_space(6.0);
     }
 
@@ -8794,7 +8814,7 @@ fn app_sequence_block(
     }
 
     // -- the palette: nothing here is typed from memory --------------------
-    ui.label(RichText::new(crate::i18n::t("edit.add_value")).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_value")).size(11.0).color(p.text_faint));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for field in palette {
@@ -8806,13 +8826,13 @@ fn app_sequence_block(
             ui.label(
                 RichText::new(crate::i18n::t("seq.no_fields"))
                     .size(11.0)
-                    .color(theme::TEXT_FAINT),
+                    .color(p.text_faint),
             );
         }
     });
     ui.add_space(6.0);
 
-    ui.label(RichText::new(crate::i18n::t("edit.add_key")).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_key")).size(11.0).color(p.text_faint));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
@@ -8824,7 +8844,7 @@ fn app_sequence_block(
     ui.add_space(6.0);
 
     // -- literal text: `2134{TOTP}` is why this box exists ------------------
-    ui.label(RichText::new(crate::i18n::t("edit.add_text")).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_text")).size(11.0).color(p.text_faint));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         crate::kit::input::field(ui, &mut app.literal_draft, 160.0);
@@ -8841,7 +8861,7 @@ fn app_sequence_block(
     ui.add_space(6.0);
 
     // -- the wait, in the seconds the user asked for -----------------------
-    ui.label(RichText::new(crate::i18n::t("edit.add_wait")).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(crate::i18n::t("edit.add_wait")).size(11.0).color(p.text_faint));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         // Only a number goes in -- `key_sequence::only_a_number`, the same
@@ -8849,7 +8869,7 @@ fn app_sequence_block(
         if crate::kit::input::field(ui, &mut app.wait_draft, 72.0).changed() {
             app.wait_draft = key_sequence::only_a_number(&app.wait_draft);
         }
-        ui.label(RichText::new(crate::i18n::t("seq.wait_unit")).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(crate::i18n::t("seq.wait_unit")).size(11.0).color(p.text_faint));
         let addable = key_sequence::wait_ms_from_seconds(&app.wait_draft).is_some();
         if ui
             .add_enabled_ui(addable, |ui| crate::kit::controls::row_button(ui, crate::i18n::t("edit.add_wait_button")))
@@ -8861,7 +8881,7 @@ fn app_sequence_block(
             }
         }
         if !addable {
-            ui.label(RichText::new(wait_refusal()).size(11.0).color(theme::TEXT_FAINT));
+            ui.label(RichText::new(wait_refusal()).size(11.0).color(p.text_faint));
         }
     });
     ui.add_space(8.0);
@@ -8898,7 +8918,7 @@ fn app_sequence_block(
     if app.previewing {
         sequence_preview(ui, &key_sequence::resolve_preview(&view.tokens, source));
     } else {
-        ui.label(RichText::new(app_sequence_hidden_note()).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(app_sequence_hidden_note()).size(11.0).color(p.text_faint));
     }
     ui.add_space(10.0);
     action
@@ -8977,6 +8997,7 @@ pub(crate) fn template_editor(
     touched: &mut bool,
     fault: Option<String>,
 ) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     // **4c's own box**: `border: 1px solid; border-radius: 8px; padding:
     // 12px 13px`, mono 13 on a line box wide enough for the token chips
     // inside it (`line-height: 1.9`). Blue and haloed while it has focus,
@@ -8984,8 +9005,8 @@ pub(crate) fn template_editor(
     let box_id = ui.id().with("template-box");
     let focused = ui.memory(|m| m.has_focus(box_id));
     let framed = egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, if focused { theme::BLUE } else { theme::BORDER_STRONG }))
+        .fill(p.card)
+        .stroke(Stroke::new(1.0, if focused { p.blue } else { p.border }))
         .corner_radius(CornerRadius::same(TEMPLATE_BOX_RADIUS))
         // Sideways only. The air above and below is measured from the chips
         // and added as space, below.
@@ -9068,7 +9089,7 @@ pub(crate) fn template_editor(
                             egui::vec2(TEMPLATE_CARET_WIDTH, chip_height),
                         ),
                         CornerRadius::ZERO,
-                        theme::INK,
+                        p.ink,
                     );
                 }
             }
@@ -9089,7 +9110,7 @@ pub(crate) fn template_editor(
         ui.painter().rect_stroke(
             framed.response.rect.expand(2.0),
             CornerRadius::same(TEMPLATE_BOX_RADIUS),
-            Stroke::new(3.0, theme::FOCUS_RING),
+            Stroke::new(3.0, p.focus),
             egui::StrokeKind::Middle,
         );
     }
@@ -9101,14 +9122,14 @@ pub(crate) fn template_editor(
 
     if template_draft.is_empty() {
         ui.add_space(TEMPLATE_GAP);
-        ui.label(RichText::new(crate::i18n::tf("edit.template_empty_note", &[("default", "{USERNAME}{TAB}{PASSWORD}")])).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(crate::i18n::tf("edit.template_empty_note", &[("default", "{USERNAME}{TAB}{PASSWORD}")])).size(11.0).color(p.text_faint));
     }
 
     // **The refusal, in the field that caused it.** Save is off while this is
     // on screen -- see `EditDraft::sequence_fault`.
     if let Some(fault) = fault {
         ui.add_space(TEMPLATE_GAP);
-        ui.label(RichText::new(fault).size(11.0).color(theme::ERROR));
+        ui.label(RichText::new(fault).size(11.0).color(p.error));
     }
 
     // **4c's `INSERT` row**: the caption in small capitals and the tokens as
@@ -9125,7 +9146,7 @@ pub(crate) fn template_editor(
                 TEMPLATE_CAPTION_PX,
                 theme::BOLD,
                 TEMPLATE_CAPTION_PX * TEMPLATE_CAPTION_TRACKING,
-                theme::TEXT_GHOST,
+                p.text_ghost,
             ))
             .extend(),
         );
@@ -9144,11 +9165,12 @@ pub(crate) fn template_editor(
 /// the line above -- blue for a value, red for a secret, outlined for a key
 /// or a wait.
 fn insert_chip(ui: &mut egui::Ui, token: &str) -> egui::Response {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (fill, edge, ink) = match token_tone(token) {
-        TokenTone::Value => (theme::BLUE_WASH, theme::BLUE_EDGE, theme::BLUE_DEEP),
-        TokenTone::Secret => (theme::DANGER_WASH, theme::DANGER_EDGE, theme::DANGER_INK),
+        TokenTone::Value => (p.blue_wash, p.blue_edge, p.blue_deep),
+        TokenTone::Secret => (p.danger_wash, p.danger_edge, p.danger_ink),
         TokenTone::Timing | TokenTone::Key => {
-            (theme::CARD, theme::BORDER_STRONG, theme::TEXT_SECONDARY)
+            (p.card, p.border, p.text_nav)
         }
     };
     let font = egui::FontId::new(TEMPLATE_CHIP_PX, egui::FontFamily::Monospace);
@@ -9239,6 +9261,7 @@ fn template_galley(
     text: &str,
     wrap: f32,
 ) -> std::sync::Arc<egui::Galley> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let font = template_font();
     // **The row is a chip plus the air between two of them**, and no longer
     // the face's own line: the chips grew ("pills should be higher as per
@@ -9261,13 +9284,13 @@ fn template_galley(
         for ((run, token), leading) in runs.iter().zip(leadings) {
             let color = if *token {
                 match token_tone(run) {
-                    TokenTone::Value => theme::BLUE_DEEP,
-                    TokenTone::Secret => theme::DANGER_INK,
-                    TokenTone::Timing => theme::TEXT_FAINT,
-                    TokenTone::Key => theme::TEXT_SECONDARY,
+                    TokenTone::Value => p.blue_deep,
+                    TokenTone::Secret => p.danger_ink,
+                    TokenTone::Timing => p.text_faint,
+                    TokenTone::Key => p.text_nav,
                 }
             } else {
-                theme::INK
+                p.ink
             };
             job.append(
                 run,
@@ -9382,7 +9405,7 @@ fn template_pills(
                 shapes.push(egui::Shape::rect_filled(
                     rect,
                     CornerRadius::same(TEMPLATE_TOKEN_RADIUS),
-                    token_ground(token_tone(run)),
+                    token_ground(token_tone(run), &crate::kit::tokens::palette(ui.ctx())),
                 ));
             }
         }
@@ -9500,11 +9523,11 @@ fn spaced_tokens(text: &str) -> String {
 
 /// The ground a token of this kind is drawn on. Its INK is
 /// [`template_galley`]'s, and the two are picked together.
-fn token_ground(tone: TokenTone) -> egui::Color32 {
+fn token_ground(tone: TokenTone, p: &crate::kit::tokens::Palette) -> egui::Color32 {
     match tone {
-        TokenTone::Value => theme::FOCUS_RING,
-        TokenTone::Secret => theme::DANGER_PILL,
-        TokenTone::Timing | TokenTone::Key => theme::CANVAS,
+        TokenTone::Value => p.focus,
+        TokenTone::Secret => p.danger_wash,
+        TokenTone::Timing | TokenTone::Key => p.field_bg,
     }
 }
 
@@ -9689,11 +9712,11 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
     // the card changed layout depending on whether the item happened to be
     // bound.
     let mut chose = None;
-    theme::section_row(ui, app_block_heading(), |ui| {
+    form::section_row(ui, app_block_heading(), |ui| {
         // **The row's height is the field's**, so the links sit on the line
         // the caption beside them is on.
         //
-        // `theme::section_row` paints its caption optically centred against a
+        // `form::section_row` paints its caption optically centred against a
         // `SECTION_FIELD_HEIGHT` box, and a bare link row is only as tall as
         // its own galley -- so the caption sat five points BELOW the link it
         // names ("should be on same line": caption ink at 672.5, link ink at
@@ -9840,6 +9863,7 @@ fn app_fresh_note(app: &AppMatchDraft) -> String {
 /// painted width and is clamped to the box, so a short name keeps it beside
 /// the name and a long one pushes it to the inset and no further.
 fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     if exe.is_empty() {
         crate::kit::input::field_disabled(ui, name, room, 0.0);
         return;
@@ -9890,15 +9914,15 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
     // **White, where 8b's chip is grey**, and the inversion is the point: 8a
     // draws this chip in `#f3f2f2` inside a WHITE box, and this form's box is
     // the greyed read-out treatment (`section_disabled_text_field_reserving`)
-    // whose fill is that same `theme::CANVAS`. Painted in the design's own
+    // whose fill is that same `palette.field_bg`. Painted in the design's own
     // colour the pill was invisible -- the owner, with the row screenshotted:
     // "no pill for the latter". The hairline edge is what makes it read as a
     // chip rather than as a gap in the box.
     ui.painter().rect(
         chip,
         CornerRadius::same(PICKER_CHIP_RADIUS),
-        theme::CARD,
-        Stroke::new(1.0, theme::HAIRLINE),
+        p.card,
+        Stroke::new(1.0, p.hairline),
         egui::StrokeKind::Inside,
     );
     // The run at the line it was measured to, NOT at the pill's own top plus a
@@ -9908,7 +9932,7 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
     ui.painter().galley(
         egui::pos2(chip.left() + PICKER_CHIP_PAD_X, chip_text_top),
         galley,
-        theme::TEXT_GHOST,
+        p.text_ghost,
     );
 }
 
@@ -9959,12 +9983,13 @@ fn app_name_field_want(ui: &egui::Ui, name: &str, exe: &str) -> f32 {
 }
 
 /// The executable chip's galley: 8a's `ui-monospace` at 11px in
-/// [`theme::TEXT_GHOST`], which is 8b's row subtitle one card over.
+/// [`palette.text_ghost`], which is 8b's row subtitle one card over.
 fn picker_chip_galley_mono(ui: &egui::Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.painter().layout_no_wrap(
         text.to_string(),
         egui::FontId::new(PICKER_SUB_PX, egui::FontFamily::Monospace),
-        theme::TEXT_GHOST,
+        p.text_ghost,
     )
 }
 
@@ -9996,6 +10021,7 @@ fn app_target_row(
     name: &str,
     icon: Option<&egui::TextureHandle>,
 ) -> TargetPress {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let fresh = app.just_picked;
     let open = app.settings_open;
     let mut press = TargetPress::default();
@@ -10016,10 +10042,10 @@ fn app_target_row(
         // 8a's `background: #eef2fc; border: 1px solid #b8c7ea` on the row it
         // highlights, and the same box drawn in nothing on the row it does
         // not -- see [`APP_ROW_RADIUS`] for why the box is always there.
-        .fill(if fresh { theme::BLUE_WASH } else { egui::Color32::TRANSPARENT })
+        .fill(if fresh { p.blue_wash } else { egui::Color32::TRANSPARENT })
         .stroke(Stroke::new(
             APP_ROW_BORDER,
-            if fresh { theme::BLUE_EDGE } else { egui::Color32::TRANSPARENT },
+            if fresh { p.blue_edge } else { egui::Color32::TRANSPARENT },
         ))
         .corner_radius(CornerRadius::same(APP_ROW_RADIUS))
         .inner_margin(pad)
@@ -10044,7 +10070,7 @@ fn app_target_row(
                 // so what `target_row` divides up is what is left after it.
                 let trailing = TARGET_SETTINGS_MARK
                     + picker_chip_width(ui, rule)
-                    + theme::CLOSE_MARK_HIT
+                    + form::CLOSE_HIT
                     + TARGET_ROW_GAP * 3.0
                     + TARGET_ROW_SLACK;
                 let process = app.process.clone();
@@ -10061,10 +10087,10 @@ fn app_target_row(
                         // and take it away", with the way in first. Lit
                         // while those settings are open.
                         let settings =
-                            theme::tune_mark(ui, TARGET_SETTINGS_MARK, open, app_settings_tip())
+                            form::tune_mark(ui, TARGET_SETTINGS_MARK, open, app_settings_tip())
                                 .clicked();
-                        picker_chip(ui, rule, theme::TEXT_FAINT);
-                        let remove = theme::close_glyph_titled(ui, app_remove_button()).clicked();
+                        picker_chip(ui, rule, p.text_faint);
+                        let remove = form::close_glyph_titled(ui, app_remove_button()).clicked();
                         TargetPress { remove, settings }
                     },
                 );
@@ -10079,7 +10105,7 @@ fn app_target_row(
                 ui.label(
                     RichText::new(app_fresh_note(app))
                         .size(TARGET_NOTE_PX)
-                        .color(theme::BLUE_DEEP),
+                        .color(p.blue_deep),
                 );
             }
         });
@@ -10097,7 +10123,7 @@ struct TargetPress {
 }
 
 /// The settings mark's box on a target row -- its hit target, which is
-/// bigger than the mark's own ink. See [`theme::tune_mark`].
+/// bigger than the mark's own ink. See [`form::tune_mark`].
 const TARGET_SETTINGS_MARK: f32 = 20.0;
 
 // **What separates a cell's last control from the link under it is egui's
@@ -10109,22 +10135,22 @@ const TARGET_SETTINGS_MARK: f32 = 20.0;
 
 /// **A line in a row's FIELD COLUMN, with no caption and no rule.**
 ///
-/// `theme::section_row` is a row of the card: it rules itself off from the
+/// `form::section_row` is a row of the card: it rules itself off from the
 /// row above and pays the card's padding either side of that rule. A link
 /// that belongs to the row above it is not a row -- 8a draws it inside the
 /// same cell, under the last control, at that cell's own gap -- and drawing
 /// it as one cost 8a's card 60 points of air it does not have.
 ///
-/// Below `theme::section_rows_fit` there is no label column to indent into,
+/// Below `form::section_rows_fit` there is no label column to indent into,
 /// and the line simply follows what came before it, which is what every
 /// other row on this form does at that width.
 fn field_column_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     // It is not a row, and it is still CONTENT: the row after it owes a rule
-    // above itself. See `theme::section_row_seen`, which records the
+    // above itself. See `form::section_row_seen`, which records the
     // measurement -- 8a's one hairline went missing when this line stopped
     // being a row.
-    theme::section_row_seen(ui);
-    if !theme::section_rows_fit(ui) {
+    form::section_row_seen(ui);
+    if !form::section_rows_fit(ui) {
         return add(ui);
     }
     ui.horizontal_top(|ui| {
@@ -10146,6 +10172,7 @@ fn app_block(
     app: &mut AppMatchDraft,
     apps: &mut AppIdentityCache,
 ) -> Option<EditAction> {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = None;
 
     if !app.bound {
@@ -10196,7 +10223,7 @@ fn app_block(
     // feature shipped, and two words for one thing on two panes is worse than
     // departing from the design's noun. See [`APP_BLOCK_HEADING`].
     let mut press = TargetPress::default();
-    theme::section_row(ui, app_block_heading(), |ui| {
+    form::section_row(ui, app_block_heading(), |ui| {
         press = app_target_row(ui, app, &name, icon.as_ref());
     });
     if press.settings {
@@ -10246,7 +10273,7 @@ fn app_block(
             // called when the app was captured, and it is the only thing that can
             // identify a suspended Store app. Typing over it would be typing a new
             // identity for something that is not there to check it against.
-            theme::section_row(ui, app_window_label(), |ui| {
+            form::section_row(ui, app_window_label(), |ui| {
                 crate::kit::input::field_disabled_fill(ui, &app.title);
             });
         }
@@ -10259,7 +10286,7 @@ fn app_block(
         // not do that. So it keeps a row of its own, with its Browse under the
         // box rather than beside it -- see the comment on the editable arm.
         let path_row = app_path_row(app.hosted);
-        theme::section_row(ui, app_path_label(), |ui| {
+        form::section_row(ui, app_path_label(), |ui| {
             match path_row {
                 AppPathRow::Editable => {
                     // **Browse at the end of the line, the way every other button
@@ -10313,10 +10340,10 @@ fn app_block(
 
         if let Some(warning) = app_path_warning(&app.to_match()) {
             ui.add_space(4.0);
-            ui.label(RichText::new(warning).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+            ui.label(RichText::new(warning).size(TARGET_NOTE_PX).color(p.text_faint));
         }
 
-        theme::section_row(ui, app_args_label(), |ui| match path_row {
+        form::section_row(ui, app_args_label(), |ui| match path_row {
             AppPathRow::Editable => {
                 crate::kit::input::field_fill(ui, &mut app.args);
             }
@@ -10334,7 +10361,7 @@ fn app_block(
     // it: its native-apps row is one cell holding the target rows and this
     // link, `gap: 8px` between them, not a row of its own.
     //
-    // **Not `theme::section_row`.** That draws a rule above itself and pays
+    // **Not `form::section_row`.** That draws a rule above itself and pays
     // the card's own padding either side of it, so the link arrived 43
     // points under the target it belongs to and 43 above the card's edge --
     // measured, and the owner: "lots of space under + Pick a running window
@@ -10557,6 +10584,7 @@ fn last_class_hint() -> &'static str {
 /// same defect (`aae9429`) wearing a different frame. See
 /// `the_generator_options_stay_inside_the_modal_card`.
 fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
     if generator.passphrase {
         crate::kit::card::field_label(ui, crate::i18n::t("edit.gen_between_words"));
@@ -10605,7 +10633,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     });
     if CharClass::ALL.iter().any(|class| generator.classes.is_last_on(*class)) {
         ui.add_space(2.0);
-        ui.label(RichText::new(last_class_hint()).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(last_class_hint()).size(11.0).color(p.text_faint));
     }
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
@@ -10613,7 +10641,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
         // gives: the number is still the user's, it comes straight back when
         // the class does, and a control that vanished would look like a
         // setting that had been forgotten rather than one that is waiting.
-        theme::number_box_enabled(
+        form::number_box_enabled(
             ui,
             generator.classes.is_on(CharClass::Number),
             egui::DragValue::new(&mut generator.min_number)
@@ -10621,7 +10649,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
                 .prefix("min ")
                 .suffix(" digits"),
         );
-        theme::number_box_enabled(
+        form::number_box_enabled(
             ui,
             generator.classes.is_on(CharClass::Special),
             egui::DragValue::new(&mut generator.min_special)
@@ -10936,7 +10964,7 @@ const CHIP_PAD_Y: f32 = 2.0;
 /// Paints [`Section::chip`] immediately after `title`.
 ///
 /// **Painted from here rather than added inside the band**, and that is
-/// deliberate rather than convenient: `theme::section_card_header_at` answers
+/// deliberate rather than convenient: `form::section_card_header_at` answers
 /// with the title's rectangle precisely so a caller can hang something off
 /// it, and a chip added INSIDE the band would have to be threaded through
 /// that helper as a third kind of content -- after the note and the `Changed`
@@ -10946,8 +10974,9 @@ const CHIP_PAD_Y: f32 = 2.0;
 /// padding a side, which is smaller than the caption it sits beside, and it
 /// is centred on that caption's own box.
 fn paint_section_chip(ui: &egui::Ui, title: egui::Rect, text: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let font = egui::FontId::new(CHIP_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, theme::TEXT_MUTED);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, p.text_muted);
     let size = egui::vec2(
         galley.size().x + CHIP_PAD_X * 2.0,
         galley.size().y + CHIP_PAD_Y * 2.0,
@@ -10960,11 +10989,11 @@ fn paint_section_chip(ui: &egui::Ui, title: egui::Rect, text: &str) {
         title.center().y - size.y / 2.0,
     );
     let rect = egui::Rect::from_min_size(at, size);
-    ui.painter().rect_filled(rect, egui::CornerRadius::same(CHIP_RADIUS), theme::CANVAS);
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(CHIP_RADIUS), p.field_bg);
     ui.painter().galley(
         egui::pos2(rect.left() + CHIP_PAD_X, rect.top() + CHIP_PAD_Y),
         galley,
-        theme::TEXT_MUTED,
+        p.text_muted,
     );
 }
 
@@ -11009,7 +11038,7 @@ fn section<R>(
     wanted: Option<Section>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    let (rect, inner) = theme::section_card(ui, |ui| {
+    let (rect, inner) = form::section_card(ui, |ui| {
         // The card takes the full width it is offered. Without this each card
         // shrinks to its own widest row, so a card holding one short row would
         // be narrower than the card above it -- a grid whose columns do not
@@ -11017,13 +11046,13 @@ fn section<R>(
         ui.set_width(ui.available_width());
         // **8a's `padding: 11px 16px` / `12px 16px`, at the width this card
         // is being drawn at.** The bands are asked at the padding
-        // `theme::section_card_pad_x` answers for THIS card's width, on this
+        // `form::section_card_pad_x` answers for THIS card's width, on this
         // frame -- 16 in the shipped pane, 12 at the window's floor -- for the
         // reason that function's doc gives. Both bands read the same width so
         // the title and the rows under it start on one vertical line.
-        let pad_x = theme::section_card_pad_x(ui.available_width());
+        let pad_x = form::section_card_pad_x(ui.available_width());
         let title =
-            theme::section_card_header_at(
+            form::section_card_header_at(
                 ui,
                 pad_x,
                 section.title(kind),
@@ -11034,7 +11063,7 @@ fn section<R>(
         if let Some(chip) = section.chip() {
             paint_section_chip(ui, title, chip);
         }
-        theme::section_card_body_at(ui, pad_x, add)
+        form::section_card_body_at(ui, pad_x, add)
     });
     if wanted == Some(section) {
         // `Align::TOP`: the rail says "take me to this section", and a card
@@ -11661,6 +11690,7 @@ pub fn draw_detail_edit(
     // behind it is the same fallback the read pane takes.
     icon: Option<&egui::TextureHandle>,
 ) -> EditAction {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = EditAction::None;
     // **Read before anything draws**: by the end of the frame a card that
     // WAS up has seen this very Escape and shut itself, and the form would
@@ -11672,13 +11702,13 @@ pub fn draw_detail_edit(
     // **The pane's ground, painted the way the READ pane paints its own.**
     //
     // This form drew nothing behind itself, so what showed between its cards
-    // was the vault window's central panel -- `theme::CANVAS`, `#f3f2f2`.
-    // The read pane fills its whole rect with `theme::WINDOW_BG`, `#f7f6f5`,
+    // was the vault window's central panel -- `palette.field_bg`, `#f3f2f2`.
+    // The read pane fills its whole rect with `palette.window_bg`, `#f7f6f5`,
     // which is four points lighter in every channel and visibly so against a
     // white card. The owner, with the two panes side by side: "background is
     // not same gray color".
     ui.painter()
-        .rect_filled(ui.clip_rect(), egui::CornerRadius::ZERO, theme::WINDOW_BG);
+        .rect_filled(ui.clip_rect(), egui::CornerRadius::ZERO, p.window_bg);
     // Read before the closure borrows `draft` mutably.
     let may_unfile = draft.may_unfile();
     // **8a's `CTRL+S`, read before anything else this frame.**
@@ -11805,7 +11835,7 @@ pub fn draw_detail_edit(
             let creatable = !creating || is_creatable(draft.kind);
             let _ = full_band;
             let from_badge = egui::Frame::new()
-                .fill(theme::CARD)
+                .fill(p.card)
                 .inner_margin(Margin::symmetric(32, 18))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -11885,15 +11915,15 @@ pub fn draw_detail_edit(
         // #eae7e7; background: #ffffff`, and the rule is what says the
         // questions are over.
         //
-        // White rather than `theme::CARD_TINT`: 8a's window footer is `#ffffff`
+        // White rather than `palette.list_bg`: 8a's window footer is `#ffffff`
         // where 5a's CARD footer is `#fbfaf9`, and the difference is not an
         // inconsistency. A tinted band inside a white card reads as the card's
         // last row; this band is the PANE's, sitting under a column of white
-        // cards on `theme::CANVAS`, and tinting it would make it look like one
+        // cards on `palette.field_bg`, and tinting it would make it look like one
         // more card that had lost its border.
         .frame(
             egui::Frame::new()
-                .fill(theme::CARD)
+                .fill(p.card)
                 // 8a's `padding: 12px 28px`, both halves. The horizontal
                 // one used to be the central panel's margin; see `FORM_PAD_X`
                 // for where that went, and `FORM_PAD_AT` for the width below
@@ -11917,18 +11947,18 @@ pub fn draw_detail_edit(
                     egui::vec2(top.width(), 1.0),
                 ),
                 egui::CornerRadius::ZERO,
-                theme::HAIRLINE,
+                p.hairline,
             );
             if !creatable {
                 ui.label(
                     RichText::new(crate::i18n::t("edit.cannot_create"))
                     .size(12.0)
-                    .color(theme::ERROR),
+                    .color(p.error),
                 );
                 ui.add_space(6.0);
             }
             if !draft.is_valid() {
-                ui.label(RichText::new(crate::i18n::t("edit.name_required")).size(12.0).color(theme::ERROR));
+                ui.label(RichText::new(crate::i18n::t("edit.name_required")).size(12.0).color(p.error));
                 ui.add_space(6.0);
             }
             // Repeated here, beside the button it disables. The same sentence
@@ -11937,13 +11967,13 @@ pub fn draw_detail_edit(
             // top of a long form and a Save that is off for no visible reason
             // is the silent no-op this file keeps refusing to ship.
             if let Some(fault) = draft.sequence_fault() {
-                ui.label(RichText::new(fault).size(12.0).color(theme::ERROR));
+                ui.label(RichText::new(fault).size(12.0).color(p.error));
                 ui.add_space(6.0);
             }
             // The same for a custom field named `PIN` on a card, whose
             // sentence is also under the field itself.
             if let Some(fault) = draft.pin_name_fault() {
-                ui.label(RichText::new(fault).size(12.0).color(theme::ERROR));
+                ui.label(RichText::new(fault).size(12.0).color(p.error));
                 ui.add_space(6.0);
             }
 
@@ -11965,31 +11995,31 @@ pub fn draw_detail_edit(
             // drawn that way, so the taller footer is a shape this band
             // already has.
             let summary = change_summary(&changes, &draft.password);
-            let summary_width = theme::form_footer_note_width(ui, &summary);
-            let note_width = theme::form_footer_note_width(ui, sync_note());
+            let summary_width = form::form_footer_note_width(ui, &summary);
+            let note_width = form::form_footer_note_width(ui, sync_note());
             // 8a's `gap: 10px` between the two buttons, and it is the SAME
             // number the row below sets as its item spacing -- so the width
             // measured here is the width laid out there.
             let gap = theme::SECTION_FOOTER_GAP;
             // What the two buttons will take, laid out before either is drawn.
-            // `theme::action_button_width` is the measurement both of them are
+            // `form::action_button_width` is the measurement both of them are
             // built from, so this is the width they really occupy rather than
             // a guess that a longer caption would invalidate -- and its pad is
             // the buttons' own `SECTION_FOOTER_BUTTON_PAD_X`, which is what
             // makes that sentence true rather than approximately true.
-            let buttons = theme::section_footer_save_width(
+            let buttons = form::section_footer_save_width(
                 ui.painter(),
                 save_label(draft),
                 SAVE_CHORD_LABEL,
             ) + gap
-                + theme::action_button_width(
+                + form::action_button_width(
                     ui.painter(),
                     cancel_button(),
                     theme::SECTION_FOOTER_BUTTON_PAD_X,
                 );
             let beside = ui.available_width() >= buttons + gap + 4.0 + summary_width;
             if !beside {
-                ui.label(RichText::new(summary.clone()).size(12.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(summary.clone()).size(12.0).color(p.text_faint));
                 ui.add_space(6.0);
             }
 
@@ -12056,7 +12086,7 @@ pub fn draw_detail_edit(
                 // line in this band a narrow window loses nothing by dropping.
                 if beside {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(summary).size(12.0).color(theme::TEXT_FAINT));
+                    ui.label(RichText::new(summary).size(12.0).color(p.text_faint));
                     if ui.available_width() >= gap + note_width {
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), theme::PILL_HEIGHT),
@@ -12065,7 +12095,7 @@ pub fn draw_detail_edit(
                         let galley = ui.painter().layout_no_wrap(
                             sync_note().to_string(),
                             egui::FontId::new(12.0, egui::FontFamily::Proportional),
-                            theme::TEXT_GHOST,
+                            p.text_ghost,
                         );
                         ui.painter().galley(
                             egui::pos2(
@@ -12073,7 +12103,7 @@ pub fn draw_detail_edit(
                                 rect.center().y - galley.size().y / 2.0,
                             ),
                             galley,
-                            theme::TEXT_GHOST,
+                            p.text_ghost,
                         );
                     }
                 }
@@ -12105,7 +12135,7 @@ pub fn draw_detail_edit(
             // the outermost `theme::SCROLLBAR_WIDTH` of the lane rather than sitting
             // centred in it, so all 4pt of the 10pt lane's slack falls between the bar
             // and the card instead of 2pt there and 2pt behind the bar.
-            theme::scrollbar_in_gutter(ui, FORM_SCROLL_GUTTER);
+            form::scrollbar_in_gutter(ui, FORM_SCROLL_GUTTER);
             // ... and the bar is hidden outright when there is nothing to
             // scroll: a full-height 6pt bar down a form that cannot move is
             // an affordance that lies. The lane stays reserved either way --
@@ -12114,7 +12144,7 @@ pub fn draw_detail_edit(
             // measured a real 10pt jump when that reservation was left
             // conditional.
             if !form_overflowed(ui.ctx()) {
-                theme::hide_scrollbar(ui);
+                form::hide_scrollbar(ui);
             }
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
@@ -12136,7 +12166,7 @@ pub fn draw_detail_edit(
     // OFFERED now has a word to look for.
     //
     // The cards are drawn directly on the scroll area, on the pane's
-    // `theme::CANVAS`, which is 8a's `#f7f6f5` ground. There is no outer box
+    // `palette.field_bg`, which is 8a's `#f7f6f5` ground. There is no outer box
     // any more, and there must not be: nine bordered cards inside a tenth
     // border is the "card in a card" the design has nowhere on the page.
     let pad_x = form_pad_x(ui.available_width());
@@ -12223,23 +12253,23 @@ pub fn draw_detail_edit(
             // is how 8a says so.
             section(ui, kind, Section::Item, changed(Section::Item), wanted, |ui| {
                 // **8a's `grid-template-columns: 1fr 1fr 1fr`**, when the card
-                // can afford three cells -- see `theme::section_grid_fits_at`
+                // can afford three cells -- see `form::section_grid_fits_at`
                 // for the floor and what the narrow pane falls back to, which
                 // is the stacked rows this card already shipped.
-                let grid = theme::section_grid_fits_at(ui.available_width());
+                let grid = form::section_grid_fits_at(ui.available_width());
                 let owner = owner_line(audience);
                 let owner_hint = owner_hint(audience);
                 if grid {
                     ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.x = theme::SECTION_GRID_GAP;
                         ui.columns(3, |cols| {
-                            theme::section_grid_cell(&mut cols[0], item_folder_label(), |ui| {
+                            form::section_grid_cell(&mut cols[0], item_folder_label(), |ui| {
                                 folder_combo(ui, draft, folders, may_unfile);
                             });
-                            theme::section_grid_cell(&mut cols[1], item_owner_label(), |ui| {
+                            form::section_grid_cell(&mut cols[1], item_owner_label(), |ui| {
                                 owner_field(ui, &owner, &owner_hint);
                             });
-                            theme::section_grid_cell(&mut cols[2], item_type_label(), |ui| {
+                            form::section_grid_cell(&mut cols[2], item_type_label(), |ui| {
                                 crate::kit::input::field_disabled_fill(ui, kind_noun(kind));
                             });
                         });
@@ -12248,11 +12278,11 @@ pub fn draw_detail_edit(
                     // inside a 148-point cell. Same sentence, same condition.
                     if !may_unfile {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(unfile_refusal()).size(11.0).color(theme::TEXT_FAINT));
+                        ui.label(RichText::new(unfile_refusal()).size(11.0).color(p.text_faint));
                     }
                     return;
                 }
-                theme::section_row(ui, item_folder_label(), |ui| {
+                form::section_row(ui, item_folder_label(), |ui| {
                     // Both the label and the rows read the *assignable* list,
                     // not the raw one, and the label matters as much as the
                     // rows: resolving a draft's folder id against the virtual
@@ -12264,13 +12294,13 @@ pub fn draw_detail_edit(
                     folder_combo(ui, draft, folders, may_unfile);
                     if !may_unfile {
                         ui.add_space(6.0);
-                        ui.label(RichText::new(unfile_refusal()).size(11.0).color(theme::TEXT_FAINT));
+                        ui.label(RichText::new(unfile_refusal()).size(11.0).color(p.text_faint));
                     }
                 });
-                theme::section_row(ui, item_owner_label(), |ui| {
+                form::section_row(ui, item_owner_label(), |ui| {
                     owner_field(ui, &owner, &owner_hint);
                 });
-                theme::section_row(ui, item_type_label(), |ui| {
+                form::section_row(ui, item_type_label(), |ui| {
                     crate::kit::input::field_disabled_fill(ui, kind_noun(kind));
                 });
             });
@@ -12294,7 +12324,7 @@ pub fn draw_detail_edit(
                     // neither carries a Remove. Their captions still come
                     // from `Slot::label`, so the Add menu could never name
                     // one of them differently from the row it reveals.
-                    theme::section_row(ui, Slot::Username.label(), |ui| {
+                    form::section_row(ui, Slot::Username.label(), |ui| {
                         // 8a's row: `field(flex: 1)` and then the buttons.
                         // The buttons are measured first so the field takes
                         // what is LEFT -- laid out the other way round the
@@ -12308,7 +12338,7 @@ pub fn draw_detail_edit(
                         });
                     });
     
-                    theme::section_row(ui, Slot::Password.label(), |ui| {
+                    form::section_row(ui, Slot::Password.label(), |ui| {
                         // 8a's password row, whole: the box, then `Generate`
                         // with its chord and `Copy`, all on one line. They
                         // used to sit on a line of their own under the box --
@@ -12460,12 +12490,12 @@ pub fn draw_detail_edit(
                     // off the password box, wrong for a LIST OF ROWS. These
                     // are bands: each one senses and tints its whole width,
                     // edge to edge across the card, exactly as the same rows
-                    // do one click away. `theme::section_row_bleed` is what
+                    // do one click away. `form::section_row_bleed` is what
                     // reconciles a band with this card's padded body, and it
                     // cancels the two paddings by subtraction -- see it for
                     // which two and why eyeballing them was not an option.
                     if draft.history_open && history_count > 0 {
-                        theme::section_row_bleed(ui, detail::ROW_PAD_Y, |ui| {
+                        form::section_row_bleed(ui, detail::ROW_PAD_Y, |ui| {
                             // **The bridge between the two panes'
                             // vocabularies.** `history_rows` reports a
                             // `DetailAction` because it is the read pane's,
@@ -12502,7 +12532,7 @@ pub fn draw_detail_edit(
                     // **Spec 2026-10-09: three rows plus ZIP plus Bank, with
                     // every row's buttons inline at its end** -- §8a's row,
                     // `field(flex: 1)` and then the buttons, built exactly as
-                    // the credentials card builds one: `theme::section_row`
+                    // the credentials card builds one: `form::section_row`
                     // for the caption, `row_with_buttons` for the line, the
                     // `_within` boxes for the field and `theme::row_button_danger`
                     // for its Remove, so a card reads as the same form as a
@@ -12512,16 +12542,16 @@ pub fn draw_detail_edit(
                     // the grey this card's own captions wear in the arm it is
                     // drawn in -- §8a's label column, or the stacked
                     // `theme::field_label` below it.
-                    let caption_ink = if theme::section_rows_fit(ui) {
-                        theme::TEXT_FAINT
+                    let caption_ink = if form::section_rows_fit(ui) {
+                        p.text_faint
                     } else {
-                        theme::TEXT_MUTED
+                        p.text_muted
                     };
                     let card = &mut draft.card;
 
                     // 1. Cardholder: one field, its Remove at the end.
                     if showing(Slot::CardholderName) {
-                        theme::section_row(ui, Slot::CardholderName.label(), |ui| {
+                        form::section_row(ui, Slot::CardholderName.label(), |ui| {
                             if removable(Slot::CardholderName) {
                                 if field_with_remove(ui, |ui, room| {
                                     crate::kit::input::field(ui, &mut card.cardholder_name, room);
@@ -12544,7 +12574,7 @@ pub fn draw_detail_edit(
                     let offers_clear =
                         !creating && !(card.number.is_empty() && card.brand.is_empty());
                     let mut clear_card = false;
-                    theme::section_row(ui, card_row_label(), |ui| {
+                    form::section_row(ui, card_row_label(), |ui| {
                         let buttons: &[&str] =
                             if offers_clear { &[slot_remove_button()] } else { &[] };
                         row_with_buttons(ui, buttons, |ui, room| {
@@ -12591,7 +12621,7 @@ pub fn draw_detail_edit(
 
                     // 3. Expires: month / year, Code, PIN -- one line, no
                     // Remove (owner's decision: an empty box is not saved).
-                    theme::section_row(ui, expires_row_label(), |ui| {
+                    form::section_row(ui, expires_row_label(), |ui| {
                         expires_row(ui, card, creating, caption_ink);
                     });
 
@@ -12601,7 +12631,7 @@ pub fn draw_detail_edit(
                     // anything typed here would be silently discarded on Save.
                     // A disabled box that says so beats a live box that lies.
                     if showing(Slot::CardBillingZip) {
-                        theme::section_row(ui, Slot::CardBillingZip.label(), |ui| {
+                        form::section_row(ui, Slot::CardBillingZip.label(), |ui| {
                             if creating {
                                 crate::kit::input::field_disabled_fill(ui, card_field_create_notice());
                             } else if field_with_remove(ui, |ui, room| {
@@ -12623,14 +12653,14 @@ pub fn draw_detail_edit(
                     // edge, level with the captions, and read as a sentence
                     // about the card rather than about this field.
                     if showing(Slot::CardBank) {
-                        theme::section_row(ui, Slot::CardBank.label(), |ui| {
+                        form::section_row(ui, Slot::CardBank.label(), |ui| {
                             if creating {
                                 crate::kit::input::field_disabled_fill(ui, card_field_create_notice());
                             } else if bank_domain_row(ui, card) {
                                 hide = Some(Slot::CardBank);
                             }
                             ui.add_space(4.0);
-                            ui.label(RichText::new(bank_hint()).size(11.0).color(theme::TEXT_FAINT));
+                            ui.label(RichText::new(bank_hint()).size(11.0).color(p.text_faint));
                         });
                     }
                 }
@@ -12683,7 +12713,7 @@ pub fn draw_detail_edit(
                     // `border: 1px solid #d7d3d3; border-radius: 8px; padding:
                     // 10px 11px`, which is the design's field box eight rows
                     // tall, and `text_area` is that box.
-                    theme::text_area_v2(ui, &mut draft.note_body, "", 8.0 * 22.0, 14);
+                    form::text_area(ui, &mut draft.note_body, "", 8.0 * 22.0, 14);
                     }
                 FormBody::SshKey => {
                     let ssh = &mut draft.ssh_key;
@@ -12719,7 +12749,7 @@ pub fn draw_detail_edit(
                     ui.label(
                         RichText::new(crate::i18n::t("edit.uneditable"))
                         .size(12.0)
-                        .color(theme::TEXT_FAINT),
+                        .color(p.text_faint),
                     );
                     ui.add_space(10.0);
                 }
@@ -12804,7 +12834,7 @@ pub fn draw_detail_edit(
                                 live_code_line(ui, code, *seconds_left, *period);
                             }
                         }
-                        theme::section_row(ui, Slot::Totp.label(), |ui| {
+                        form::section_row(ui, Slot::Totp.label(), |ui| {
                             if creating {
                                 crate::kit::input::field_disabled_fill(ui, totp_create_notice());
                             } else if !has_seed {
@@ -12895,7 +12925,7 @@ pub fn draw_detail_edit(
                             if has_seed || creating {
                                 ui.add_space(4.0);
                                 ui.label(
-                                    RichText::new(totp_hint()).size(13.0).color(theme::TEXT_FAINT),
+                                    RichText::new(totp_hint()).size(13.0).color(p.text_faint),
                                 );
                             }
                         });
@@ -12978,7 +13008,7 @@ pub fn draw_detail_edit(
                     // **8a's one hairline on this card falls out of the rows**,
                     // between the websites group and the native-apps group: the
                     // design's `border-bottom: 1px solid #f3f2f2` on the websites
-                    // cell. `theme::section_row` takes a rule above itself unless
+                    // cell. `form::section_row` takes a rule above itself unless
                     // it is the body's first, and each website is its own row
                     // inside its own `scope_builder` -- so the websites stack
                     // ruleless, as one cell, and the `Matched app` row below them
@@ -13114,7 +13144,7 @@ pub fn draw_detail_edit(
                     // `TextEdit` frame; see the note kind's box for the
                     // history. Four rows, which is about what 8a's box holds
                     // beside the `Custom fields` card it shares a line with.
-                    theme::text_area_v2(ui, &mut draft.note_body, notes_placeholder(), 96.0, 14);
+                    form::text_area(ui, &mut draft.note_body, notes_placeholder(), 96.0, 14);
                 });
             }
 
@@ -13139,7 +13169,7 @@ pub fn draw_detail_edit(
                     // #7d7979`, which is `TEXT_FAINT`. It was `TEXT_SECONDARY`,
                     // the ink of 8a's Send line above it, which this card
                     // does not draw (see `sharing_line`).
-                    ui.label(RichText::new(line).size(12.0).color(theme::TEXT_FAINT));
+                    ui.label(RichText::new(line).size(12.0).color(p.text_faint));
                 });
             }
             let facts = history_rows(item, fills, history.len());
@@ -13163,8 +13193,8 @@ pub fn draw_detail_edit(
                         // captions line up with every other caption on the
                         // form; the VALUE is 8a's `font-size: 12px`, which is
                         // the whole grid's size. It was 13.
-                        theme::section_row(ui, label, |ui| {
-                            ui.label(RichText::new(value).size(12.0).color(theme::INK));
+                        form::section_row(ui, label, |ui| {
+                            ui.label(RichText::new(value).size(12.0).color(p.ink));
                         });
                     }
                 });
@@ -13619,14 +13649,14 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
         // which is on screen. The ranges are the route's own clamps; a box
         // that offered 1 would come back as 5.
         if generator.passphrase {
-            theme::number_box(
+            form::number_box(
                 ui,
                 egui::DragValue::new(&mut generator.words)
                     .range(MIN_WORDS..=MAX_WORDS)
                     .suffix(" words"),
             );
         } else {
-            theme::number_box(
+            form::number_box(
                 ui,
                 egui::DragValue::new(&mut generator.length)
                     .range(MIN_LENGTH..=MAX_LENGTH)
@@ -16680,7 +16710,7 @@ mod generator_row_tests {
 
         /// The ✕ marks this frame painted, one rect each, top to bottom.
         ///
-        /// **A ✕ has no text to be found by.** `theme::close_glyph_titled`
+        /// **A ✕ has no text to be found by.** `form::close_glyph_titled`
         /// draws two crossing `Shape::LineSegment`s and hangs its caption on
         /// the hover, because neither the bundled Archivo faces nor egui's
         /// fallback stack carry U+2715 (`theme::close_glyph`'s own doc records
@@ -16691,7 +16721,7 @@ mod generator_row_tests {
         /// not.
         ///
         /// Found by geometry instead: both arms are diagonals of ONE square,
-        /// so both report the same visual bounding box, `theme::CLOSE_MARK_SPAN`
+        /// so both report the same visual bounding box, `form::CLOSE_SPAN`
         /// on a side before the stroke expands it. Grouped by that box and
         /// asserted in PAIRS, which is what makes "one arm is half a ✕" a
         /// failure here rather than an extra mark -- the same check
@@ -16704,8 +16734,8 @@ mod generator_row_tests {
                 std::collections::BTreeMap::new();
             for (kind, rect) in &self.marks {
                 let square = (rect.width() - rect.height()).abs() < 0.01;
-                let sized = rect.width() >= theme::CLOSE_MARK_SPAN
-                    && rect.width() <= theme::CLOSE_MARK_SPAN + 3.0;
+                let sized = rect.width() >= form::CLOSE_SPAN
+                    && rect.width() <= form::CLOSE_SPAN + 3.0;
                 if *kind == "a line" && square && sized {
                     by_centre.entry(key(rect)).or_default().push(*rect);
                 }
@@ -16875,7 +16905,7 @@ mod generator_row_tests {
     /// The ✕ that takes away the row captioned `label`.
     ///
     /// **The caption and the mark are on the same line, and that is the whole
-    /// of the lookup.** `theme::section_row` paints the caption in the label
+    /// of the lookup.** `form::section_row` paints the caption in the label
     /// cell and the row's controls beside it, so the mark belonging to a row
     /// is the close mark nearest that caption's own middle -- which is also
     /// exactly what a reader uses to tell two ✕s apart.
@@ -19074,17 +19104,9 @@ mod generator_row_tests {
             "a bitmap was read as a chevron"
         );
 
-        // Positive control: the probes are not simply blind. A real drawn icon
-        // in the same tree IS found, so "found nothing" above is a fact about
-        // the bitmap and not about the walker.
-        let output = ctx.run_ui(raw_input(&[]), |ui| {
-            theme::eye_toggle(ui, false);
-        });
-        let drawn = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
-        assert!(
-            !theme::icon_probe::eyes(&drawn).is_empty(),
-            "control: the eye probe finds no eye even when one is drawn"
-        );
+        // The reveal eye is a kit icon stroke now, which the vertex-count
+        // probes were never written to find, so there is no drawn eye to use as
+        // a positive control; `theme`'s own tests keep the probes honest.
     }
 }
 
@@ -20984,7 +21006,7 @@ mod sequence_builder_tests {
     /// and caution is the only thing in amber -- two semantic colours that
     /// appear nowhere else, so the hatched password step cannot be mistaken
     /// for ordinary UI." This list used to tint the secret row
-    /// `theme::CARD_TINT`, which is `#fbfaf9` -- one step off the card behind
+    /// `palette.list_bg`, which is `#fbfaf9` -- one step off the card behind
     /// it, and the same tint the app uses for every footer strip.
     ///
     /// Asserted on the FILLS and not on the strings, because a row that said
@@ -21008,7 +21030,7 @@ mod sequence_builder_tests {
         assert_eq!(rows.iter().filter(|r| r.secret).count(), 1, "the fixture lost its secret");
 
         let red: Vec<&PaintedRect> =
-            open.rects.iter().filter(|r| r.fill == theme::secret_band().fill).collect();
+            open.rects.iter().filter(|r| r.fill == form::secret_band(&crate::kit::tokens::Palette::LIGHT).fill).collect();
         assert_eq!(
             red.len(),
             1,
@@ -21017,7 +21039,7 @@ mod sequence_builder_tests {
         );
         assert_eq!(
             red[0].stroke,
-            theme::secret_band().stroke.color,
+            form::secret_band(&crate::kit::tokens::Palette::LIGHT).stroke.color,
             "the secret row is not edged #e8a9a2"
         );
         assert_eq!(
@@ -21031,7 +21053,7 @@ mod sequence_builder_tests {
         let plain = open
             .rects
             .iter()
-            .filter(|r| r.fill == theme::CARD && r.stroke == theme::HAIRLINE && r.radius.nw == 10)
+            .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.card && r.stroke == crate::kit::tokens::Palette::LIGHT.hairline && r.radius.nw == 10)
             .count();
         assert!(
             plain >= 4,
@@ -21057,7 +21079,7 @@ mod sequence_builder_tests {
         let mut draft = draft_for(&item, "{ESC}{USERNAME}{TAB}{ENTER}");
         let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
         assert!(
-            !open.rects.iter().any(|r| r.fill == theme::secret_band().fill),
+            !open.rects.iter().any(|r| r.fill == form::secret_band(&crate::kit::tokens::Palette::LIGHT).fill),
             "a sequence that types no secret was still drawn with 4a's red on it"
         );
     }
@@ -21413,7 +21435,7 @@ mod sequence_builder_tests {
             .iter()
             .copied()
             .filter(|r| {
-                r.fill == theme::CARD && r.radius == egui::CornerRadius::same(crate::kit::modal::RADIUS)
+                r.fill == crate::kit::tokens::Palette::LIGHT.card && r.radius == egui::CornerRadius::same(crate::kit::modal::RADIUS)
             })
             .collect();
         assert_eq!(
@@ -21612,7 +21634,7 @@ mod sequence_builder_tests {
         let card = picker_card(&painted).rect;
         let title = painted.rect_of(picker_title());
         let mark = Pos2::new(
-            card.right() - theme::MODAL_CLOSE_INSET - theme::CLOSE_MARK_HIT / 2.0,
+            card.right() - theme::MODAL_CLOSE_INSET - form::CLOSE_HIT / 2.0,
             title.center().y,
         );
         let mut clicked = picker_draft(&item, rows);
@@ -21744,7 +21766,7 @@ mod sequence_builder_tests {
             .iter()
             .copied()
             .filter(|r| {
-                r.fill == theme::HAIRLINE && r.rect.height() <= 1.5 && card.rect.contains_rect(r.rect)
+                r.fill == crate::kit::tokens::Palette::LIGHT.hairline && r.rect.height() <= 1.5 && card.rect.contains_rect(r.rect)
             })
             .collect();
         assert_eq!(
@@ -21769,7 +21791,7 @@ mod sequence_builder_tests {
             .rects
             .iter()
             .copied()
-            .filter(|r| r.fill == theme::CARD_TINT && r.rect.contains_rect(caption))
+            .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.list_bg && r.rect.contains_rect(caption))
             .collect();
         assert_eq!(
             tinted.len(),
@@ -21962,7 +21984,7 @@ mod sequence_builder_tests {
             .rects
             .iter()
             .copied()
-            .filter(|r| r.fill == theme::BLUE_WASH && card.rect.contains_rect(r.rect))
+            .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.blue_wash && card.rect.contains_rect(r.rect))
             .collect();
         assert_eq!(
             washed.len(),
@@ -21970,7 +21992,7 @@ mod sequence_builder_tests {
             "expected exactly the staged row to be washed #eef2fc, found {}",
             washed.len()
         );
-        assert_eq!(washed[0].stroke, theme::BLUE_EDGE, "the washed row is not edged #b8c7ea");
+        assert_eq!(washed[0].stroke, crate::kit::tokens::Palette::LIGHT.blue_edge, "the washed row is not edged #b8c7ea");
         assert_eq!(
             washed[0].radius,
             egui::CornerRadius::same(PICKER_ROW_RADIUS),
@@ -21988,7 +22010,7 @@ mod sequence_builder_tests {
             .iter()
             .copied()
             .filter(|r| {
-                r.stroke == theme::BLUE_EDGE && (r.rect.width() - PICKER_TILE).abs() <= 0.6
+                r.stroke == crate::kit::tokens::Palette::LIGHT.blue_edge && (r.rect.width() - PICKER_TILE).abs() <= 0.6
             })
             .collect();
         assert_eq!(blue_tiles.len(), 1, "the staged row's tile did not take the selection's edge");
@@ -22000,7 +22022,7 @@ mod sequence_builder_tests {
             .rects
             .iter()
             .copied()
-            .filter(|r| r.fill == theme::BLUE && washed[0].rect.contains_rect(r.rect))
+            .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.blue && washed[0].rect.contains_rect(r.rect))
             .collect();
         assert_eq!(caps.len(), 1, "the staged row carries no `↵` keycap");
         assert_eq!(
@@ -22166,9 +22188,9 @@ mod edit_pane_layout_tests {
         /// property over. Nothing else in this struct can see a grey: two
         /// captions at 12pt in two different inks occupy identical boxes in
         /// identical faces, and that is exactly what the form shipped -- the
-        /// `Item` card's captions in `theme::TEXT_FAINT` (§8a's label column,
-        /// painted by `theme::section_row`) directly above a `Card` card's in
-        /// `theme::TEXT_MUTED` (`theme::field_label`, stacked). One form, two
+        /// `Item` card's captions in `palette.text_faint` (§8a's label column,
+        /// painted by `form::section_row`) directly above a `Card` card's in
+        /// `palette.text_muted` (`theme::field_label`, stacked). One form, two
         /// greys, every geometry assertion in this module green. See
         /// [`every_per_kind_caption_is_the_same_grey_as_the_item_cards`].
         inks: Vec<(String, egui::Color32)>,
@@ -22231,7 +22253,7 @@ mod edit_pane_layout_tests {
 
         /// The ✕ marks this frame painted, one rect each, top to bottom.
         ///
-        /// **A ✕ has no text to be found by.** `theme::close_glyph_titled`
+        /// **A ✕ has no text to be found by.** `form::close_glyph_titled`
         /// draws two crossing `Shape::LineSegment`s and hangs its caption on
         /// the hover, because neither the bundled Archivo faces nor egui's
         /// fallback stack carry U+2715 (`theme::close_glyph`'s own doc records
@@ -22242,7 +22264,7 @@ mod edit_pane_layout_tests {
         /// not.
         ///
         /// Found by geometry instead: both arms are diagonals of ONE square,
-        /// so both report the same visual bounding box, `theme::CLOSE_MARK_SPAN`
+        /// so both report the same visual bounding box, `form::CLOSE_SPAN`
         /// on a side before the stroke expands it. Grouped by that box and
         /// asserted in PAIRS, which is what makes "one arm is half a ✕" a
         /// failure here rather than an extra mark -- the same check
@@ -22255,8 +22277,8 @@ mod edit_pane_layout_tests {
                 std::collections::BTreeMap::new();
             for (kind, rect) in &self.marks {
                 let square = (rect.width() - rect.height()).abs() < 0.01;
-                let sized = rect.width() >= theme::CLOSE_MARK_SPAN
-                    && rect.width() <= theme::CLOSE_MARK_SPAN + 3.0;
+                let sized = rect.width() >= form::CLOSE_SPAN
+                    && rect.width() <= form::CLOSE_SPAN + 3.0;
                 if *kind == "a line" && square && sized {
                     by_centre.entry(key(rect)).or_default().push(*rect);
                 }
@@ -22564,7 +22586,7 @@ mod edit_pane_layout_tests {
     ///
     /// `ROOMY_PANE` above is 560, which leaves the card body 334 points once
     /// the section rail and its gutter are off -- ten points clear of
-    /// `theme::section_rows_fit`'s own floor of 324. That is close enough that
+    /// `form::section_rows_fit`'s own floor of 324. That is close enough that
     /// a design change worth one point would silently flip these tests onto
     /// the other arm and leave them green, so the wide shots get their own
     /// width with room in it.
@@ -22617,7 +22639,7 @@ mod edit_pane_layout_tests {
     /// The form drew §8a's label column on the `Item` and `Login credentials`
     /// cards and stacked label-above-field on the per-kind ones, and the two
     /// arms are not only different geometry: they are different GREYS.
-    /// `theme::section_row` paints its caption in `TEXT_FAINT`;
+    /// `form::section_row` paints its caption in `TEXT_FAINT`;
     /// `theme::field_label` sets it in `TEXT_MUTED`. So a card whose rows had
     /// quietly gone back to the stacked shape would show up here even if every
     /// box on it still landed in the right place -- which is the failure mode
@@ -22647,7 +22669,7 @@ mod edit_pane_layout_tests {
         let reference = ink_of_run(&painted, "Folder");
         assert_eq!(
             reference,
-            theme::TEXT_FAINT,
+            crate::kit::tokens::Palette::LIGHT.text_faint,
             "the Item card's caption is no longer §8a's label-column grey"
         );
         // The card's row captions, and the inline captions on its `Expires`
@@ -23505,14 +23527,14 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// Every 1-point [`theme::CANVAS`] line this frame drew, top to bottom --
+    /// Every 1-point [`palette.field_bg`] line this frame drew, top to bottom --
     /// the card row rules, which are the only thing in this app painted that
     /// way.
     fn rules(painted: &Painted) -> Vec<Rect> {
         let mut found: Vec<Rect> = painted
             .rects
             .iter()
-            .filter(|(r, c)| (*c == theme::CANVAS || *c == crate::kit::tokens::Palette::LIGHT.row_rule) && r.height() < 2.0)
+            .filter(|(r, c)| (*c == crate::kit::tokens::Palette::LIGHT.field_bg || *c == crate::kit::tokens::Palette::LIGHT.row_rule) && r.height() < 2.0)
             .map(|(r, _)| *r)
             .collect();
         found.sort_by(|a, b| a.top().total_cmp(&b.top()));
@@ -24485,13 +24507,13 @@ mod edit_pane_layout_tests {
     /// that say it is this design's link -- the 12pt it sets links in, its
     /// `font-weight: 600`, and its `color: #14307a` -- rather than by button
     /// measurements the control no longer has. A regression to
-    /// `theme::secondary_button` is 13pt in [`theme::INK`] and fails two of
+    /// `theme::secondary_button` is 13pt in [`palette.ink`] and fails two of
     /// the three.
     ///
     /// **All three of the card's adders, in one test**, because the defect
     /// they were reported for was precisely that they had drifted apart:
     /// `+ Add website` and `+ Pick a running window` were
-    /// `theme::link_label`'s regular weight and lighter [`theme::BLUE`] ("not
+    /// `theme::link_label`'s regular weight and lighter [`palette.blue`] ("not
     /// bold as per design"), and `Add an app\u{2026}` was an outlined button
     /// while the other two were type ("add app is link as well to match the
     /// design"). One assertion over the set is what stops the next one being
@@ -24534,7 +24556,7 @@ mod edit_pane_layout_tests {
                 .expect("the link was found above, so it has an ink");
             assert_eq!(
                 ink,
-                theme::BLUE_DEEP,
+                crate::kit::tokens::Palette::LIGHT.blue_deep,
                 "{link:?} is painted {ink:?}, not the design's `color: #14307a` -- either a \
                  run the user has no reason to think is clickable, or a second blue on one card"
             );
@@ -24795,10 +24817,13 @@ mod edit_pane_layout_tests {
         }];
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, false, &[]);
         let _ = ctx.run_ui(raw_input(ROOMY_PANE, &[]), |ui| {
-            theme::modal_scrim(
-                ui.ctx(),
-                egui::Area::new(egui::Id::new("sequence-builder-scrim")),
-            );
+            let screen = ui.ctx().content_rect();
+            egui::Area::new(egui::Id::new("sequence-builder-scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(screen.min)
+                .show(ui.ctx(), |ui| {
+                    ui.allocate_response(screen.size(), egui::Sense::click());
+                });
         });
         assert!(
             super::super::item_list::a_modal_is_up(&ctx),
@@ -25232,7 +25257,7 @@ mod edit_pane_layout_tests {
             .collect()
     }
 
-    /// The white form card: every [`theme::CARD`] fill that contains the
+    /// The white form card: every [`palette.card`] fill that contains the
     /// "Folder" label, unioned. A `Frame` with a corner radius paints itself
     /// as more than one rectangle, so the union rather than one of them.
     ///
@@ -25243,7 +25268,7 @@ mod edit_pane_layout_tests {
         painted
             .rects
             .iter()
-            .filter(|(rect, fill)| *fill == theme::CARD && rect.contains_rect(name))
+            .filter(|(rect, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && rect.contains_rect(name))
             .map(|(rect, _)| *rect)
             .reduce(Rect::union)
             .unwrap_or_else(|| panic!("the form card has no white surface; painted: {:?}", painted.strings()))
@@ -26843,7 +26868,7 @@ mod edit_pane_layout_tests {
         //
         // **Counted as ✕ MARKS, not as galleys.** 8a puts the remove at the
         // far right of each row as a `\u{2715}`, and
-        // `theme::close_glyph_titled` draws it as two line segments with its
+        // `form::close_glyph_titled` draws it as two line segments with its
         // caption on the hover -- so `rects_of(WEBSITE_REMOVE_BUTTON)` finds
         // nothing whether three are drawn or none are. The fixture has no app
         // binding, so every mark on the form belongs to a website row.
@@ -27946,7 +27971,7 @@ mod edit_pane_layout_tests {
     /// a heading in a flat column -- the same defect with extra words.
     ///
     /// So both halves are asserted: the string is drawn, AND there is a
-    /// `theme::CARD` rectangle edged in `theme::HAIRLINE` that contains it.
+    /// `palette.card` rectangle edged in `palette.hairline` that contains it.
     #[test]
     fn every_section_card_is_titled_and_carries_the_designs_own_edge() {
         let mut panes = 0;
@@ -27987,7 +28012,7 @@ mod edit_pane_layout_tests {
                     .rects
                     .iter()
                     .find(|(r, fill)| {
-                        *fill == theme::CARD
+                        *fill == crate::kit::tokens::Palette::LIGHT.card
                             && r.contains_rect(title_rect)
                             && r.width() > title_rect.width() + 24.0
                     })
@@ -28004,7 +28029,7 @@ mod edit_pane_layout_tests {
                 // is what the flat column already had.
                 assert!(
                     painted.rects.iter().any(|(r, fill)| {
-                        *fill == theme::HAIRLINE
+                        *fill == crate::kit::tokens::Palette::LIGHT.hairline
                             && r.height() <= 2.0
                             && r.top() >= title_rect.bottom()
                             && r.left() >= card.left() - 1.0
@@ -28257,7 +28282,7 @@ mod edit_pane_layout_tests {
             // One `Changed` pill on the card, plus -- where the rail is drawn
             // -- one `Changed` heading in it. Never zero.
             assert!(
-                painted.strings().contains(&theme::changed_pill()),
+                painted.strings().contains(&form::changed_pill()),
                 "{pane:?}: nothing on screen says a field changed: {:?}",
                 painted.strings()
             );
@@ -28330,7 +28355,7 @@ mod edit_pane_layout_tests {
     // the design, and a number that was silently 14 once can be silently 14
     // again.
 
-    /// The smallest white card containing `inner`: `theme::CARD` fill, wider
+    /// The smallest white card containing `inner`: `palette.card` fill, wider
     /// than the run by more than a caption's worth of padding. The same
     /// search `every_section_card_is_titled_and_carries_the_designs_own_edge`
     /// makes, taking the smallest rather than the first so the pane's own
@@ -28340,7 +28365,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, fill)| {
-                *fill == theme::CARD && r.contains_rect(inner) && r.width() > inner.width() + 24.0
+                *fill == crate::kit::tokens::Palette::LIGHT.card && r.contains_rect(inner) && r.width() > inner.width() + 24.0
             })
             .map(|(r, _)| *r)
             .collect();
@@ -28349,7 +28374,7 @@ mod edit_pane_layout_tests {
     }
 
     /// The field BOX round the run painted from `text`: the smallest
-    /// `theme::CARD`-filled rect containing it.
+    /// `palette.card`-filled rect containing it.
     ///
     /// Not [`Painted::frame_around`], which answers with the smallest rect of
     /// any fill -- and the smallest rect round a field's text is the
@@ -28370,7 +28395,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, fill)| {
-                *fill == theme::CARD
+                *fill == crate::kit::tokens::Palette::LIGHT.card
                     && r.min.x <= inner.min.x + 1.0
                     && r.max.x > inner.min.x
                     && r.min.y <= inner.min.y + 1.0
@@ -28395,7 +28420,7 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
         let painted = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
         assert!(
-            theme::section_rows_fit_at(GRID_PANE.x),
+            form::section_rows_fit_at(GRID_PANE.x),
             "the shipped pane is too narrow for a label column, so this measures nothing"
         );
 
@@ -28480,7 +28505,7 @@ mod edit_pane_layout_tests {
         let strip = painted
             .rects
             .iter()
-            .filter(|(r, fill)| *fill == theme::CARD && full_width(r) && r.height() > 40.0)
+            .filter(|(r, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && full_width(r) && r.height() > 40.0)
             .map(|(r, _)| *r)
             .min_by(|a, b| a.top().total_cmp(&b.top()))
             .expect("the title strip is painted");
@@ -28488,7 +28513,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, fill)| {
-                (*fill == theme::HAIRLINE || *fill == crate::kit::tokens::Palette::LIGHT.hairline) && full_width(r) && r.top() >= strip.bottom() - 0.5
+                (*fill == crate::kit::tokens::Palette::LIGHT.hairline || *fill == crate::kit::tokens::Palette::LIGHT.hairline) && full_width(r) && r.top() >= strip.bottom() - 0.5
             })
             .map(|(r, _)| *r)
             .min_by(|a, b| a.top().total_cmp(&b.top()))
@@ -28506,7 +28531,7 @@ mod edit_pane_layout_tests {
         let card = painted
             .rects
             .iter()
-            .filter(|(r, fill)| *fill == theme::CARD && r.top() > rule.bottom())
+            .filter(|(r, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && r.top() > rule.bottom())
             .map(|(r, _)| *r)
             .min_by(|a, b| a.top().total_cmp(&b.top()))
             .expect("the card column is painted");
@@ -28544,7 +28569,7 @@ mod edit_pane_layout_tests {
         let card = painted
             .rects
             .iter()
-            .filter(|(r, fill)| *fill == theme::CARD && r.contains(title.center()))
+            .filter(|(r, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && r.contains(title.center()))
             .map(|(r, _)| *r)
             .max_by(|a, b| a.height().total_cmp(&b.height()))
             .expect("the ITEM card is painted");
@@ -28590,7 +28615,7 @@ mod edit_pane_layout_tests {
             let card = painted
                 .rects
                 .iter()
-                .filter(|(r, fill)| *fill == theme::CARD && r.contains(caption.center()))
+                .filter(|(r, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && r.contains(caption.center()))
                 .map(|(r, _)| *r)
                 .max_by(|a, b| a.height().total_cmp(&b.height()))
                 .unwrap_or_else(|| panic!("{title}'s card is painted"));
@@ -28598,7 +28623,7 @@ mod edit_pane_layout_tests {
                 .rects
                 .iter()
                 .filter(|(r, fill)| {
-                    *fill == theme::HAIRLINE
+                    *fill == crate::kit::tokens::Palette::LIGHT.hairline
                         && r.height() <= 1.5
                         && r.top() > caption.bottom()
                         && r.left() <= card.left() + 0.5
@@ -28616,7 +28641,7 @@ mod edit_pane_layout_tests {
             // and the band is 2 x 11 + the line either way.
             //
             // NOT plus the card's border, which this card paints rather
-            // than reserves -- see `theme::section_card`, where reserving
+            // than reserves -- see `form::section_card`, where reserving
             // it was tried and pushed the card past the app's minimum
             // pane.
             let pad = f32::from(theme::SECTION_CARD_HEADER_PAD_Y);
@@ -28639,7 +28664,7 @@ mod edit_pane_layout_tests {
 
     /// **The unbound app row's links sit on the line its caption is on.**
     ///
-    /// `theme::section_row` paints its caption optically centred against a
+    /// `form::section_row` paints its caption optically centred against a
     /// `theme::SECTION_FIELD_HEIGHT` box, because that is what is usually
     /// beside it. A row whose control is a bare link is only as tall as the
     /// link's own galley, so the caption sat five points BELOW the run it
@@ -28911,7 +28936,7 @@ mod edit_pane_layout_tests {
 
     /// **The runs on a link row do not touch.**
     ///
-    /// `theme::section_card` zeroes `item_spacing` so its bands stack flush and
+    /// `form::section_card` zeroes `item_spacing` so its bands stack flush and
     /// `section_card_body_at` restores only the `y`, so every row on this card
     /// that puts two things side by side has to set its own `x`
     /// (`row_with_buttons` uses `ROW_BUTTON_GAP`, `target_row` uses
@@ -29054,7 +29079,7 @@ mod edit_pane_layout_tests {
                 let laid = ui.painter().layout_no_wrap(
                     caption.to_string(),
                     egui::FontId::new(12.0, egui::FontFamily::Proportional),
-                    theme::TEXT_FAINT,
+                    crate::kit::tokens::Palette::LIGHT.text_faint,
                 );
                 assert!(
                     laid.size().x <= theme::SECTION_LABEL_WIDTH,
@@ -29141,7 +29166,7 @@ mod edit_pane_layout_tests {
     /// line between two websites. The owner: "should be separator between web
     /// and native".
     ///
-    /// **It falls out of `theme::section_row`'s own rule** and is asserted
+    /// **It falls out of `form::section_row`'s own rule** and is asserted
     /// here rather than at a call site, because the mechanism is indirect
     /// enough to be broken by a change that looks unrelated: each website is a
     /// row inside its own `scope_builder`, so each has its own body state,
@@ -29176,7 +29201,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, c)| {
-                r.height() <= 1.5 && r.top() > top && r.bottom() < bottom && *c == theme::CANVAS
+                r.height() <= 1.5 && r.top() > top && r.bottom() < bottom && *c == crate::kit::tokens::Palette::LIGHT.field_bg
             })
             .map(|(r, _)| r.top())
             .collect();
@@ -29400,7 +29425,7 @@ mod edit_pane_layout_tests {
         let ctx = styled_context(Vec2::new(WIDE_PANE_WIDTH, 800.0));
         let mut gutter = None;
         let _ = ctx.run_ui(raw_input(Vec2::new(WIDE_PANE_WIDTH, 800.0), &[]), |ui| {
-            theme::scrollbar_in_gutter(ui, f32::from(FORM_PAD_X));
+            form::scrollbar_in_gutter(ui, f32::from(FORM_PAD_X));
             gutter = Some((*ui.style().clone()).clone());
         });
         let mut style = gutter.expect("the form drew");
@@ -29460,7 +29485,7 @@ mod edit_pane_layout_tests {
         let card = painted
             .rects
             .iter()
-            .filter(|(r, fill)| *fill == theme::CARD && r.contains(username.center()))
+            .filter(|(r, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && r.contains(username.center()))
             .map(|(r, _)| *r)
             .max_by(|a, b| a.height().total_cmp(&b.height()))
             .expect("the credentials card is painted");
@@ -29469,7 +29494,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, fill)| {
-                *fill == theme::CANVAS
+                *fill == crate::kit::tokens::Palette::LIGHT.field_bg
                     && r.height() <= 1.5
                     && r.top() > username.bottom()
                     && r.bottom() < password.top()
@@ -29492,7 +29517,7 @@ mod edit_pane_layout_tests {
     /// **The card column stands the READ pane's `padding: 18px` off the
     /// strip's rule, and its cards sit 8a's `gap: 14px` apart.**
     ///
-    /// The rule is the topmost `theme::HAIRLINE` line; the first card is the
+    /// The rule is the topmost `palette.hairline` line; the first card is the
     /// white card round `ITEM`, the second the one round the credentials
     /// title. Both gaps used to be 12, which was neither design's number.
     ///
@@ -29514,7 +29539,7 @@ mod edit_pane_layout_tests {
             let rule = painted
                 .rects
                 .iter()
-                .filter(|(r, fill)| (*fill == theme::HAIRLINE || *fill == crate::kit::tokens::Palette::LIGHT.hairline) && r.height() <= 1.5)
+                .filter(|(r, fill)| (*fill == crate::kit::tokens::Palette::LIGHT.hairline || *fill == crate::kit::tokens::Palette::LIGHT.hairline) && r.height() <= 1.5)
                 .map(|(r, _)| *r)
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .expect("the strip is closed by a hairline");
