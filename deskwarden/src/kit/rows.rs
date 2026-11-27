@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn the_eye_keeps_the_probe_s_vertex_count() {
-        assert_eq!(eye_outline(Pos2::ZERO, 1.0, 1.0).len(), theme::EYE_VERTICES);
+        assert_eq!(eye_outline(Pos2::ZERO, 1.0, 1.0).len(), EYE_LID_SEGMENTS * 2);
     }
 
     #[test]

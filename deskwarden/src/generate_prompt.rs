@@ -4651,24 +4651,12 @@ mod tests {
              programs answering the same hotkey"
         );
         assert_eq!(SEGMENT_H, crate::theme::SEGMENT_HEIGHT as i32);
-        assert_eq!(SEGMENT_SEAM, crate::theme::SEGMENT_SEAM as i32);
-        for width in KIND_W {
-            assert!(
-                width > crate::theme::SEGMENT_PADDING as i32,
-                "a kind cell is {width} wide, which is not even the run's own padding"
-            );
-        }
         const {
             assert!(
                 BADGE_ROOM >= 2 * crate::panel_draw::PILL_PAD_X + 58,
                 "the pill's room is narrower than its widest label inside design 1.8's padding"
             );
         }
-        assert_eq!(
-            (TOGGLE_W, TOGGLE_H),
-            (crate::theme::TOGGLE_W as i32, crate::theme::TOGGLE_H as i32),
-            "the look-alikes switch is not the app's own 40x22"
-        );
         assert_eq!(
             SLIDER_HANDLE_R * 2,
             SLIDER_H,

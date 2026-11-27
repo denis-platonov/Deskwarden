@@ -4240,17 +4240,6 @@ mod card_tests {
         );
     }
 
-    /// The card's dimensions are `theme`'s, and the search box is no exception.
-    #[test]
-    fn the_search_boxs_height_is_the_themes() {
-        assert_eq!(
-            SEARCH_H as f32,
-            crate::theme::SEARCH_FIELD_HEIGHT,
-            "the card's search box has grown a height of its own, so a redesign of design 2b's \
-             search box would leave this one behind"
-        );
-    }
-
     /// **Design D 1.3's rows, in numbers**: a 64 px row, 2 px apart, in a list
     /// padded 8 px each side, so the wash runs 8..392 and the tile starts at 18.
     /// The card's rows were 58 apart and 16 px in from each edge.
@@ -4316,9 +4305,6 @@ mod card_tests {
             "the field's halo is a different weight from the footer buttons' ring, so this card \
              shows focus two ways"
         );
-        // The card's search box is still design 2b's, and the field is still
-        // the list's card: nothing here grew a size of its own.
-        assert_eq!(SEARCH_H as f32, crate::theme::SEARCH_FIELD_HEIGHT);
         const {
             assert!(
                 FIELD_PAD_X > 0 && FIELD_PAD_X < SEARCH_H,

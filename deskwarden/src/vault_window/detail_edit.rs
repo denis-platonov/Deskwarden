@@ -21635,7 +21635,7 @@ mod sequence_builder_tests {
         let card = picker_card(&painted).rect;
         let title = painted.rect_of(picker_title());
         let mark = Pos2::new(
-            card.right() - theme::MODAL_CLOSE_INSET - form::CLOSE_HIT / 2.0,
+            card.right() - crate::kit::modal::CLOSE_INSET - form::CLOSE_HIT / 2.0,
             title.center().y,
         );
         let mut clicked = picker_draft(&item, rows);

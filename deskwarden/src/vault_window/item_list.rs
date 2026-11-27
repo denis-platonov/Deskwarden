@@ -7239,7 +7239,14 @@ mod keyboard_selection_tests {
     /// Named with `folder_modal`'s own id, so if the id there changes,
     /// `every_modal_scrim_in_the_crate_is_named_here` is what fails.
     fn draw_a_modal_scrim(ctx: &egui::Context) {
-        crate::theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("folder-edit-scrim")));
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("folder-edit-scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.allocate_response(screen.size(), egui::Sense::click());
+                ui.painter().rect_filled(screen, egui::CornerRadius::ZERO, crate::kit::modal::SCRIM);
+            });
     }
 
     /// A live item pane across frames: the selection and the scroll offset
