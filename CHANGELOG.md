@@ -15,6 +15,44 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 1.0.2 - 2026-11-27
+
+> The rest of the old design is gone, dark mode reaches every window and
+> card, and the vault password is called that.
+
+### Changed
+
+- Every screen of the vault window -- the list, sidebar, top bar, item
+  detail, the item editor, the sequence builder, sharing, Sends, import,
+  password health and every small dialog -- is drawn with the new design's
+  widgets and colours.
+- Light, Dark or System (Settings > General > Look) now applies to the whole
+  app: the vault window on every screen, its startup screen, the sign-in and
+  Preferences windows, both pickers, and the floating cards (unlock, save
+  login, new password, the picker card, confirmations and the tray pop-up).
+  The cards share the app's palette rather than keeping colours of their own.
+- The pickers are borderless windows with the same title bar as the rest of
+  the app.
+- Confirmations and notices are Deskwarden's own card instead of the stock
+  Windows message box.
+- "Master password" is called "Vault password" wherever the app shows it, in
+  every language. It is the same password; Bitwarden's own apps still say
+  master password.
+- Autofill cards open only on `Ctrl Alt B`. A window coming to the front no
+  longer opens one on its own, which could fire without reason and open the
+  same card repeatedly.
+- A locked vault answers `Ctrl Alt B` with the unlock card itself, password
+  box included.
+
+### Fixed
+
+- Site icons are asked for again once they are more than 30 days old, so a
+  site whose icon changed (GitLab's showed as a dark square) picks up the new
+  one. The old icon stays on screen until the new one arrives.
+- The tray pop-up's Generate tile draws its whole arrow, not only the head.
+- A fill keeps typing when its own app's pop-up takes the foreground, and a
+  stopped fill names both windows.
+
 ## 1.0.1 - 2026-11-25
 
 > A security release: nothing in the app changed, only a library it is
