@@ -4707,6 +4707,9 @@ mod round_window_corners_stays_inside_this_process {
             ("login_ui.rs", include_str!("login_ui.rs")),
             ("loading_ui.rs", include_str!("loading_ui.rs")),
             ("prefs_ui.rs", include_str!("prefs_ui.rs")),
+            // The two "Add app" pickers, frameless since they wear the v2
+            // title bar: both windows are in this one file.
+            ("picker_ui.rs", include_str!("picker_ui.rs")),
             ("app_window.rs", include_str!("app_window.rs")),
             ("vault_window/mod.rs", include_str!("vault_window/mod.rs")),
         ] {

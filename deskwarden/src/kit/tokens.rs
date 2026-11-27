@@ -220,6 +220,31 @@ impl ThemeChoice {
     }
 }
 
+/// **One place a window turns the Theme setting into its palette.** Every
+/// egui window calls [`ThemeFollower::apply`] once a frame (the shared host,
+/// `window_host`, does it for all of them before their own closure runs), so a
+/// dark theme reaches the sign-in card, the spinner, Preferences and the
+/// pickers the same way it reaches the vault window -- and `System` follows
+/// Windows' app theme, asked at most once a second.
+#[derive(Debug, Default)]
+pub struct ThemeFollower {
+    watcher: crate::system_theme::Watcher,
+}
+
+impl ThemeFollower {
+    /// Sets `ctx`'s palette for `choice`, reading Windows' app theme through
+    /// `system_is_dark` only when the choice is `System`.
+    pub fn apply_with(&self, ctx: &egui::Context, choice: ThemeChoice, system_is_dark: impl FnOnce() -> bool) {
+        let dark = choice == ThemeChoice::System && self.watcher.dark_at(ctx.input(|i| i.time), system_is_dark);
+        set_palette(ctx, choice.palette(dark));
+    }
+
+    /// [`Self::apply_with`] against the real registry.
+    pub fn apply(&self, ctx: &egui::Context, choice: ThemeChoice) {
+        self.apply_with(ctx, choice, crate::system_theme::apps_use_dark);
+    }
+}
+
 /// General > Look > Text size. Saved as `"default"` / `"large"` / `"larger"`;
 /// applied as egui's zoom factor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -470,6 +495,28 @@ mod tests {
         let changed = Palette { ink: rgb(0x010203), ..Palette::LIGHT };
         set_palette(&ctx, changed);
         assert_eq!(palette(&ctx), changed);
+    }
+
+    #[test]
+    fn the_follower_sets_each_choices_palette_and_asks_windows_only_for_system() {
+        let ctx = egui::Context::default();
+        let follower = ThemeFollower::default();
+        let asked = std::cell::Cell::new(0);
+        let windows = |dark: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                dark
+            }
+        };
+        follower.apply_with(&ctx, ThemeChoice::Dark, windows(false));
+        assert_eq!(palette(&ctx), Palette::DARK);
+        follower.apply_with(&ctx, ThemeChoice::Light, windows(true));
+        assert_eq!(palette(&ctx), Palette::LIGHT);
+        assert_eq!(asked.get(), 0, "Windows was asked although the choice was explicit");
+        follower.apply_with(&ctx, ThemeChoice::System, windows(true));
+        assert_eq!(palette(&ctx), Palette::DARK);
+        assert_eq!(asked.get(), 1);
     }
 
     fn luminance(c: Color32) -> f32 {

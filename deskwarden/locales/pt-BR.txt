@@ -1469,7 +1469,6 @@ prefs.sync_poll_sub = Minutos entre as verificações
 prefs.sync_poll_tip = Cada verificação baixa o cofre, então um intervalo curto custa mais em um cofre grande.
 prefs.picker_shortcut_tip = Sem associação, ele pergunta ao Deskwarden sobre aquela janela, o que o torna o atalho certo quando nada acontece.
 prefs.updates_label = Atualizações
-prefs.modal_title = Preferências
 settings.nav_heading = Configurações
 settings.back_label = Voltar
 settings.open_at_sign_in_label = Abrir quando eu entrar no Windows

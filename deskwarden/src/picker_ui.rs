@@ -4,6 +4,7 @@ use crate::icon;
 use crate::kit::controls::{self, ButtonKind};
 use crate::kit::{avatar, input, tokens};
 use crate::loading_ui;
+use crate::login_ui::{draw_window_chrome_with_extra, ChromeAction, ChromeMetrics, CloseControl};
 use crate::theme;
 use crate::vault_bridge::{ItemKind, VaultError, VaultItem};
 use crate::vault_cache::{AppMatchWrite, PopulateOutcome, VaultCache, VaultEra, VaultUnavailable};
@@ -95,10 +96,13 @@ const PICK_ITEM_TITLE: &str = "Choose a vault item";
 const ADD_APP_TITLE: &str = "Add app to Deskwarden";
 
 /// The windows' inner sizes: the item picker, the app picker, and the empty /
-/// error state either of them can open as.
-const ITEM_WINDOW: [f32; 2] = [480.0, 620.0];
-const APP_WINDOW: [f32; 2] = [480.0, 680.0];
-const NOTICE_WINDOW: [f32; 2] = [480.0, 400.0];
+/// error state either of them can open as. Each is the body's old height plus
+/// the 40 px title bar the window now draws itself (it used to be the OS's,
+/// outside the inner size). Public so `examples/ui_preview` renders the same
+/// size.
+pub const ITEM_WINDOW: [f32; 2] = [480.0, 660.0];
+pub const APP_WINDOW: [f32; 2] = [480.0, 720.0];
+pub const NOTICE_WINDOW: [f32; 2] = [480.0, 440.0];
 
 // ---------------------------------------------------------------------------
 // THE v2 BODIES
@@ -110,8 +114,9 @@ const NOTICE_WINDOW: [f32; 2] = [480.0, 400.0];
 // rows (spec A 3.1): a white card holding a title, a search field and a list on
 // the list ground, with the answers underneath on the window ground.
 //
-// The windows keep the OS's own frame -- `window_host` records why: they have
-// nothing to round -- so this draws the BODY only.
+// The windows are frameless like every other window here: `picker_panels`
+// draws the same v2 title bar (mark, title, minimise / close, drag) the
+// sign-in, loading and Preferences windows wear, then the body under it.
 // ---------------------------------------------------------------------------
 
 /// One row: a 40 tile and two lines.
@@ -289,14 +294,34 @@ fn picker_card(
     });
 }
 
-/// The window's two panels: `footer` pinned under the card on the window
-/// ground, `body` filling the rest.
+/// The window: the v2 title bar over two panels, `footer` pinned under the
+/// card on the window ground and `body` filling the rest. Answers whether the
+/// bar's close control was clicked (minimise is sent to the window here, it
+/// has no answer for the caller to give).
 fn picker_panels(
     ui: &mut egui::Ui,
+    title: &str,
     footer: impl FnOnce(&mut egui::Ui),
     body: impl FnOnce(&mut egui::Ui),
-) {
+) -> bool {
     let p = tokens::palette(ui.ctx());
+    // The chrome leaves the cursor `item_spacing.y` below the bar; zero it
+    // around the call so the panels start where the bar ends, as
+    // `loading_ui::draw_spinner_body` does.
+    let saved_item_spacing_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let action = draw_window_chrome_with_extra(
+        ui,
+        title,
+        ChromeMetrics::LOGIN,
+        false,
+        CloseControl::Active,
+        |_ui| {},
+    );
+    ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
+    if action == ChromeAction::Minimize {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
     egui::Panel::bottom("picker-footer")
         .show_separator_line(false)
         .resizable(false)
@@ -313,6 +338,7 @@ fn picker_panels(
                 .inner_margin(Margin { left: SIDE, right: SIDE, top: SIDE, bottom: 0 }),
         )
         .show(ui, body);
+    action == ChromeAction::Close
 }
 
 /// A line of small print under the card.
@@ -342,8 +368,9 @@ pub fn draw_item_picker(
 ) -> ItemPickerEvents {
     let mut events = ItemPickerEvents::default();
     let can_next = can_pick_next(selected_id);
-    picker_panels(
+    let chrome_closed = picker_panels(
         ui,
+        PICK_ITEM_TITLE,
         |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -407,6 +434,9 @@ pub fn draw_item_picker(
             );
         },
     );
+    // The bar's close control is the window's own close: the same answer as
+    // Cancel, which is what closing this window has always meant.
+    events.cancel |= chrome_closed;
     events
 }
 
@@ -451,8 +481,9 @@ impl PickerNotice {
 pub fn draw_picker_notice(ui: &mut egui::Ui, notice: &PickerNotice) -> bool {
     let p = tokens::palette(ui.ctx());
     let mut close = false;
-    picker_panels(
+    let chrome_closed = picker_panels(
         ui,
+        PICK_ITEM_TITLE,
         |ui| {
             close = controls::button(
                 ui,
@@ -496,7 +527,7 @@ pub fn draw_picker_notice(ui: &mut egui::Ui, notice: &PickerNotice) -> bool {
                 });
         },
     );
-    close
+    close || chrome_closed
 }
 
 /// What the app picker has to show besides its list, and what gates Save.
@@ -547,8 +578,9 @@ pub fn draw_app_picker(
     // through the same `selected_window` the save itself uses, so the row this
     // answers for and the row that gets written can never be two different rows.
     let selected_process = selected_window(view.windows, *selected_hwnd).map(|w| w.exe_name.as_str());
-    picker_panels(
+    let chrome_closed = picker_panels(
         ui,
+        ADD_APP_TITLE,
         |ui| {
             // Exhaustively matched (no catch-all), same discipline as
             // `TotpState`'s render: `Ready` needs no caption of its own (the
@@ -692,6 +724,9 @@ pub fn draw_app_picker(
             );
         },
     );
+    // The bar's close control is the window's own close, which is the answer
+    // Cancel gives (and Close, once a save has landed).
+    events.dismiss |= chrome_closed;
     events.selection_changed = selection_changed;
     if selection_changed {
         // The gates above read the selection before the row that changed it was
@@ -1071,28 +1106,29 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             // window's own background, which is the white box the user reported
             // blinking. See `crate::window_host::Reveal`.
             //
-            // Not `with_transparent(true)`: this window opens no child viewport
-            // and so keeps `eframe`'s ordinary clear colour -- see
-            // `crate::window_host`, which argues why only the two vault hosts
-            // take a transparent one.
+            // **Frameless and transparent, like every other window here**: the
+            // title bar is `picker_panels`'s, and the 18 px corners are cut by
+            // `window_host`'s mask, which only a transparent window can show.
+            // Fixed-size, as Preferences is: with no OS frame there is nothing
+            // to grab an edge of.
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_transparent(true)
             .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
-    let _ = eframe::run_ui_native(PICK_ITEM_TITLE, options, move |ui, _frame| {
+    let _ = crate::window_host::run_ui_native(PICK_ITEM_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
-            ui.painter().rect_filled(
-                ui.max_rect(),
-                CornerRadius::ZERO,
-                tokens::palette(ui.ctx()).window_bg,
-            );
+            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
+            crate::login_ui::round_window_corners(PICK_ITEM_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
@@ -1618,19 +1654,26 @@ pub fn run_picker(
             // one does: its first frame registers fonts and paints NOTHING at
             // all, so the window Windows was showing in the meantime stayed the
             // bare white one for a frame longer.
+            //
+            // Frameless and transparent: see the item picker above.
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_transparent(true)
             .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
-    let _ = eframe::run_ui_native(ADD_APP_TITLE, options, move |ui, _frame| {
+    let _ = crate::window_host::run_ui_native(ADD_APP_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
+            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
+            crate::login_ui::round_window_corners(ADD_APP_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;

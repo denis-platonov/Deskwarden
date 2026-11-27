@@ -1406,7 +1406,6 @@ prefs.sync_poll_sub = Minuuttia tarkistusten välillä
 prefs.sync_poll_tip = Jokainen tarkistus lataa holvin, joten lyhyt väli maksaa enemmän suuressa holvissa.
 prefs.picker_shortcut_tip = Kun mitään ei ole yhdistetty, se kysyy Deskwardenilta kyseisestä ikkunasta, minkä vuoksi tämä on pikanäppäin, jota kannattaa käyttää, kun mikään ei tapahdu.
 prefs.updates_label = Päivitykset
-prefs.modal_title = Asetukset
 settings.nav_heading = Asetukset
 settings.back_label = Takaisin
 settings.open_at_sign_in_label = Avaa, kun kirjaudun Windowsiin

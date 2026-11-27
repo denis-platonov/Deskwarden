@@ -1406,7 +1406,6 @@ prefs.sync_poll_sub = Minutter mellem tjek
 prefs.sync_poll_tip = Hvert tjek downloader boksen, så et kort interval koster mere på en stor boks.
 prefs.picker_shortcut_tip = Når intet er matchet, spørger den i stedet Deskwarden om det vindue, hvilket gør den til den genvej, du skal række ud efter, når intet sker.
 prefs.updates_label = Opdateringer
-prefs.modal_title = Indstillinger
 settings.nav_heading = Indstillinger
 settings.back_label = Tilbage
 settings.open_at_sign_in_label = Åbn, når jeg logger ind på Windows

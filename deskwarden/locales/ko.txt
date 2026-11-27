@@ -1365,7 +1365,6 @@ prefs.sync_poll_sub = 확인 사이의 분
 prefs.sync_poll_tip = 확인할 때마다 보관함을 다운로드하므로, 보관함이 크면 간격이 짧을수록 부담이 커집니다.
 prefs.picker_shortcut_tip = 연결된 것이 없으면 대신 해당 창에 대해 Deskwarden에 묻습니다. 아무 일도 일어나지 않을 때 사용할 단축키입니다.
 prefs.updates_label = 업데이트
-prefs.modal_title = 환경설정
 settings.nav_heading = 설정
 settings.back_label = 뒤로
 settings.open_at_sign_in_label = Windows에 로그인할 때 열기

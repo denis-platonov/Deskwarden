@@ -1428,7 +1428,6 @@ prefs.sync_poll_sub = Minuten zwischen den Prüfungen
 prefs.sync_poll_tip = Jede Prüfung lädt den Tresor herunter, daher kostet ein kurzes Intervall bei einem großen Tresor mehr.
 prefs.picker_shortcut_tip = Ohne Zuordnung fragt es stattdessen Deskwarden nach diesem Fenster – deshalb ist dies das Kürzel der Wahl, wenn nichts passiert.
 prefs.updates_label = Updates
-prefs.modal_title = Einstellungen
 settings.nav_heading = Einstellungen
 settings.back_label = Zurück
 settings.open_at_sign_in_label = Bei der Windows-Anmeldung öffnen

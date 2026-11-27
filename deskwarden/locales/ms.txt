@@ -1360,7 +1360,6 @@ prefs.sync_poll_sub = Minit antara semakan
 prefs.sync_poll_tip = Setiap semakan memuat turun peti besi, jadi selang yang pendek lebih mahal pada peti besi yang besar.
 prefs.picker_shortcut_tip = Jika tiada yang dipadankan ia bertanya Deskwarden tentang tetingkap itu sebagai ganti, yang menjadikan ini pintasan untuk dicapai apabila tiada apa-apa berlaku.
 prefs.updates_label = Kemas kini
-prefs.modal_title = Keutamaan
 settings.nav_heading = Tetapan
 settings.back_label = Kembali
 settings.open_at_sign_in_label = Buka apabila saya log masuk ke Windows

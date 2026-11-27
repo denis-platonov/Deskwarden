@@ -1442,7 +1442,6 @@ prefs.sync_poll_sub = Minuts entre comprovacions
 prefs.sync_poll_tip = Cada comprovació descarrega la caixa forta, així que un interval curt costa més en una de gran.
 prefs.picker_shortcut_tip = Sense res vinculat, pregunta a Deskwarden per aquella finestra, cosa que fa que sigui la drecera a la qual recórrer quan no passa res.
 prefs.updates_label = Actualitzacions
-prefs.modal_title = Preferències
 settings.nav_heading = Configuració
 settings.back_label = Enrere
 settings.open_at_sign_in_label = Obre quan iniciï la sessió a Windows

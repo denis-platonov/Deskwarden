@@ -1469,7 +1469,6 @@ prefs.sync_poll_sub = Minuti tra un controllo e l'altro
 prefs.sync_poll_tip = Ogni controllo scarica la cassaforte, quindi un intervallo breve costa di più su una cassaforte grande.
 prefs.picker_shortcut_tip = Senza nulla di associato chiede a Deskwarden di quella finestra, ed è per questo la scorciatoia da usare quando non succede nulla.
 prefs.updates_label = Aggiornamenti
-prefs.modal_title = Preferenze
 settings.nav_heading = Impostazioni
 settings.back_label = Indietro
 settings.open_at_sign_in_label = Apri quando accedo a Windows

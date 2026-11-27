@@ -1443,7 +1443,6 @@ prefs.sync_poll_sub = Minuta između provjera
 prefs.sync_poll_tip = Svaka provjera preuzima trezor, pa kratak interval više košta kod velikog trezora.
 prefs.picker_shortcut_tip = Bez povezanog prozora pita Deskwarden o tom prozoru, zbog čega je ovo prečac koji treba upotrijebiti kad se ništa ne događa.
 prefs.updates_label = Ažuriranja
-prefs.modal_title = Postavke
 settings.nav_heading = Postavke
 settings.back_label = Natrag
 settings.open_at_sign_in_label = Otvori pri prijavi u Windows

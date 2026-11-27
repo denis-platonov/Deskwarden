@@ -42,9 +42,15 @@
 //!
 //! **Every frameless window**: the vault window (`vault_window::run`), the
 //! single startup window (`app_window::run_the_one_window`) which becomes that
-//! same vault UI, the standalone sign-in card, the spinner and Preferences. The
-//! two "Add app" pickers keep `eframe::run_ui_native` -- they have the OS's own
-//! frame and nothing to round.
+//! same vault UI, the standalone sign-in card, the spinner, Preferences and
+//! the two "Add app" pickers (item picker and app picker), which used to keep
+//! `eframe::run_ui_native` and the OS's own title bar and now wear the same
+//! v2 chrome and corners as the rest.
+//!
+//! **And the theme**: [`WindowLook`] reads the Theme setting once when a
+//! window opens and sets `kit::tokens::palette` from it on every frame,
+//! before the window's own closure runs, so a dark theme reaches every
+//! window opened here and not only the vault window's Settings screen.
 //!
 //! A transparent clear moves the responsibility for a window's opacity from
 //! `eframe` to the window: every pixel the app does not paint this frame is
@@ -166,6 +172,38 @@ struct TransparentlyCleared<U> {
     ui_fun: U,
     corners: CornerMask,
     slow: SlowFrames,
+    look: WindowLook,
+}
+
+/// **What this window paints with: the Theme setting, as a palette.**
+///
+/// Read from `settings.json` once, when the window opens (the same place the
+/// vault window reads it at open), and applied on every frame so that
+/// `System` follows Windows' own app theme. A window with a live setting of
+/// its own -- Preferences -- sets the palette again from its edits, after
+/// this has run.
+#[derive(Debug, Default)]
+pub struct WindowLook {
+    choice: crate::kit::tokens::ThemeChoice,
+    follower: crate::kit::tokens::ThemeFollower,
+}
+
+impl WindowLook {
+    /// The saved Theme choice, or the default (light) when there is no
+    /// settings file or it cannot be read.
+    pub fn from_settings() -> Self {
+        let choice = crate::settings::default_path()
+            .as_deref()
+            .map(crate::settings::Settings::load)
+            .unwrap_or_default()
+            .theme;
+        Self { choice, follower: Default::default() }
+    }
+
+    /// Sets `ctx`'s palette for this window's theme.
+    pub fn apply(&self, ctx: &egui::Context) {
+        self.follower.apply(ctx, self.choice);
+    }
 }
 
 /// **A frame whose UI pass alone took longer than [`SlowFrames::LIMIT`] goes
@@ -208,6 +246,9 @@ impl<U: FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static> eframe::App
 {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let started = std::time::Instant::now();
+        // **The theme first**, so the background below and everything the
+        // closure draws read the same palette.
+        self.look.apply(ui.ctx());
         // **The window's own opacity, on every frame and before anything the
         // closure does.** With a transparent clear an unpainted pixel is a
         // see-through one, so every window through here -- not only the two
@@ -261,7 +302,14 @@ pub fn run_ui_native(
     eframe::run_native(
         app_name,
         native_options,
-        Box::new(|_cc| Ok(Box::new(TransparentlyCleared { ui_fun, corners: CornerMask::new(), slow: SlowFrames::default() }))),
+        Box::new(|_cc| {
+            Ok(Box::new(TransparentlyCleared {
+                ui_fun,
+                corners: CornerMask::new(),
+                slow: SlowFrames::default(),
+                look: WindowLook::from_settings(),
+            }))
+        }),
     )
 }
 
@@ -939,12 +987,43 @@ mod tests {
         assert_eq!(slow.unlogged, 1, "a second inside the same second waits for the next line");
     }
 
+    /// **Every window through here is given its theme before it draws.**
+    /// The palette is a value in the egui context that only the vault window
+    /// used to set, so the sign-in card, the spinner, Preferences and the
+    /// pickers stayed light in dark mode. Pinned as an order: the look is
+    /// applied, then the host paints the background, then the window's closure
+    /// runs.
+    #[test]
+    fn the_theme_is_applied_before_the_background_and_the_windows_closure() {
+        let source = include_str!("window_host.rs");
+        let start = source.find("fn ui(&mut self, ui: &mut egui::Ui").expect("the host's `ui`");
+        let body = &source[start..];
+        let look = body.find("self.look.apply(ui.ctx())").expect("the host no longer applies the theme");
+        let background = body.find("theme::paint_window_background(ui)").expect("no background");
+        let closure = body.find("(self.ui_fun)(ui, frame)").expect("no closure call");
+        assert!(look < background && background < closure, "theme, background, closure -- in that order");
+    }
+
+    #[test]
+    fn a_window_without_a_settings_file_is_light() {
+        let ctx = egui::Context::default();
+        WindowLook::default().apply(&ctx);
+        assert_eq!(crate::kit::tokens::palette(&ctx), crate::kit::tokens::Palette::LIGHT);
+        let dark = WindowLook {
+            choice: crate::kit::tokens::ThemeChoice::Dark,
+            follower: Default::default(),
+        };
+        dark.apply(&ctx);
+        assert_eq!(crate::kit::tokens::palette(&ctx), crate::kit::tokens::Palette::DARK);
+    }
+
     #[test]
     fn the_clear_colour_is_fully_transparent() {
         let app = TransparentlyCleared {
             ui_fun: |_: &mut egui::Ui, _: &mut eframe::Frame| {},
             corners: CornerMask::new(),
             slow: SlowFrames::default(),
+            look: WindowLook::default(),
         };
         let cleared = eframe::App::clear_color(&app, &egui::Visuals::light());
         assert_eq!(

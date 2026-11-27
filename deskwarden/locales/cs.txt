@@ -1443,7 +1443,6 @@ prefs.sync_poll_sub = Minuty mezi kontrolami
 prefs.sync_poll_tip = Každá kontrola stahuje trezor, takže krátký interval u velkého trezoru stojí víc.
 prefs.picker_shortcut_tip = Když nic není spárováno, ptá se Deskwarden na to okno, proto je to zkratka, po které sáhnout, když se nic neděje.
 prefs.updates_label = Aktualizace
-prefs.modal_title = Nastavení
 settings.nav_heading = Nastavení
 settings.back_label = Zpět
 settings.open_at_sign_in_label = Otevřít při přihlášení do Windows

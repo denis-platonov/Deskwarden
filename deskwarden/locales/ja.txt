@@ -1365,7 +1365,6 @@ prefs.sync_poll_sub = 確認と確認の間の分数
 prefs.sync_poll_tip = 確認のたびに保管庫をダウンロードするため、大きな保管庫では間隔が短いほど負荷が増えます。
 prefs.picker_shortcut_tip = 関連付けがない場合は、代わりにそのウィンドウについて Deskwarden に尋ねます。何も起こらないときは、このショートカットを使ってください。
 prefs.updates_label = 更新
-prefs.modal_title = 環境設定
 settings.nav_heading = 設定
 settings.back_label = 戻る
 settings.open_at_sign_in_label = Windows にサインインしたときに開く

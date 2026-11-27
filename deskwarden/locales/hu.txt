@@ -1402,7 +1402,6 @@ prefs.sync_poll_sub = Percek az ellenőrzések között
 prefs.sync_poll_tip = Minden ellenőrzés letölti a széfet, ezért rövid időköz nagy széfnél többe kerül.
 prefs.picker_shortcut_tip = Párosítás nélkül az adott ablakról kérdezi a Deskwardent, ezért ez az a gyorsbillentyű, amelyhez nyúlni kell, ha semmi sem történik.
 prefs.updates_label = Frissítések
-prefs.modal_title = Beállítások
 settings.nav_heading = Beállítások
 settings.back_label = Vissza
 settings.open_at_sign_in_label = Megnyitás a Windowsba való bejelentkezéskor

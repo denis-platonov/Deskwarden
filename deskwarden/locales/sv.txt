@@ -1406,7 +1406,6 @@ prefs.sync_poll_sub = Minuter mellan kontroller
 prefs.sync_poll_tip = Varje kontroll laddar ned valvet, så ett kort intervall kostar mer på ett stort valv.
 prefs.picker_shortcut_tip = Utan matchning frågar den Deskwarden om det fönstret i stället, vilket gör den till genvägen att ta när inget händer.
 prefs.updates_label = Uppdateringar
-prefs.modal_title = Inställningar
 settings.nav_heading = Inställningar
 settings.back_label = Tillbaka
 settings.open_at_sign_in_label = Öppna när jag loggar in i Windows
