@@ -6331,10 +6331,11 @@ fn chip_palette(tone: ChipTone, p: &crate::kit::tokens::Palette) -> (egui::FontF
 /// boxes, and a height computed per chip would step up and down along the row.
 fn chip_height(ui: &egui::Ui) -> f32 {
     let faces = [ChipTone::Key, ChipTone::Field, ChipTone::Secret, ChipTone::Wait];
+    let p = crate::kit::tokens::palette(ui.ctx());
     let tallest = ui.ctx().fonts_mut(|f| {
         faces
             .iter()
-            .map(|tone| f.row_height(&egui::FontId::new(STEP_CHIP_PX, chip_palette(*tone, &crate::kit::tokens::palette(ui.ctx())).0)))
+            .map(|tone| f.row_height(&egui::FontId::new(STEP_CHIP_PX, chip_palette(*tone, &p).0)))
             .fold(0.0_f32, f32::max)
     });
     tallest + STEP_CHIP_PAD_Y * 2.0
@@ -29201,7 +29202,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, c)| {
-                r.height() <= 1.5 && r.top() > top && r.bottom() < bottom && *c == crate::kit::tokens::Palette::LIGHT.field_bg
+                r.height() <= 1.5 && r.top() > top && r.bottom() < bottom && *c == crate::kit::tokens::Palette::LIGHT.row_rule
             })
             .map(|(r, _)| r.top())
             .collect();
@@ -29494,7 +29495,7 @@ mod edit_pane_layout_tests {
             .rects
             .iter()
             .filter(|(r, fill)| {
-                *fill == crate::kit::tokens::Palette::LIGHT.field_bg
+                *fill == crate::kit::tokens::Palette::LIGHT.row_rule
                     && r.height() <= 1.5
                     && r.top() > username.bottom()
                     && r.bottom() < password.top()

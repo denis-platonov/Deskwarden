@@ -1437,7 +1437,8 @@ impl BandSubject<'_> {
     /// here and a size laid out below are the same number because they are
     /// the same layout.
     fn metrics(&self, ui: &egui::Ui, go: ChipsGo) -> SubjectMetrics {
-        let caption = ui.ctx().fonts_mut(|f| f.layout_job(self.caption_job(crate::kit::tokens::palette(ui.ctx()).text_ghost))).size();
+        let ghost = crate::kit::tokens::palette(ui.ctx()).text_ghost;
+        let caption = ui.ctx().fonts_mut(|f| f.layout_job(self.caption_job(ghost))).size();
         let name = run_size(ui, self.name, Self::name_font());
         let (beside, under) = match (&self.beside, go) {
             (BandBeside::Folder(""), _) => (egui::Vec2::ZERO, egui::Vec2::ZERO),

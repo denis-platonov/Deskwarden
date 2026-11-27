@@ -399,8 +399,13 @@ fn paint_close(ui: &Ui, rect: Rect, response: &Response) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let color = if response.hovered() { p.ink } else { p.text_ghost };
-    let glyph = Rect::from_center_size(rect.center(), Vec2::splat(CLOSE_SPAN * 2.0));
-    icon::stroke(ui.painter(), glyph, icon::glyph::CLOSE, 1.9, color);
+    // Two crossing strokes, not a font glyph: no bundled face carries U+2715.
+    let stroke = Stroke::new(1.5, color);
+    let arm = CLOSE_SPAN / 2.0;
+    let c = rect.center();
+    let painter = ui.painter();
+    painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
+    painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
 }
 
 /// The small x that removes a row, with a stable id so a hit test can find it.
