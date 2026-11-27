@@ -37,7 +37,6 @@
 //! stays in the one place that already knows how to invalidate the three
 //! lists this window keeps.
 
-use crate::theme;
 use crate::vault_bridge::VaultItem;
 use eframe::egui::{self, RichText};
 
@@ -181,7 +180,7 @@ pub fn draw_delete_modal(
         state.subject.draw(ui);
         if let Some(error) = &state.error {
             ui.add_space(10.0);
-            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
+            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(crate::kit::tokens::palette(ui.ctx()).error)).wrap());
         }
         ui.add_space(18.0);
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
@@ -217,6 +216,7 @@ pub fn draw_delete_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme;
 
     /// One vault item, with whatever the test needs on it.
     ///

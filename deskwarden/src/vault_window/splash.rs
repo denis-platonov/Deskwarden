@@ -28,6 +28,47 @@ const TRACK: egui::Vec2 = egui::vec2(220.0, 4.0);
 /// The shield (design 1a: 84 by 98).
 const SHIELD: egui::Vec2 = egui::vec2(84.0, 98.0);
 
+/// The reversed shield (white, light blue, soft blue, bright blue): it reads
+/// on the navy ground and on the dark theme's near-black one alike, so it is
+/// the same four fills in both.
+const MARK_REVERSED: [Color32; 4] = [
+    Color32::WHITE,
+    tokens::Palette::LIGHT.blue_edge,
+    tokens::Palette::LIGHT.blue_soft,
+    tokens::Palette::LIGHT.blue_bright,
+];
+
+/// What the splash paints with. Light: the design's navy ground with white
+/// text. Dark theme: the dark window ground with the palette's own ink, so
+/// the launch does not flash a blue sheet at someone in a dark room.
+struct Look {
+    ground: Color32,
+    caption: Color32,
+    text: Color32,
+    track: Color32,
+}
+
+impl Look {
+    fn of(p: &tokens::Palette) -> Self {
+        if is_dark(p) {
+            Look { ground: p.window_bg, caption: p.text_icon, text: p.ink, track: p.meter_track }
+        } else {
+            Look {
+                ground: p.blue_deep,
+                caption: p.blue_edge,
+                text: Color32::WHITE,
+                track: Color32::from_rgba_unmultiplied(255, 255, 255, 41),
+            }
+        }
+    }
+}
+
+/// Whether `p` is a dark palette (its window ground is closer to black).
+fn is_dark(p: &tokens::Palette) -> bool {
+    let g = p.window_bg;
+    u16::from(g.r()) + u16::from(g.g()) + u16::from(g.b()) < 3 * 128
+}
+
 fn layer() -> LayerId {
     LayerId::new(Order::Middle, egui::Id::new("vault-splash"))
 }
@@ -44,11 +85,12 @@ pub fn paint_line(ctx: &egui::Context, rect: Rect, line: &str, fade: f32) {
     let shown = (1.0 - fade).clamp(0.0, 1.0);
     let t = ctx.input(|i| i.time);
     let painter = ctx.layer_painter(layer());
-    painter.rect_filled(rect, CornerRadius::ZERO, p.blue_deep.gamma_multiply(shown));
+    let look = Look::of(&p);
+    painter.rect_filled(rect, CornerRadius::ZERO, look.ground.gamma_multiply(shown));
 
     // The design's caption glyphs, light blue on navy (the window's own
     // buttons sit underneath and still take the clicks).
-    let ink = p.blue_edge.gamma_multiply(shown);
+    let ink = look.caption.gamma_multiply(shown);
     let cell = |i: f32| Rect::from_min_size(pos2(rect.right() - 46.0 * (3.0 - i), rect.top()), vec2(46.0, 34.0));
     let stroke = Stroke::new(1.0, ink);
     let c = cell(0.0).center();
@@ -66,7 +108,7 @@ pub fn paint_line(ctx: &egui::Context, rect: Rect, line: &str, fade: f32) {
     // The column: shield, then 28 below it the line and, 18 under that, the
     // track -- centred as a block.
     let role = Role { size: 24.0, face: theme::EXTRABOLD, tracking_em: -0.01 };
-    let white = Color32::WHITE.gamma_multiply(shown);
+    let white = look.text.gamma_multiply(shown);
     let line = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, line, white)));
     let block = SHIELD.y + 28.0 + line.size().y + 18.0 + TRACK.y;
     let top = rect.center().y - block / 2.0;
@@ -74,7 +116,7 @@ pub fn paint_line(ctx: &egui::Context, rect: Rect, line: &str, fade: f32) {
         pos2(rect.center().x, top + SHIELD.y / 2.0),
         SHIELD * motion::breathe(t),
     );
-    let fills = theme::MARK_REVERSED.map(|c| c.gamma_multiply(shown));
+    let fills = MARK_REVERSED.map(|c| c.gamma_multiply(shown));
     theme::paint_mark_colours(&painter, shield, fills);
     let line_top = top + SHIELD.y + 28.0;
     painter.galley(pos2(rect.center().x - line.size().x / 2.0, line_top), line.clone(), white);
@@ -86,7 +128,7 @@ pub fn paint_line(ctx: &egui::Context, rect: Rect, line: &str, fade: f32) {
     painter.rect_filled(
         track,
         CornerRadius::same(2),
-        Color32::from_rgba_unmultiplied(255, 255, 255, 41).gamma_multiply(shown),
+        look.track.gamma_multiply(shown),
     );
     // A bar 34% of the track, sliding from -110% to 330% of its own width;
     // cut to the track so it never paints outside it.

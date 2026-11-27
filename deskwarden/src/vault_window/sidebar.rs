@@ -1032,7 +1032,7 @@ const FOLDER_EDIT_BUTTON_WIDTH: f32 = 24.0;
 ///
 /// **One constant for two things that must be the same number.** The panel
 /// frame keeps it as its LEFT inner margin and sets its RIGHT one to zero; the
-/// rail then hands the same value to [`theme::scrollbar_in_gutter`], which
+/// rail then hands the same value to [`crate::kit::rows::scrollbar_in_gutter`], which
 /// reserves it back as a lane down the rail's right edge. The two cancel, so
 /// the rows span the panel less 14 on each side -- 224pt on the 252pt panel --
 /// and the bar is drawn in the lane instead of on top of them.
@@ -1183,11 +1183,11 @@ pub fn draw_sidebar(
         // **The rail scrolls, and its bar has a lane.** A vault with a folder
         // for every letter must still reach its last rows, and the bar must
         // sit beside the rows rather than on them -- see [`PANEL_PAD_X`] and
-        // `theme::scrollbar_in_gutter`, which reserves the lane down this ui's
+        // `crate::kit::rows::scrollbar_in_gutter`, which reserves the lane down this ui's
         // right edge. The width read here is re-imposed on the scroll
         // content so a rail that grows past the fold does not slide every row
         // sideways when the bar appears.
-        theme::scrollbar_in_gutter(ui, f32::from(PANEL_PAD_X));
+        crate::kit::rows::scrollbar_in_gutter(ui, f32::from(PANEL_PAD_X));
         let rail_width = (ui.available_width() - f32::from(PANEL_PAD_X)).max(0.0);
         // The Lock row is pinned below the scroll region, so the region
         // leaves it its band whatever the row count.
@@ -1281,8 +1281,8 @@ pub fn draw_sidebar(
                     if let Some(outcome) = outcomes.as_ref().map(|o| &o[index]) {
                         let hot = response.contains_pointer();
                         let (color, width) = match outcome {
-                            DropOutcome::Accept => (theme::BLUE_BRIGHT, if hot { 2.0 } else { 1.0 }),
-                            DropOutcome::Refuse(_) => (theme::ERROR, if hot { 2.0 } else { 1.0 }),
+                            DropOutcome::Accept => (crate::kit::tokens::palette(ui.ctx()).blue_bright, if hot { 2.0 } else { 1.0 }),
+                            DropOutcome::Refuse(_) => (crate::kit::tokens::palette(ui.ctx()).error, if hot { 2.0 } else { 1.0 }),
                         };
                         ui.painter().rect_stroke(
                             response.rect,
@@ -1796,7 +1796,7 @@ fn received_row(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<
         // count, placed off the count's MEASURED width.
         let count_width = count_galley(ui, &count, palette.nav_fg).size().x;
         let at = egui::pos2(row.rect.right() - ROW_INSET_X - count_width - 6.0 - 3.0, row.rect.center().y);
-        ui.painter().circle_filled(at, 3.0, theme::BLUE_BRIGHT);
+        ui.painter().circle_filled(at, 3.0, crate::kit::tokens::palette(ui.ctx()).blue_bright);
     }
     if row.clicked() {
         screens.select(Screen::Received);
@@ -2884,9 +2884,9 @@ mod drag_and_drop_tests {
                 .1
                 .color
         };
-        assert_eq!(stroke_of("No Folder"), theme::ERROR, "the virtual bucket did not refuse visibly");
-        assert_eq!(stroke_of("Work"), theme::ERROR, "the item's own folder did not refuse visibly");
-        assert_eq!(stroke_of("Personal"), theme::BLUE_BRIGHT, "an accepting folder was not offered");
+        assert_eq!(stroke_of("No Folder"), crate::kit::tokens::Palette::LIGHT.error, "the virtual bucket did not refuse visibly");
+        assert_eq!(stroke_of("Work"), crate::kit::tokens::Palette::LIGHT.error, "the item's own folder did not refuse visibly");
+        assert_eq!(stroke_of("Personal"), crate::kit::tokens::Palette::LIGHT.blue_bright, "an accepting folder was not offered");
     }
 
     #[test]
@@ -3372,7 +3372,7 @@ mod tests {
     fn collect_hairline_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
         match shape {
             egui::Shape::Rect(rect)
-                if rect.fill == theme::HAIRLINE && (rect.rect.height() - 1.0).abs() < 0.01 =>
+                if rect.fill == crate::kit::tokens::Palette::LIGHT.hairline && (rect.rect.height() - 1.0).abs() < 0.01 =>
             {
                 out.push(rect.rect);
             }
@@ -4332,7 +4332,7 @@ mod tests {
     /// **The rail asks for the app's bar -- width, lane and all -- and asks
     /// BEFORE it opens the scroll area.**
     ///
-    /// `theme::scrollbar_in_gutter` writes into `ui.spacing_mut()`, which an
+    /// `crate::kit::rows::scrollbar_in_gutter` writes into `ui.spacing_mut()`, which an
     /// `egui::ScrollArea` reads when it is BUILT -- so the same call moved
     /// one line down, inside the `show` closure, would style whatever the
     /// rail's CONTENT scrolls and leave the rail's own bar at egui's default:
@@ -4360,7 +4360,7 @@ mod tests {
     #[test]
     fn the_rail_takes_the_apps_scrollbar_width_before_it_builds_its_scroll_area() {
         let source = include_str!("sidebar.rs");
-        let bar = concat!("theme::scrollbar_in_", "gutter(ui, f32::from(PANEL_PAD_X));");
+        let bar = concat!("crate::kit::rows::scrollbar_in_", "gutter(ui, f32::from(PANEL_PAD_X));");
         let area = concat!("egui::ScrollArea::", "vertical()");
 
         let at_bar = source.find(bar).unwrap_or_else(|| {
@@ -4504,7 +4504,7 @@ mod tests {
     ///
     /// Before: the rail reserved no lane, so a floating bar pinned to the ui's
     /// right edge painted -- and registered its hit rect -- over the rows'
-    /// rightmost `theme::SCROLLBAR_WIDTH`. Measured inside the real panel
+    /// rightmost `crate::kit::rows::SCROLLBAR_WIDTH`. Measured inside the real panel
     /// frame, rows x=10..202 and bar x=196..202. That rect is registered after
     /// the rows, so it wins the hit test, and a click at x=199 on a 900pt rail
     /// with 26 folders (overflowing, bar showing) selected NOTHING while the
@@ -4717,7 +4717,7 @@ mod tests {
     ///   lane's leftover -- `PANEL_PAD_X - SCROLLBAR_WIDTH` = 4pt -- lies
     ///   between the bar and the rows, where the reader compares it to the
     ///   10pt on the left, and none of it behind the bar. That is
-    ///   `theme::scrollbar_in_gutter`'s rule, asserted here on the rail the
+    ///   `crate::kit::rows::scrollbar_in_gutter`'s rule, asserted here on the rail the
     ///   same way `item_list.rs` asserts it on the tiles;
     /// * the countdown, the one thing drawn OUTSIDE the scroll area and so
     ///   the one thing the lane does not reserve for, still starts on the row
@@ -4765,13 +4765,13 @@ mod tests {
                 bar.right()
             );
             assert!(
-                (slack_left - (f32::from(PANEL_PAD_X) - theme::SCROLLBAR_WIDTH)).abs() < 0.51
+                (slack_left - (f32::from(PANEL_PAD_X) - crate::kit::rows::SCROLLBAR_WIDTH)).abs() < 0.51
                     && slack_right.abs() < 0.51,
                 "the bar has {slack_left}pt of lane to its left and {slack_right}pt to its \
                  right, expected {}pt and 0pt -- what is left of the lane once the bar is in it \
                  belongs on the ROW side, where the reader compares it to the gap on the left, \
                  and none of it between the bar and the panel's own edge",
-                f32::from(PANEL_PAD_X) - theme::SCROLLBAR_WIDTH
+                f32::from(PANEL_PAD_X) - crate::kit::rows::SCROLLBAR_WIDTH
             );
         }
 
@@ -4785,7 +4785,7 @@ mod tests {
     }
 
     /// **The rail lays itself out identically whether or not the bar is
-    /// showing**, which `theme::scrollbar_in_gutter` does NOT give for free.
+    /// showing**, which `crate::kit::rows::scrollbar_in_gutter` does NOT give for free.
     ///
     /// That helper reserves its lane through `floating_allocated_width`, and
     /// egui applies that only on an axis it is showing a bar for. The rail
@@ -5242,7 +5242,7 @@ mod tests {
     fn a_waiting_invitation_dots_shared_with_me_beside_its_count() {
         fn blue_dots(shape: &egui::Shape, out: &mut Vec<egui::Pos2>) {
             match shape {
-                egui::Shape::Circle(c) if c.fill == theme::BLUE_BRIGHT && (c.radius - 3.0).abs() < 0.01 => out.push(c.center),
+                egui::Shape::Circle(c) if c.fill == crate::kit::tokens::Palette::LIGHT.blue_bright && (c.radius - 3.0).abs() < 0.01 => out.push(c.center),
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| blue_dots(s, out)),
                 _ => {}
             }

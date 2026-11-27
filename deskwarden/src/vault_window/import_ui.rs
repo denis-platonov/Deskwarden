@@ -67,14 +67,6 @@ pub fn see_items() -> &'static str {
 pub const DOWNLOAD_TRAY: &str = "M12 4v11M7 10l5 5 5-5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4";
 const UPLOAD: &str = "M12 16V5M7 10l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3";
 
-const EDGE: Color32 = Color32::from_rgb(0xe8, 0xe6, 0xe3);
-const TILE_BG: Color32 = Color32::from_rgb(0xf1, 0xf0, 0xee);
-const NAVY: Color32 = Color32::from_rgb(0x14, 0x30, 0x7a);
-const MUTED: Color32 = Color32::from_rgb(0x7d, 0x79, 0x79);
-const NOTE_INK: Color32 = Color32::from_rgb(0x8a, 0x87, 0x85);
-const GREEN: Color32 = Color32::from_rgb(0x1b, 0x7a, 0x3f);
-const GREEN_WASH: Color32 = Color32::from_rgb(0xe8, 0xf3, 0xec);
-const BAR: Color32 = Color32::from_rgb(0xee, 0xec, 0xe9);
 const GAP: f32 = 10.0;
 const TILE_HEIGHT: f32 = 104.0;
 const ZONE_HEIGHT: f32 = 220.0;
@@ -398,6 +390,7 @@ fn source_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
 
 /// One source's tile; true when clicked.
 fn tile(ui: &mut egui::Ui, source: ImportSource, width: f32) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (slot, response) = ui.allocate_exact_size(Vec2::new(width, TILE_HEIGHT), Sense::click());
     let _ = ui.interact(slot, tile_id(source), Sense::hover());
     let hovered = response.hovered();
@@ -406,28 +399,29 @@ fn tile(ui: &mut egui::Ui, source: ImportSource, width: f32) -> bool {
         let lift = egui::Shadow { offset: [0, 10], blur: 22, spread: 0, color: Color32::from_rgba_unmultiplied(27, 63, 160, 31) };
         ui.painter().add(lift.as_shape(rect, CornerRadius::same(16)));
     }
-    let edge = if hovered { theme::BLUE } else { EDGE };
-    ui.painter().rect(rect, CornerRadius::same(16), theme::CARD, Stroke::new(2.0, edge), StrokeKind::Inside);
+    let edge = if hovered { p.blue } else { p.hairline };
+    ui.painter().rect(rect, CornerRadius::same(16), p.card, Stroke::new(2.0, edge), StrokeKind::Inside);
     let badge = Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 14.0 + 21.0), Vec2::splat(42.0));
-    ui.painter().rect_filled(badge, CornerRadius::same(12), TILE_BG);
+    ui.painter().rect_filled(badge, CornerRadius::same(12), p.hover);
     ui.painter().text(
         badge.center(),
         egui::Align2::CENTER_CENTER,
         source.initials(),
         egui::FontId::new(13.0, egui::FontFamily::Name(theme::EXTRABOLD.into())),
-        theme::INK,
+        p.ink,
     );
     ui.painter().text(
         egui::pos2(rect.center().x, badge.bottom() + 10.0 + 9.0),
         egui::Align2::CENTER_CENTER,
         source.label(),
         egui::FontId::new(15.0, egui::FontFamily::Name(theme::BOLD.into())),
-        theme::INK,
+        p.ink,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut answer = Answer::Open;
     let (slot, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ZONE_HEIGHT), Sense::click());
     let _ = ui.interact(slot, zone_id(), Sense::hover());
@@ -435,9 +429,9 @@ fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
     let dragging_over = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
     let lit = hovered || dragging_over;
     let (border, fill) = if lit {
-        (theme::BLUE, Color32::from_rgb(0xee, 0xf2, 0xfc))
+        (p.blue, p.blue_wash)
     } else {
-        (Color32::from_rgb(0xb8, 0xc7, 0xea), Color32::from_rgb(0xf5, 0xf7, 0xfd))
+        (p.blue_edge, p.chip_on)
     };
     ui.painter().rect_filled(slot, CornerRadius::same(20), fill);
     let outline = rounded_outline(slot.shrink(1.0), 20.0);
@@ -445,21 +439,21 @@ fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
     let tile = Rect::from_center_size(egui::pos2(slot.center().x, slot.top() + 62.0), Vec2::splat(58.0));
     let shadow = egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_rgba_unmultiplied(27, 63, 160, 36) };
     ui.painter().add(shadow.as_shape(tile, CornerRadius::same(17)));
-    ui.painter().rect_filled(tile, CornerRadius::same(17), theme::CARD);
-    icon::stroke(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(26.0)), UPLOAD, 2.2, theme::BLUE);
+    ui.painter().rect_filled(tile, CornerRadius::same(17), p.card);
+    icon::stroke(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(26.0)), UPLOAD, 2.2, p.blue);
     ui.painter().text(
         egui::pos2(slot.center().x, tile.bottom() + 28.0),
         egui::Align2::CENTER_CENTER,
         drop_headline(),
         egui::FontId::new(18.0, egui::FontFamily::Name(theme::EXTRABOLD.into())),
-        NAVY,
+        p.blue_deep,
     );
     ui.painter().text(
         egui::pos2(slot.center().x, tile.bottom() + 54.0),
         egui::Align2::CENTER_CENTER,
         drop_sub(),
         egui::FontId::proportional(15.0),
-        Color32::from_rgb(0x4a, 0x47, 0x45),
+        p.text_nav,
     );
     if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
         answer = Answer::PickFile;
@@ -469,7 +463,7 @@ fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
     }
     if let Some(error) = wizard.error {
         ui.add_space(12.0);
-        ui.label(egui::RichText::new(error).size(14.0).color(theme::ERROR));
+        ui.label(egui::RichText::new(error).size(14.0).color(p.error));
     }
     ui.add_space(16.0);
     ui.horizontal(|ui| {
@@ -480,7 +474,7 @@ fn file_step(ui: &mut egui::Ui, wizard: &mut Wizard) -> Answer {
             wizard.error = None;
         }
         ui.add_space(8.0);
-        ui.add(egui::Label::new(egui::RichText::new(delete_note()).size(14.0).color(NOTE_INK)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(delete_note()).size(14.0).color(p.text_label)).wrap());
     });
     answer
 }
@@ -505,43 +499,45 @@ fn rounded_outline(rect: Rect, radius: f32) -> Vec<Pos2> {
 }
 
 fn progress_step(ui: &mut egui::Ui, wizard: &Wizard) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (done, total) = wizard.counted();
     ui.vertical_centered(|ui| {
         ui.add_space(30.0);
         ui.label(
             egui::RichText::new(done.to_string())
                 .font(egui::FontId::new(56.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
-                .color(NAVY),
+                .color(p.blue_deep),
         );
         ui.add_space(16.0);
-        ui.label(egui::RichText::new(count_label()).size(16.0).color(MUTED));
+        ui.label(egui::RichText::new(count_label()).size(16.0).color(p.text_faint));
         ui.add_space(16.0);
         let (bar, _) = ui.allocate_exact_size(Vec2::new(320.0, 5.0), Sense::hover());
-        ui.painter().rect_filled(bar, CornerRadius::same(3), BAR);
+        ui.painter().rect_filled(bar, CornerRadius::same(3), p.meter_track);
         let fraction = if total == 0 { 0.0 } else { (done as f32 / total as f32).clamp(0.0, 1.0) };
         let fill = Rect::from_min_size(bar.min, Vec2::new(bar.width() * fraction, bar.height()));
-        ui.painter().rect_filled(fill, CornerRadius::same(3), theme::BLUE);
+        ui.painter().rect_filled(fill, CornerRadius::same(3), p.blue);
         ui.add_space(30.0);
     });
 }
 
 fn done_step(ui: &mut egui::Ui, wizard: &Wizard) -> Answer {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut answer = Answer::Open;
     let summary = wizard.summary.clone().unwrap_or_default();
     ui.vertical_centered(|ui| {
         ui.add_space(8.0);
         let (ring, _) = ui.allocate_exact_size(Vec2::splat(80.0), Sense::hover());
-        ui.painter().circle_filled(ring.center(), 40.0, GREEN_WASH);
-        icon::stroke(ui.painter(), Rect::from_center_size(ring.center(), Vec2::splat(40.0)), icon::glyph::CHECK, 2.6, GREEN);
+        ui.painter().circle_filled(ring.center(), 40.0, p.done_wash);
+        icon::stroke(ui.painter(), Rect::from_center_size(ring.center(), Vec2::splat(40.0)), icon::glyph::CHECK, 2.6, p.done_mark);
         ui.add_space(14.0);
         ui.label(
             egui::RichText::new(imported_headline(summary.imported))
                 .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
-                .color(theme::INK),
+                .color(p.ink),
         );
         for (line, bad) in done_lines(&summary) {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(line).size(16.0).color(if bad { theme::ERROR } else { MUTED }));
+            ui.label(egui::RichText::new(line).size(16.0).color(if bad { p.error } else { p.text_faint }));
         }
         ui.add_space(14.0);
     });

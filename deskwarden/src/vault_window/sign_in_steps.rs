@@ -10,6 +10,7 @@
 use eframe::egui::{self, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::kit::icon::{self, glyph};
+use crate::kit::tokens::{palette, Palette};
 use crate::theme;
 
 /// One step a fill can press (spec B 1.4 D's `STEP`).
@@ -220,21 +221,16 @@ fn menu_id() -> egui::Id {
     egui::Id::new(("sign-in-steps-menu-open", SESSION.with(|s| s.get())))
 }
 
-const SECRET_EDGE: Color32 = Color32::from_rgb(0xf0, 0xcf, 0xca);
-const CHIP_EDGE: Color32 = Color32::from_rgb(0xe8, 0xe6, 0xe3);
-const ARROW: Color32 = Color32::from_rgb(0xc9, 0xc6, 0xc2);
-const TEST_WELL: Color32 = Color32::from_rgb(0xf7, 0xf6, 0xf5);
-const FAINT: Color32 = Color32::from_rgb(0x9b, 0x97, 0x97);
 pub(crate) const CHIP_HEIGHT: f32 = 46.0;
 
 /// A chip's colours: (border, fill, ink).
-pub(crate) fn chip_colours(step: Step, live: bool) -> (Color32, Color32, Color32) {
+pub(crate) fn chip_colours(p: &Palette, step: Step, live: bool) -> (Color32, Color32, Color32) {
     if live {
-        (theme::BLUE, theme::BLUE_WASH, theme::INK)
+        (p.blue, p.blue_wash, p.ink)
     } else if step.secret() {
-        (SECRET_EDGE, theme::DANGER_WASH, theme::DANGER_INK)
+        (p.danger_edge, p.danger_wash, p.danger_ink)
     } else {
-        (CHIP_EDGE, theme::CARD, theme::INK)
+        (p.hairline, p.card, p.ink)
     }
 }
 
@@ -246,11 +242,12 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
         return false;
     };
     let now = ui.input(|i| i.time);
+    let p = palette(ui.ctx());
     let mut wants_editor = false;
 
     // Presets.
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(title_tip());
+        ui.label(egui::RichText::new("?").color(p.text_ghost)).on_hover_text(title_tip());
         let labels: Vec<&str> = presets().iter().map(|(name, _)| *name).collect();
         let selected = active_preset(&steps).unwrap_or(usize::MAX);
         if let Some(picked) = crate::kit::controls::segmented(ui, &labels, selected, crate::kit::controls::SEG_SETTINGS) {
@@ -275,16 +272,16 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
             }
             if i + 1 < steps.len() {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, CHIP_HEIGHT), Sense::hover());
-                icon::stroke(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(16.0)), glyph::ARROW_RIGHT, 2.4, ARROW);
+                icon::stroke(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(16.0)), glyph::ARROW_RIGHT, 2.4, p.kbd_border);
             }
         }
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(CHIP_HEIGHT), Sense::click());
         // Its stable id, for tests and later frames (an id'd click on the
         // same rect as an allocated widget never sees the pointer).
         let _ = ui.interact(rect, add_button_id(), Sense::hover());
-        let ink = if response.hovered() { theme::BLUE } else { ARROW };
+        let ink = if response.hovered() { p.blue } else { p.kbd_border };
         dashed_box(ui.painter(), rect, ink);
-        icon::stroke(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), glyph::PLUS, 2.0, if response.hovered() { theme::BLUE } else { theme::TEXT_MUTED });
+        icon::stroke(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), glyph::PLUS, 2.0, if response.hovered() { p.blue } else { p.text_muted });
         if response.clicked() {
             let open = ui.data(|d| d.get_temp::<bool>(menu_id())).unwrap_or(false);
             ui.data_mut(|d| d.insert_temp(menu_id(), !open));
@@ -347,9 +344,9 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
         ui.spacing_mut().item_spacing.x = 12.0;
         let mut on = true;
         ui.add_enabled_ui(false, |ui| crate::kit::controls::switch(ui, &mut on));
-        ui.label(theme::semibold(only_type_into(app), 15.0).color(theme::INK));
-        ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(only_tip());
-        if theme::action_link(ui, crate::vault_window::detail_edit::sequence_edit_button(), 13.0).clicked() {
+        ui.label(theme::semibold(only_type_into(app), 15.0).color(p.ink));
+        ui.label(egui::RichText::new("?").color(p.text_ghost)).on_hover_text(only_tip());
+        if crate::kit::controls::link(ui, crate::vault_window::detail_edit::sequence_edit_button(), 13.0).clicked() {
             wants_editor = true;
         }
     });
@@ -358,7 +355,7 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
     // The test box.
     let testing = run.as_ref().is_some_and(|r| !r.done);
     egui::Frame::new()
-        .fill(TEST_WELL)
+        .fill(p.window_bg)
         .corner_radius(CornerRadius::same(16))
         .inner_margin(12)
         .show(ui, |ui| {
@@ -376,14 +373,14 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
                 }
                 let width = (ui.available_width() - 28.0).max(80.0);
                 let (pane, _) = ui.allocate_exact_size(Vec2::new(width, 46.0), Sense::hover());
-                ui.painter().rect(pane, CornerRadius::same(12), theme::CARD, Stroke::new(1.0, CHIP_EDGE), StrokeKind::Inside);
+                ui.painter().rect(pane, CornerRadius::same(12), p.card, Stroke::new(1.0, p.hairline), StrokeKind::Inside);
                 let shown = ui.data(|d| d.get_temp::<Run>(run_id())).map(|r| {
                     let f = test_frame(&r.steps, now - r.started);
                     if r.done { r.steps.iter().map(|s| s.test_output()).collect() } else { f.text }
                 });
                 let (text, ink) = match shown.as_deref() {
-                    None | Some("") if !testing => (test_empty().to_string(), FAINT),
-                    other => (other.unwrap_or_default().to_string(), theme::INK),
+                    None | Some("") if !testing => (test_empty().to_string(), p.text_ghost),
+                    other => (other.unwrap_or_default().to_string(), p.ink),
                 };
                 let clip = ui.painter().with_clip_rect(pane.shrink2(Vec2::new(14.0, 0.0)));
                 let at = clip.text(
@@ -395,9 +392,9 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
                 );
                 if testing && (now.fract() < 0.5) {
                     let caret = Rect::from_center_size(egui::pos2(at.right() + 3.0, pane.center().y), Vec2::new(2.0, 20.0));
-                    clip.rect_filled(caret, 0.0, theme::INK);
+                    clip.rect_filled(caret, 0.0, p.ink);
                 }
-                ui.label(egui::RichText::new("?").color(FAINT)).on_hover_text(test_tip());
+                ui.label(egui::RichText::new("?").color(p.text_ghost)).on_hover_text(test_tip());
             });
         });
 
@@ -425,7 +422,8 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
 /// One chip; true when its ✕ was clicked.
 fn chip(ui: &mut egui::Ui, step: Step, index: usize, live: bool) -> bool {
     let font = egui::FontId::new(15.0, egui::FontFamily::Name(theme::BOLD.into()));
-    let (border, fill, ink) = chip_colours(step, live);
+    let p = palette(ui.ctx());
+    let (border, fill, ink) = chip_colours(&p, step, live);
     let galley = ui.painter().layout_no_wrap(step.label().to_string(), font, ink);
     let width = 14.0 + 17.0 + 9.0 + galley.size().x + 9.0 + 26.0 + 6.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, CHIP_HEIGHT), Sense::hover());
@@ -443,7 +441,7 @@ fn chip(ui: &mut egui::Ui, step: Step, index: usize, live: bool) -> bool {
     if response.hovered() {
         ui.painter().rect_filled(cross, CornerRadius::same(8), Color32::from_rgba_unmultiplied(32, 30, 29, 18));
     }
-    icon::stroke(ui.painter(), Rect::from_center_size(cross.center(), Vec2::splat(12.0)), glyph::CLOSE, 2.0, if response.hovered() { theme::INK } else { FAINT });
+    icon::stroke(ui.painter(), Rect::from_center_size(cross.center(), Vec2::splat(12.0)), glyph::CLOSE, 2.0, if response.hovered() { p.ink } else { p.text_ghost });
     response.on_hover_text(crate::i18n::t("steps.remove_step")).clicked()
 }
 
@@ -551,13 +549,14 @@ mod tests {
 
     #[test]
     fn the_password_step_wears_the_secret_colours() {
-        assert_eq!(chip_colours(Step::Pw, false), (SECRET_EDGE, theme::DANGER_WASH, theme::DANGER_INK));
-        assert_eq!(chip_colours(Step::User, false).1, theme::CARD);
+        let l = Palette::LIGHT;
+        assert_eq!(chip_colours(&l, Step::Pw, false), (l.danger_edge, l.danger_wash, l.danger_ink));
+        assert_eq!(chip_colours(&l, Step::User, false).1, l.card);
         let ctx = testing::ctx();
         let mut sequence = render(presets()[0].1);
         let p = paint(&ctx, 0.0, &mut sequence, vec![]);
-        assert!(p.rects.iter().any(|r| r.fill == theme::DANGER_WASH && r.stroke.color == SECRET_EDGE && r.rect.height() == CHIP_HEIGHT));
-        assert_eq!(ink_of(&p, Step::Pw.label()), theme::DANGER_INK);
+        assert!(p.rects.iter().any(|r| r.fill == Palette::LIGHT.danger_wash && r.stroke.color == Palette::LIGHT.danger_edge && r.rect.height() == CHIP_HEIGHT));
+        assert_eq!(ink_of(&p, Step::Pw.label()), Palette::LIGHT.danger_ink);
     }
 
     /// Review I3: the menu and the test run belong to one editor session.

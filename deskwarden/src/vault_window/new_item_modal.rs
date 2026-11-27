@@ -7,6 +7,7 @@ use eframe::egui::{self, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind,
 
 use crate::kit::icon::{self, glyph};
 use crate::kit::modal::{Dialog, ModalOutcome};
+use crate::kit::tokens::Palette;
 use crate::theme;
 use crate::vault_bridge::ItemKind;
 
@@ -18,8 +19,6 @@ pub fn title() -> &'static str {
 const WIDTH: f32 = 660.0;
 const CARD_HEIGHT: f32 = 168.0;
 const GAP: f32 = 12.0;
-const SUB_INK: Color32 = Color32::from_rgb(0x6b, 0x68, 0x66);
-const EDGE: Color32 = Color32::from_rgb(0xe8, 0xe6, 0xe3);
 
 /// What the chooser did this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,14 +39,13 @@ pub struct Choice {
 }
 
 /// Every card, in order.
-pub fn choices() -> [Choice; 5] {
-    let rgb = Color32::from_rgb;
+pub fn choices(p: &Palette) -> [Choice; 5] {
     [
-        Choice { kind: ItemKind::Login, title: crate::i18n::t("new_item.login"), sub: crate::i18n::t("new_item.login_sub"), glyph: glyph::LOGIN, tile: rgb(0xee, 0xf2, 0xfc), ink: rgb(0x1b, 0x3f, 0xa0) },
-        Choice { kind: ItemKind::Card, title: crate::i18n::t("new_item.card"), sub: crate::i18n::t("new_item.card_sub"), glyph: glyph::CARD, tile: rgb(0xe8, 0xf3, 0xec), ink: rgb(0x17, 0x67, 0x3a) },
-        Choice { kind: ItemKind::SecureNote, title: crate::i18n::t("new_item.note"), sub: crate::i18n::t("new_item.note_sub"), glyph: glyph::NOTE, tile: rgb(0xfe, 0xf6, 0xe7), ink: rgb(0x8a, 0x5a, 0x06) },
-        Choice { kind: ItemKind::Identity, title: crate::i18n::t("new_item.identity"), sub: crate::i18n::t("new_item.identity_sub"), glyph: glyph::IDENTITY, tile: rgb(0xf1, 0xf0, 0xee), ink: rgb(0x4a, 0x47, 0x45) },
-        Choice { kind: ItemKind::SshKey, title: crate::i18n::t("new_item.ssh"), sub: crate::i18n::t("new_item.ssh_sub"), glyph: glyph::SSH, tile: rgb(0xf1, 0xf0, 0xee), ink: rgb(0x4a, 0x47, 0x45) },
+        Choice { kind: ItemKind::Login, title: crate::i18n::t("new_item.login"), sub: crate::i18n::t("new_item.login_sub"), glyph: glyph::LOGIN, tile: p.blue_wash, ink: p.blue },
+        Choice { kind: ItemKind::Card, title: crate::i18n::t("new_item.card"), sub: crate::i18n::t("new_item.card_sub"), glyph: glyph::CARD, tile: p.done_wash, ink: p.done_ink },
+        Choice { kind: ItemKind::SecureNote, title: crate::i18n::t("new_item.note"), sub: crate::i18n::t("new_item.note_sub"), glyph: glyph::NOTE, tile: p.caution_wash, ink: p.caution_mark },
+        Choice { kind: ItemKind::Identity, title: crate::i18n::t("new_item.identity"), sub: crate::i18n::t("new_item.identity_sub"), glyph: glyph::IDENTITY, tile: p.hover, ink: p.text_nav },
+        Choice { kind: ItemKind::SshKey, title: crate::i18n::t("new_item.ssh"), sub: crate::i18n::t("new_item.ssh_sub"), glyph: glyph::SSH, tile: p.hover, ink: p.text_nav },
     ]
 }
 
@@ -61,7 +59,7 @@ pub fn draw(ctx: &egui::Context) -> ChooserAnswer {
         let mut picked = None;
         let width = ui.available_width();
         let card_w = ((width - 2.0 * GAP) / 3.0).floor();
-        for row in choices().chunks(3) {
+        for row in choices(&crate::kit::tokens::palette(ui.ctx())).chunks(3) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = GAP;
                 for choice in row {
@@ -83,6 +81,7 @@ pub fn draw(ctx: &egui::Context) -> ChooserAnswer {
 
 /// One kind's card; true when clicked.
 fn card(ui: &mut egui::Ui, choice: &Choice, width: f32) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let (slot, response) = ui.allocate_exact_size(Vec2::new(width, CARD_HEIGHT), Sense::click());
     let _ = ui.interact(slot, card_id(choice.kind), Sense::hover());
     let hovered = response.hovered();
@@ -91,8 +90,8 @@ fn card(ui: &mut egui::Ui, choice: &Choice, width: f32) -> bool {
         let lift = egui::Shadow { offset: [0, 12], blur: 26, spread: 0, color: Color32::from_rgba_unmultiplied(27, 63, 160, 36) };
         ui.painter().add(lift.as_shape(rect, CornerRadius::same(18)));
     }
-    let edge = if hovered { theme::BLUE } else { EDGE };
-    ui.painter().rect(rect, CornerRadius::same(18), theme::CARD, Stroke::new(2.0, edge), StrokeKind::Inside);
+    let edge = if hovered { p.blue } else { p.hairline };
+    ui.painter().rect(rect, CornerRadius::same(18), p.card, Stroke::new(2.0, edge), StrokeKind::Inside);
     let tile = Rect::from_min_size(rect.min + Vec2::splat(20.0), Vec2::splat(52.0));
     ui.painter().rect_filled(tile, CornerRadius::same(15), choice.tile);
     icon::stroke(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(24.0)), choice.glyph, 2.0, choice.ink);
@@ -100,14 +99,14 @@ fn card(ui: &mut egui::Ui, choice: &Choice, width: f32) -> bool {
     let title = ui.painter().layout(
         choice.title.to_string(),
         egui::FontId::new(18.0, egui::FontFamily::Name(theme::EXTRABOLD.into())),
-        theme::INK,
+        p.ink,
         text_w,
     );
     let title_at = egui::pos2(rect.left() + 20.0, tile.bottom() + 16.0);
     let title_h = title.size().y;
-    ui.painter().galley(title_at, title, theme::INK);
-    let sub = ui.painter().layout(choice.sub.to_string(), egui::FontId::proportional(14.0), SUB_INK, text_w);
-    ui.painter().galley(title_at + Vec2::new(0.0, title_h + 4.0), sub, SUB_INK);
+    ui.painter().galley(title_at, title, p.ink);
+    let sub = ui.painter().layout(choice.sub.to_string(), egui::FontId::proportional(14.0), p.text_icon, text_w);
+    ui.painter().galley(title_at + Vec2::new(0.0, title_h + 4.0), sub, p.text_icon);
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 

@@ -98,7 +98,7 @@ pub struct ModalSubject {
     name: String,
     /// The login's username, or `""` for an item that has no login block at
     /// all. Empty rather than `Option`, because that is the shape
-    /// `item_row` reads it in and `theme::modal_subject` answers to.
+    /// `item_row` reads it in and `crate::kit::pills::modal_subject` answers to.
     username: String,
     kind: ItemKind,
     icon: Option<egui::TextureHandle>,
@@ -140,14 +140,14 @@ impl ModalSubject {
     /// against -- the modal is about exactly one item, so a treatment that
     /// distinguishes it from its neighbours has no neighbours to do it among.
     pub fn draw(&self, ui: &mut egui::Ui) {
-        theme::modal_subject(ui, &self.name, &self.username, |ui, size| match &self.icon {
+        crate::kit::pills::modal_subject(ui, &self.name, &self.username, |ui, size| match &self.icon {
             // `avatar_artwork_tile` then `avatar_image`, which is
             // `item_row`'s pair and not a second way of saying it: the tile
             // is drawn unfilled and the artwork fills it, clipped to the
             // tile's own radius, with the border re-drawn on top.
             Some(texture) => {
-                let tile = theme::avatar_artwork_tile(ui, size, false);
-                theme::avatar_image(ui, tile, texture, false);
+                let tile = crate::kit::pills::artwork_tile(ui, size, false);
+                crate::kit::pills::artwork_image(ui, tile, texture, false);
             }
             None => crate::kind_mark::avatar(ui, self.kind, &self.name, size, false),
         });
@@ -1665,7 +1665,7 @@ pub fn build_frame_with_search(
     let (theme_at_open, text_size_at_open, hide_share_at_open) =
         (look_at_open.theme, look_at_open.text_size, look_at_open.hide_on_screen_share);
     let screen_share_applied = crate::screen_share::Applied::default();
-    let system_dark = crate::system_theme::Watcher::default();
+    let theme_follower = crate::kit::tokens::ThemeFollower::default();
     // Whether an item's DOMAIN may be sent to the icon service at all, read
     // the same way and live-editable for the same reason -- but defaulting
     // the other way round. `true` is the default for this one (see
@@ -3237,19 +3237,12 @@ pub fn build_frame_with_search(
             .map_or((theme_at_open, text_size_at_open, hide_share_at_open), |s| {
                 (s.theme, s.text_size, s.hide_on_screen_share)
             });
-        // The theme shows on the Settings screen, the one surface drawn wholly
-        // from the kit's palette; every other screen keeps the light look
-        // (its text and fills are `theme::` constants). One call, one place.
-        let frame_palette = if settings_selected && prefs.is_some() {
-            let system = theme == crate::kit::tokens::ThemeChoice::System;
-            // No repaint of its own: the window's per-frame schedule already
-            // wakes it, and the watcher asks Windows at most once a second.
-            let now = ui.input(|i| i.time);
-            theme.palette(system && system_dark.dark_at(now, crate::system_theme::apps_use_dark))
-        } else {
-            crate::kit::tokens::Palette::LIGHT
-        };
-        crate::kit::tokens::set_palette(ui.ctx(), frame_palette);
+        // The Theme setting reaches every screen of the window, not only the
+        // Settings one: Light, Dark, or System (which follows Windows, asked at
+        // most once a second). One call, one place. No repaint of its own: the
+        // window's per-frame schedule already wakes it.
+        theme_follower.apply(ui.ctx(), theme);
+        restyle_for_palette(ui.ctx());
         let zoom = text_size.zoom_factor();
         if (ui.ctx().zoom_factor() - zoom).abs() > f32::EPSILON {
             ui.ctx().set_zoom_factor(zoom);
@@ -3259,7 +3252,7 @@ pub fn build_frame_with_search(
             VaultBodyState::Loading => {
                 top_bar_band(ui);
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(theme::CANVAS))
+                    .frame(egui::Frame::new().fill(crate::kit::tokens::palette(ui.ctx()).window_bg))
                     .show(ui, |ui| {
                         let available = ui.available_height();
                         ui.vertical_centered(|ui| {
@@ -3321,7 +3314,7 @@ pub fn build_frame_with_search(
             VaultBodyState::Unavailable(reason) => {
                 top_bar_band(ui);
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(theme::CANVAS))
+                    .frame(egui::Frame::new().fill(crate::kit::tokens::palette(ui.ctx()).window_bg))
                     .show(ui, |ui| {
                         let available = ui.available_height();
                         ui.vertical_centered(|ui| {
@@ -3329,15 +3322,15 @@ pub fn build_frame_with_search(
                             ui.label(
                                 egui::RichText::new(crate::i18n::t("vault.load_failed"))
                                     .size(15.0)
-                                    .color(theme::INK),
+                                    .color(crate::kit::tokens::palette(ui.ctx()).ink),
                             );
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new(reason).size(13.0).color(theme::TEXT_FAINT));
+                            ui.label(egui::RichText::new(reason).size(13.0).color(crate::kit::tokens::palette(ui.ctx()).text_faint));
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(crate::i18n::t("vault.load_failed_hint"))
                                     .size(13.0)
-                                    .color(theme::TEXT_FAINT),
+                                    .color(crate::kit::tokens::palette(ui.ctx()).text_faint),
                             );
                         });
                     });
@@ -3351,7 +3344,7 @@ pub fn build_frame_with_search(
 
         // No `.stroke(...)` on this frame: `egui::Panel` already paints its
         // own right-edge separator (`show_separator_line`, on by default) in
-        // the same `theme::HAIRLINE` color via the ambient
+        // the same `crate::kit::tokens::palette(ui.ctx()).hairline` color via the ambient
         // `noninteractive.bg_stroke` style (see `theme::apply`). A full-box
         // stroke here used to duplicate that on the right edge and, worse,
         // duplicate the chrome bar's own bottom hairline on the *top* edge
@@ -3993,7 +3986,7 @@ pub fn build_frame_with_search(
                             egui::pos2(edge.right() + 1.0, edge.bottom()),
                         ),
                         egui::CornerRadius::ZERO,
-                        theme::HAIRLINE,
+                        crate::kit::tokens::palette(ui.ctx()).hairline,
                     );
             }
             // ARM SITE 2 OF 2: a row opened by a primary click while no detail
@@ -4712,7 +4705,7 @@ pub fn build_frame_with_search(
             // column's text and rows, `DETAIL_PAD_X`/`DETAIL_PAD_Y` on the
             // detail's strip and body -- where it is each column's own
             // padding rather than the shared container's.
-            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .frame(egui::Frame::new().fill(crate::kit::tokens::palette(ui.ctx()).window_bg))
             .show(ui, |ui| {
                 // The Sends screen replaces the detail pane as well as the
                 // item list, so it takes this panel whole and the read/edit
@@ -12163,7 +12156,7 @@ fn report_dialog(dialog: crate::kit::modal::Dialog<'_>, text: &str, bad: bool, c
         if bad {
             modal::note(ui, modal::Tone::Danger, text);
         } else {
-            ui.add(egui::Label::new(egui::RichText::new(text).size(15.0).color(theme::INK)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(text).size(15.0).color(crate::kit::tokens::palette(ui.ctx()).ink)).wrap());
         }
         ui.add_space(18.0);
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
@@ -14670,7 +14663,54 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
     });
 }
 
-/// Design 2b's titlebar avatar: a 28px circle, `theme::INK` background,
+/// Brings egui's own style (the colours of anything drawn without an explicit
+/// one: plain labels, text boxes, buttons) in line with the context's current
+/// palette. `theme::apply` builds the light style once; under a dark palette
+/// that would leave default ink dark on a dark ground, so the style is
+/// rewritten from the palette whenever the palette changes, and not otherwise.
+fn restyle_for_palette(ctx: &egui::Context) {
+    // The palette is read BEFORE any `ctx.data` closure: reading it inside one
+    // takes the same lock and deadlocks.
+    let p = crate::kit::tokens::palette(ctx);
+    let seen = egui::Id::new("vault-window-style-palette");
+    let last = ctx.data(|d| d.get_temp::<crate::kit::tokens::Palette>(seen));
+    if last == Some(p) || (last.is_none() && p == crate::kit::tokens::Palette::LIGHT) {
+        ctx.data_mut(|d| d.insert_temp(seen, p));
+        return;
+    }
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        let v = &mut style.visuals;
+        let stroke = egui::Stroke::new;
+        v.panel_fill = p.window_bg;
+        v.window_fill = p.card;
+        v.faint_bg_color = p.list_bg;
+        v.extreme_bg_color = p.card;
+        v.selection.bg_fill = p.blue_edge;
+        v.selection.stroke = stroke(1.0, p.blue);
+        v.hyperlink_color = p.blue_deep;
+        v.window_stroke = stroke(1.0, p.border);
+        v.widgets.noninteractive.fg_stroke = stroke(1.0, p.ink);
+        v.widgets.noninteractive.bg_stroke = stroke(1.0, p.hairline);
+        v.widgets.inactive.bg_fill = p.card;
+        v.widgets.inactive.weak_bg_fill = p.card;
+        v.widgets.inactive.bg_stroke = stroke(1.0, p.border);
+        v.widgets.inactive.fg_stroke = stroke(1.0, p.ink);
+        v.widgets.hovered.bg_fill = p.secondary_hover;
+        v.widgets.hovered.weak_bg_fill = p.secondary_hover;
+        v.widgets.hovered.bg_stroke = stroke(1.0, p.blue_edge);
+        v.widgets.hovered.fg_stroke = stroke(1.0, p.ink);
+        v.widgets.active.bg_fill = p.blue_wash;
+        v.widgets.active.weak_bg_fill = p.blue_wash;
+        v.widgets.active.bg_stroke = stroke(1.0, p.blue);
+        v.widgets.active.fg_stroke = stroke(1.0, p.blue_deep);
+        v.widgets.open.weak_bg_fill = p.blue_wash;
+        v.widgets.open.bg_stroke = stroke(1.0, p.blue);
+    });
+    ctx.data_mut(|d| d.insert_temp(seen, p));
+    ctx.request_repaint();
+}
+
+/// Design 2b's titlebar avatar: a 28px circle, `crate::kit::tokens::palette(ui.ctx()).ink` background,
 /// white 11px Bold initials. Paints the same way `theme::avatar` does
 /// (allocate a square, paint a shape, center the text) but with a full
 /// circle instead of a rounded rect -- kept local to this one call site
@@ -14726,13 +14766,13 @@ fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) -> egui::Response {
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    ui.painter().circle_filled(rect.center(), SIZE / 2.0, theme::INK);
+    ui.painter().circle_filled(rect.center(), SIZE / 2.0, crate::kit::tokens::palette(ui.ctx()).ink);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())),
-        egui::Color32::WHITE,
+        crate::kit::tokens::palette(ui.ctx()).card,
     );
     response
 }
@@ -15041,10 +15081,10 @@ fn account_menu(
             // pane's own header/subtitle pair uses.
             let text = egui::RichText::new(line).size(12.0);
             let text = if row == 0 {
-                text.color(theme::INK)
+                text.color(crate::kit::tokens::palette(ui.ctx()).ink)
                     .family(egui::FontFamily::Name(theme::SEMIBOLD.into()))
             } else {
-                text.color(theme::TEXT_FAINT)
+                text.color(crate::kit::tokens::palette(ui.ctx()).text_faint)
             };
             ui.add(egui::Label::new(text).wrap());
         }
@@ -15061,7 +15101,7 @@ fn account_menu(
                 egui::Label::new(
                     egui::RichText::new(notice)
                         .size(12.0)
-                        .color(theme::TEXT_SECONDARY),
+                        .color(crate::kit::tokens::palette(ui.ctx()).text_nav),
                 )
                 .wrap(),
             );
@@ -15177,22 +15217,22 @@ fn sync_pill(
     from_disk_age: Option<Duration>,
 ) -> (egui::Color32, String) {
     if sync_in_progress {
-        return (theme::TEXT_GHOST, crate::i18n::t("vault.pill_syncing").to_string());
+        return (crate::kit::tokens::Palette::LIGHT.text_ghost, crate::i18n::t("vault.pill_syncing").to_string());
     }
     // Blue for success (there's no dedicated "success" green in this app's
     // palette -- see `theme.rs`'s module doc on "one blue hue... red reserved
     // for actual errors"), the design's error red for failure, and a neutral
     // ghost dot before the first sync has reported anything.
     match (sync_status, vault_load_error) {
-        (Some(Err(_)), _) => (theme::ERROR, with_age(crate::i18n::t("vault.pill_sync_failed"), from_disk_age)),
-        (_, Some(_)) => (theme::ERROR, with_age(vault_not_refreshed_pill(), from_disk_age)),
-        (Some(Ok(())), None) => (theme::BLUE, crate::i18n::tf("vault.pill_synced", &[("ago", &synced_ago_text(since_last_sync))])),
+        (Some(Err(_)), _) => (crate::kit::tokens::Palette::LIGHT.error, with_age(crate::i18n::t("vault.pill_sync_failed"), from_disk_age)),
+        (_, Some(_)) => (crate::kit::tokens::Palette::LIGHT.error, with_age(vault_not_refreshed_pill(), from_disk_age)),
+        (Some(Ok(())), None) => (crate::kit::tokens::Palette::LIGHT.blue, crate::i18n::tf("vault.pill_synced", &[("ago", &synced_ago_text(since_last_sync))])),
         (None, None) => match from_disk_age {
             Some(age) => (
-                theme::TEXT_GHOST,
+                crate::kit::tokens::Palette::LIGHT.text_ghost,
                 crate::i18n::tf("vault.pill_cached", &[("age", &cache_age_text(age))]),
             ),
-            None => (theme::TEXT_GHOST, crate::i18n::t("vault.pill_idle").to_string()),
+            None => (crate::kit::tokens::Palette::LIGHT.text_ghost, crate::i18n::t("vault.pill_idle").to_string()),
         },
     }
 }
@@ -16230,7 +16270,7 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
         .title(launch_confirm_title())
         .sub(&pending.item_name)
         .show(ctx, |ui| {
-            ui.add(egui::Label::new(RichText::new(launch_confirm_body()).size(15.0).color(theme::INK)).wrap());
+            ui.add(egui::Label::new(RichText::new(launch_confirm_body()).size(15.0).color(crate::kit::tokens::palette(ui.ctx()).ink)).wrap());
             ui.add_space(10.0);
             // The exact command line, in a quiet box: what the vault says to
             // run, character for character.
@@ -16244,7 +16284,7 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
                         RichText::new(detail::command_line(&pending.plan))
                             .size(13.0)
                             .monospace()
-                            .color(theme::INK),
+                            .color(crate::kit::tokens::palette(ui.ctx()).ink),
                     );
                 });
             ui.add_space(18.0);
@@ -16401,7 +16441,7 @@ mod v2_window_size_tests {
     /// window's own level.
     #[test]
     fn the_window_sets_the_kit_palette() {
-        assert_eq!(production().matches(concat!("kit::tokens::set_", "palette(")).count(), 1);
+        assert_eq!(production().matches(concat!("theme_follower.", "apply(ui.ctx(), theme)")).count(), 1);
     }
 
     #[test]
@@ -22813,7 +22853,7 @@ mod sync_pill_tests {
     // spelled for the user, and until this function existed the wording was
     // an `if` chain inside a 3000-line `eframe` closure that nothing could
     // call.
-    use super::{cache_age_text, list_offline, sync_pill, theme, still_offline_toast, vault_not_refreshed_pill};
+    use super::{cache_age_text, list_offline, sync_pill, still_offline_toast, vault_not_refreshed_pill};
     use std::time::Duration;
 
     /// Spec 3.1's offline banner: a vault off the disk cache whose last sync
@@ -22848,7 +22888,7 @@ mod sync_pill_tests {
             "\"Sync failed\" would be a red pill on a sync that worked; \"Synced just now\" \
              would claim a refresh that never landed"
         );
-        assert_eq!(dot, theme::ERROR, "it is still something the user has to act on");
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.error, "it is still something the user has to act on");
     }
 
     #[test]
@@ -22856,7 +22896,7 @@ mod sync_pill_tests {
         let (dot, label) =
             sync_pill(false, Some(&Err("boom".to_string())), None, Duration::ZERO, None);
         assert_eq!(label, "Sync failed");
-        assert_eq!(dot, theme::ERROR);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.error);
     }
 
     #[test]
@@ -22883,7 +22923,7 @@ mod sync_pill_tests {
             THREE_HOURS,
         );
         assert_eq!(label, "Syncing…");
-        assert_eq!(dot, theme::TEXT_GHOST);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.text_ghost);
     }
 
     #[test]
@@ -22891,14 +22931,14 @@ mod sync_pill_tests {
         let (dot, label) =
             sync_pill(false, Some(&Ok(())), None, Duration::from_secs(120), None);
         assert_eq!(label, "Synced 2m ago");
-        assert_eq!(dot, theme::BLUE);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.blue);
     }
 
     #[test]
     fn nothing_reported_yet_is_neutral() {
         let (dot, label) = sync_pill(false, None, None, Duration::ZERO, None);
         assert_eq!(label, "Sync");
-        assert_eq!(dot, theme::TEXT_GHOST);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.text_ghost);
     }
 
     // -- a snapshot that came off the encrypted disk cache ------------------
@@ -22915,7 +22955,7 @@ mod sync_pill_tests {
     fn a_disk_loaded_snapshot_reports_its_age_rather_than_a_sync() {
         let (dot, label) = sync_pill(false, None, None, Duration::ZERO, THREE_HOURS);
         assert_eq!(label, "Loaded from cache · 3 h old");
-        assert_eq!(dot, theme::TEXT_GHOST);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.text_ghost);
     }
 
     #[test]
@@ -22927,7 +22967,7 @@ mod sync_pill_tests {
             Duration::ZERO,
             Some(Duration::from_secs(86_400 * 2)),
         );
-        assert_eq!(dot, theme::ERROR);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.error);
         assert_eq!(label, "Sync failed · 2 d old");
     }
 
@@ -22944,7 +22984,7 @@ mod sync_pill_tests {
         // must not depend on that ordering to stop dating the file.
         let (dot, label) = sync_pill(false, Some(&Ok(())), None, Duration::ZERO, THREE_HOURS);
         assert_eq!(label, "Synced just now");
-        assert_eq!(dot, theme::BLUE);
+        assert_eq!(dot, crate::kit::tokens::Palette::LIGHT.blue);
     }
 
     #[test]
@@ -23069,7 +23109,7 @@ mod detail_pane_frame_placement_tests {
              out. Its chain is now: {chain:?}"
         );
         assert!(
-            chain.contains("fill(theme::CANVAS)"),
+            chain.contains(concat!("fill(crate::kit::tokens::palette(ui.ctx())", ".window_bg)")),
             "the panel's ground is no longer CANVAS; the band's colour was the tell that \
              identified it, so this is pinned beside the margin. Chain: {chain:?}"
         );
@@ -33322,7 +33362,7 @@ mod export_wiring {
             // The INK, not the card's outline: `egui::Frame`'s stroke reaches
             // the tessellator rather than the shape list at this layer, so
             // reading it here would discriminate nothing.
-            let error_ink = card.text_colours.contains(&theme::ERROR);
+            let error_ink = card.text_colours.contains(&crate::kit::tokens::Palette::LIGHT.error);
             match tone {
                 ExportTone::Bad => assert!(
                     error_ink,
@@ -37800,7 +37840,7 @@ mod send_delete_wiring {
             error: SendError::Offline,
         });
         assert!(
-            card.text_colours.contains(&theme::ERROR),
+            card.text_colours.contains(&crate::kit::tokens::Palette::LIGHT.error),
             "a failed Extend is painted like a success: {:?}",
             card.text_colours
         );
@@ -37896,7 +37936,7 @@ mod send_delete_wiring {
             // loud because the first draft of this test asserted on it and
             // the assertion was vacuous in one direction and false in the
             // other.
-            let error_ink = card.text_colours.contains(&theme::ERROR);
+            let error_ink = card.text_colours.contains(&crate::kit::tokens::Palette::LIGHT.error);
             match tone {
                 DeleteTone::Bad => assert!(
                     error_ink,
@@ -39838,7 +39878,7 @@ mod send_create_wiring {
             // which reaches the tessellator rather than the shape list at
             // this layer, so reading it would be reading a value that is the
             // same for every report.
-            let error_ink = card.text_colours.contains(&theme::ERROR);
+            let error_ink = card.text_colours.contains(&crate::kit::tokens::Palette::LIGHT.error);
             match tone {
                 CreateTone::Bad => assert!(
                     error_ink,

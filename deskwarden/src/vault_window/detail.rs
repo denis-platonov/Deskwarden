@@ -5682,7 +5682,7 @@ fn sharing_card(
                 super::share_ui::entry_title(
                     ui,
                     send_reach(),
-                    EntryPill::Send(send_ui::state_tone(state), send_ui::state_label(state)),
+                    EntryPill::Send(send_ui::state_tone(&crate::kit::tokens::palette(ui.ctx()), state), send_ui::state_label(state)),
                 );
                 let _ = super::share_ui::entry_line(ui, &send_ui::row_subtitle(send, now), None);
             },

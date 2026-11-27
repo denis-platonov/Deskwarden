@@ -1251,13 +1251,11 @@ pub fn state_label(state: crate::send::SendState) -> &'static str {
 /// mark at all, that `Waiting` is the only blue one -- and a test can read a
 /// returned `PillTone` without a frame.
 ///
-/// Every colour is a `theme` constant. The three greens and three reds the
-/// design uses here were added to `theme` by this pass rather than written
-/// locally, because 5b draws this pill in the list and again in the detail
-/// header and 5d draws it on a record; see `theme::state_pill`.
-pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
+/// Every colour is the palette's, so the pills go dark with the window: the
+/// greens and reds are `done_*` and `danger_*`. 5b draws this pill in the list
+/// and again in the detail header and 5d draws it on a record.
+pub fn state_tone(p: &crate::kit::tokens::Palette, state: crate::send::SendState) -> theme::PillTone {
     // Spec section 4's pills, borderless: the edge is the fill.
-    let p = crate::kit::tokens::Palette::LIGHT;
     let pill = |fill, ink, mark| theme::PillTone { fill, edge: fill, ink, mark };
     match state {
         crate::send::SendState::Waiting => pill(p.blue_wash, p.blue_deep, theme::PillMark::Dot(p.blue)),
@@ -1281,33 +1279,28 @@ pub fn link_copied_toast() -> &'static str {
 /// field, red for a secret one (the password), as the design draws them.
 /// Wraps when the row runs out of width.
 pub fn field_pills(ui: &mut egui::Ui, fields: &[(&str, bool)]) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
         for (label, secret) in fields {
-            let tone = if *secret { SECRET_FIELD_TONE } else { FIELD_TONE };
-            let width = theme::state_pill_width(ui.painter(), tone, label);
+            let tone = if *secret { secret_field_tone(&p) } else { field_tone(&p) };
+            let width = crate::kit::rows::state_pill_width(ui.painter(), tone, label);
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(width, theme::PILL_HEIGHT), egui::Sense::hover());
-            theme::state_pill(ui.painter(), egui::pos2(rect.left(), rect.center().y), tone, label);
+            crate::kit::rows::state_pill(ui.painter(), egui::pos2(rect.left(), rect.center().y), tone, label);
         }
     });
 }
 
 /// An ordinary field's pill: the blue the `Waiting` pill wears, without its dot.
-pub const FIELD_TONE: theme::PillTone = theme::PillTone {
-    fill: theme::BLUE_WASH,
-    edge: theme::BLUE_EDGE,
-    ink: theme::BLUE_DEEP,
-    mark: theme::PillMark::None,
-};
+pub fn field_tone(p: &crate::kit::tokens::Palette) -> theme::PillTone {
+    theme::PillTone { fill: p.blue_wash, edge: p.blue_edge, ink: p.blue_deep, mark: theme::PillMark::None }
+}
 
 /// A secret field's pill: the red the `Revoked` pill wears.
-pub const SECRET_FIELD_TONE: theme::PillTone = theme::PillTone {
-    fill: theme::DANGER_WASH,
-    edge: theme::DANGER_EDGE,
-    ink: theme::DANGER_INK,
-    mark: theme::PillMark::None,
-};
+pub fn secret_field_tone(p: &crate::kit::tokens::Palette) -> theme::PillTone {
+    theme::PillTone { fill: p.danger_wash, edge: p.danger_edge, ink: p.danger_ink, mark: theme::PillMark::None }
+}
 
 /// The heading the Sends PANE paints in its list column's strip.
 ///
@@ -2332,11 +2325,11 @@ fn lifetime_for_row(
 fn pickable_window(
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
-) -> (theme::Day, theme::Day) {
+) -> (crate::kit::pills::Day, crate::kit::pills::Day) {
     let (first, last) = crate::send::pickable_window(now, zone);
     (
-        theme::Day { year: first.0, month: first.1, day: first.2 },
-        theme::Day { year: last.0, month: last.1, day: last.2 },
+        crate::kit::pills::Day { year: first.0, month: first.1, day: first.2 },
+        crate::kit::pills::Day { year: last.0, month: last.1, day: last.2 },
     )
 }
 
@@ -2373,6 +2366,7 @@ const ACCESS_LABEL_PX: f32 = 13.0;
 /// It is a function of the room rather than a constant for the same reason
 /// `action_pad_for` is: the pane is resizable, so the answer has to be too.
 fn access_label_width(ui: &egui::Ui) -> f32 {
+    let ink = crate::kit::tokens::palette(ui.ctx()).text_nav;
     let room = ui.available_width();
     if ACCESS_LABEL_WIDTH + ACCESS_ROW_GAP + EXPIRY_FIELD_WIDTH <= room {
         return ACCESS_LABEL_WIDTH;
@@ -2384,7 +2378,7 @@ fn access_label_width(ui: &egui::Ui) -> f32 {
                 .layout_no_wrap(
                     (*label).to_string(),
                     egui::FontId::new(ACCESS_LABEL_PX, egui::FontFamily::Proportional),
-                    theme::TEXT_SECONDARY,
+                    ink,
                 )
                 .size()
                 .x
@@ -2416,6 +2410,7 @@ fn access_row<R>(
     enabled: bool,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    let p = crate::kit::tokens::palette(ui.ctx());
     ui.horizontal(|ui| {
         // The design's gap, rather than egui's default item spacing, applied
         // once for the whole row so the note after a control sits the same
@@ -2433,7 +2428,7 @@ fn access_row<R>(
         cell.label(
             egui::RichText::new(label)
                 .size(ACCESS_LABEL_PX)
-                .color(if enabled { theme::TEXT_SECONDARY } else { theme::TEXT_GHOST }),
+                .color(if enabled { p.text_nav } else { p.text_ghost }),
         );
         body(ui)
     })
@@ -2716,7 +2711,8 @@ pub fn draw_access_block(
     now: &dyn SendClock,
     zone: &dyn LocalOffset,
 ) {
-    theme::eyebrow(ui, access_eyebrow());
+    let p = crate::kit::tokens::palette(ui.ctx());
+    crate::kit::card::section_label(ui, access_eyebrow(), p.text_ghost);
     ui.add_space(theme::EYEBROW_GAP);
 
     // Measured ONCE, at the top, and handed to all three rows: the property
@@ -2781,14 +2777,14 @@ pub fn draw_access_block(
         .iter()
         .map(|choice| lifetime_row_label(*choice, *controls.lifetime, zone))
         .collect();
-    let choices: Vec<theme::Choice<'_>> = labels
+    let choices: Vec<crate::kit::menu::Choice<'_>> = labels
         .iter()
         .zip(crate::send::LIFETIME_CHOICES)
         .map(|(label, choice)| {
             // The picked-date row is the answer in force whenever the answer
             // IS a picked date, whatever date that is -- it is one row, not a
             // row per day.
-            theme::Choice::new(
+            crate::kit::menu::Choice::new(
                 label.as_str(),
                 match choice {
                     Some(lifetime) => *controls.lifetime == lifetime,
@@ -2806,13 +2802,15 @@ pub fn draw_access_block(
         // by which it can be opened at all -- and the answer in force stays at
         // full strength rather than fading with the box round it.
         if enabled {
-            if let Some(index) = theme::dropdown(ui, EXPIRY_FIELD_WIDTH, &current, &choices) {
+            if let Some(index) =
+                crate::kit::menu::select(ui, "send-expiry", EXPIRY_FIELD_WIDTH, crate::kit::menu::ROW, &current, &choices)
+            {
                 if let Some(next) = lifetime_for_row(index, *controls.lifetime, now, zone) {
                     *controls.lifetime = next;
                 }
             }
         } else {
-            theme::dropdown_disabled(ui, EXPIRY_FIELD_WIDTH, &current);
+            crate::kit::menu::select_disabled(ui, crate::kit::menu::ROW, EXPIRY_FIELD_WIDTH, &current);
         }
     });
     // **The DATE, not only the duration**, and for a sub-day lifetime the
@@ -2828,7 +2826,7 @@ pub fn draw_access_block(
     ui.label(
         egui::RichText::new(crate::vault_window::send_ui::words::expiry_wording(*controls.lifetime, now, zone))
             .size(11.0)
-            .color(theme::TEXT_FAINT),
+            .color(p.text_faint),
     );
     // ---- the calendar, only while the answer is a date -------------------
     //
@@ -2846,13 +2844,13 @@ pub fn draw_access_block(
         let selected = controls
             .lifetime
             .local_day(now, zone)
-            .map(|(year, month, day)| theme::Day { year, month, day });
+            .map(|(year, month, day)| crate::kit::pills::Day { year, month, day });
         // The calendar is drawn while a publish is in flight too, and it is
         // simply not asked for its answer: the chosen day stays legible, which
         // is what the row above it does, and a grid that vanished for the
         // duration of a publish would take the reader's own answer off the
         // card at the moment they are watching it be used.
-        if let Some(day) = theme::date_picker(ui, EXPIRY_CALENDAR_ID, selected, first, last) {
+        if let Some(day) = crate::kit::pills::date_picker(ui, EXPIRY_CALENDAR_ID, selected, first, last) {
             if enabled {
                 *controls.lifetime =
                     crate::send::SendLifetime::on_local_day(day.year, day.month, day.day, zone);
@@ -2889,7 +2887,7 @@ pub fn draw_access_block(
         ui.label(
             egui::RichText::new(views_note(*controls.max_access_count))
                 .size(12.0)
-                .color(theme::TEXT_FAINT),
+                .color(p.text_faint),
         );
     });
     ui.add_space(ACCESS_ROW_SPACING);
@@ -2932,7 +2930,7 @@ pub fn draw_access_block(
             .layout_no_wrap(
                 generate_label().to_string(),
                 egui::FontId::proportional(ACCESS_LINK_PX),
-                theme::BLUE,
+                p.blue_deep,
             )
             .size()
             .x;
@@ -2941,7 +2939,7 @@ pub fn draw_access_block(
             crate::kit::input::inline(ui, &mut buffer, password_hint(), room, true);
         });
         ui.add_space(ACCESS_LINK_GAP);
-        if enabled && theme::link_label(ui, generate_label(), ACCESS_LINK_PX).clicked() {
+        if enabled && crate::kit::controls::link(ui, generate_label(), ACCESS_LINK_PX).clicked() {
             // The vault's own generator at its own defaults -- one generator
             // in this app, not a second recipe written here. A refusal (the
             // recipe cannot produce nothing at these defaults) leaves the box
@@ -2963,14 +2961,15 @@ fn draw_notice_band(ui: &mut egui::Ui, message: &str) -> bool {
     let width = ui.available_width();
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+    let p = crate::kit::tokens::palette(ui.ctx());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(6), theme::BLUE_WASH);
+    painter.rect_filled(rect, CornerRadius::same(6), p.blue_wash);
     painter.text(
         egui::pos2(rect.left() + 10.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         message,
         egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        theme::ERROR,
+        p.error,
     );
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2994,7 +2993,7 @@ mod tests {
             (SendState::Expired, p.hover, p.text_faint),
             (SendState::Revoked, p.danger_wash, p.error),
         ] {
-            let tone = super::state_tone(state);
+            let tone = super::state_tone(&p, state);
             assert_eq!((tone.fill, tone.ink), (fill, ink), "{state:?}");
         }
         assert_eq!(super::link_copied_toast(), "Link copied");
@@ -4283,7 +4282,7 @@ mod paint_tests {
         painted
             .fills
             .iter()
-            .filter(|(rect, colour)| *colour == theme::CARD && rect.contains_rect(text))
+            .filter(|(rect, colour)| *colour == crate::kit::tokens::Palette::LIGHT.card && rect.contains_rect(text))
             .map(|(rect, _)| *rect)
             .min_by(|a, b| area(a).total_cmp(&area(b)))
             .unwrap_or_else(|| {
@@ -4359,8 +4358,8 @@ mod paint_tests {
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let output = ctx.run_ui(input(), |ui| {
-            theme::form_card(ui, |ui| {
-                theme::form_card_body(ui, |ui| {
+            crate::kit::form::section_card(ui, |ui| {
+                crate::kit::form::section_card_body_at(ui, crate::kit::form::section_card_pad_x(ui.available_width()), |ui| {
                     draw_access_block(
                         ui,
                         AccessControls {
@@ -4452,10 +4451,10 @@ mod paint_tests {
         let (shut, _) = painted.control_under(&chosen);
         assert_eq!(
             shut.height(),
-            theme::DROPDOWN_HEIGHT,
+            crate::kit::menu::ROW.height,
             "the lifetime control is {}pt tall against the design system's dropdown box of {}",
             shut.height(),
-            theme::DROPDOWN_HEIGHT
+            crate::kit::menu::ROW.height
         );
         assert!(
             (shut.width() - EXPIRY_FIELD_WIDTH).abs() < 0.5,
@@ -4593,7 +4592,10 @@ mod paint_tests {
         let _ = ctx.run_ui(input(), |ui| {
             for row in crate::send::LIFETIME_CHOICES {
                 let label = lifetime_row_label(row, crate::send::DEFAULT_LIFETIME, &UTC);
-                let width = theme::dropdown_text_width(ui, &label);
+                let width = {
+                    let job = crate::kit::tokens::job(crate::kit::menu::ROW.role, &label, egui::Color32::BLACK);
+                    ui.fonts_mut(|f| f.layout_job(job)).size().x
+                };
                 if width > widest {
                     widest = width;
                     name = label;
@@ -4601,7 +4603,8 @@ mod paint_tests {
             }
         });
         assert!(widest > 0.0, "control: no row was measured at all");
-        let room = EXPIRY_FIELD_WIDTH - theme::DROPDOWN_TEXT_BUDGET;
+        let room = EXPIRY_FIELD_WIDTH
+            - (crate::kit::menu::ROW.pad_x * 2.0 + crate::kit::menu::CHEVRON_WIDTH + crate::kit::menu::ROW_GAP);
         assert!(
             widest <= room,
             "the {name:?} row is {widest}pt wide and the box leaves {room}pt for text, \
@@ -4897,15 +4900,15 @@ mod paint_tests {
     fn only_the_two_live_states_carry_a_mark_and_only_one_of_them_is_a_tick() {
         use crate::send::SendState;
         assert!(matches!(
-            state_tone(SendState::Waiting).mark,
+            state_tone(&crate::kit::tokens::Palette::LIGHT, SendState::Waiting).mark,
             theme::PillMark::Dot(_)
         ));
         assert!(matches!(
-            state_tone(SendState::Used).mark,
+            state_tone(&crate::kit::tokens::Palette::LIGHT, SendState::Used).mark,
             theme::PillMark::Check(_)
         ));
-        assert_eq!(state_tone(SendState::Expired).mark, theme::PillMark::None);
-        assert_eq!(state_tone(SendState::Revoked).mark, theme::PillMark::None);
+        assert_eq!(state_tone(&crate::kit::tokens::Palette::LIGHT, SendState::Expired).mark, theme::PillMark::None);
+        assert_eq!(state_tone(&crate::kit::tokens::Palette::LIGHT, SendState::Revoked).mark, theme::PillMark::None);
         // The four words are four words. A mapping that returned one label
         // twice would leave two states indistinguishable on screen while
         // every assertion above still passed.
@@ -5957,7 +5960,7 @@ mod paint_tests {
         painted
             .fills
             .iter()
-            .filter(|(r, fill)| *fill == theme::CARD && r.width() > 200.0 && r.contains_rect(text))
+            .filter(|(r, fill)| *fill == crate::kit::tokens::Palette::LIGHT.card && r.width() > 200.0 && r.contains_rect(text))
             .map(|(r, _)| *r)
             .min_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())))
             .unwrap_or_else(|| panic!("{name:?} is on no card"))
@@ -6010,7 +6013,7 @@ mod paint_tests {
         use crate::send::SendState;
         for state in [SendState::Waiting, SendState::Used, SendState::Expired, SendState::Revoked] {
             let word = state_label(state);
-            let tone = state_tone(state);
+            let tone = state_tone(&crate::kit::tokens::Palette::LIGHT, state);
             let (painted, _) = paint(&one_row(state), None, min_pane_size());
             assert_eq!(painted.in_list(word), 1, "{state:?}: the card's pill: {:?}", painted.text);
             assert_eq!(painted.in_detail(word), 1, "{state:?}: the modal header's pill: {:?}", painted.text);
@@ -6030,7 +6033,10 @@ mod paint_tests {
         let painted = paint(&one_row(SendState::Opened), None, min_pane_size()).0;
         assert_eq!(painted.in_list(opened_label()), 1, "{:?}", painted.text);
         assert_eq!(painted.in_list(waiting_label()), 0, "an opened link still says Waiting");
-        assert_ne!(state_tone(SendState::Opened).fill, state_tone(SendState::Waiting).fill);
+        assert_ne!(
+            state_tone(&crate::kit::tokens::Palette::LIGHT, SendState::Opened).fill,
+            state_tone(&crate::kit::tokens::Palette::LIGHT, SendState::Waiting).fill
+        );
     }
 
     #[test]
@@ -6341,7 +6347,7 @@ mod paint_tests {
             assert_eq!(painted.in_detail(seen_title()), 1, "at {}pt: {:?}", size.x, painted.text);
             let text = painted.dialog_rect_of(seen_title());
             let (band, fill) = painted.fill_behind(text).expect("the caution has no band behind it");
-            assert_eq!(fill, theme::CAUTION_WASH, "the caution is not on the amber ground");
+            assert_eq!(fill, crate::kit::tokens::Palette::LIGHT.caution_wash, "the caution is not on the amber ground");
             assert!(band.right() <= size.x + 1.0 && band.left() >= 0.0, "{band:?}");
             assert_eq!(
                 click_nth_picking(&with_password(crate::send::SendState::Opened), SendDeleteView::default(), Some("id0".into()), change_password(), 0),
@@ -6481,7 +6487,7 @@ mod paint_tests {
         assert_eq!(cards.len(), 2, "one share and one Send: {:?}", painted.text);
         assert!(cards[0].top() <= cards[1].top() && cards[0].left() < cards[1].left(), "the share leads: {cards:?}");
         assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "{:?}", painted.text);
-        let pill = theme::SharePillKind::Shared.tone();
+        let pill = crate::kit::rows::share_tone(&crate::kit::tokens::Palette::LIGHT, theme::SharePillKind::Shared).0;
         let share_card = card_of(&painted, &record.name);
         assert!(
             painted.fills.iter().any(|(r, f)| *f == pill.fill && share_card.contains_rect(*r)),
@@ -11375,7 +11381,7 @@ mod source_pins {
         //    move UP -- into the doc comment that spells the gate, say -- this
         //    anchor would fall below it instead.
         const LAST_PRODUCTION_ITEM: &str =
-            concat!("CornerRadius::same(6), ", "theme::BLUE_WASH");
+            concat!("CornerRadius::same(6), ", "p.blue_wash");
         assert_eq!(
             source.matches(LAST_PRODUCTION_ITEM).count(),
             1,

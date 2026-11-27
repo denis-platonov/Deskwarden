@@ -28,9 +28,6 @@ pub const CLOSE_INSET: f32 = 18.0;
 /// The room a dialog keeps from the window's edges.
 pub const GUTTER: f32 = 24.0;
 
-const SUB_INK: Color32 = Color32::from_rgb(0x7d, 0x79, 0x79);
-const CLOSE_INK: Color32 = Color32::from_rgb(0x6b, 0x68, 0x66);
-const CLOSE_HOVER: Color32 = Color32::from_rgb(0xf1, 0xf0, 0xee);
 
 /// The id of a dialog's close mark.
 pub fn close_id(id: &str) -> egui::Id {
@@ -173,10 +170,11 @@ impl<'a> Dialog<'a> {
             Some(top) => area.anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, top)),
             None => area.anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO),
         };
+        let p = crate::kit::tokens::palette(ctx);
         let (inner, closed_by_mark) = area
             .show(ctx, |ui| {
                 let shown = egui::Frame::new()
-                    .fill(theme::CARD)
+                    .fill(p.card)
                     .corner_radius(CornerRadius::same(self.radius))
                     .shadow(Shadow { offset: [0, 30], blur: 80, spread: 0, color: Color32::from_rgba_unmultiplied(20, 26, 48, 89) })
                     .inner_margin(self.padding)
@@ -189,7 +187,7 @@ impl<'a> Dialog<'a> {
                             ui.allocate_ui(Vec2::new(inner_width - reserve, 0.0), |ui| {
                                 let heading = egui::RichText::new(title)
                                     .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
-                                    .color(theme::INK);
+                                    .color(p.ink);
                                 if let Some((text, bubble)) = self.tip {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -207,7 +205,7 @@ impl<'a> Dialog<'a> {
                                     ui.label(heading);
                                 }
                                 if let Some(sub) = self.sub {
-                                    ui.label(egui::RichText::new(sub).size(16.0).color(SUB_INK));
+                                    ui.label(egui::RichText::new(sub).size(16.0).color(p.text_faint));
                                 }
                             });
                             ui.add_space(22.0);
@@ -223,14 +221,14 @@ impl<'a> Dialog<'a> {
                     );
                     let response = ui.interact(mark, close_id(self.id), Sense::click());
                     if response.hovered() {
-                        ui.painter().rect_filled(mark, CornerRadius::same(12), CLOSE_HOVER);
+                        ui.painter().rect_filled(mark, CornerRadius::same(12), p.hover);
                     }
                     crate::kit::icon::stroke(
                         ui.painter(),
                         Rect::from_center_size(mark.center(), Vec2::splat(16.0)),
                         crate::kit::icon::glyph::CLOSE,
                         2.0,
-                        CLOSE_INK,
+                        p.text_icon,
                     );
                     closed = response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
                 }

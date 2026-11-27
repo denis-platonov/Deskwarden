@@ -85,7 +85,7 @@ impl SyncPill {
         if label == crate::i18n::t("vault.pill_syncing") {
             return SyncPill { label: crate::i18n::t("vault.pill_syncing").into(), tone: PillTone::Green, hint: sync_now() };
         }
-        if dot == theme::ERROR {
+        if dot == crate::kit::tokens::Palette::LIGHT.error {
             return SyncPill { label: label.into(), tone: PillTone::Amber, hint: sync_now() };
         }
         let synced = crate::i18n::tf("vault.pill_synced", &[("ago", "\u{0}")]);
@@ -710,23 +710,22 @@ mod tests {
 
     #[test]
     fn the_pill_maps_every_sync_state_to_the_design() {
-        use crate::theme;
         let cases = [
-            (theme::TEXT_GHOST, "Syncing…", "Syncing…", PillTone::Green),
-            (theme::ERROR, "Sync failed", "Sync failed", PillTone::Amber),
-            (theme::ERROR, "Vault not refreshed · 3 h old", "Vault not refreshed · 3 h old", PillTone::Amber),
-            (theme::BLUE, "Synced 2 min ago", "Synced", PillTone::Green),
-            (theme::TEXT_GHOST, "Loaded from cache · 3 d old", "Offline", PillTone::Amber),
-            (theme::TEXT_GHOST, "Sync", "Sync", PillTone::Neutral),
+            (crate::kit::tokens::Palette::LIGHT.text_ghost, "Syncing…", "Syncing…", PillTone::Green),
+            (crate::kit::tokens::Palette::LIGHT.error, "Sync failed", "Sync failed", PillTone::Amber),
+            (crate::kit::tokens::Palette::LIGHT.error, "Vault not refreshed · 3 h old", "Vault not refreshed · 3 h old", PillTone::Amber),
+            (crate::kit::tokens::Palette::LIGHT.blue, "Synced 2 min ago", "Synced", PillTone::Green),
+            (crate::kit::tokens::Palette::LIGHT.text_ghost, "Loaded from cache · 3 d old", "Offline", PillTone::Amber),
+            (crate::kit::tokens::Palette::LIGHT.text_ghost, "Sync", "Sync", PillTone::Neutral),
         ];
         for (dot, label, want, tone) in cases {
             let pill = SyncPill::from_v1(dot, label);
             assert_eq!((pill.label.as_str(), pill.tone), (want, tone), "{label}");
             assert!(pill.hint.starts_with("Sync now"), "{label}: {}", pill.hint);
         }
-        assert_eq!(SyncPill::from_v1(theme::BLUE, "Synced 2 min ago").hint, "Sync now \u{2014} synced 2 min ago");
+        assert_eq!(SyncPill::from_v1(crate::kit::tokens::Palette::LIGHT.blue, "Synced 2 min ago").hint, "Sync now \u{2014} synced 2 min ago");
         assert_eq!(
-            SyncPill::from_v1(theme::TEXT_GHOST, "Loaded from cache · 3 d old").hint,
+            SyncPill::from_v1(crate::kit::tokens::Palette::LIGHT.text_ghost, "Loaded from cache · 3 d old").hint,
             "Sync now \u{2014} saved copy 3 d old"
         );
     }

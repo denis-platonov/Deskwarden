@@ -1646,8 +1646,8 @@ pub fn draw_item_list(
     // pane's panel frame has none -- see the header strip's comment above.
     //
     // The RIGHT padding is 0 because the scroll bar's lane IS that padding:
-    // `theme::scrollbar_in_gutter` below reserves exactly `LIST_PADDING` and
-    // draws a `theme::SCROLLBAR_WIDTH` bar inside it, so the gutter measures
+    // `crate::kit::rows::scrollbar_in_gutter` below reserves exactly `LIST_PADDING` and
+    // draws a `crate::kit::rows::SCROLLBAR_WIDTH` bar inside it, so the gutter measures
     // `LIST_PADDING` on both sides whether or not a bar is showing.
     egui::Frame::new()
         .inner_margin(Margin {
@@ -1756,9 +1756,9 @@ pub fn draw_item_list(
             // otherwise run a full-height 6pt line down a list with nothing to
             // scroll, which is the original report. Only the PAINT is
             // suppressed; the lane stays reserved, so nothing resizes.
-            theme::scrollbar_in_gutter(ui, LIST_PADDING);
+            crate::kit::rows::scrollbar_in_gutter(ui, LIST_PADDING);
             if fits {
-                theme::hide_scrollbar(ui);
+                crate::kit::rows::hide_scrollbar(ui);
             }
             // **egui's own fade is left alone.** A floating bar fades out when
             // the pointer leaves the area. The previous attempt had to pin the
@@ -2169,7 +2169,7 @@ fn list_header(ui: &mut egui::Ui, title: &str, count: usize) -> Option<ItemListA
                     for kind in super::detail_edit::CREATABLE_KINDS {
                         let label = super::detail::kind_label(kind);
                         let mut row = crate::kit::menu::Item::new(&label);
-                        if let Some(choice) = super::new_item_modal::choices().iter().find(|c| c.kind == kind) {
+                        if let Some(choice) = super::new_item_modal::choices(&p).iter().find(|c| c.kind == kind) {
                             row = row.icon(choice.glyph);
                         }
                         if crate::kit::menu::item(ui, row).clicked() {
@@ -2535,7 +2535,7 @@ fn move_error_band(ui: &mut egui::Ui, message: &str) -> bool {
     const GLYPH_LANE: f32 = 14.0;
     const GAP: f32 = 8.0;
     let band = egui::Frame::new()
-        .fill(theme::CARD)
+        .fill(crate::kit::tokens::palette(ui.ctx()).card)
         .inner_margin(Margin::same(PAD))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2560,13 +2560,13 @@ fn move_error_band(ui: &mut egui::Ui, message: &str) -> bool {
                     ui.set_max_width(text_width);
                     ui.add(
                         egui::Label::new(
-                            RichText::new(message).size(11.0).color(theme::ERROR),
+                            RichText::new(message).size(11.0).color(crate::kit::tokens::palette(ui.ctx()).error),
                         )
                         .wrap(),
                     );
                 });
                 ui.add_space(GAP);
-                ui.label(RichText::new("✕").size(11.0).color(theme::TEXT_GHOST));
+                ui.label(RichText::new("✕").size(11.0).color(crate::kit::tokens::palette(ui.ctx()).text_ghost));
             });
         })
         .response;
@@ -2586,7 +2586,7 @@ fn move_error_band(ui: &mut egui::Ui, message: &str) -> bool {
             egui::Pos2::new(response.rect.right(), response.rect.bottom()),
         ),
         CornerRadius::ZERO,
-        theme::ERROR,
+        crate::kit::tokens::palette(ui.ctx()).error,
     );
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2611,20 +2611,21 @@ fn drag_ghost(ui: &egui::Ui, name: &str) {
     /// Offset from the cursor's hot spot, so the chip does not sit under the
     /// pointer and hide the row it is about to be dropped on.
     const CURSOR_OFFSET: egui::Vec2 = egui::Vec2::new(14.0, 10.0);
+    let p = crate::kit::tokens::palette(ui.ctx());
     let painter = ui
         .ctx()
         .layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("vault-drag-ghost")));
     let galley = painter.layout_no_wrap(
         name.to_string(),
         egui::FontId::new(TITLE_SIZE, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        theme::CARD,
+        p.card,
     );
     let rect = egui::Rect::from_min_size(
         pointer + CURSOR_OFFSET,
         galley.size() + egui::Vec2::new(PAD_X * 2.0, PAD_Y * 2.0),
     );
-    painter.rect_filled(rect, CornerRadius::same(8), theme::BLUE);
-    painter.galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, theme::CARD);
+    painter.rect_filled(rect, CornerRadius::same(8), p.blue);
+    painter.galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, p.card);
 }
 
 /// One line of a row's context menu, drawn from [`MenuCommand`] and deciding
@@ -4289,13 +4290,13 @@ mod row_tile_tests {
             let slack_left = bar.left() - GUTTER.start;
             let slack_right = GUTTER.end - bar.right();
             assert!(
-                (slack_left - (LIST_PADDING - theme::SCROLLBAR_WIDTH)).abs() < 0.51
+                (slack_left - (LIST_PADDING - crate::kit::rows::SCROLLBAR_WIDTH)).abs() < 0.51
                     && slack_right.abs() < 0.51,
                 "the scrollbar has {slack_left}pt of gutter to its left and {slack_right}pt to \
                  its right, expected {}pt and 0pt -- what is left of the padding once the bar \
                  is in it belongs on the TILE side, where the reader compares it to the left \
                  gap, and none of it between the bar and the pane's own outer edge",
-                LIST_PADDING - theme::SCROLLBAR_WIDTH
+                LIST_PADDING - crate::kit::rows::SCROLLBAR_WIDTH
             );
         }
     }
@@ -4321,7 +4322,7 @@ mod row_tile_tests {
 
         // The middle of the bar's own 6pt column, taken from the geometry the
         // placement test pins, not from a guess.
-        let on_bar = egui::pos2(PANE_WIDTH - theme::SCROLLBAR_WIDTH / 2.0, 300.0);
+        let on_bar = egui::pos2(PANE_WIDTH - crate::kit::rows::SCROLLBAR_WIDTH / 2.0, 300.0);
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -4508,12 +4509,12 @@ mod row_tile_tests {
              {LIST_PADDING}pt -- something is being painted in the LEFT gutter"
         );
         assert!(
-            (clear_right - (LIST_PADDING - theme::SCROLLBAR_WIDTH)).abs() < 0.51,
+            (clear_right - (LIST_PADDING - crate::kit::rows::SCROLLBAR_WIDTH)).abs() < 0.51,
             "with the bar showing the tiles have {clear_right}pt of clear space to their \
              right, expected exactly {}pt. MORE than that means the bar has drifted off the \
              pane's outer edge and is wasting the gutter behind itself; LESS means it has \
              grown or moved inward over the tiles. Visible rects: {:?}",
-            LIST_PADDING - theme::SCROLLBAR_WIDTH,
+            LIST_PADDING - crate::kit::rows::SCROLLBAR_WIDTH,
             visibly_painted(&p).collect::<Vec<_>>()
         );
 
@@ -6187,7 +6188,7 @@ mod row_tile_tests {
     ///
     /// The user's report was that the row menu's Delete looked like every
     /// other entry while the detail pane's kebab had spent the app's whole
-    /// life painting the same act in `theme::ERROR` -- one item, two menus,
+    /// life painting the same act in `crate::kit::tokens::Palette::LIGHT.error` -- one item, two menus,
     /// two answers to "is this the dangerous one".
     ///
     /// **The neighbours are half the assertion.** "Delete is `ERROR`" alone
@@ -6205,16 +6206,16 @@ mod row_tile_tests {
         for colour in painted_colours_of(&p, delete_label()) {
             assert_eq!(
                 colour,
-                theme::ERROR,
+                crate::kit::tokens::Palette::LIGHT.error,
                 "the row menu's Delete is painted {colour:?}; the kebab's Delete is \
                  {:?}, and one item's two menus disagree about which act is destructive",
-                theme::ERROR
+                crate::kit::tokens::Palette::LIGHT.error
             );
         }
         for neighbour in ["Archive", "Edit"] {
             for colour in painted_colours_of(&p, neighbour) {
                 assert_ne!(
-                    colour, theme::ERROR,
+                    colour, crate::kit::tokens::Palette::LIGHT.error,
                     "{neighbour:?} is painted in the alarm colour too, so the menu is \
                      uniformly red and says nothing about Delete"
                 );
@@ -6240,13 +6241,13 @@ mod row_tile_tests {
         for colour in painted_colours_of(&p, purge_label()) {
             assert_eq!(
                 colour,
-                theme::ERROR,
+                crate::kit::tokens::Palette::LIGHT.error,
                 "the app's one irreversible entry is painted {colour:?}"
             );
         }
         for colour in painted_colours_of(&p, "Restore") {
             assert_ne!(
-                colour, theme::ERROR,
+                colour, crate::kit::tokens::Palette::LIGHT.error,
                 "Restore is painted in the alarm colour, so the trash menu is uniformly \
                  red and says nothing about Delete forever"
             );
@@ -7303,7 +7304,7 @@ mod keyboard_selection_tests {
                     egui::Pos2::ZERO,
                     egui::vec2(PANE_WIDTH, crate::vault_window::top_bar::HEIGHT),
                 );
-                let pill = crate::vault_window::top_bar::SyncPill::from_v1(theme::TEXT_GHOST, "Sync");
+                let pill = crate::vault_window::top_bar::SyncPill::from_v1(crate::kit::tokens::Palette::LIGHT.text_ghost, "Sync");
                 crate::vault_window::top_bar::draw(
                     ui,
                     bar,

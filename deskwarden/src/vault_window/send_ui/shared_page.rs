@@ -292,8 +292,9 @@ fn includes_words(row: &SendRow) -> String {
     }
 }
 
-fn send_face<'a>(row: &'a SendRow, delete: SendDeleteView<'_>) -> Face<'a> {
-    let tone = super::state_tone(row.state);
+fn send_face<'a>(row: &'a SendRow, delete: SendDeleteView<'_>, p: &crate::kit::tokens::Palette) -> Face<'a> {
+    let tone = super::state_tone(p, row.state);
+
     let busy = (!row.id.is_empty() && delete.in_flight == Some(row.id.as_str())).then(|| delete.busy_label());
     Face {
         key: &row.id,
@@ -310,9 +311,9 @@ fn send_face<'a>(row: &'a SendRow, delete: SendDeleteView<'_>) -> Face<'a> {
     }
 }
 
-fn share_face<'a>(share: &'a ShareRow) -> Face<'a> {
+fn share_face<'a>(share: &'a ShareRow, p: &crate::kit::tokens::Palette) -> Face<'a> {
     let kind = share.pill();
-    let tone = kind.tone();
+    let tone = crate::kit::rows::share_tone(p, kind).0;
     Face {
         key: &share.key,
         record: Some(&share.item_id),
@@ -566,6 +567,7 @@ fn grid(
     action: &mut Option<SendUiAction>,
 ) {
     let _ = people;
+    let p = tokens::palette(ui.ctx());
     let width = ui.available_width();
     let cols = if width >= TWO_COLUMNS_FROM { 2 } else { 1 };
     let card_w = (width - GRID_GAP * (cols as f32 - 1.0)) / cols as f32;
@@ -581,8 +583,8 @@ fn grid(
             .iter()
             .enumerate()
             .map(|(i, e)| match e {
-                Entry::Send(row) => send_face(row, delete),
-                Entry::Share(share) => share_face(share),
+                Entry::Send(row) => send_face(row, delete, &p),
+                Entry::Share(share) => share_face(share, &p),
                 Entry::Person(row) => person_face(row, &subtitles[r * cols + i]),
                 Entry::Received(row) => received_face(row),
             })
@@ -1024,7 +1026,8 @@ fn send_modal(
     let has_id = !row.id.is_empty();
     let revoking = has_id && delete.in_flight == Some(row.id.as_str());
     let confirming = has_id && !revoking && delete.confirming == Some(row.id.as_str());
-    let tone = super::state_tone(row.state);
+    let tone = super::state_tone(&tokens::palette(ctx), row.state);
+
     Dialog::new(ID, 600.0).show(ctx, |ui| {
         let p = tokens::palette(ui.ctx());
         let mut action: Option<SendUiAction> = None;
@@ -1167,7 +1170,7 @@ fn share_modal(
     let stopping = people.stopping.as_deref() == Some(key);
     let confirming = !stopping && people.confirming.as_deref() == Some(key);
     let kind = share.pill();
-    let tone = kind.tone();
+    let tone = crate::kit::rows::share_tone(&tokens::palette(ctx), kind).0;
     let mut open_record = false;
     let (outcome, ()) = Dialog::new(ID, 600.0).show(ctx, |ui| {
         let p = tokens::palette(ui.ctx());

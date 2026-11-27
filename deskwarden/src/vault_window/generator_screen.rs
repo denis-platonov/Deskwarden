@@ -1,7 +1,7 @@
 //! Spec C §1: the Generator as its own screen -- a password, a passphrase or
 //! a PIN, with its options remembered between runs.
 
-use eframe::egui::{self, Color32, Vec2};
+use eframe::egui::{self, Vec2};
 use zeroize::Zeroizing;
 
 use crate::generator_mode::{generator_strength, GeneratorLevel, GeneratorMode};
@@ -31,7 +31,6 @@ pub fn avoid_lookalikes() -> &'static str {
     crate::i18n::t("generator.avoid_lookalikes")
 }
 const WIDTH: f32 = 760.0;
-const MUTED: Color32 = Color32::from_rgb(0x8a, 0x87, 0x85);
 
 /// What the screen did this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,9 +143,9 @@ pub fn draw(ui: &mut egui::Ui, state: &mut GeneratorScreen) -> GeneratorAction {
                 ui.label(
                     egui::RichText::new(title())
                         .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
-                        .color(theme::INK),
+                        .color(crate::kit::tokens::palette(ui.ctx()).ink),
                 );
-                ui.label(egui::RichText::new(sub()).size(16.0).color(Color32::from_rgb(0x7d, 0x79, 0x79)));
+                ui.label(egui::RichText::new(sub()).size(16.0).color(crate::kit::tokens::palette(ui.ctx()).text_faint));
                 ui.add_space(20.0);
                 value_card(ui, state);
                 ui.add_space(16.0);
@@ -174,7 +173,6 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// The slider's empty rail.
-const SLIDER_RAIL: Color32 = Color32::from_rgb(0xe6, 0xe3, 0xdf);
 
 fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
     card(ui, |ui| {
@@ -185,10 +183,10 @@ fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
         ui.horizontal(|ui| {
             let room = (ui.available_width() - buttons).max(80.0);
             let text = match &state.error {
-                Some(error) => egui::RichText::new(error).size(15.0).color(theme::ERROR),
+                Some(error) => egui::RichText::new(error).size(15.0).color(crate::kit::tokens::palette(ui.ctx()).error),
                 None => egui::RichText::new(state.value.as_str())
                     .font(egui::FontId::new(24.0, egui::FontFamily::Monospace))
-                    .color(theme::INK),
+                    .color(crate::kit::tokens::palette(ui.ctx()).ink),
             };
             ui.add_sized(Vec2::new(room, 48.0), egui::Label::new(text).truncate());
             let copy = controls::button(ui, ButtonKind::Primary, size, copy(), None);
@@ -206,13 +204,13 @@ fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
         ui.add_space(10.0);
         let (bits, level) = generator_strength(state.prefs.mode, state.size(), state.pool());
         let ink = match level {
-            GeneratorLevel::Weak => theme::ERROR,
-            GeneratorLevel::Fair => Color32::from_rgb(0x8a, 0x5a, 0x06),
-            _ => Color32::from_rgb(0x17, 0x67, 0x3a),
+            GeneratorLevel::Weak => crate::kit::tokens::palette(ui.ctx()).error,
+            GeneratorLevel::Fair => crate::kit::tokens::palette(ui.ctx()).caution_mark,
+            _ => crate::kit::tokens::palette(ui.ctx()).done_ink,
         };
         ui.horizontal(|ui| {
             ui.label(theme::bold(level.label(), 15.0).color(ink));
-            ui.label(egui::RichText::new(crate::i18n::tf("generator.bits", &[("bits", &(bits.round() as u32).to_string())])).size(14.0).color(MUTED));
+            ui.label(egui::RichText::new(crate::i18n::tf("generator.bits", &[("bits", &(bits.round() as u32).to_string())])).size(14.0).color(crate::kit::tokens::palette(ui.ctx()).text_label));
         });
     });
 }
@@ -230,14 +228,15 @@ fn options_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
             GeneratorMode::Pin => (crate::i18n::t("generator.digits"), &mut state.prefs.pin_length, 4..=12),
         };
         ui.horizontal(|ui| {
-            ui.label(theme::bold(label, 15.0).color(theme::INK));
+            ui.label(theme::bold(label, 15.0).color(crate::kit::tokens::palette(ui.ctx()).ink));
             ui.add_space(12.0);
             // egui's default rail is the card's own white: paint it a
             // visible grey with a blue trailing fill.
+            let rail = crate::kit::tokens::palette(ui.ctx());
             let visuals = ui.visuals_mut();
-            visuals.widgets.inactive.bg_fill = SLIDER_RAIL;
-            visuals.widgets.inactive.weak_bg_fill = SLIDER_RAIL;
-            visuals.selection.bg_fill = theme::BLUE;
+            visuals.widgets.inactive.bg_fill = rail.meter_track;
+            visuals.widgets.inactive.weak_bg_fill = rail.meter_track;
+            visuals.selection.bg_fill = rail.blue;
             ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(120.0);
             ui.spacing_mut().slider_rail_height = 6.0;
             ui.add(egui::Slider::new(value, range).trailing_fill(true));
@@ -254,14 +253,14 @@ fn options_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
                 ] {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         controls::switch(ui, on);
-                        ui.label(theme::bold(text, 15.0).color(theme::INK));
+                        ui.label(theme::bold(text, 15.0).color(crate::kit::tokens::palette(ui.ctx()).ink));
                     });
                 }
             });
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 controls::switch(ui, &mut state.prefs.avoid_lookalikes);
-                ui.label(theme::bold(avoid_lookalikes(), 15.0).color(theme::INK));
+                ui.label(theme::bold(avoid_lookalikes(), 15.0).color(crate::kit::tokens::palette(ui.ctx()).ink));
             });
         }
     });

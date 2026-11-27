@@ -74,12 +74,12 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
         ui.label(
             RichText::new(crate::i18n::t("folder.name_label"))
                 .font(egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())))
-                .color(theme::TEXT_SECONDARY),
+                .color(crate::kit::tokens::palette(ui.ctx()).text_nav),
         );
         crate::kit::input::text(ui, name_id(), &mut state.name, "", false, width);
-        ui.label(RichText::new(crate::i18n::t("folder.nest_hint")).size(13.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(crate::i18n::t("folder.nest_hint")).size(13.0).color(crate::kit::tokens::palette(ui.ctx()).text_faint));
         if let Some(error) = &state.error {
-            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
+            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(crate::kit::tokens::palette(ui.ctx()).error)).wrap());
         }
         ui.add_space(11.0);
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };

@@ -18,6 +18,7 @@ pub mod logo_paths;
 pub mod logos;
 pub mod menu;
 pub mod modal;
+pub mod pills;
 pub mod motion;
 pub mod rows;
 #[cfg(test)]

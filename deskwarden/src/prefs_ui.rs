@@ -5341,7 +5341,7 @@ fn release_notes(ui: &mut Ui, body: &str) {
             // Notes that fit paint no bar at all: a line down the side of a
             // region with nothing to scroll points at nothing. Only the PAINT
             // is suppressed -- see `notes_fit`.
-            theme::hide_scrollbar(ui);
+            crate::kit::rows::hide_scrollbar(ui);
         } else {
             // **Fully opaque, not egui's dormant defaults.** A floating bar
             // is normally faint until the pointer comes near it, which is the
@@ -8114,7 +8114,7 @@ mod tests {
         // to be highlighted". This was `Section::Autofill`, which no longer
         // exists; Clipboard is the nearest surviving row to where it sat.
         let painted = paint(Section::Clipboard);
-        assert_eq!(painted.count_filled(theme::BLUE_WASH), 1);
+        assert_eq!(painted.count_filled(crate::kit::tokens::Palette::LIGHT.blue_wash), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -10662,7 +10662,7 @@ mod tests {
             let card = painted
                 .rects
                 .iter()
-                .filter(|r| r.fill == theme::CARD && r.rect.width() > 300.0)
+                .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.card && r.rect.width() > 300.0)
                 .find(|r| r.rect.contains(run.center()))
                 .unwrap_or_else(|| panic!("{what} is not inside a card at all"));
             assert!(
@@ -10806,7 +10806,7 @@ mod tests {
                 .rects
                 .iter()
                 .filter(|r| r.rect.min.x >= NAV_WIDTH)
-                .filter(|r| r.fill == theme::BLUE_WASH)
+                .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.blue_wash)
                 .count();
             assert_eq!(
                 washed, 0,
@@ -12582,7 +12582,7 @@ mod tests {
         painted
             .rects
             .iter()
-            .filter(|r| r.fill == theme::CARD && r.rect.contains(anchor.center()) && r.rect.width() > anchor.width())
+            .filter(|r| r.fill == crate::kit::tokens::Palette::LIGHT.card && r.rect.contains(anchor.center()) && r.rect.width() > anchor.width())
             .map(|r| r.rect)
             .min_by(|a, b| a.area().partial_cmp(&b.area()).unwrap())
             .expect("the update card's status line is painted on no card at all")

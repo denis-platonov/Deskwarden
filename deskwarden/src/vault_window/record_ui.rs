@@ -1481,7 +1481,7 @@ pub fn draw_share_form(
     }
     let label = |ui: &mut egui::Ui, text: &str, tip: Option<&str>| {
         ui.horizontal(|ui| {
-            ui.label(theme::bold(text, 15.0).color(theme::INK));
+            ui.label(theme::bold(text, 15.0).color(crate::kit::tokens::palette(ui.ctx()).ink));
             if let Some(tip) = tip {
                 // Spec B 0.4: the 18 px dot, its bubble above (250 for "once").
                 let width = if text == open_once() { 250.0 } else { 260.0 };
@@ -1520,11 +1520,11 @@ pub fn draw_share_form(
             });
             ui.data_mut(|d| d.insert_temp(field_id.with("revealed"), revealed));
             ui.add_space(4.0);
-            note(ui, passphrase_note(), theme::TEXT_FAINT);
+            note(ui, passphrase_note(), crate::kit::tokens::palette(ui.ctx()).text_faint);
         }
     } else {
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(whole_record_lead()).size(15.0).color(theme::INK));
+            ui.label(egui::RichText::new(whole_record_lead()).size(15.0).color(crate::kit::tokens::palette(ui.ctx()).ink));
             ui.add_space(4.0);
             super::send_ui::field_pills(ui, &whole_record_fields(item));
         });
@@ -1583,11 +1583,11 @@ pub fn draw_share_form(
 
     let problem = export_problem(draft, now);
     if draft.selection.password {
-        note(ui, password_travels(), theme::DANGER_INK);
+        note(ui, password_travels(), crate::kit::tokens::palette(ui.ctx()).danger_ink);
         ui.add_space(8.0);
     }
     if let Some(problem) = problem.filter(|p| *p != nothing_ticked()) {
-        note(ui, problem, theme::ERROR);
+        note(ui, problem, crate::kit::tokens::palette(ui.ctx()).error);
         ui.add_space(8.0);
     }
     // Spec B 6.1: Create link is the dialog's full-width primary, 54 high.
@@ -1609,11 +1609,12 @@ pub fn draw_share_form(
 
 /// One "What to share" chip; true when clicked.
 fn share_chip(ui: &mut egui::Ui, text: &str, field: IncludeField, on: bool, secret: bool, enabled: bool) -> bool {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let font = egui::FontId::new(15.0, egui::FontFamily::Name(theme::BOLD.into()));
     let (edge, fill, ink) = match (on, secret) {
-        (true, true) => (theme::ERROR, theme::DANGER_WASH, theme::DANGER_INK),
-        (true, false) => (theme::BLUE, egui::Color32::from_rgb(0xf5, 0xf7, 0xfd), egui::Color32::from_rgb(0x14, 0x30, 0x7a)),
-        (false, _) => (egui::Color32::from_rgb(0xe8, 0xe6, 0xe3), theme::CARD, egui::Color32::from_rgb(0x6b, 0x68, 0x66)),
+        (true, true) => (p.error, p.danger_wash, p.danger_ink),
+        (true, false) => (p.blue, p.chip_on, p.blue_deep),
+        (false, _) => (p.hairline, p.card, p.text_icon),
     };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, ink);
     let check = if on { 16.0 + 8.0 } else { 0.0 };
@@ -1637,31 +1638,32 @@ fn share_chip(ui: &mut egui::Ui, text: &str, field: IncludeField, on: bool, secr
 
 /// Spec B §6.2.
 pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUiAction {
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = RecordUiAction::None;
     ui.vertical_centered(|ui| {
         ui.add_space(10.0);
         let (circle, _) = ui.allocate_exact_size(egui::Vec2::splat(76.0), egui::Sense::hover());
-        ui.painter().circle_filled(circle.center(), 38.0, egui::Color32::from_rgb(0xe8, 0xf3, 0xec));
+        ui.painter().circle_filled(circle.center(), 38.0, p.done_wash);
         crate::kit::icon::stroke(
             ui.painter(),
             egui::Rect::from_center_size(circle.center(), egui::Vec2::splat(38.0)),
             crate::kit::icon::glyph::TICK,
             2.6,
-            egui::Color32::from_rgb(0x1b, 0x7a, 0x3f),
+            p.done_mark,
         );
         ui.add_space(16.0);
         ui.label(
             egui::RichText::new(link_ready())
                 .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
-                .color(theme::INK),
+                .color(crate::kit::tokens::palette(ui.ctx()).ink),
         );
         ui.add_space(6.0);
-        ui.label(egui::RichText::new(summary).size(16.0).color(egui::Color32::from_rgb(0x7d, 0x79, 0x79)));
+        ui.label(egui::RichText::new(summary).size(16.0).color(p.text_faint));
     });
     ui.add_space(16.0);
     // The link bar.
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0xf3, 0xf2, 0xf0))
+        .fill(p.field_bg)
         .corner_radius(CornerRadius::same(16))
         .inner_margin(egui::Margin { left: 18, right: 8, top: 7, bottom: 7 })
         .show(ui, |ui| {
@@ -1675,7 +1677,7 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
                     egui::Label::new(
                         egui::RichText::new(link)
                             .font(egui::FontId::new(15.0, egui::FontFamily::Monospace))
-                            .color(egui::Color32::from_rgb(0x4a, 0x47, 0x45)),
+                            .color(p.text_nav),
                     )
                     .truncate(),
                 );
@@ -2827,12 +2829,12 @@ mod paint_tests {
         let blue = painted
             .fills
             .iter()
-            .find(|(r, f)| *f == theme::BLUE && r.contains_rect(create))
+            .find(|(r, f)| *f == crate::kit::tokens::Palette::LIGHT.blue && r.contains_rect(create))
             .map(|(r, _)| *r)
             .expect("the import's create is not the filled primary. It is the answer this card is FOR");
         assert_eq!(blue.height(), 48.0, "the v2 answer buttons are 48 high");
         let (outline, outline_fill) = painted.button_under(fetch_label());
-        assert_eq!(outline_fill, theme::CARD, "`Fetch` is not the outlined secondary");
+        assert_eq!(outline_fill, crate::kit::tokens::Palette::LIGHT.card, "`Fetch` is not the outlined secondary");
         assert_eq!(outline.height(), 48.0, "the two answers are different heights");
         assert!(
             fetch.left() < create.left(),
@@ -3115,7 +3117,7 @@ mod v2_share_tests {
         let mut state = RecordSend::opening("1", "Ledgerline");
         let (_, p) = settled(&mut state);
         assert!(state.draft.selection.password, "the password is picked by default");
-        assert!(p.rects.iter().any(|r| r.fill == theme::DANGER_WASH && r.stroke.color == theme::ERROR && r.rect.height() == 42.0));
+        assert!(p.rects.iter().any(|r| r.fill == crate::kit::tokens::Palette::LIGHT.danger_wash && r.stroke.color == crate::kit::tokens::Palette::LIGHT.error && r.rect.height() == 42.0));
     }
 
     #[test]

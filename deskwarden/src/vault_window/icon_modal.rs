@@ -194,7 +194,7 @@ pub fn draw_icon_modal(ctx: &egui::Context, state: &mut IconPickState) -> IconPi
 
         if let Some(error) = &state.error {
             ui.add_space(10.0);
-            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
+            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(crate::kit::tokens::palette(ui.ctx()).error)).wrap());
         }
         ui.add_space(18.0);
         ui.scope(|ui| {
@@ -223,13 +223,13 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
             .font(egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())))
-            .color(theme::TEXT_SECONDARY),
+            .color(crate::kit::tokens::palette(ui.ctx()).text_nav),
     );
 }
 
 /// A hint under a field.
 fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).size(13.0).color(theme::TEXT_FAINT)).wrap());
+    ui.add(egui::Label::new(RichText::new(text).size(13.0).color(crate::kit::tokens::palette(ui.ctx()).text_faint)).wrap());
 }
 
 /// The refusal a caller shows when the vault write itself fails.
