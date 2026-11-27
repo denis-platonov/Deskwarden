@@ -450,7 +450,7 @@ impl Rehearsal {
                 let view = mine.view();
                 let mut closed = root.input(|i| i.viewport().close_requested());
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(theme::WINDOW_BG))
+                    .frame(egui::Frame::new().fill(crate::kit::tokens::palette(root.ctx()).window_bg))
                     .show(root, |ui| {
                         let mut held = locked(&mine.inner);
                         closed |= draw(ui, &view, &mut held.arrived);
@@ -586,32 +586,34 @@ pub fn show_open_rehearsal(ctx: &egui::Context) {
 //    is what a user who has just edited it wants anyway.
 // ---------------------------------------------------------------------------
 
-/// Design 4d's own check-mark green. A one-off, and named as one: 4e says the
-/// product is blue, with red for secrets and amber for caution and nothing
-/// else. This colour appears in the design exactly once, on this card, and it
-/// appears in this crate exactly once, here.
-const CHECK_GREEN: Color32 = Color32::from_rgb(0x1b, 0x7a, 0x3f);
-
+/// The transcript panel is dark in BOTH themes (it is a terminal-like readout,
+/// design 4d), so its four inks are the light palette's own entries, fixed,
+/// rather than being read from the context's palette -- which, in the dark
+/// theme, would turn the panel light under light text.
+///
+/// The panel's ground.
+const PANEL_INK: Color32 = crate::kit::tokens::Palette::LIGHT.ink;
 /// The design's near-white on the dark transcript panel.
-const PANEL_TEXT: Color32 = Color32::from_rgb(0xf7, 0xf6, 0xf5);
+const PANEL_TEXT: Color32 = crate::kit::tokens::Palette::LIGHT.window_bg;
+/// The panel's small heading.
+const PANEL_HEADING: Color32 = crate::kit::tokens::Palette::LIGHT.text_ghost;
+/// The invisible keys, drawn in the design's blue.
+const PANEL_KEY: Color32 = crate::kit::tokens::Palette::LIGHT.blue_soft;
 
-/// 4d's refusal band, which is 4e's one red.
-///
-/// **The palette's own entries, not a third copy of the hexes.** These were
-/// `#fdf3f2` and `#e8a9a2` written out here, and they are `theme::DANGER_WASH`
-/// and `theme::DANGER_EDGE` to the byte -- one of three files that each named
-/// the same red privately, which does not stop a fourth surface reaching for
-/// red and only stops anyone noticing when one of them gets it wrong.
-///
-/// **NOT `theme::secret_band()`**, and that is the whole reason these are
-/// still named here rather than being one call. That helper carries 4e's rule
-/// about SECRETS with it, and this band is not one: it is 4d's refusal -- the
-/// rehearsal saying it will not type something -- which happens to be drawn
-/// in the same red. A band that took the secret primitive would be claiming a
-/// meaning this card does not have, and the primitive's own doc says so.
-const BAND_FILL: Color32 = theme::DANGER_WASH;
-/// See [`BAND_FILL`].
-const BAND_EDGE: Color32 = theme::DANGER_EDGE;
+// 4d's refusal band, which is 4e's one red.
+//
+// **The palette's own entries, not a third copy of the hexes.** These were
+// `#fdf3f2` and `#e8a9a2` written out here, and they are `theme::DANGER_WASH`
+// and `theme::DANGER_EDGE` to the byte -- one of three files that each named
+// the same red privately, which does not stop a fourth surface reaching for
+// red and only stops anyone noticing when one of them gets it wrong.
+//
+// **NOT `theme::secret_band()`**, and that is the whole reason these are
+// still named here rather than being one call. That helper carries 4e's rule
+// about SECRETS with it, and this band is not one: it is 4d's refusal -- the
+// rehearsal saying it will not type something -- which happens to be drawn
+// in the same red. A band that took the secret primitive would be claiming a
+// meaning this card does not have, and the primitive's own doc says so.
 
 /// **Everything the rehearsal surface draws, as data.**
 ///
@@ -662,7 +664,7 @@ pub fn arrived_job(arrived: &str, font: egui::FontId) -> egui::text::LayoutJob {
             0.0,
             egui::TextFormat {
                 font_id: font.clone(),
-                color: if key { theme::BLUE_SOFT } else { PANEL_TEXT },
+                color: if key { PANEL_KEY } else { PANEL_TEXT },
                 ..Default::default()
             },
         );
@@ -741,13 +743,13 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
 
             // ---- WHAT ARRIVED, on a dark panel ------------------------------
             egui::Frame::new()
-                .fill(theme::INK)
+                .fill(PANEL_INK)
                 .corner_radius(CornerRadius::same(14))
                 .inner_margin(Margin::symmetric(16, 14))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.label(tokens::job(tokens::SECTION, rehearsal::arrived_heading(), theme::TEXT_GHOST));
+                    ui.label(tokens::job(tokens::SECTION, rehearsal::arrived_heading(), PANEL_HEADING));
                     let font = egui::FontId::new(14.0, egui::FontFamily::Monospace);
                     if view.finished {
                         // The invisible keys, drawn, in the design's blue.
@@ -833,7 +835,7 @@ fn check_mark(ui: &mut egui::Ui, drawn: bool) {
     if !drawn {
         return;
     }
-    let stroke = Stroke::new(2.4, CHECK_GREEN);
+    let stroke = Stroke::new(2.4, p.done_mark);
     let c = rect.center();
     ui.painter().line_segment(
         [egui::pos2(c.x - 6.5, c.y + 0.5), egui::pos2(c.x - 2.0, c.y + 5.0)],
@@ -847,14 +849,15 @@ fn check_mark(ui: &mut egui::Ui, drawn: bool) {
 
 /// The band a refusal is reported in.
 fn failure_band(ui: &mut egui::Ui, failure: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     egui::Frame::new()
-        .fill(BAND_FILL)
-        .stroke(Stroke::new(1.0, BAND_EDGE))
+        .fill(p.danger_wash)
+        .stroke(Stroke::new(1.0, p.danger_edge))
         .corner_radius(CornerRadius::same(14))
         .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(failure).size(14.0).color(theme::ERROR));
+            ui.label(RichText::new(failure).size(14.0).color(p.error));
         });
 }
 
@@ -1455,7 +1458,7 @@ mod tests {
         let blue: Vec<&str> = job
             .sections
             .iter()
-            .filter(|s| s.format.color == theme::BLUE_SOFT)
+            .filter(|s| s.format.color == PANEL_KEY)
             .map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0])
             .collect();
         assert_eq!(

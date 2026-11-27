@@ -13334,13 +13334,14 @@ fn send_create_message(report: &SendCreateReport) -> (CreateTone, String) {
 /// Answers `true` when the user dismissed it.
 fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bool {
     let (tone, text) = send_create_message(report);
+    let p = crate::kit::tokens::palette(ctx);
     let accent = match tone {
-        CreateTone::Good => theme::BORDER,
-        CreateTone::Bad => theme::ERROR,
+        CreateTone::Good => p.border,
+        CreateTone::Bad => p.error,
     };
     let ink = match tone {
-        CreateTone::Good => theme::INK,
-        CreateTone::Bad => theme::ERROR,
+        CreateTone::Good => p.ink,
+        CreateTone::Bad => p.error,
     };
     let mut dismissed = false;
     // **Pinned, and deliberately left out of the modals that are not.**
@@ -13355,7 +13356,7 @@ fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bo
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -18.0))
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(theme::CARD)
+                .fill(p.card)
                 .stroke(egui::Stroke::new(1.0, accent))
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(Margin::symmetric(14, 10))
@@ -13364,17 +13365,7 @@ fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bo
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(text).size(12.0).color(ink));
                         ui.add_space(10.0);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(crate::i18n::t("vault.dismiss"))
-                                        .size(12.0)
-                                        .color(theme::TEXT_MUTED),
-                                )
-                                .min_size(egui::vec2(72.0, 24.0)),
-                            )
-                            .clicked()
-                        {
+                        if crate::kit::controls::row_button(ui, crate::i18n::t("vault.dismiss")).clicked() {
                             dismissed = true;
                         }
                     });
