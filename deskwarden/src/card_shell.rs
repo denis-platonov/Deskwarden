@@ -93,6 +93,7 @@
 //! into, and a click-through shadow cannot "open behind something" in a way
 //! that matters. See the entry in that file's `OPENS_NO_WINDOW`.
 
+use crate::kit::tokens::Palette;
 use crate::win32_draw::{coverage, rounded_rect_sdf};
 use eframe::egui::Color32;
 use std::ffi::c_void;
@@ -137,32 +138,8 @@ pub const SIGMA: f32 = 26.0;
 /// How far the shadow stands below the card (the design's `24px`).
 pub const OFFSET_Y: i32 = 22;
 
-/// The shadow's strength where it is darkest, at the card's own edge. Kept
-/// low on purpose: the brief is "subtle".
-pub const PEAK_ALPHA: f32 = 0.20;
-
-/// The shadow's colour: the design's ink at the shadow's alpha.
-pub const SHADOW_RGB: [u8; 3] = [45, 43, 43];
-
 /// How many full-resolution pixels one pixel of the shadow's blur grid covers.
 const BLUR_GRID: usize = 4;
-
-/// The panel's hairline: the design's `border: 1px solid #d7d3d3`, which is
-/// `theme::BORDER_STRONG`. It was Windows' own DWM border before; the shell
-/// draws it now, so it follows the new curve.
-pub const BORDER_RGB: [u8; 3] = [0xd7, 0xd3, 0xd3];
-
-/// The dark theme's hairline: the palette's `kbd_border`, a step above the
-/// dark card so the edge still reads against a dark desktop.
-pub const DARK_BORDER_RGB: [u8; 3] = [0x4a, 0x47, 0x44];
-
-/// The dark theme's shadow: black, since the light shadow's warm grey would
-/// not show on a dark desktop at all.
-pub const DARK_SHADOW_RGB: [u8; 3] = [0, 0, 0];
-
-/// The dark shadow's strength at the card's edge: higher than
-/// [`PEAK_ALPHA`], because a shadow on a dark ground has less to darken.
-pub const DARK_PEAK_ALPHA: f32 = 0.55;
 
 /// The hairline's width in device pixels: one logical pixel, never less than
 /// one device pixel.
@@ -260,16 +237,39 @@ pub fn blur(grid: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
+/// The four colours a card's shell is painted with, all of them read off one
+/// [`Palette`]: the card's fill, its hairline (`kbd_border`), and the shadow's
+/// colour and strength (`shadow`, whose alpha is the peak). Light and dark
+/// are the palette's, not this module's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardColours {
+    pub fill: [u8; 3],
+    pub border: [u8; 3],
+    pub shadow: [u8; 3],
+    /// The shadow's alpha at the card's own edge, 0..=255.
+    pub peak: u8,
+}
+
+impl CardColours {
+    /// `palette`'s card.
+    pub fn of(palette: &Palette) -> Self {
+        let rgb = |c: Color32| [c.r(), c.g(), c.b()];
+        Self {
+            fill: rgb(palette.card),
+            border: rgb(palette.kbd_border),
+            shadow: rgb(palette.shadow),
+            peak: palette.shadow.a(),
+        }
+    }
+}
+
 /// What a shell paints in the card's own footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Look {
     /// The card's colour and hairline in an antialiased rounded rectangle, over
     /// the shadow: the bare-Win32 cards, which paint nothing of their own
     /// along the curve.
-    Card([u8; 3]),
-    /// [`Look::Card`] for the dark theme: the same card, with the dark
-    /// hairline and a black shadow that is strong enough to show.
-    DarkCard([u8; 3]),
+    Card(CardColours),
     /// **Only the shadow**: the footprint is fully transparent (alpha 0) and
     /// the shadow is cut out of it by the same antialiased curve. The main
     /// windows paint their own content and edge on the GL surface and cut their
@@ -283,7 +283,8 @@ pub enum Look {
 /// rounded rectangle, over a blurred shadow. `out.len()` must be
 /// `shell_w * shell_h` (the sizes [`shell_size`] answers). Pure.
 pub fn render_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i32, fill: [u8; 3]) {
-    render_look_into(out, card_w, card_h, scale_pct, Look::Card(fill));
+    let colours = CardColours { fill, ..CardColours::of(&Palette::LIGHT) };
+    render_look_into(out, card_w, card_h, scale_pct, Look::Card(colours));
 }
 
 /// [`render_into`] for either [`Look`]. Pure.
@@ -298,10 +299,12 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
     let offset = dev(OFFSET_Y as f32, scale_pct);
     let sigma = dev(SIGMA, scale_pct);
     let border = border_px(scale_pct) as f32;
-    let (line_rgb, shadow_rgb, peak) = match look {
-        Look::DarkCard(_) => (DARK_BORDER_RGB, DARK_SHADOW_RGB, DARK_PEAK_ALPHA),
-        _ => (BORDER_RGB, SHADOW_RGB, PEAK_ALPHA),
+    // The main windows' shadow-only shell is always the light theme's.
+    let colours = match look {
+        Look::Card(colours) => colours,
+        _ => CardColours::of(&Palette::LIGHT),
     };
+    let (line_rgb, shadow_rgb, peak) = (colours.border, colours.shadow, f32::from(colours.peak) / 255.0);
 
     // ---- the shadow: a card-shaped mask, blurred on a coarser grid ---------
     let k = BLUR_GRID;
@@ -356,12 +359,12 @@ pub fn render_look_into(out: &mut [u32], card_w: i32, card_h: i32, scale_pct: i3
                     (shadow as f32 * a).round().clamp(0.0, 255.0) as u32
                 };
                 out[y * sw_u + x] = ((a * 255.0).round().clamp(0.0, 255.0) as u32) << 24
-                    | channel(SHADOW_RGB[0]) << 16
-                    | channel(SHADOW_RGB[1]) << 8
-                    | channel(SHADOW_RGB[2]);
+                    | channel(shadow_rgb[0]) << 16
+                    | channel(shadow_rgb[1]) << 8
+                    | channel(shadow_rgb[2]);
                 continue;
             }
-            let (Look::Card(fill) | Look::DarkCard(fill)) = look else { continue };
+            let Look::Card(CardColours { fill, .. }) = look else { continue };
             let inner = coverage(d + border).min(c);
             // Premultiplied "card (fill + hairline) over shadow".
             let a = c + shadow_a * (1.0 - c);
@@ -897,11 +900,12 @@ pub fn attach(card: HWND, fill: Color32) {
             original,
             size: (0, 0),
             scale_pct: screen_scale_pct(),
-            look: if crate::gdi_palette::is_dark() {
-                Look::DarkCard([fill.r(), fill.g(), fill.b()])
-            } else {
-                Look::Card([fill.r(), fill.g(), fill.b()])
-            },
+            // The border and shadow are the palette the card opened with; the
+            // fill is the caller's (the palette's card).
+            look: Look::Card(CardColours {
+                fill: [fill.r(), fill.g(), fill.b()],
+                ..CardColours::of(&crate::gdi_palette::current())
+            }),
             affinity: 0,
             sizing: false,
             opaque: false,
@@ -1018,9 +1022,9 @@ mod tests {
         assert_eq!(region_diameter(100), 32);
         assert_eq!(region_inset(200), 3);
         assert_eq!(region_diameter(200), 66);
-        assert_eq!(BORDER_RGB, [0xd7, 0xd3, 0xd3], "the design's hairline is theme::BORDER_STRONG");
-        let strong = crate::theme::BORDER_STRONG;
-        assert_eq!(BORDER_RGB, [strong.r(), strong.g(), strong.b()]);
+        let light = CardColours::of(&Palette::LIGHT);
+        let kbd = Palette::LIGHT.kbd_border;
+        assert_eq!(light.border, [kbd.r(), kbd.g(), kbd.b()], "the hairline is the palette's kbd_border");
     }
 
     #[test]
@@ -1070,9 +1074,9 @@ mod tests {
                     inside += 1;
                 } else if (d + 0.5).abs() < 1e-4 {
                     // The edge's own first pixel row, along the straight
-                    // sides: the hairline.
+                    // sides: the hairline (the palette's kbd_border, #dcdad7).
                     assert_eq!(alpha(p), 255, "({x},{y}) hairline is not opaque");
-                    assert_eq!(p & 0x00ff_ffff, 0x00d7_d3d3, "({x},{y}) hairline is not the border colour: {p:#x}");
+                    assert_eq!(p & 0x00ff_ffff, 0x00dc_dad7, "({x},{y}) hairline is not the border colour: {p:#x}");
                     line += 1;
                 }
             }
@@ -1122,7 +1126,7 @@ mod tests {
             assert!(pair[1] <= pair[0], "the shadow is not monotonic: {below:?}");
         }
         assert!(
-            below[0] as f32 <= 255.0 * PEAK_ALPHA + 1.0,
+            below[0] as f32 <= f32::from(Palette::LIGHT.shadow.a()) + 1.0,
             "the shadow is darker than its peak: {}",
             below[0]
         );
@@ -1162,9 +1166,9 @@ mod tests {
         let (card_w, card_h) = (200, 120);
         let (sw, sh) = shell_size(card_w, card_h, 100);
         let mut dark = vec![0u32; (sw * sh) as usize];
-        render_look_into(&mut dark, card_w, card_h, 100, Look::DarkCard(fill));
+        render_look_into(&mut dark, card_w, card_h, 100, Look::Card(CardColours { fill, ..CardColours::of(&Palette::DARK) }));
         let mut light = vec![0u32; (sw * sh) as usize];
-        render_look_into(&mut light, card_w, card_h, 100, Look::Card(fill));
+        render_look_into(&mut light, card_w, card_h, 100, Look::Card(CardColours { fill, ..CardColours::of(&Palette::LIGHT) }));
         let m = margins(100);
         let at = |buf: &[u32], x: i32, y: i32| buf[(y * sw + x) as usize];
         // The middle of the card is the fill, opaque.

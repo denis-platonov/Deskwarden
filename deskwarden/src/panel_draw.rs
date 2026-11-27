@@ -148,31 +148,16 @@ pub const TIP_PX: i32 = 14;
 pub fn help_fill() -> Color32 {
     crate::gdi_palette::badge_bg()
 }
-/// The tooltip's ground is the design's `ink` on light; on dark it is a step
-/// above the card, since pale ink would blind. [`tip_ink`] is what is written.
+/// The tooltip's ground (the palette's `tip_bg`: the design's `ink` on light).
 pub fn tip_fill() -> Color32 {
-    if crate::gdi_palette::is_dark() {
-        crate::gdi_palette::kbd_border()
-    } else {
-        crate::gdi_palette::ink()
-    }
-}
-
-/// What is written on the tooltip: white on the dark ground light has, the
-/// theme's ink on the lifted one dark has.
-pub fn tip_ink() -> Color32 {
-    if crate::gdi_palette::is_dark() {
-        crate::gdi_palette::ink()
-    } else {
-        Color32::WHITE
-    }
+    crate::gdi_palette::tip_bg()
 }
 
 /// An account's avatar colours (D 1.3's `OV` table): the first account is the
 /// brand blue, then a pale blue, then a neutral -- and round again.
 pub fn avatar_colours(index: usize) -> (Color32, Color32) {
     match index % 3 {
-        0 => (crate::gdi_palette::blue(), Color32::WHITE),
+        0 => (crate::gdi_palette::blue(), crate::gdi_palette::on_blue()),
         1 => (crate::gdi_palette::focus(), crate::gdi_palette::blue_deep()),
         _ => (help_fill(), crate::gdi_palette::ink()),
     }
@@ -297,7 +282,7 @@ pub fn draw_enter_badge(hdc: HDC, row: RECT, font: HFONT, scale: i32) -> i32 {
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(Color32::WHITE));
+        SetTextColor(hdc, rgb(crate::gdi_palette::on_blue()));
         let mut at = rc;
         draw_text(hdc, enter_label(), &mut at, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old);
@@ -344,7 +329,7 @@ pub fn draw_key_tooltip(hdc: HDC, rc: RECT, font: HFONT, lines: &[&str], scale: 
     unsafe {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(tip_ink()));
+        SetTextColor(hdc, rgb(crate::gdi_palette::tip_ink()));
         for (i, line) in lines.iter().enumerate() {
             let top = rc.top + px(TIP_PAD_Y, scale) + i as i32 * px(TIP_LINE_H, scale);
             let mut at = RECT {
@@ -1130,7 +1115,7 @@ mod tests {
             crate::gdi_palette::set_dark(dark);
             let primary = skin(PanelButton::Primary, false);
             assert_eq!(primary.fill, rgb(palette.blue));
-            assert_eq!(primary.text, rgb(Color32::WHITE));
+            assert_eq!(primary.text, rgb(palette.on_blue));
             let outline = skin(PanelButton::Outline, false);
             assert_eq!(outline.fill, rgb(palette.card));
             assert_eq!(outline.text, rgb(palette.ink));

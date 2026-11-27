@@ -588,7 +588,7 @@ impl ButtonSkin {
             fill: rgb(crate::gdi_palette::blue()),
             text: rgb(crate::gdi_palette::on_blue()),
             border: None,
-            hover_fill: rgb(if crate::gdi_palette::is_dark() { crate::gdi_palette::primary_hover() } else { crate::gdi_palette::blue_deep() }),
+            hover_fill: rgb(crate::gdi_palette::primary_hover()),
         }
     }
 
@@ -606,10 +606,10 @@ impl ButtonSkin {
     /// blue.
     pub fn panel_deep() -> Self {
         Self {
-            fill: rgb(if crate::gdi_palette::is_dark() { crate::gdi_palette::blue() } else { crate::gdi_palette::blue_deep() }),
+            fill: rgb(crate::gdi_palette::deep_button()),
             text: rgb(crate::gdi_palette::on_blue()),
             border: None,
-            hover_fill: rgb(if crate::gdi_palette::is_dark() { crate::gdi_palette::primary_hover() } else { crate::gdi_palette::blue() }),
+            hover_fill: rgb(crate::gdi_palette::deep_button_hover()),
         }
     }
 

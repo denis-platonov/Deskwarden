@@ -8,7 +8,10 @@
 //! `WM_PAINT`) asks the functions here for its colours. A thread that never
 //! chose paints [`Palette::LIGHT`], which is also what every test sees.
 //!
-//! [`crate::win32_draw::rgb`] is the one place a `Color32` becomes a
+//! **One source of truth**: the colours are `kit::tokens::Palette::LIGHT` and
+//! `DARK`, nothing else, chosen by the same `Settings.theme` and the same
+//! System-follows-Windows rule ([`ThemeChoice::palette_with`]) as the egui
+//! windows. [`crate::win32_draw::rgb`] is the one place a `Color32` becomes a
 //! `COLORREF`.
 
 use crate::kit::tokens::{Palette, ThemeChoice};
@@ -17,31 +20,22 @@ use std::cell::Cell;
 
 thread_local! {
     static CURRENT: Cell<Palette> = const { Cell::new(Palette::LIGHT) };
-    static DARK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether `choice` paints dark when Windows' app theme is `system_dark`.
-/// Pure.
-#[must_use]
-pub fn is_dark_for(choice: ThemeChoice, system_dark: bool) -> bool {
-    match choice {
-        ThemeChoice::Light => false,
-        ThemeChoice::Dark => true,
-        ThemeChoice::System => system_dark,
-    }
+/// Makes this thread paint `palette`.
+fn set(palette: Palette) {
+    CURRENT.with(|c| c.set(palette));
 }
 
 /// Makes this thread paint dark (or light).
 pub fn set_dark(dark: bool) {
-    DARK.with(|d| d.set(dark));
-    CURRENT.with(|c| c.set(if dark { Palette::DARK } else { Palette::LIGHT }));
+    set(if dark { Palette::DARK } else { Palette::LIGHT });
 }
 
-/// Chooses this thread's palette for `choice`, asking `system_dark` only when
-/// the choice is `System`.
+/// Chooses this thread's palette for `choice`: [`ThemeChoice::palette_with`],
+/// the rule the egui windows' `ThemeFollower` applies too.
 pub fn choose_with(choice: ThemeChoice, system_dark: impl FnOnce() -> bool) {
-    let system = choice == ThemeChoice::System && system_dark();
-    set_dark(is_dark_for(choice, system));
+    set(choice.palette_with(system_dark));
 }
 
 /// The saved theme setting, from `settings.json` (light when there is none).
@@ -73,7 +67,7 @@ pub fn open_for_card() {
 /// Whether this thread paints dark.
 #[must_use]
 pub fn is_dark() -> bool {
-    DARK.with(Cell::get)
+    current() == Palette::DARK
 }
 
 /// This thread's palette.
@@ -112,22 +106,46 @@ pub fn badge_bg() -> Color32 {
     current().badge_bg
 }
 
-/// What sits on a blue fill (the primary button's label, a ticked box's
-/// tick): white on both themes.
+/// The palette's `on_blue`.
 #[must_use]
 pub fn on_blue() -> Color32 {
-    Color32::WHITE
+    current().on_blue
 }
 
-/// The primary button's hover fill: the brighter blue on light, and on dark
-/// (where the button already is the bright blue) the lifted one.
+/// The palette's `primary_hover`.
 #[must_use]
 pub fn primary_hover() -> Color32 {
-    if is_dark() {
-        current().blue_bright_hover
-    } else {
-        current().blue_bright
-    }
+    current().primary_hover
+}
+
+/// The palette's `deep_button`.
+#[must_use]
+pub fn deep_button() -> Color32 {
+    current().deep_button
+}
+
+/// The palette's `deep_button_hover`.
+#[must_use]
+pub fn deep_button_hover() -> Color32 {
+    current().deep_button_hover
+}
+
+/// The palette's `tip_bg`.
+#[must_use]
+pub fn tip_bg() -> Color32 {
+    current().tip_bg
+}
+
+/// The palette's `tip_ink`.
+#[must_use]
+pub fn tip_ink() -> Color32 {
+    current().tip_ink
+}
+
+/// The palette's `shadow`.
+#[must_use]
+pub fn shadow() -> Color32 {
+    current().shadow
 }
 
 /// The palette's `ink`.
@@ -299,14 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn the_choice_and_windows_decide_dark() {
-        assert!(!is_dark_for(ThemeChoice::Light, true));
-        assert!(is_dark_for(ThemeChoice::Dark, false));
-        assert!(is_dark_for(ThemeChoice::System, true));
-        assert!(!is_dark_for(ThemeChoice::System, false));
-    }
-
-    #[test]
     fn windows_is_asked_only_for_system() {
         {
             choose_with(ThemeChoice::Dark, || panic!("asked"));
@@ -327,6 +337,7 @@ mod tests {
                 assert_eq!(blue(), if dark { Palette::DARK.blue } else { Palette::LIGHT.blue });
                 assert_eq!(on_blue(), Color32::WHITE);
                 assert_ne!(primary_hover(), blue());
+                assert_eq!(on_blue(), if dark { Palette::DARK.on_blue } else { Palette::LIGHT.on_blue });
             }
         }
     }
