@@ -3278,7 +3278,12 @@ mod tests {
             // became `"1.0.3"`, 4 bytes shorter. No dependency or table moved. Same
             // FNV-1a/64 implementation, first run against the PREVIOUS pinned pair
             // (31312, 0xe1c6_42bf_696e_a836), which it reproduced.
-            (31308, 0x7565_e43c_922e_f9d4_u64),
+            //
+            // **31312 bytes, new hash: back to 1.0.4-dev after the 1.0.3 release.**
+            // `version = "1.0.3"` became `"1.0.4-dev"`, 4 bytes longer. No dependency
+            // or table moved. Same FNV-1a/64 implementation, first run against the
+            // PREVIOUS pinned pair (31308, 0x7565_e43c_922e_f9d4), which it reproduced.
+            (31312, 0x1297_7530_0dbe_e66f_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
