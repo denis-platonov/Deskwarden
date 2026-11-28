@@ -755,32 +755,27 @@ pub const ROW_CAP: usize = 5;
 /// candidate cap and that is the whole of the difference.
 pub const LIST_ROWS: usize = ROW_CAP + 1;
 
-/// The search box's height. `theme::SEARCH_FIELD_HEIGHT` -- design 2b's search
-/// box, which is deliberately shorter than a form field, and this is the same
-/// control doing the same job on a smaller surface. Pinned against `theme` by
-/// [`the_cards_dimensions_are_the_themes`], so a redesign there cannot leave
-/// this card drawing a box of its own invented height.
-const SEARCH_H: i32 = 34;
+/// **The search field's height**: design 2.3's search field (46 tall, radius
+/// 14, `field_bg`), the same box the vault window's top bar draws. It is its
+/// own rounded box at the top of the card and nothing but the text lives in it;
+/// the results are rows BELOW it, drawn exactly as the list's are.
+const SEARCH_H: i32 = 46;
 
-/// **The field's horizontal inner inset**, which is what keeps the search
-/// text off the border now that the text has no box of its own.
-///
-/// `theme`'s own search field is drawn with a `PAD_X` of 10 (see
-/// `theme::search_field`), and `unlock_prompt` insets its password text by the
-/// same. Pinned against neither, because `theme` keeps it as a private `const`
-/// inside the function that draws it -- what is pinned instead is that this
-/// card does not invent a *second* inset for its rows: `win32_draw::draw_row`
-/// carries the rows' own, and this is the box's.
-const FIELD_PAD_X: i32 = 10;
+/// **The field's horizontal inner inset** (design 2.3: `padding 0 16`), on
+/// both sides.
+const FIELD_PAD_X: i32 = 16;
 
-/// The field's corner radius and the halo's, in that order.
+/// The magnifier's square (design 2.3: 18 px stroke) and the gap between it
+/// and the text (design 2.3: `gap 10`).
+const FIELD_GLYPH: i32 = 18;
+const FIELD_GLYPH_GAP: i32 = 10;
+
+/// The field's corner radius (design 2.3: 14) and the halo's, in that order.
 ///
-/// 8 is the radius the list's own card has always been drawn at, and the field
-/// IS that card -- it grew a search box at the top, it did not become a new
-/// shape. The halo is one larger so its outer edge stays concentric with the
-/// border it surrounds rather than cutting across it, which is exactly the
-/// relationship the footer buttons' ring already has to their 8.
-const FIELD_RADIUS: i32 = 12;
+/// The halo is one larger so its outer edge stays concentric with the border
+/// it surrounds rather than cutting across it, which is exactly the
+/// relationship the footer buttons' ring already has to their radius.
+const FIELD_RADIUS: i32 = 14;
 const FIELD_RING_RADIUS: i32 = FIELD_RADIUS + 1;
 
 /// How far the focus halo stands outside the field it surrounds.
@@ -892,33 +887,20 @@ pub struct Layout {
     pub heading: bool,
     pub title: Box2,
     pub subtitle: Box2,
-    /// **The one bordered container**, and the only rectangle on this card
-    /// that carries a border at all.
-    ///
-    /// Asked for by the app's owner about search mode: "no border for those
-    /// matching elements (item + search) but they both inside of same field".
-    /// So the search box and the rows it filters are elements of this, not two
-    /// outlined boxes stacked with a gap between them -- and in the other
-    /// modes the same reading holds already: the candidate rows and the
-    /// *Search the vault* row are elements of one field, which is what
-    /// [`list`](Self::list) has always been drawn as.
-    ///
-    /// In every mode but search this is exactly `list`. In search mode it is
-    /// `search` on top of `list`, with nothing between them but the hairline
-    /// that separates one element from the next.
+    /// **The one bordered rectangle on this card.** In search mode it is
+    /// exactly the search field -- a rounded box at the top that holds the
+    /// typed text and nothing else; the result rows are BELOW it and are not
+    /// inside any border. In every other mode it is `list`, which is drawn
+    /// borderless (the design's list is bare rows on the card).
     pub field: Box2,
-    /// The search box's slot **inside [`field`](Self::field)**, in search mode
-    /// only. `None` in every other mode, rather than a zero-height rectangle:
-    /// a `Box2` with `h: 0` is a control the card would still place and still
-    /// hit-test, and "there is no search box here" is exactly the thing that
-    /// must not be expressible as a number.
-    ///
-    /// **It has no border of its own.** The field around it is the border; all
-    /// this rectangle does is say where the text sits and where the hairline
-    /// under it goes.
+    /// The search field's slot, in search mode only. `None` in every other
+    /// mode, rather than a zero-height rectangle: a `Box2` with `h: 0` is a
+    /// control the card would still place and still hit-test, and "there is no
+    /// search box here" is exactly the thing that must not be expressible as a
+    /// number. In search mode it equals [`field`](Self::field).
     pub search: Option<Box2>,
-    /// The rows' area, inside [`field`](Self::field). Individual rows are
-    /// [`row_at`].
+    /// The rows' area. In search mode it starts [`HEADER_GAP`] under the
+    /// search field. Individual rows are [`row_at`].
     pub list: Box2,
 }
 
@@ -931,7 +913,7 @@ pub const EMPTY_RING: i32 = 2;
 enum Shape {
     /// Header, then rows: the first step and the second.
     List,
-    /// Header, then one bordered field holding the search box and the results.
+    /// Header, the search field, then the results as list rows under it.
     Search,
     /// Design 1.5's No-match card: header, heading pair, two buttons.
     Empty,
@@ -945,14 +927,14 @@ enum Shape {
 /// the *Search the vault* row under them; the second step is as tall as its
 /// fields. Design 1b fixes no height, and a footer that moved out from under
 /// the pointer -- the reason this card was once laid out at a fixed six slots --
-/// is gone with the footer. Search mode is the one shape that stays at its
-/// full height, because its result count changes with every keystroke.
+/// is gone with the footer. Search mode is sized the same way, to its results
+/// (at least one row), so it resizes only when the row count changes.
 pub fn layout(rows: usize) -> Layout {
     shaped(rows, Shape::List)
 }
 
-/// [`layout`], told whether the card is in **search mode**: the same header
-/// over one bordered field holding the search box and the results.
+/// [`layout`], told whether the card is in **search mode**: the same header,
+/// then the search field, then the results as list rows.
 pub fn layout_for(rows: usize, search: bool) -> Layout {
     shaped(rows, if search { Shape::Search } else { Shape::List })
 }
@@ -1022,16 +1004,17 @@ fn shaped(rows: usize, shape: Shape) -> Layout {
     let search = (shape == Shape::Search)
         .then_some(Box2 { x: MARGIN_X, y: below, w: content_w, h: SEARCH_H });
     let list_y = match search {
-        Some(box2) => box2.bottom(),
+        Some(box2) => box2.bottom() + HEADER_GAP,
         None => below,
     };
     // Design D 1.3: the list is padded 8 px each side, so a row's wash runs
-    // 8..392 and its tile starts at 18. Search mode's rows sit inside the
-    // bordered field, which keeps a 16 px margin, and so do the empty card's
-    // buttons.
+    // 8..392 and its tile starts at 18 -- in search mode too, under the field.
+    // The empty card's buttons keep the 18 px margin.
     let (list_x, list_w) = match shape {
-        Shape::List => (crate::panel_draw::LIST_PAD_X, WIDTH - 2 * crate::panel_draw::LIST_PAD_X),
-        Shape::Search | Shape::Empty => (margin_x, content_w),
+        Shape::List | Shape::Search => {
+            (crate::panel_draw::LIST_PAD_X, WIDTH - 2 * crate::panel_draw::LIST_PAD_X)
+        }
+        Shape::Empty => (margin_x, content_w),
     };
     // The empty card's list is ONE line of buttons side by side (D 1.5), so its
     // height is a button's however many offers it has.
@@ -1041,13 +1024,19 @@ fn shaped(rows: usize, shape: Shape) -> Layout {
         ROW_H * rows as i32
     };
     let list = Box2 { x: list_x, y: list_y, w: list_w, h: list_h };
-    let field = Box2 { x: list.x, y: below, w: list.w, h: list.bottom() - below };
+    // The bordered rectangle: the search field itself, and never anything that
+    // reaches down over the rows.
+    let field = match search {
+        Some(slot) => slot,
+        None => list,
+    };
 
     // The last row's 2 px gap is not padding: the design's list ends 8 px under
     // its last row.
     let bottom = match shape {
-        Shape::List => list.bottom() - crate::panel_draw::ROW_GAP + crate::panel_draw::LIST_PAD_BOTTOM,
-        Shape::Search => list.bottom() + MARGIN_X,
+        Shape::List | Shape::Search => {
+            list.bottom() - crate::panel_draw::ROW_GAP + crate::panel_draw::LIST_PAD_BOTTOM
+        }
         Shape::Empty => list.bottom() + crate::panel_draw::PAD,
     };
     let window = Box2 { x: 0, y: 0, w: width, h: bottom };
@@ -1068,26 +1057,33 @@ fn shaped(rows: usize, shape: Shape) -> Layout {
     }
 }
 
-/// **Where the search text sits inside its slot in the field.**
+/// **Where the magnifier sits in the search field**: [`FIELD_PAD_X`] in from
+/// the left, [`FIELD_GLYPH`] square, vertically centred.
+pub fn search_glyph_box(slot: Box2) -> Box2 {
+    Box2 {
+        x: slot.x + FIELD_PAD_X,
+        y: slot.y + (slot.h - FIELD_GLYPH) / 2,
+        w: FIELD_GLYPH,
+        h: FIELD_GLYPH,
+    }
+}
+
+/// **Where the search text sits inside its slot.**
 ///
 /// One function, read by `open` when it creates the `EDIT` and by `apply_mode`
 /// every time it moves it: two insets that had to agree is this codebase's
 /// standing defect shape, and there is no reason for a second one here.
 ///
-/// `slot` is [`Layout::search`] -- the top element of [`Layout::field`]. What
-/// comes back is the text's own rectangle: [`FIELD_PAD_X`] off each side, and
-/// a single line's height centred in the slot. **No border is drawn around
+/// `slot` is [`Layout::search`]. What comes back is the text's own rectangle:
+/// after the magnifier and its gap, [`FIELD_PAD_X`] short of the right edge,
+/// and a single line's height centred in the slot. **No border is drawn around
 /// what this returns**; the field around the slot is the border.
 pub fn search_text_box(slot: Box2) -> Box2 {
     /// One line of the field font, which is what an `EDIT` needs to show a
     /// caret and a run of text without clipping either.
     const TEXT_H: i32 = 20;
-    Box2 {
-        x: slot.x + FIELD_PAD_X,
-        y: slot.y + (slot.h - TEXT_H) / 2,
-        w: slot.w - 2 * FIELD_PAD_X,
-        h: TEXT_H,
-    }
+    let x = search_glyph_box(slot).right() + FIELD_GLYPH_GAP;
+    Box2 { x, y: slot.y + (slot.h - TEXT_H) / 2, w: slot.right() - FIELD_PAD_X - x, h: TEXT_H }
 }
 
 /// **A candidate row's two lines, as design D 1.3 sets them**: the account's
@@ -1592,7 +1588,7 @@ mod win32 {
         DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetDeviceCaps,
         InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
         AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
-        DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL,
+        DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL,
         HBITMAP, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, SRCCOPY,
         SetBkColor, TRANSPARENT,
     };
@@ -1915,6 +1911,8 @@ mod win32 {
     /// a slot per control would be `ROW_CAP + 2` statics that must all hold
     /// one value.
     static ORIGINAL_PROC: AtomicIsize = AtomicIsize::new(0);
+    /// The search `EDIT`'s own original procedure (the rows' is above).
+    static EDIT_ORIGINAL_PROC: AtomicIsize = AtomicIsize::new(0);
 
     // ---- the window --------------------------------------------------------
 
@@ -2152,18 +2150,17 @@ mod win32 {
         let search_box = super::layout_for(LIST_ROWS, true)
             .search
             .expect("`layout_for(.., true)` is the search shape and always has the box");
-        if child(
+        let Some(edit) = child(
             window,
             w!("EDIT"),
             WS_TABSTOP.0 | ES_AUTOHSCROLL as u32,
             super::search_text_box(search_box),
             ID_SEARCH,
             field_font,
-        )
-        .is_none()
-        {
+        ) else {
             return abandon(window);
-        }
+        };
+        subclass_edit(edit);
 
         // The key-hint tooltip, created last so it is the topmost child, and
         // hidden until the pointer is on the `?`.
@@ -2649,18 +2646,6 @@ mod win32 {
         }
     }
 
-    /// The card's white as a brush, for `WM_CTLCOLOREDIT`.
-    ///
-    /// A `OnceLock` and never deleted, exactly as `unlock_prompt::card_brush`
-    /// is: the value returned from `WM_CTLCOLOREDIT` is a handle the system
-    /// keeps using after the handler returns, so a brush created per message
-    /// and deleted would be a use-after-free -- and one created per message and
-    /// not deleted would leak one GDI object per repaint of a control the user
-    /// is typing into.
-    fn card_brush() -> HBRUSH {
-        crate::win32_draw::card_brush()
-    }
-
     /// Swaps the card to its second step: the chosen account's fields.
     pub(super) fn show_palette(window: PickerWindow, palette: &Palette) {
         if let Ok(mut slot) = ENTRIES.lock() {
@@ -2877,10 +2862,10 @@ mod win32 {
     fn laid_out_rows() -> usize {
         match MODE.load(Ordering::SeqCst) {
             MODE_EMPTY => super::empty_rows().len().min(LIST_ROWS),
-            // Search mode at the full height: its row count changes with every
-            // keystroke, and a card that grew and shrank as the user typed
-            // would jump under their hand.
-            MODE_SEARCH => LIST_ROWS,
+            // Search mode is sized to its results like the list is (never
+            // fewer than one row's worth, `Nothing` being a row): the card
+            // resizes only when the row count changes, from its bottom edge,
+            // so the field under the user's hand never moves.
             // The first two steps are as tall as their rows.
             _ => visible_row_count().max(1),
         }
@@ -3081,9 +3066,10 @@ mod win32 {
             // same three calls.
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetBkColor(hdc, rgb(crate::gdi_palette::card()));
+                // The search field's own fill: the only EDIT on this card.
+                SetBkColor(hdc, rgb(crate::gdi_palette::field_bg()));
                 SetTextColor(hdc, rgb(crate::gdi_palette::ink()));
-                LRESULT(card_brush().0 as isize)
+                LRESULT(crate::win32_draw::field_brush().0 as isize)
             }
             // Frameless windows are dragged by their background.
             WM_NCHITTEST => {
@@ -3316,16 +3302,16 @@ mod win32 {
 
             let l = card();
 
-            // **Search mode is the one mode with a container.** The search box
-            // and the rows it filters are elements of one bordered field, as the
-            // owner asked ("no border for those matching elements (item +
-            // search) but they both inside of same field"); the design's list
-            // is bare rows on white, so the other modes draw no field at all.
+            // **Search mode's field is its own rounded box**, design 2.3's
+            // search field: `field_bg`, radius 14, a 1 px border that is the
+            // fill's own colour (invisible) until the box has focus and then
+            // `theme::BLUE`, a magnifier at the left and the text after it. The
+            // result rows are BELOW it and carry no border of their own; the
+            // list's design is bare rows.
             //
-            // Focus is shown on the field, in the design's own vocabulary:
-            // `theme::FOCUS_RING` as a halo standing `FOCUS_RING_W` outside the
-            // edge, and the edge itself in `theme::BLUE`.
-            if l.search.is_some() {
+            // Focus also keeps the card's halo: `theme::FOCUS_RING` standing
+            // `FOCUS_RING_W` outside the edge, as the footer buttons' ring.
+            if let Some(slot) = l.search {
                 let search_focused = GetDlgItem(window, ID_SEARCH as i32)
                     .map(|control| GetFocus() == control)
                     .unwrap_or(false);
@@ -3347,25 +3333,13 @@ mod win32 {
                     mem,
                     l.field,
                     FIELD_RADIUS,
-                    crate::gdi_palette::card(),
+                    crate::gdi_palette::field_bg(),
                     Some((
                         1,
-                        if search_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::hairline() },
+                        if search_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::field_bg() },
                     )),
                 );
-                // **The hairline between the two elements**, drawn inside the
-                // search box's own slot rather than at the first row's top edge:
-                // the rows are child windows painted over this surface, so a
-                // line on their side of the boundary would simply be covered.
-                if let Some(box2) = l.search {
-                    rounded(
-                        mem,
-                        Box2 { x: box2.x, y: box2.bottom() - 1, w: box2.w, h: 1 },
-                        0,
-                        crate::gdi_palette::hairline(),
-                        None,
-                    );
-                }
+                paint_field_glyph(mem, dev(super::search_glyph_box(slot)));
             }
 
             if let Some(fonts) = fonts {
@@ -3508,9 +3482,28 @@ mod win32 {
                 // **No chip on either.** Neither is an account, and a number on
                 // one would be a trap -- the same rule the *Search the vault*
                 // row is drawn under.
-                SearchRow::Overflow { .. } | SearchRow::Nothing => {
+                SearchRow::Overflow { .. } => {
                     let (name, says) = super::search_row_text(row);
                     look(panel_draw::Tile::None, &name, &says, focused);
+                }
+                // **One quiet line, centred, no tile and no wash**: nothing
+                // here is an offer, and a row that looked like one would be
+                // a trap.
+                SearchRow::Nothing => {
+                    let (name, _) = super::search_row_text(row);
+                    let mut at = rect;
+                    unsafe {
+                        let old = SelectObject(hdc, fonts.field);
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, rgb(crate::gdi_palette::text_faint()));
+                        draw_text(
+                            hdc,
+                            &name,
+                            &mut at,
+                            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                        );
+                        SelectObject(hdc, old);
+                    }
                 }
             }
             return;
@@ -3611,6 +3604,93 @@ mod win32 {
         // names what the key does rather than describing a second path.
         let tile = look(panel_draw::Tile::Blank, name, says, focused);
         draw_search_glyph(hdc, tile, dpi);
+    }
+
+    /// **The search field's magnifier**, 18 px, `text_faint` stroke (design
+    /// 2.3), on the field's own fill. `at` is device pixels.
+    fn paint_field_glyph(hdc: HDC, at: RECT) {
+        use windows::Win32::Graphics::Gdi::{CreatePen, LineTo, MoveToEx, PS_SOLID};
+        let side = at.right - at.left;
+        let ink = rgb(crate::gdi_palette::text_faint());
+        let stroke = (side * 2 / 18).max(1);
+        // The lens: a ring about 2/3 of the square, up and to the left.
+        let r = side * 7 / 18;
+        let (cx, cy) = (at.left + side * 8 / 18, at.top + side * 8 / 18);
+        crate::win32_draw::aa_circle(
+            hdc,
+            cx,
+            cy,
+            r + stroke / 2,
+            rgb(crate::gdi_palette::field_bg()),
+            Some((ink, stroke)),
+        );
+        unsafe {
+            let pen = CreatePen(PS_SOLID, stroke, ink);
+            let old_pen = SelectObject(hdc, pen);
+            let from = (cx + r * 7 / 10 + stroke / 2, cy + r * 7 / 10 + stroke / 2);
+            let _ = MoveToEx(hdc, from.0, from.1, None);
+            let _ = LineTo(hdc, at.left + side * 16 / 18, at.top + side * 16 / 18);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(pen);
+        }
+    }
+
+    /// The search box's procedure: the system's, plus the placeholder. An EDIT
+    /// paints over its whole client, so a placeholder cannot be drawn beneath
+    /// it -- it is drawn over the empty control after the control has painted
+    /// (the tray popup's search box does the same).
+    unsafe extern "system" fn edit_proc(
+        edit: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let original = EDIT_ORIGINAL_PROC.load(Ordering::SeqCst);
+        if original == 0 {
+            return DefWindowProcW(edit, msg, wparam, lparam);
+        }
+        let result = CallWindowProcW(
+            Some(std::mem::transmute::<
+                isize,
+                unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+            >(original)),
+            edit,
+            msg,
+            wparam,
+            lparam,
+        );
+        if msg == WM_PAINT && windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit) == 0 {
+            let hdc = GetDC(edit);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(edit, &mut rc);
+            let font = FONTS.lock().ok().and_then(|g| g.as_ref().map(|f| f.field));
+            if let Some(font) = font {
+                let old = SelectObject(hdc, font);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, rgb(crate::gdi_palette::text_faint()));
+                draw_text(
+                    hdc,
+                    crate::i18n::t("topbar.search_placeholder"),
+                    &mut rc,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                );
+                SelectObject(hdc, old);
+            }
+            ReleaseDC(edit, hdc);
+        }
+        result
+    }
+
+    /// **The search field's face**, which is the text box's own `EDIT`
+    /// subclassed for the placeholder.
+    fn subclass_edit(edit: HWND) {
+        unsafe {
+            let previous =
+                SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
+            if previous != 0 {
+                EDIT_ORIGINAL_PROC.store(previous, Ordering::SeqCst);
+            }
+        }
     }
 
     /// **The *Search the vault* row's icon**, drawn in its tile: a magnifier in
@@ -4100,9 +4180,8 @@ mod card_tests {
         }
     }
 
-    /// **The search card's own geometry**: the header, then one field holding the
-    /// box and the six result slots, at a height that does not change with the
-    /// results.
+    /// **The search card's own geometry**: the header, the search field, then
+    /// the result rows under it, sized to the rows.
     #[test]
     fn nothing_the_search_card_lays_out_falls_off_the_bottom_of_it() {
         let l = layout_for(LIST_ROWS, true);
@@ -4111,7 +4190,7 @@ mod card_tests {
         assert_eq!(slot.y, l.mark.bottom() + 10, "the box sits where the first row would");
         assert!(slot.bottom() <= l.list.y, "the search box overlaps the list");
         assert!(slot.x >= MARGIN_X && slot.right() <= l.window.right() - MARGIN_X);
-        assert!(l.list.bottom() + MARGIN_X <= l.window.bottom());
+        assert!(l.list.bottom() <= l.window.bottom());
         let last = row_at_for(LIST_ROWS, true, LIST_ROWS - 1);
         assert!(last.bottom() <= l.list.bottom());
 
@@ -4119,8 +4198,9 @@ mod card_tests {
         let list = layout(LIST_ROWS);
         assert_eq!(
             l.window.h - list.window.h,
-            SEARCH_H + MARGIN_X - 6,
-            "search mode changed the card's height by something other than its own box"
+            SEARCH_H + HEADER_GAP,
+            "search mode changed the card's height by something other than its own box and the \
+             gap under it"
         );
         assert_eq!(l.title, list.title);
         assert_eq!(
@@ -4129,60 +4209,97 @@ mod card_tests {
         );
     }
 
-    /// **The results and the search box are elements of ONE field.**
+    /// **The search field is its own box and the results are not inside it.**
     ///
-    /// Asked for in exactly those terms: "no border for those matching
-    /// elements (item + search) but they both inside of same field". What is
-    /// decidable without opening a window is the geometry that makes it true
-    /// -- the field encloses both, they touch rather than sitting a gap apart,
-    /// and nothing of either sticks out of it -- and, by source pin below,
-    /// that the card paints a border on the field and on nothing else.
+    /// The owner photographed the card: one rounded border ran from the typed
+    /// text down past the last result, so the list looked like rows inside a
+    /// huge text box, and the rows painted over the border's right edge. The
+    /// field is the search slot and nothing below it.
     #[test]
-    fn the_results_and_the_search_box_share_one_field() {
-        let l = layout_for(LIST_ROWS, true);
+    fn the_search_fields_border_does_not_extend_below_the_search_slot() {
+        for rows in 1..=LIST_ROWS {
+            let l = layout_for(rows, true);
+            let slot = l.search.expect("the search shape has a search box");
+            assert_eq!(l.field, slot, "{rows} rows: the bordered field is not the search slot");
+            assert!(
+                l.field.bottom() <= slot.bottom(),
+                "{rows} rows: the field's border runs {} px below the search slot",
+                l.field.bottom() - slot.bottom()
+            );
+            assert_eq!(l.field.h, SEARCH_H, "the field is not design 2.3's 46 px box");
+        }
+    }
+
+    /// **No result row overlaps the field**, or its border, and the gap between
+    /// them is the card's ordinary one.
+    #[test]
+    fn the_search_rows_do_not_overlap_the_field() {
+        for rows in 1..=LIST_ROWS {
+            let l = layout_for(rows, true);
+            for index in 0..rows {
+                let row = row_at_for(rows, true, index);
+                assert!(
+                    row.y >= l.field.bottom(),
+                    "{rows} rows: row {index} starts at {} but the field ends at {}",
+                    row.y,
+                    l.field.bottom()
+                );
+            }
+            assert_eq!(
+                row_at_for(rows, true, 0).y - l.field.bottom(),
+                HEADER_GAP,
+                "{rows} rows: the gap under the field is not the card's header gap"
+            );
+        }
+    }
+
+    /// **No row paints outside the card**, on either axis, at every row count;
+    /// and the rows are the list's rows -- the same 8 px list padding, so the
+    /// same wash and tile geometry.
+    #[test]
+    fn no_search_row_paints_outside_the_card() {
+        for rows in 1..=LIST_ROWS {
+            let l = layout_for(rows, true);
+            for index in 0..rows {
+                let row = row_at_for(rows, true, index);
+                assert!(row.x >= 0 && row.right() <= l.window.w, "{rows} rows: row {index} leaves the card sideways");
+                assert!(row.y >= 0 && row.bottom() <= l.window.bottom(), "{rows} rows: row {index} leaves the card's bottom");
+                assert_eq!(row.x, row_at(rows, index).x, "search rows are not the list's rows horizontally");
+                assert_eq!(row.w, row_at(rows, index).w, "search rows are not as wide as the list's");
+            }
+            assert!(l.field.right() <= l.window.w && l.field.bottom() <= l.window.bottom());
+            // Sized to its rows: the same bottom padding as the list's card.
+            assert_eq!(
+                l.window.bottom() - row_at_for(rows, true, rows - 1).bottom(),
+                layout(rows).window.bottom() - row_at(rows, rows - 1).bottom(),
+                "{rows} rows: the card does not end under its last row the way the list's does"
+            );
+        }
+    }
+
+    /// The magnifier and the text sit inside the field, the glyph first and
+    /// the text after it, off the border by the design's 16.
+    #[test]
+    fn the_search_text_sits_after_the_magnifier_inside_the_field() {
+        let l = layout_for(1, true);
         let slot = l.search.expect("the search shape has a search box");
-
-        assert_eq!(l.field.x, slot.x, "the search box is not flush with the field's left edge");
-        assert_eq!(l.field.w, slot.w, "the search box is not the field's full width");
-        assert_eq!(l.field.y, slot.y, "the field does not begin at the search box");
-        assert_eq!(
-            slot.bottom(),
-            l.list.y,
-            "there is a {} px gap between the search box and the rows, so they read as two \
-             stacked containers rather than as two elements of one field",
-            l.list.y - slot.bottom()
-        );
-        assert_eq!(
-            l.field.bottom(),
-            l.list.bottom(),
-            "the field does not end where its last row does"
-        );
-        assert_eq!(l.field.x, l.list.x);
-        assert_eq!(l.field.w, l.list.w);
-
-        // The text inside the box is inset off the field's border, and is the
-        // only thing that is: no second inset, and no box of its own.
+        let glyph = search_glyph_box(slot);
         let text = search_text_box(slot);
-        assert!(text.x > l.field.x, "the search text is drawn against the field's border");
-        assert!(text.right() < l.field.right());
+        assert_eq!((glyph.w, glyph.h), (18, 18), "design 2.3: the magnifier is 18 px");
+        assert_eq!(glyph.x - slot.x, 16, "design 2.3: the field is padded `0 16`");
+        assert_eq!(text.x - glyph.right(), 10, "design 2.3: the gap is 10");
+        assert_eq!(slot.right() - text.right(), 16);
+        assert!(glyph.y >= slot.y && glyph.bottom() <= slot.bottom());
         assert!(text.y >= slot.y && text.bottom() <= slot.bottom());
-        assert_eq!(
-            text.x - l.field.x,
-            l.field.right() - text.right(),
-            "the search text is inset by different amounts on its two sides"
-        );
+        // Nothing is vertically off-centre.
+        assert_eq!(glyph.y - slot.y, slot.bottom() - glyph.bottom());
 
-        // **And in every other mode the same field IS the list**, which is
-        // where the card already read that way: the candidate rows and the
-        // *Search the vault* row are elements of one container, not separately
-        // outlined boxes.
+        // And in every other mode the field IS the list, drawn without a
+        // border at all (the paint call is gated on `l.search`).
         for rows in 1..=LIST_ROWS {
             let l = layout(rows);
-            assert_eq!(
-                l.field, l.list,
-                "the list card's field and its list are two different rectangles, so the card \
-                 would draw a container around a container"
-            );
+            assert_eq!(l.field, l.list);
+            assert_eq!(l.search, None);
         }
     }
 
@@ -4197,7 +4314,7 @@ mod card_tests {
     /// already draws around a focused footer button -- rather than with
     /// something invented to replace the border that was taken away.
     #[test]
-    fn one_field_carries_the_only_border_and_shows_focus_the_design_s_way() {
+    fn the_search_field_carries_the_only_border_and_shows_focus_the_design_s_way() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let raw =
             std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
@@ -4219,9 +4336,8 @@ mod card_tests {
             "control: this scan is not reading the function that paints the card's surface"
         );
         assert!(
-            flat.contains("rounded( mem, l.field, FIELD_RADIUS, crate::gdi_palette::card(), Some(( 1,"),
-            "the one bordered container is no longer drawn from `l.field`, so the search box and \
-             the rows are not inside one field any more"
+            flat.contains("rounded( mem, l.field, FIELD_RADIUS, crate::gdi_palette::field_bg(), Some(( 1,"),
+            "the search field is no longer drawn from `l.field` in `field_bg`"
         );
         assert!(
             !flat.contains("crate::gdi_palette::kbd_border()"),
@@ -4229,7 +4345,7 @@ mod card_tests {
              `BORDER_STRONG`, and taking it away is the whole of change two"
         );
         assert!(
-            flat.contains("if search_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::hairline() }"),
+            flat.contains("if search_focused { crate::gdi_palette::blue() } else { crate::gdi_palette::field_bg() }"),
             "the field no longer changes to `theme::BLUE` when the search box has focus. \
              Removing the input's border removed its focus indication, and the field's edge is \
              where that indication moved"
@@ -4262,7 +4378,7 @@ mod card_tests {
         assert_eq!((tile.left, tile.right - tile.left, tile.bottom - tile.top), (18, 42, 42));
         assert_eq!(tile.top, 12);
         // Search mode keeps the bordered field's 16 px margin.
-        assert_eq!(layout_for(LIST_ROWS, true).list.x, MARGIN_X);
+        assert_eq!(layout_for(LIST_ROWS, true).list.x, 8, "search rows keep the list's padding");
     }
 
     /// **The bold line is the username and the faint one the item's name**

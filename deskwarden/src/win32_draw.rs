@@ -50,6 +50,18 @@ pub(crate) fn card_brush() -> HBRUSH {
         as *mut std::ffi::c_void)
 }
 
+/// [`card_brush`]'s twin for a search field: the brush a card answers
+/// `WM_CTLCOLOREDIT` with when its text box sits on `field_bg` rather than on
+/// the card. Same lifetime rules: one per theme, made once, never deleted.
+pub(crate) fn field_brush() -> HBRUSH {
+    use std::sync::OnceLock;
+    static LIGHT: OnceLock<isize> = OnceLock::new();
+    static DARK: OnceLock<isize> = OnceLock::new();
+    let slot = if crate::gdi_palette::is_dark() { &DARK } else { &LIGHT };
+    HBRUSH(*slot.get_or_init(|| unsafe { CreateSolidBrush(rgb(crate::gdi_palette::field_bg())).0 as isize })
+        as *mut std::ffi::c_void)
+}
+
 // ---------------------------------------------------------------------------
 // Cyrillic on the GDI cards.
 //
