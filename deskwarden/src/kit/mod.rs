@@ -21,6 +21,7 @@ pub mod modal;
 pub mod pills;
 pub mod motion;
 pub mod rows;
+pub mod select;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod tips;

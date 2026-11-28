@@ -2861,6 +2861,7 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
     use crate::kit::{self, tokens};
     let p = tokens::palette(ui.ctx());
     let mut out = HeaderTopOutcome::default();
+    arm_selection(ui.ctx(), &top.item.id);
     let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), V2_AVATAR), egui::Sense::hover());
     let avatar = egui::Rect::from_min_size(row.min, egui::Vec2::splat(V2_AVATAR));
     kit::avatar::paint(ui.painter(), avatar, &super::item_list::row_look(top.item, top.icon), 20);
@@ -2930,7 +2931,7 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
     let mut title = tokens::job(tokens::PAGE_TITLE, &top.item.name, p.ink);
     title.wrap = egui::text::TextWrapping::truncate_at_width(width);
     let title = ctx.fonts_mut(|f| f.layout_job(title));
-    ui.painter().galley(egui::pos2(left, y), title, p.ink);
+    let _ = crate::kit::select::galley(ui, egui::Id::new(("detail-title", &top.item.id)), egui::pos2(left, y), title, p.ink, true);
 
     let line_top = y + title_h + 8.0;
     let mut x = left;
@@ -2942,7 +2943,7 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
     if let Some(galley) = shared_galley {
         let at = egui::Rect::from_min_size(egui::pos2(x, centred(galley.size().y)), galley.size());
         x += galley.size().x + 8.0;
-        ui.painter().galley(at.min, galley, p.text_faint);
+        let _ = crate::kit::select::galley(ui, egui::Id::new(("detail-shared-text", &top.item.id)), at.min, galley, p.text_faint, true);
         if top.shared_by.is_some_and(|(_, unverified)| unverified) {
             let _ = ui
                 .interact(at, egui::Id::new(("detail-shared-by", &top.item.id)), egui::Sense::hover())
@@ -2954,12 +2955,23 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
         let response = ui
             .interact(chip, egui::Id::new(("detail-folder-chip", &top.item.id)), egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let bg = if response.hovered() { FOLDER_CHIP_HOVER } else { p.tag_neutral_bg };
+        let bg = if response.hovered() || ui.rect_contains_pointer(chip) { FOLDER_CHIP_HOVER } else { p.tag_neutral_bg };
         ui.painter().rect_filled(chip, CornerRadius::same(7), bg);
         let glyph = egui::Rect::from_min_size(egui::pos2(chip.left() + 7.0, chip.center().y - 6.5), egui::Vec2::splat(13.0));
         kit::icon::stroke(ui.painter(), glyph, kit::icon::glyph::FOLDER, 2.0, p.tag_neutral_ink);
-        ui.painter().galley(egui::pos2(glyph.right() + 6.0, chip.top() + 3.0), galley, p.tag_neutral_ink);
-        out.folder = response.clicked();
+        // The folder's name can be selected; a click on it still opens the folder.
+        let name = crate::kit::select::galley(
+            ui,
+            egui::Id::new(("detail-folder-name", &top.item.id)),
+            egui::pos2(glyph.right() + 6.0, chip.top() + 3.0),
+            galley,
+            p.tag_neutral_ink,
+            true,
+        );
+        if ui.rect_contains_pointer(chip) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        out.folder = response.clicked() || name.as_ref().is_some_and(|name| name.clicked());
         x = chip.right() + 8.0;
     }
     for (tag, size) in top.tags.iter().zip(&tag_sizes) {
@@ -4371,13 +4383,29 @@ fn fills_in_chip(ui: &mut egui::Ui, d: &str, label: &str) -> egui::Response {
     let size = egui::vec2(14.0 + 16.0 + 9.0 + text.size().x + 14.0, 38.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let bg = if response.hovered() { p.secondary_hover } else { p.field_bg };
+    let bg = if response.hovered() || ui.rect_contains_pointer(rect) { p.secondary_hover } else { p.field_bg };
     ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
     let glyph = egui::Rect::from_min_size(egui::pos2(rect.left() + 14.0, rect.center().y - 8.0), egui::Vec2::splat(16.0));
     kit::icon::stroke(ui.painter(), glyph, d, 2.0, p.text_icon);
     let text_h = text.size().y;
-    ui.painter().galley(egui::pos2(glyph.right() + 9.0, rect.center().y - text_h / 2.0), text, p.ink);
-    response
+    // The site's name can be selected; a click on it still opens the site.
+    let name = crate::kit::select::galley(
+        ui,
+        response.id.with("site-name"),
+        egui::pos2(glyph.right() + 9.0, rect.center().y - text_h / 2.0),
+        text,
+        p.ink,
+        true,
+    );
+    match name {
+        Some(name) => {
+            if ui.rect_contains_pointer(rect) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            response | name
+        }
+        None => response,
+    }
 }
 
 /// Spec 3.3's "Fills in" card: the item's websites as chips; a chip opens
@@ -5086,10 +5114,12 @@ fn app_match_card(
                 ui,
                 app_row.label,
                 |ui| {
-                    ui.label(
+                    value_label(
+                        ui,
                         RichText::new(&app_row.value)
                             .size(ROW_VALUE_SIZE)
                             .color(p.text_faint),
+                        true,
                     );
                 },
                 |_ui| {},
@@ -5252,7 +5282,7 @@ fn app_name_row(
                         .clicked();
                 }
                 None => {
-                    ui.label(galley);
+                    value_label(ui, galley, true);
                 }
             }
         },
@@ -5356,7 +5386,7 @@ fn app_value_row(
             // path drew its full 285pt anyway. A `Galley` is already laid;
             // `Label` paints it as it is.
             let galley = ui.painter().layout_job(job);
-            ui.label(galley);
+            value_label(ui, galley, true);
         },
         |_ui| {},
         // `copy`, not `value`: the `App` row displays the app's resolved
@@ -6067,7 +6097,7 @@ fn copy_row(
         row_impl(ui, label, value, controls, egui::Sense::hover(), shape);
         return;
     }
-    let response = row_impl(ui, label, value, controls, egui::Sense::click(), shape);
+    let (response, row_value) = row_impl(ui, label, value, controls, egui::Sense::click(), shape);
     // **Asked for only while the tile itself is what the pointer is on.**
     // `Response::hovered` is egui's answer to "which one widget would a click
     // go to", so over the eye or the website link it is the CHILD that is
@@ -6086,13 +6116,78 @@ fn copy_row(
     let response = if response.hovered() {
         response.on_hover_text(copy_row_tooltip(hint))
     } else {
+        // The pointer is on the value's own text, which sits on top of the
+        // tile: the tile is not hovered, the row still is.
+        if let Some(value) = row_value.as_ref().filter(|value| value.hovered()) {
+            let _ = value.clone().on_hover_text(copy_row_tooltip(hint));
+        }
         response
     };
-    if response.clicked() {
+    if response.clicked() || row_value.as_ref().is_some_and(|value| value.clicked()) {
         *action = on_copy;
         // The row names its own confirmation, off the very label it just
         // painted -- so the toast cannot say a field the row does not.
         note_copied(ui.ctx(), label);
+    }
+}
+
+thread_local! {
+    /// **The first selectable value drawn inside the row being laid out**, or
+    /// `None` outside a row. A value you can drag across is a widget of its
+    /// own, on top of the row's tile -- so a click or a hover on the text
+    /// lands on the text and not on the tile. [`row_impl`] opens this before
+    /// the row is drawn and takes the answer after, and [`copy_row`] counts
+    /// the text's click as the tile's click: **click = copy, drag = select.**
+    static ROW_VALUE: std::cell::RefCell<Option<Option<egui::Response>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn begin_row_value() {
+    ROW_VALUE.with(|row| *row.borrow_mut() = Some(None));
+}
+
+fn note_row_value(response: &egui::Response) {
+    ROW_VALUE.with(|row| {
+        if let Some(slot) = row.borrow_mut().as_mut() {
+            if slot.is_none() {
+                *slot = Some(response.clone());
+            }
+        }
+    });
+}
+
+fn take_row_value() -> Option<egui::Response> {
+    ROW_VALUE.with(|row| row.borrow_mut().take().flatten())
+}
+
+/// **A value's text, selectable with the mouse** when `selectable`: drag any
+/// part of it, double-click a word, Ctrl+C. Not selectable it is exactly the
+/// plain `ui.label` it always was -- which is what a masked value must be (see
+/// [`crate::kit::select`]). Inside a copy row the text's click and hover are
+/// handed to the row, so a click still copies the whole value.
+fn value_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, selectable: bool) -> egui::Response {
+    let response = ui.add(egui::Label::new(text).selectable(selectable));
+    if selectable {
+        note_row_value(&response);
+    }
+    response
+}
+
+/// Both read panes call this first: the frame's selection copies go through
+/// the app's own protected clipboard writer (never eframe's plain one), and a
+/// selection made on another item is dropped rather than laid over this one.
+fn arm_selection(ctx: &egui::Context, item_id: &str) {
+    crate::kit::select::protect_copies(ctx, crate::clipboard::copy_secret);
+    let last = egui::Id::new("detail-selection-item");
+    let changed = ctx.data_mut(|d| {
+        let same = d.get_temp::<String>(last).as_deref() == Some(item_id);
+        if !same {
+            d.insert_temp(last, item_id.to_string());
+        }
+        !same
+    });
+    if changed {
+        crate::kit::select::clear_selection(ctx);
     }
 }
 
@@ -6103,9 +6198,10 @@ fn row_impl(
     controls: impl FnOnce(&mut egui::Ui),
     sense: egui::Sense,
     shape: RowShape,
-) -> egui::Response {
+) -> (egui::Response, Option<egui::Response>) {
     let p = crate::kit::tokens::palette(ui.ctx());
     let clickable = sense == egui::Sense::click();
+    begin_row_value();
     let scope = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
         // The hover tint's slot, reserved BEFORE anything paints into this
         // row: the response that decides whether to fill it only exists once
@@ -6116,7 +6212,9 @@ fn row_impl(
         tint
     });
     let response = scope.response;
-    if clickable && response.hovered() {
+    let row_value = take_row_value();
+    let over = response.hovered() || row_value.as_ref().is_some_and(|value| value.hovered());
+    if clickable && over {
         // The affordance. Design 2b has no hovered-row style of its own --
         // it draws no hover states at all -- so this borrows the tint the
         // design already uses for a raised surface (`CARD_TINT`, the same
@@ -6131,7 +6229,7 @@ fn row_impl(
             egui::Shape::rect_filled(response.rect, CornerRadius::ZERO, p.list_bg),
         );
     }
-    response
+    (response, row_value)
 }
 
 fn row_body(
@@ -6292,7 +6390,7 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(text);
+            value_label(ui, text, true);
         });
 }
 
@@ -6487,8 +6585,8 @@ fn card_text_pair(ui: &mut egui::Ui, first: RichText, second: RichText) {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.label(first);
-                ui.label(second);
+                value_label(ui, first, true);
+                value_label(ui, second, true);
             });
         });
 }
@@ -6525,8 +6623,8 @@ fn card_text_stacked(ui: &mut egui::Ui, first: RichText, second: RichText) {
             ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(first);
-                ui.label(second);
+                value_label(ui, first, true);
+                value_label(ui, second, true);
             });
         });
 }
@@ -6788,7 +6886,7 @@ fn legible_digits_line(ui: &egui::Ui) -> f32 {
 /// exists to correct. So the box is allocated the same way `Label` would
 /// allocate it, which keeps the row's height and the controls' right-alignment
 /// exactly as they were, and only the paint position moves.
-fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
+fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32, selectable: bool) {
     let p = crate::kit::tokens::palette(ui.ctx());
     let mut job = digits_job(text, p.ink);
     job.wrap.max_width = room;
@@ -6833,7 +6931,7 @@ fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
     // and an ellipsis on the end of one would make it invisible to all three
     // while they went on passing for the wrong reason.
     job.wrap.max_rows = 1;
-    paint_on_the_value_baseline(ui, job, p.ink);
+    paint_on_the_value_baseline(ui, job, p.ink, selectable);
 }
 
 /// Allocate a run's box the way `Label` would and paint it on the baseline
@@ -6854,12 +6952,27 @@ fn paint_on_the_value_baseline(
     ui: &mut egui::Ui,
     job: egui::text::LayoutJob,
     color: egui::Color32,
+    selectable: bool,
 ) {
     let galley = ui.painter().layout_job(job);
     let drop = digits_baseline_drop(&galley, &ordinary_value_galley(ui));
-    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
-    ui.painter()
-        .galley(egui::pos2(rect.left(), rect.top() + drop), galley, color);
+    // **Selectable only while the value is showing.** A masked run of dots is
+    // allocated with `Sense::hover()` and painted by the plain painter, as it
+    // always was: there is no widget for a drag to start on, so selecting the
+    // dots can never copy the secret behind them.
+    let sense = if selectable { crate::kit::select::sense() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(galley.size(), sense);
+    crate::kit::select::paint(
+        ui,
+        &response,
+        egui::pos2(rect.left(), rect.top() + drop),
+        galley,
+        color,
+        selectable,
+    );
+    if selectable {
+        note_row_value(&response);
+    }
 }
 
 /// Cut a masked run down to what fits `room` on ONE line, returning it
@@ -6927,7 +7040,7 @@ fn credential_row(
         ui,
         label,
         |ui| {
-            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(p.ink));
+            value_label(ui, RichText::new(value).size(ROW_VALUE_SIZE).color(p.ink), true);
         },
         |_ui| {},
         on_copy,
@@ -7191,6 +7304,7 @@ fn masked_row(
     // elided with `…`, because there really is more of it and the reader has
     // to be told. See [`fit_mask`] and [`paint_digits`].
     let shown = if *revealed { shown } else { fit_mask(ui, &shown, room) };
+    let selectable = *revealed;
     copy_row(
         ui,
         label,
@@ -7222,7 +7336,7 @@ fn masked_row(
                 );
                 ui.add_space(BRAND_MARK_GAP);
             }
-            paint_digits(ui, &shown, room);
+            paint_digits(ui, &shown, room, selectable);
         },
         |ui| {
             // AN EYE, not the words "Reveal"/"Hide". The state it shows is
@@ -7520,14 +7634,29 @@ fn card_hero(
     let digits_size = digits.size();
     let digits_at = egui::pos2(inner.left(), (top_end + bottom_start) / 2.0 - digits_size.y / 2.0);
     let number_rect = egui::Rect::from_min_size(digits_at, digits_size);
+    let mut number_response: Option<egui::Response> = None;
     if !number.is_empty() {
-        let r = ui.interact(number_rect.expand(4.0 * k), ui.id().with("hero-number"), egui::Sense::click());
+        // Selectable only once the number is showing: the masked digits keep
+        // the plain click sense and the plain painter below.
+        let sense = if reveal.card_number { crate::kit::select::sense() } else { egui::Sense::click() };
+        let r = ui.interact(number_rect.expand(4.0 * k), ui.id().with("hero-number"), sense);
+        number_response = Some(r.clone());
         if hero_copy_affordance(ui, &r, ink_centred(number_rect, &digits), 6.0 * k, CopyShortcut::CardNumber) {
             *action = DetailAction::CopyCardNumber;
             note_copied(ui.ctx(), number_label());
         }
     }
-    ui.painter().galley(digits_at, digits, white);
+    match &number_response {
+        Some(r) if reveal.card_number => {
+            crate::kit::select::paint(ui, r, digits_at, digits, white, true);
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        _ => {
+            ui.painter().galley(digits_at, digits, white);
+        }
+    }
     let eye = egui::Rect::from_center_size(egui::pos2(digits_at.x + digits_size.x + (12.0 + 16.0) * k, digits_at.y + digits_size.y / 2.0), egui::Vec2::splat(32.0 * k));
     if !number.is_empty() {
         let response = ui.interact(eye, ui.id().with("hero-number-eye"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -7590,17 +7719,40 @@ fn card_hero(
         } else {
             None
         };
+        // **Selectable when the value is on show and there is something to
+        // select**: the cardholder and the expiry always, the security code
+        // only once its eye is open. A masked code stays the plain painter.
+        let value_selectable = if label == hero_holder() {
+            fields.cardholder.is_some()
+        } else if label == hero_expires() {
+            fields.expiry.is_some()
+        } else {
+            !code.is_empty() && reveal.card_code
+        };
+        let mut value_response: Option<egui::Response> = None;
         if let Some((on_copy, hint, name)) = copy {
             let value_rect = egui::Rect::from_min_size(value_at, v.size());
             let id = ui.id().with(("hero-copy", name));
-            let r = ui.interact(value_rect.expand(4.0 * k), id, egui::Sense::click());
+            let sense = if value_selectable { crate::kit::select::sense() } else { egui::Sense::click() };
+            let r = ui.interact(value_rect.expand(4.0 * k), id, sense);
+            value_response = Some(r.clone());
             if hero_copy_affordance(ui, &r, ink_centred(value_rect, &v), 5.0 * k, hint) {
                 *action = on_copy;
                 note_copied(ui.ctx(), name);
             }
         }
         ui.painter().galley(egui::pos2(x, label_y), l, faint);
-        ui.painter().galley(value_at, v, white);
+        match &value_response {
+            Some(r) if value_selectable => {
+                crate::kit::select::paint(ui, r, value_at, v, white, true);
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+            _ => {
+                ui.painter().galley(value_at, v, white);
+            }
+        }
         if label == hero_code() && !code.is_empty() {
             let at = egui::Rect::from_center_size(egui::pos2(x + value_w + (8.0 + 12.0) * k, label_y + label_h + 2.0 + value_h / 2.0), egui::Vec2::splat(24.0 * k));
             let response = ui.interact(at, ui.id().with("hero-code-eye"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -8462,7 +8614,7 @@ fn plain_value_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui,
         label,
         |ui| {
-            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(p.ink));
+            value_label(ui, RichText::new(value).size(ROW_VALUE_SIZE).color(p.ink), true);
         },
         |_ui| {},
     );
@@ -8547,7 +8699,7 @@ fn totp_code_row(
         role.size = (role.size * room / digits.size().x).floor();
         digits = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, &grouped_code(code), ink)));
     }
-    ui.painter().galley(egui::pos2(inner.left(), top + label_h + 4.0), digits, ink);
+    let _ = crate::kit::select::galley(ui, ui.id().with("totp-code"), egui::pos2(inner.left(), top + label_h + 4.0), digits, ink, true);
     let copy = ui
         .interact(copy_rect, ui.id().with("totp-copy"), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -9652,6 +9804,21 @@ mod tests {
         vault: Vec<VaultItem>,
     }
 
+    thread_local! {
+        /// Every string a frame of this thread's panes handed to the
+        /// protected clipboard writer -- see [`record_protected_copy`].
+        static PROTECTED_COPIES: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_protected_copy(text: &str) {
+        PROTECTED_COPIES.with(|copies| copies.borrow_mut().push(text.to_string()));
+    }
+
+    fn protected_copies() -> Vec<String> {
+        PROTECTED_COPIES.with(|copies| copies.borrow().clone())
+    }
+
     /// One frame's output: what it returned, every string it painted with
     /// the rect it landed in, and the three drawn icons -- which paint no
     /// string at all and can therefore only be found by their geometry (see
@@ -10008,6 +10175,10 @@ mod tests {
             theme::apply(&ctx);
             crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
             let _ = ctx.run_ui(input, |_ui| {});
+            // The protected writer, as a recording stand-in: `arm_selection`
+            // installs `clipboard::copy_secret` only if nobody has yet, and
+            // that one ends in Win32, which no test may reach.
+            crate::kit::select::protect_copies(&ctx, record_protected_copy);
             Self {
                 ctx,
                 width,
@@ -15738,6 +15909,167 @@ mod tests {
             other: serde_json::Map::new(),
         });
         item
+    }
+
+
+    // --------------------------------------- selecting values with the mouse
+
+    fn pointer_button(at: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A real drag from `from` to `to`, then Ctrl+C -- the events egui-winit
+    /// turns the keystroke into. Everything the protected writer was handed
+    /// is read back by [`protected_copies`].
+    fn drag_over_and_copy(pane: &mut Pane, item: &VaultItem, from: egui::Pos2, to: egui::Pos2) {
+        let totp = TotpState::NoSecret;
+        let _ = pane.frame(item, &totp, vec![egui::Event::PointerMoved(from), pointer_button(from, true)]);
+        let _ = pane.frame(item, &totp, vec![egui::Event::PointerMoved(to)]);
+        let _ = pane.frame(item, &totp, vec![egui::Event::PointerMoved(to), pointer_button(to, false)]);
+        let _ = pane.frame(item, &totp, vec![egui::Event::Copy]);
+        let _ = pane.idle(item, &totp);
+    }
+
+    /// The first half of the value's box, which is a partial selection.
+    fn first_half(rect: egui::Rect) -> (egui::Pos2, egui::Pos2) {
+        (
+            egui::pos2(rect.left() + 1.0, rect.center().y),
+            egui::pos2(rect.left() + rect.width() * 0.5, rect.center().y),
+        )
+    }
+
+    /// **A password that is showing can be selected, and a drag copies exactly
+    /// that part -- through the protected writer.** The owner's "select with a
+    /// mouse any characters and copy like a portion of it".
+    #[test]
+    fn a_revealed_password_selects_by_drag_and_copies_through_the_protected_writer() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        pane.reveal.password = true;
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let (from, to) = first_half(laid_out.rect_of("hunter2"));
+        drag_over_and_copy(&mut pane, &item, from, to);
+        let copies = protected_copies();
+        assert_eq!(copies.len(), 1, "the selection copy did not reach the protected writer once: {copies:?}");
+        assert!(
+            !copies[0].is_empty() && copies[0].len() < "hunter2".len() && "hunter2".starts_with(copies[0].as_str()),
+            "a drag over the first half of the password copied {:?}, not a part of it",
+            copies[0]
+        );
+    }
+
+    /// **The hidden password is not selectable.** Dragging across the dots and
+    /// pressing Ctrl+C puts nothing on any clipboard: the dots are painted with
+    /// no widget under them, so there is nothing for egui to copy -- least of
+    /// all the secret behind them.
+    #[test]
+    fn a_hidden_password_cannot_be_selected_so_a_drag_over_the_dots_copies_nothing() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let (from, to) = first_half(laid_out.rect_of(MASKED_PASSWORD));
+        drag_over_and_copy(&mut pane, &item, from, to);
+        assert!(protected_copies().is_empty(), "a drag over the hidden password copied {:?}", protected_copies());
+        // The positive control: the same drag does select once it is showing.
+        pane.reveal.password = true;
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let (from, to) = first_half(laid_out.rect_of("hunter2"));
+        drag_over_and_copy(&mut pane, &item, from, to);
+        assert_eq!(protected_copies().len(), 1, "the control drag did not select either, so the first half proves nothing");
+    }
+
+    /// The same two states for a masked ROW (the SSH private key goes through
+    /// `masked_row`, as do custom hidden fields, history and the card's
+    /// secrets): the dots are not selectable, the revealed key is.
+    #[test]
+    fn a_masked_row_is_selectable_only_while_it_is_revealed() {
+        let item = an_ssh_key_item();
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let dots = laid_out
+            .texts
+            .iter()
+            .find(|(t, _)| t.starts_with('\u{2022}'))
+            .map(|(_, r)| *r)
+            .expect("the masked private key painted no dots");
+        let (from, to) = first_half(dots);
+        drag_over_and_copy(&mut pane, &item, from, to);
+        assert!(
+            protected_copies().is_empty(),
+            "a drag over the masked private key copied {:?}",
+            protected_copies()
+        );
+
+        pane.reveal.ssh_private_key = true;
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let key = laid_out
+            .texts
+            .iter()
+            .find(|(t, _)| t.starts_with("-----BEGIN"))
+            .map(|(_, r)| *r)
+            .expect("the revealed private key painted no text");
+        let (from, to) = first_half(key);
+        drag_over_and_copy(&mut pane, &item, from, to);
+        let copies = protected_copies();
+        assert_eq!(copies.len(), 1, "the revealed key did not select: {copies:?}");
+        assert!(PRIVATE_KEY.contains(copies[0].as_str()), "the copy {:?} is not a part of the key", copies[0]);
+    }
+
+    /// **Click = copy the whole value (as before), drag = select a part of
+    /// it.** A plain row (the SSH fingerprint) has its text on top of the
+    /// row's tile; the text's click still reaches the row, and a drag over it
+    /// neither copies the row nor is swallowed by it.
+    #[test]
+    fn a_value_in_a_copy_row_still_copies_on_click_and_selects_on_drag() {
+        let item = an_ssh_key_item();
+        let totp = TotpState::NoSecret;
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &totp);
+        let laid_out = pane.idle(&item, &totp);
+        let value = laid_out.rect_of(FINGERPRINT);
+        let clicked = pane.click(&item, &totp, value.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyValue(FINGERPRINT.to_string()),
+            "a click on the value's own glyphs no longer copies the row"
+        );
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &totp);
+        let laid_out = pane.idle(&item, &totp);
+        let (from, to) = first_half(laid_out.rect_of(FINGERPRINT));
+        let _ = pane.frame(&item, &totp, vec![egui::Event::PointerMoved(from), pointer_button(from, true)]);
+        let _ = pane.frame(&item, &totp, vec![egui::Event::PointerMoved(to)]);
+        let released = pane.frame(&item, &totp, vec![egui::Event::PointerMoved(to), pointer_button(to, false)]);
+        assert_eq!(released.action, DetailAction::None, "a drag over the value copied the whole row");
+        let _ = pane.frame(&item, &totp, vec![egui::Event::Copy]);
+        let copies = protected_copies();
+        assert_eq!(copies.len(), 1, "the dragged part did not reach the protected writer: {copies:?}");
+        assert!(
+            !copies[0].is_empty() && copies[0].len() < FINGERPRINT.len() && FINGERPRINT.starts_with(copies[0].as_str()),
+            "the drag copied {:?}, not a part of {FINGERPRINT:?}",
+            copies[0]
+        );
+    }
+
+    /// The wiring that makes every selection copy protected is one call, made
+    /// by the header both read panes share: the app's own writer, not eframe's.
+    #[test]
+    fn the_read_panes_route_selection_copies_through_the_apps_clipboard_writer() {
+        let source = include_str!("detail.rs");
+        let call = concat!("protect_copies(ctx, crate::clipboard::", "copy_secret)");
+        assert_eq!(source.matches(call).count(), 1, "arm_selection does not install the protected writer");
+        let arm = concat!("arm_selection(ui.ctx(), ", "&top.item.id)");
+        assert_eq!(source.matches(arm).count(), 1, "the shared header does not arm the protected writer");
     }
 
     // ------------------------------------------------ the TOTP SECRET row
