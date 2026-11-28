@@ -105,7 +105,12 @@ fn paint_cell(ui: &mut Ui, rect: Rect, cell: &Cell<'_>, shape: &Shape, id: egui:
 
     let mut value_job = tokens::job(tokens::Role { tracking_em: cell.tracking_em, ..tokens::FIELD_VALUE }, cell.value, p.ink);
     value_job.wrap = egui::text::TextWrapping::truncate_at_width(width);
-    painter.galley(pos2(inner.left(), y + label_h + LABEL_GAP), painter.layout_job(value_job), p.ink);
+    let value = painter.layout_job(value_job);
+    // **The value can be selected with the mouse -- unless it is a masked
+    // secret.** `Some(false)` is the eye shut: the dots are painted as they
+    // always were, with no widget under them for a drag to start on.
+    let selectable = cell.secret != Some(false);
+    let _ = crate::kit::select::galley(ui, id.with("value"), pos2(inner.left(), y + label_h + LABEL_GAP), value, p.ink, selectable);
 
     FieldResponse { copy, reveal, eye_rect, copy_rect }
 }

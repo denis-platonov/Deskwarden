@@ -60,9 +60,11 @@ pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
 }
 
 /// A link from text the caller has already laid out (in `palette.blue`): the
-/// pointing hand and the un-selectable click sense.
+/// pointing hand and the click sense. **The text can also be selected**: a
+/// click opens the link, a drag selects part of it (egui reports a click only
+/// for a press that never became a drag).
 pub fn link_galley(ui: &mut Ui, galley: std::sync::Arc<egui::Galley>) -> Response {
-    let response = ui.add(egui::Label::new(galley).selectable(false).sense(Sense::click()));
+    let response = ui.add(egui::Label::new(galley).selectable(true).sense(Sense::click()));
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
