@@ -6,6 +6,7 @@
 //! cargo run --example picker_preview -- --few
 //! cargo run --example picker_preview -- --full
 //! cargo run --example picker_preview -- --empty
+//! cargo run --example picker_preview -- --shot out.png --search north
 //! ```
 //!
 //! `--few` shows a populated card with **two** candidates, which is the state
@@ -199,6 +200,38 @@ fn shoot(window: PickerWindow) -> Event {
     Event::Cancel
 }
 
+/// `--search QUERY`: opens the card's search mode and types QUERY into it
+/// (`north` finds three, `zzz` none, `a` more than the cap), then shoots.
+static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The shots-mode pump for `--search`: click the *Search the vault* row, type
+/// the query into the card's own text box, then shoot.
+fn shoot_search(window: PickerWindow) -> Event {
+    use std::sync::atomic::Ordering;
+    match STEP.fetch_add(1, Ordering::SeqCst) {
+        0 => {
+            shot::pump(300);
+            Event::Search
+        }
+        1 => {
+            shot::pump(300);
+            let query = QUERY.get().cloned().unwrap_or_default();
+            unsafe {
+                use windows::core::{w, HSTRING};
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, SetWindowTextW};
+                let top = HWND(window.0 as *mut std::ffi::c_void);
+                if let Ok(edit) = FindWindowExW(top, None, w!("EDIT"), None) {
+                    let _ = SetWindowTextW(edit, &HSTRING::from(query.as_str()));
+                }
+            }
+            Event::Typed(query)
+        }
+        _ => shoot(window),
+    }
+}
+
 /// The app the card is pretending to have been opened in front of. A fixture
 /// like the candidates are -- nothing here reads a real foreground window.
 ///
@@ -286,6 +319,9 @@ fn main() {
     if let Some(path) = &shooting {
         let _ = SHOT.set(path.into());
     }
+    if let Some(query) = shot::value("--search") {
+        let _ = QUERY.set(query);
+    }
     let capturable = shooting.is_some() || std::env::args().any(|arg| arg == "--capturable");
     if capturable {
         eprintln!("preview: capture exclusion is stubbed out, so this window can be screenshotted");
@@ -326,7 +362,7 @@ fn main() {
             &PickerCalls {
                 open: REAL.open,
                 protect: |_| true,
-                next: if shooting.is_some() { shoot } else { REAL.next },
+                next: if shooting.is_some() && QUERY.get().is_some() { shoot_search } else if shooting.is_some() { shoot } else { REAL.next },
                 show_palette: REAL.show_palette,
                 show_search: REAL.show_search,
                 close: REAL.close,
