@@ -15,6 +15,25 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 1.0.3 - 2026-11-27
+
+> Detail values can be selected and copied in part, the picker's search
+> looks like the rest of the app, and the About page is tidier.
+
+### Changed
+
+- Every value on an item's detail pane -- usernames, passwords once shown,
+  URIs, notes, custom fields -- can be selected with the mouse and copied in
+  part, not only whole with the copy button. Copied text is cleared from the
+  clipboard like any other copied secret.
+- The picker card's search is its own rounded field, with the matches as
+  ordinary rows below it.
+- The release notes on the About page use the same type and colours as the
+  rest of Settings.
+- The update card says only which version is ready, next to its Restart to
+  install button.
+- The About page shows the version once, in its Version tile.
+
 ## 1.0.2 - 2026-11-27
 
 > The rest of the old design is gone, dark mode reaches every window and
